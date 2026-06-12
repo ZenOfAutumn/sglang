@@ -17,13 +17,15 @@ if TYPE_CHECKING:
 class StateType(str, enum.Enum):
     MAMBA = "mamba"
     SWA = "swa"
-    NSA = "nsa"
+    DSA = "dsa"
 
 
 @dataclasses.dataclass
 class KVTransferMetric:
     # Backends that cannot isolate transfer latency can leave this as None.
     transfer_latency_s: Optional[float] = None
+    # Backends that cannot isolate allocation wait latency can leave this as None.
+    alloc_latency_s: Optional[float] = None
     transfer_total_bytes: Optional[int] = None
 
 
