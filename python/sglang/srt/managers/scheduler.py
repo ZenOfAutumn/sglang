@@ -12,6 +12,15 @@
 # limitations under the License.
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
+# 本文件实现 SGLang 的核心调度器（Scheduler）。
+# 调度器运行在独立进程中，负责管理张量并行（TP）的 GPU worker，主要职责包括：
+#   1. 通过 ZMQ 从 TokenizerManager 接收请求、向 DetokenizerManager 发送结果；
+#   2. 维护等待队列（waiting_queue）与运行批次（running_batch），实现连续批处理（continuous batching）；
+#   3. 组织 prefill（预填充）与 decode（解码）批次的调度策略、KV 缓存与显存池管理；
+#   4. 驱动前向计算（run_batch）并处理输出（process_batch_result）；
+#   5. 支持多种高级特性：投机解码、PD 分离部署、流水线并行（PP）、DP attention、
+#      分层缓存（HiCache）、LoRA、结构化生成（grammar）等。
+# Scheduler 通过继承多个 Mixin 将上述能力组合到一起，事件循环是其运行的主入口。
 
 import faulthandler
 import logging
@@ -238,7 +247,7 @@ else:
 
 logger = logging.getLogger(__name__)
 
-# Test retract decode for debugging purposes
+# 用于调试目的的 retract（回退）decode 测试开关
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
@@ -246,13 +255,18 @@ TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 _is_npu = is_npu()
 
 
+# Embedding/Reward 模型一次前向计算的结果封装。
 @dataclass
 class EmbeddingBatchResult:
+    # 模型输出的 embedding 张量（可能在 GPU 上）。
     embeddings: torch.Tensor
+    # overlap 调度下用于标记拷贝到 CPU 完成的事件。
     copy_done: Optional[torch.cuda.Event] = None
 
     def copy_to_cpu(self):
         """Copy embeddings tensor to CPU in overlap scheduling."""
+        # 在 overlap（CPU 调度与 GPU 计算重叠）调度下，将 embedding 异步拷贝到 CPU，
+        # 并记录一个事件，便于后续等待拷贝完成后再读取结果。
 
         if isinstance(self.embeddings, torch.Tensor):
             self.copy_done = torch.get_device_module(self.embeddings.device).Event()
@@ -270,52 +284,65 @@ class EmbeddingBatchResult:
         self.copy_done.record()
 
 
+# Scheduler 通过继承一系列 Mixin 组合出完整功能，每个 Mixin 负责一类职责：
 class Scheduler(
-    SchedulerOutputProcessorMixin,
-    SchedulerUpdateWeightsMixin,
-    SchedulerProfilerMixin,
-    SchedulerMetricsMixin,
-    SchedulerDisaggregationDecodeMixin,
-    SchedulerDisaggregationPrefillMixin,
-    SchedulerMultiplexMixin,
-    SchedulerRuntimeCheckerMixin,
-    SchedulerPPMixin,
-    SchedulerDPAttnMixin,
-    SchedulerDllmMixin,
+    SchedulerOutputProcessorMixin,  # 输出处理（生成结果的后处理、流式发送等）
+    SchedulerUpdateWeightsMixin,  # 在线权重更新（RLHF 等场景）
+    SchedulerProfilerMixin,  # 性能分析（profiler）
+    SchedulerMetricsMixin,  # 监控指标统计
+    SchedulerDisaggregationDecodeMixin,  # PD 分离部署的 decode 端逻辑
+    SchedulerDisaggregationPrefillMixin,  # PD 分离部署的 prefill 端逻辑
+    SchedulerMultiplexMixin,  # PD 多路复用（pdmux）
+    SchedulerRuntimeCheckerMixin,  # 运行期自检（显存、状态一致性等）
+    SchedulerPPMixin,  # 流水线并行（Pipeline Parallel）
+    SchedulerDPAttnMixin,  # DP attention 相关同步
+    SchedulerDllmMixin,  # 扩散式 LLM（diffusion LLM）支持
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
 
     def __init__(
         self,
+        # 全局服务配置（模型路径、并行规模、各类功能开关等），几乎所有初始化都依赖它。
         server_args: ServerArgs,
+        # 进程间通信端口配置（ZMQ ipc 名称、nccl 端口等）。
         port_args: PortArgs,
+        # 本调度器进程绑定的 GPU 编号。
         gpu_id: int,
+        # 张量并行（Tensor Parallel）的 rank（取值 0..tp_size-1）。
         tp_rank: int,
+        # MoE 专家并行（Expert Parallel）的 rank（取值 0..ep_size-1）。
         moe_ep_rank: int,
+        # 流水线并行（Pipeline Parallel）的 rank（取值 0..pp_size-1）。
         pp_rank: int,
+        # 注意力上下文并行（Attention Context Parallel）的 rank。
         attn_cp_rank: int,
+        # MoE 数据并行（Data Parallel）的 rank。
         moe_dp_rank: int,
+        # 数据并行（Data Parallel）的 rank；未启用 DP 时为 None（也可由环境变量 SGLANG_DP_RANK 提供）。
         dp_rank: Optional[int],
     ):
+        # 标记调度器正处于初始化阶段（用于软看门狗等组件判断当前状态）。
         self.is_initializing = True
+        # 先启动软看门狗，监控初始化是否超时/卡死。
         self.init_soft_watchdog(server_args)
 
-        # Parse args
+        # 解析并保存各类配置参数与分布式 rank 信息。
+        # 约定：*_rank 为本进程在该并行维度中的编号，*_size 为该维度的总规模。
         self.server_args = server_args
-        self.tp_rank = tp_rank
-        self.moe_ep_rank = moe_ep_rank
-        self.pp_rank = pp_rank
-        self.attn_cp_rank = attn_cp_rank
-        self.attn_cp_size = server_args.attn_cp_size
-        self.moe_dp_rank = moe_dp_rank
-        self.moe_dp_size = server_args.moe_dp_size
-        self.dp_rank = dp_rank
-        self.tp_size = server_args.tp_size
-        self.moe_ep_size = server_args.ep_size
-        self.pp_size = server_args.pp_size
-        self.dp_size = server_args.dp_size
-        self.nccl_port = port_args.nccl_port
-        self.schedule_policy = server_args.schedule_policy
+        self.tp_rank = tp_rank  # 张量并行 rank
+        self.moe_ep_rank = moe_ep_rank  # MoE 专家并行 rank
+        self.pp_rank = pp_rank  # 流水线并行 rank
+        self.attn_cp_rank = attn_cp_rank  # 注意力上下文并行 rank
+        self.attn_cp_size = server_args.attn_cp_size  # 注意力上下文并行规模
+        self.moe_dp_rank = moe_dp_rank  # MoE 数据并行 rank
+        self.moe_dp_size = server_args.moe_dp_size  # MoE 数据并行规模
+        self.dp_rank = dp_rank  # 数据并行 rank（未启用时为 None）
+        self.tp_size = server_args.tp_size  # 张量并行规模
+        self.moe_ep_size = server_args.ep_size  # MoE 专家并行规模
+        self.pp_size = server_args.pp_size  # 流水线并行规模
+        self.dp_size = server_args.dp_size  # 数据并行规模
+        self.nccl_port = port_args.nccl_port  # NCCL 通信端口
+        self.schedule_policy = server_args.schedule_policy  # 调度策略（如 fcfs、lpm 等）
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.abort_on_priority_when_disabled = (
             server_args.abort_on_priority_when_disabled
@@ -344,7 +371,7 @@ class Scheduler(
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
-        # Distributed rank info
+        # 分布式 rank 信息：根据是否启用 DP attention 计算 attention 维度下的 TP rank/size 与 DP rank。
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
             compute_dp_attention_world_info(
                 server_args.enable_dp_attention,
@@ -359,89 +386,91 @@ class Scheduler(
             server_args.kv_events_config and self.attn_tp_rank == 0
         )
 
-        # Init model configs
+        # 初始化模型配置（从 server_args 解析模型结构、精度等信息）
         self.init_model_config()
 
-        # Init metrics stats
+        # 初始化监控指标统计
         self.init_metrics(tp_rank, pp_rank, dp_rank)
 
-        # Init inter-process communication
+        # 初始化进程间通信（ZMQ 套接字：接收请求、发送结果等）
         self.init_ipc_channels(port_args)
 
-        # Init PD-multiplexing context
+        # 初始化 PD 多路复用（pdmux）上下文
         if self.enable_pdmux:
             self.init_pdmux()
 
-        # Init tokenizer
+        # 初始化分词器（tokenizer）
         self.init_tokenizer()
 
-        # Init moe config and GEMM config (FP8 GEMM, etc.)
+        # 初始化 MoE 配置与 GEMM 配置（如 FP8 GEMM 等）
         self.init_moe_gemm_config()
 
-        # Init mamba backend
+        # 初始化 mamba 后端
         self.init_mamba_backend()
 
-        # Launch a model worker and draft model worker if using speculative decoding
+        # 启动模型 worker；若启用投机解码则同时启动 draft 模型 worker
         self.init_model_worker()
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
 
-        # Init cache and memory pool
+        # 初始化 KV 缓存（radix tree 等）与显存池
         self.init_cache_with_memory_pool()
 
-        # Init running status
+        # 初始化运行状态（等待队列、运行批次、当前/上一批次等）
         self.init_running_status()
 
-        # Init chunked prefill
+        # 初始化分块预填充（chunked prefill）
         self.init_chunked_prefill()
 
-        # Init diffusion LLM
+        # 初始化扩散式 LLM（diffusion LLM）
         self.init_diffusion_llm()
 
-        # Init schedule policy and new token estimation
+        # 初始化调度策略与新 token 数量预估
         self.init_schedule_policy()
 
-        # Init watchdog, memory saver, input blocker and recv skipper
+        # 初始化看门狗、显存节省器、输入阻断器与接收跳过器
         self.init_watch_dog_memory_saver_input_blocker()
 
-        # Init profiler
+        # 初始化性能分析器（profiler）
         self.init_profiler()
 
-        # Init prefill-decodedisaggregation
+        # 初始化 prefill-decode 分离部署（PD disaggregation）
         self.init_disaggregation()
 
-        # Init overlap schedule
+        # 初始化 overlap 调度（CPU 调度与 GPU 计算重叠）
         self.init_overlap()
 
-        # Init Ngram Embedding
+        # 初始化 N-gram embedding（如启用）
         self.maybe_init_ngram_embedding()
 
-        # Init prefill kv split size when deterministic inference is enabled with various attention backends
+        # 当启用确定性推理时，针对不同 attention 后端初始化 prefill 的 KV 切分大小
         self.init_deterministic_inference_config()
 
-        # Init request dispatcher
+        # 初始化请求分发器（将不同类型请求路由到对应处理函数）
         self.init_request_dispatcher()
 
-        # Init LoRA overlap loader
+        # 初始化 LoRA overlap 加载器（将 LoRA 权重加载与计算重叠）
         if self.enable_lora_overlap_loading:
             self.lora_overlap_loader = LoRAOverlapLoader(
                 self.tp_worker.model_runner.lora_manager
             )
 
-        # Init the grammar backend for constrained generation
+        # 初始化用于约束生成（结构化输出）的 grammar 后端
         self.grammar_manager = GrammarManager(self)
 
+        # 初始化完成，清除初始化标记。
         self.is_initializing = False
 
     def init_model_config(self):
+        """初始化模型配置；在 NPU 后端下还会根据 diffusion LLM 的 block_size 修正 page_size。"""
         self.model_config = ModelConfig.from_server_args(self.server_args)
         if _is_npu:
-            # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
-            # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
+            # 确保在 NPU 后端上 page size 不大于 block_size 和 chunked_prefill_size
+            # NPU 后端要求所定义的 page size 不超过 block_size 和 chunked_prefill_size
             from sglang.srt.dllm.config import DllmConfig
 
-            self.dllm_config = (  # For diffusion LLM
+            self.dllm_config = (  # 用于 diffusion LLM
                 DllmConfig.from_server_args(self.server_args)
                 if self.server_args.dllm_algorithm is not None
                 else None
@@ -456,6 +485,12 @@ class Scheduler(
                     self.page_size = self.dllm_config.block_size
 
     def init_ipc_channels(self, port_args: PortArgs):
+        """初始化进程间通信的 ZMQ 套接字。
+
+        仅在入口 rank（pp/attn_tp/attn_cp 均为 0）上创建接收/发送套接字：
+        从 TokenizerManager 拉取请求、接收 RPC，并向 Tokenizer/Detokenizer 推送结果。
+        非入口 rank 则不创建真实套接字。
+        """
         context = zmq.Context(2)
         self.idle_sleeper = None
 
@@ -471,12 +506,12 @@ class Scheduler(
                 context, zmq.PUSH, port_args.tokenizer_ipc_name, False
             )
             if self.server_args.skip_tokenizer_init:
-                # Directly send to the TokenizerManager
+                # 直接发送给 TokenizerManager
                 send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.tokenizer_ipc_name, False
                 )
             else:
-                # Send to the DetokenizerManager
+                # 发送给 DetokenizerManager
                 send_to_detokenizer = get_zmq_socket(
                     context, zmq.PUSH, port_args.detokenizer_ipc_name, False
                 )
@@ -503,6 +538,7 @@ class Scheduler(
             )
 
     def init_tokenizer(self):
+        """初始化分词器/多模态处理器，并按需准备推理解析器（reasoning parser）相关 token。"""
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
 
@@ -526,7 +562,7 @@ class Scheduler(
                     revision=server_args.revision,
                 )
 
-        # Load multimodal processor for M-RoPE fallback computation.
+        # 加载多模态处理器，用于 M-RoPE 的回退计算。
         self._mm_processor = None
         if self.model_config.is_multimodal and self.processor is not None:
             try:
@@ -544,7 +580,7 @@ class Scheduler(
                     "M-RoPE fallback will not be available."
                 )
 
-        # Set reasoning_parser and think_end_id if --reasoning_parser is enabled
+        # 若启用了 --reasoning_parser，则设置 reasoning_parser 与 think_end_id
         if self.server_args.reasoning_parser and self.tokenizer:
             reasoning_parser = ReasoningParser(
                 model_type=self.server_args.reasoning_parser, stream_reasoning=False
@@ -554,10 +590,12 @@ class Scheduler(
             )[0]
 
     def init_mamba_backend(self) -> None:
+        """初始化 mamba 的选择性状态更新（selective state update）后端。"""
         initialize_mamba_selective_state_update_backend(self.server_args)
 
     def init_moe_gemm_config(self):
-        # For the MM models, check the text_config for MoE settings
+        """初始化 MoE 及 FP8/FP4 GEMM 相关配置，并确定是否需要 MLP 同步。"""
+        # 对于多模态（MM）模型，从 text_config 中检查 MoE 设置
         config_to_check = getattr(
             self.model_config.hf_config, "text_config", self.model_config.hf_config
         )
@@ -565,15 +603,15 @@ class Scheduler(
         if hasattr(config_to_check, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
 
-        # Initialize GEMM-related configuration for FP8 and FP4 backends.
+        # 为 FP8 和 FP4 后端初始化 GEMM 相关配置。
         initialize_fp8_gemm_config(self.server_args)
         initialize_fp4_gemm_config(self.server_args)
 
-        # This must be called after initialize_moe_config
+        # 这一步必须在 initialize_moe_config 之后调用
         self.require_mlp_sync = require_mlp_sync(self.server_args)
 
     def init_tp_model_worker(self):
-
+        """创建张量并行（TP）模型 worker，根据硬件后端选择 MLX 或通用 TpModelWorker。"""
         worker_kwargs = dict(
             server_args=self.server_args,
             gpu_id=self.gpu_id,
@@ -586,7 +624,7 @@ class Scheduler(
             nccl_port=self.nccl_port,
         )
 
-        # FIXME: move tp worker's init logic outside of the scheduler.
+        # FIXME: 将 tp worker 的初始化逻辑移到 scheduler 之外。
         if use_mlx():
             from sglang.srt.hardware_backend.mlx.tp_worker import MlxTpModelWorker
 
@@ -597,11 +635,12 @@ class Scheduler(
             self.tp_worker = TpModelWorker(**worker_kwargs)
 
     def maybe_init_draft_worker(self):
+        """若启用投机解码，则创建 draft（草稿）模型 worker；否则不创建。"""
         if self.spec_algorithm.is_none():
             self.draft_worker = None
             return
 
-        # Launch a draft worker for speculative decoding
+        # 为投机解码（speculative decoding）启动一个 draft worker
         draft_worker_kwargs = dict(
             server_args=self.server_args,
             gpu_id=self.gpu_id,
@@ -626,16 +665,18 @@ class Scheduler(
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
 
     def init_model_worker(self):
+        """初始化模型 worker：创建 TP worker 与（可选）draft worker，
+        获取 token/显存上限等信息，并初始化各类分布式通信组与随机种子。"""
         self.init_tp_model_worker()
         self.maybe_init_draft_worker()
 
-        # Dispatch the model worker
+        # 选定实际使用的 model worker
         if self.spec_algorithm.is_none():
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
 
-        # Get token and memory info from the model worker
+        # 从 model worker 获取 token 数与显存信息
         (
             self.max_total_num_tokens,
             self.max_prefill_tokens,
@@ -664,11 +705,11 @@ class Scheduler(
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
-        # NOTE: dp_tp_* are request/data-plane coordination groups (not tensor collectives).
-        # When DP attention is enabled, scope to the attention-TP group; otherwise use
-        # the base TP group. Entry rank is the local rank 0 in that group.
-        # Use the CPU (gloo) group to broadcast VLM Python objects and avoid CUDA
-        # stream/device coupling (#11910).
+        # NOTE: dp_tp_* 是请求/数据平面（data-plane）的协调通信组（不是张量集合通信组）。
+        # 启用 DP attention 时，范围限定在 attention-TP group；否则使用基础的 TP group。
+        # 入口 rank 即该组内的本地 rank 0。
+        # 使用 CPU（gloo）通信组来广播 VLM 的 Python 对象，以避免 CUDA
+        # stream/device 的耦合（#11910）。
         self.dp_tp_group = (
             self.attn_tp_group
             if self.server_args.enable_dp_attention
@@ -679,7 +720,7 @@ class Scheduler(
         self.pad_input_ids_func = self.tp_worker.get_pad_input_ids_func()
         set_random_seed(self.random_seed)
 
-        # Print debug info
+        # 打印调试信息
         if self.tp_rank == 0:
             avail_mem = get_available_gpu_memory(
                 self.device, self.gpu_id, empty_cache=False
@@ -699,12 +740,17 @@ class Scheduler(
             )
 
     def init_cache_with_memory_pool(self):
+        """初始化 KV 缓存与显存池。
+
+        根据是否启用分块预填充、分层缓存、混合 SWA/SSM、LMCache 等配置，
+        选择并构造合适的 tree_cache 实现（ChunkCache/RadixCache/HiRadixCache 等）。
+        """
         server_args = self.server_args
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
         )
 
-        # Hybrid memory pool
+        # 混合（hybrid）显存池
         self.is_hybrid_swa = self.tp_worker.is_hybrid_swa
         self.is_hybrid_ssm = (
             self.tp_worker.model_runner.hybrid_gdn_config is not None
@@ -768,7 +814,7 @@ class Scheduler(
         else:
 
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
-                # lazy import to avoid JIT overhead
+                # 延迟导入以避免 JIT 开销
                 from sglang.srt.mem_cache.radix_cache_cpp import RadixCacheCpp
 
                 logger.info("Using experimental C++ radix tree implementation.")
@@ -818,7 +864,7 @@ class Scheduler(
             self.tree_cache = SessionAwareCache(self.tree_cache)
 
         if self.enable_hisparse:
-            # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
+            # coordinator 已在 ModelRunner.initialize() 中、CUDA graph 捕获之前创建
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
             self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
@@ -840,12 +886,13 @@ class Scheduler(
         init_mm_embedding_cache(embedding_cache_size * 1024 * 1024)
 
     def init_running_status(self):
+        """初始化运行时状态：等待队列、运行批次、当前/上一批次、计数器与会话控制器等。"""
         self.waiting_queue: List[Req] = []
-        # The running decoding batch for continuous batching
+        # 用于连续批处理（continuous batching）的运行中 decode 批次
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
-        # The current forward batch
+        # 当前前向计算的批次
         self.cur_batch: Optional[ScheduleBatch] = None
-        # The last forward batch
+        # 上一个前向计算的批次
         self.last_batch: Optional[ScheduleBatch] = None
         self.forward_ct = 0
         self.return_health_check_ipcs: Deque[Optional[str]] = deque()
@@ -857,6 +904,7 @@ class Scheduler(
         self._engine_paused = False
 
     def init_chunked_prefill(self):
+        """初始化分块预填充（chunked prefill）配置，并在 PP>1 时初始化动态分块预测器。"""
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
         uses_transformers_backend = (
             get_resolved_model_impl(self.model_config) == ModelImpl.TRANSFORMERS
@@ -880,7 +928,7 @@ class Scheduler(
             and self.server_args.enable_mixed_chunk
         )
 
-        # Init the dynamic chunking predictor for PP
+        # 为 PP 初始化动态分块（dynamic chunking）预测器
         self.enable_dynamic_chunking = (
             self.server_args.enable_dynamic_chunking and self.pp_size > 1
         )
@@ -895,7 +943,8 @@ class Scheduler(
                 self.enable_dynamic_chunking = False
 
     def init_schedule_policy(self):
-        # Init schedule policy and new token estimation
+        """初始化调度策略、（可选的）prefill 延迟器与优先级抢占，并设置新 token 比例的估计参数。"""
+        # 初始化调度策略与新 token 数量估计
         self.policy = SchedulePolicy(
             self.schedule_policy,
             self.tree_cache,
@@ -923,7 +972,7 @@ class Scheduler(
                 ),
             )
 
-        # NOTE: preemption is enabled by default for priority scheduling.
+        # NOTE: 在优先级调度（priority scheduling）下，默认启用抢占（preemption）。
         self.enable_priority_preemption = (
             self.enable_priority_scheduling
             and not self.server_args.disable_priority_preemption
@@ -944,24 +993,26 @@ class Scheduler(
         self.new_token_ratio = self.init_new_token_ratio
 
     def init_soft_watchdog(self, server_args: ServerArgs):
+        """若配置了软看门狗超时，则创建软看门狗（超时仅告警、不强制终止）。"""
         if (x := server_args.soft_watchdog_timeout) is not None:
             self.soft_watchdog = create_scheduler_watchdog(
                 self, watchdog_timeout=x, soft=True
             )
 
     def init_watch_dog_memory_saver_input_blocker(self):
-        # Start watchdog thread
+        """初始化看门狗线程、显存节省器、接收跳过器与输入阻断器，并配置 GC 日志。"""
+        # 启动看门狗（watchdog）线程
         self.watchdog = create_scheduler_watchdog(
             self, watchdog_timeout=self.server_args.watchdog_timeout
         )
 
-        # Init memory saver, profiler and metric stats
+        # 初始化显存节省器、profiler 与监控指标统计
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=self.server_args.enable_memory_saver
         )
         self.offload_tags = set()
 
-        # Init recv skipper and input blocker
+        # 初始化接收跳过器（recv skipper）与输入阻断器（input blocker）
         self.recv_skipper = SchedulerRecvSkipper.maybe_create(self.server_args)
         self.input_blocker = (
             SchedulerInputBlocker(noop=self.attn_tp_rank != 0)
@@ -969,11 +1020,12 @@ class Scheduler(
             else None
         )
 
-        # Configure GC logger
+        # 配置 GC 日志
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
 
     def init_disaggregation(self):
+        """初始化 prefill-decode 分离部署（PD disaggregation）的模式、传输后端与相关队列。"""
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
@@ -991,13 +1043,13 @@ class Scheduler(
             draft_token_to_kv_pool = draft_runner.token_to_kv_pool
             model_config = draft_runner.model_config
         else:
-            # todo: should we fix this when enabling mtp or it doesn't matter since we only enable mtp in decode node thus we don't transfer draft kvs between P and D?
+            # todo: 启用 mtp 时是否需要修复这里？还是说无所谓——因为我们只在 decode 节点启用 mtp，所以不会在 P 和 D 之间传输 draft 的 KV？
             draft_token_to_kv_pool = self.draft_worker.model_runner.token_to_kv_pool
             model_config = self.draft_worker.model_config
 
         if (
             self.disaggregation_mode == DisaggregationMode.DECODE
-        ):  # *2 for the headroom.
+        ):  # *2 留出余量。
             buffer_size = (self.req_to_token_pool.size) * 2
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
@@ -1007,7 +1059,7 @@ class Scheduler(
                 hidden_size=(
                     model_config.hidden_size
                     if self.spec_algorithm.is_eagle()
-                    else 16  # minimal padding size for RDMA
+                    else 16  # RDMA 的最小 padding 大小
                 ),
                 hidden_states_dtype=(
                     model_config.dtype
@@ -1017,7 +1069,7 @@ class Scheduler(
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
 
-            # The decode requests polling kv cache
+            # 正在轮询 KV cache 的 decode 请求队列
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
                 gloo_group=self.attn_tp_cpu_group,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
@@ -1027,7 +1079,7 @@ class Scheduler(
                 tree_cache=self.tree_cache,
             )
 
-            # The decode requests pending for pre-allocation
+            # 等待预分配（pre-allocation）的 decode 请求队列
             self.disagg_decode_prealloc_queue = DecodePreallocQueue(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -1050,7 +1102,7 @@ class Scheduler(
             )
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # *2 for the headroom.
+            # *2 留出余量。
             buffer_size = self.max_running_requests * 2
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
@@ -1061,7 +1113,7 @@ class Scheduler(
                     model_config.hidden_size
                     if self.spec_algorithm.is_eagle()
                     or self.spec_algorithm.is_standalone()
-                    else 16  # minimal padding size for RDMA
+                    else 16  # RDMA 的最小 padding 大小
                 ),
                 hidden_states_dtype=(
                     model_config.dtype
@@ -1088,10 +1140,10 @@ class Scheduler(
                 pp_size=self.pp_size,
                 transfer_backend=self.transfer_backend,
             )
-            # The prefill requests that are in the middle of kv sending
+            # 正在进行 KV 发送过程中的 prefill 请求队列
             self.disagg_prefill_inflight_queue: List[Req] = []
 
-        # Init mm receiver for EPD disaggregation mode
+        # 为 EPD 分离部署模式初始化 mm（多模态）接收器
         if (
             self.server_args.language_only
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
@@ -1106,6 +1158,7 @@ class Scheduler(
             )
 
     def init_overlap(self):
+        """初始化 overlap 调度所需的计算流与拷贝流；若启用 overlap，还会创建 FutureMap 等结构。"""
         self.device_module = torch.get_device_module(self.device)
 
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
@@ -1131,6 +1184,7 @@ class Scheduler(
         self.batch_record_ct = 0
 
     def maybe_init_ngram_embedding(self):
+        """若模型使用 N-gram embedding，则初始化其 token 表与 n/k 等参数。"""
         self.use_ngram_embedding = self.tp_worker.model_config.use_ngram_embedding
         if self.use_ngram_embedding:
             self.token_table = self.tp_worker.model_runner.token_table
@@ -1141,7 +1195,7 @@ class Scheduler(
     def _maybe_prepare_ngram_embedding(
         self, batch: Optional[ScheduleBatch]
     ) -> Optional[ScheduleBatch]:
-        """Fill the token table for ngram embedding before a forward pass."""
+        """在一次前向计算之前，为 ngram embedding 填充 token 表。"""
         if batch is None or not self.use_ngram_embedding:
             return batch
         batch.ne_token_table = self.token_table
@@ -1160,7 +1214,7 @@ class Scheduler(
                     tokens = fill_ids[0:end]
                     column_starts.append(0)
                 else:
-                    # Prepend n-1 tokens before prefix_len for n-gram context
+                    # 在 prefix_len 之前补上 n-1 个 token，作为 n-gram 上下文
                     tokens = fill_ids[start - self.ngram_embedding_n + 1 : end]
                     column_starts.append(start - self.ngram_embedding_n + 1)
                 all_tokens.extend(tokens)
@@ -1182,7 +1236,7 @@ class Scheduler(
         return batch
 
     def init_deterministic_inference_config(self):
-        """Initialize deterministic inference configuration for different attention backends."""
+        """为不同的 attention 后端初始化确定性推理（deterministic inference）配置。"""
         if not self.server_args.enable_deterministic_inference:
             self.truncation_align_size = None
             return
@@ -1199,6 +1253,7 @@ class Scheduler(
         )
 
     def init_request_dispatcher(self):
+        """初始化基于请求类型的分发器，将各类输入请求映射到对应的处理函数。"""
         self._request_dispatcher = TypeBasedDispatcher(
             [
                 (TokenizedGenerateReqInput, self.handle_generate_request),
@@ -1255,8 +1310,9 @@ class Scheduler(
         )
 
     def _abort_on_running_timeout(self):
-        # NOTE: this should be called before a batch is launched,
-        # as current spec-v1 still filters batch inside verify stage.
+        """检查运行中请求是否超时，超时则标记为中止（需在启动批次前调用）。"""
+        # NOTE: 这应在启动一个批次之前调用，
+        # 因为当前的 spec-v1 仍会在 verify 阶段内部对批次进行过滤。
         timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
         if timeout_s <= 0:
             return
@@ -1271,10 +1327,9 @@ class Scheduler(
                 )
 
     def get_init_info(self) -> Dict[str, Any]:
-        """Return scheduler initialization info for handshake.
+        """返回用于握手（handshake）的调度器初始化信息。
 
-        This method provides the initialization info needed by the tokenizer manager
-        and other components to verify the scheduler is ready.
+        该方法提供 tokenizer manager 及其他组件用于确认调度器已就绪所需的初始化信息。
         """
         result_dict = {
             "status": "ready",
@@ -1285,75 +1340,82 @@ class Scheduler(
         return result_dict
 
     def run_event_loop(self) -> None:
-        """Run the scheduler's event loop.
+        """运行调度器的事件循环。
 
-        Sets up the schedule stream and dispatches to the appropriate event loop.
-        The event loop blocks until shutdown.
+        创建调度流（schedule stream），并分发到相应的事件循环。
+        事件循环会一直阻塞，直到进程关闭。
         """
+        # 调度器事件循环的总入口：
+        # 创建专用的调度流（schedule stream），并根据部署模式分发到具体的事件循环。
+        # 事件循环会一直阻塞运行，直到进程关闭。
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
-            self.schedule_stream.synchronize = lambda: None  # No-op for CPU
+            self.schedule_stream.synchronize = lambda: None  # CPU 上同步为空操作
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
     @DynamicGradMode()
     def event_loop_normal(self):
-        """A normal scheduler loop."""
+        """一个普通的调度器循环。"""
+        # 普通（非 overlap）调度循环：CPU 调度与 GPU 计算串行执行。
         while True:
-            # Receive requests
+            # 1) 接收请求并处理输入（入队、预处理等）
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
+                # 引擎被暂停时，取消气泡计时并跳过本轮调度。
                 self.cancel_bubble_timer()
                 continue
 
-            # Get the next batch to run
+            # 2) 获取下一个要运行的批次（优先 prefill，否则 decode）
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
-            # Launch the current batch
+            # 3) 运行当前批次并处理输出
             if batch:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
-                # When the server is idle, do self-check and re-init some states.
+                # 服务空闲时，执行自检并重置部分状态。
                 self.self_check_during_idle()
 
-            # Update last_batch
+            # 4) 更新 last_batch，供下一轮调度合并 prefill/decode 批次使用
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                # 启用严格显存检查时，在繁忙阶段也做一次自检。
                 self.self_check_during_busy()
 
     @DynamicGradMode()
     def event_loop_overlap(self):
-        """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        """一个将 CPU 处理与 GPU 计算重叠（overlap）的调度器循环。"""
+        # overlap 调度循环：将当前批次的 CPU 调度与上一批次的 GPU 计算重叠，以提升吞吐。
+        # result_queue 缓存已启动但尚未处理输出的批次及其结果。
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
         def pop_and_process():
-            # Process the results of the last batch
+            # 处理上一（最早入队）批次的计算结果。
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
-            # Receive requests
+            # 1) 接收请求并处理输入
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
 
-            # Get the next batch to run
+            # 2) 获取下一个要运行的批次，并判断是否需要禁用本批次的 overlap
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
-            # If we do not need to overlap the current batch with the last batch,
-            # we can process the last batch immediately.
+            # 若无需将当前批次与上一批次重叠，则可立即处理上一批次的结果。
             if disable_overlap_for_batch:
                 pop_and_process()
 
-            # Launch the current batch
+            # 3) 启动当前批次的前向计算，将（批次副本, 结果）压入队列等待后续处理
             if batch:
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
@@ -1361,30 +1423,36 @@ class Scheduler(
                 batch_result = None
                 self.cancel_bubble_timer()
 
-            # Process the last batch
+            # 4) 在 GPU 计算当前批次的同时，处理上一批次的结果（实现重叠）
             if self.last_batch:
                 if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
-                # When the server is idle, do self-check and re-init some states
+                # 服务空闲时执行自检并重置部分状态。
                 self.self_check_during_idle()
 
-            # Run sample of the current batch
-            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
+            # 5) 运行当前批次的采样：
+            # 由于采样可能依赖上一批次的结果（如 grammar 状态），故需在上一批次处理完后再执行。
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result)
 
-            # Update last_batch
+            # 6) 更新 last_batch
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.self_check_during_busy()
 
     def is_disable_overlap_for_batch(self, batch: ScheduleBatch) -> bool:
-        # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
-        # This might slightly hurt the throughput, so we use an environment variable to control it.
-        # In DP attention mode, use the globally synchronized is_extend_in_batch
-        # so all DP ranks make the same overlap decision (avoiding deadlock).
-        # In non-DP mode, use the local forward_mode directly.
+        """判断是否需要对本批次禁用 overlap。
+
+        主要场景：连续两个 prefill 批次时禁用 overlap 以改善首 token 延迟（TTFT）；
+        以及尚不支持 overlap + 投机解码 + grammar 的组合。在 DP attention 下使用全局同步的
+        is_extend_in_batch 以保证各 DP rank 决策一致（避免死锁）。
+        """
+        # 对于连续两个 prefill 批次，我们禁用 overlap 以改善第一个批次的 TTFT。
+        # 这可能会略微损害吞吐，因此用一个环境变量来控制该行为。
+        # 在 DP attention 模式下，使用全局同步的 is_extend_in_batch，
+        # 以保证所有 DP rank 做出相同的 overlap 决策（避免死锁）。
+        # 在非 DP 模式下，直接使用本地的 forward_mode。
         if self.require_mlp_sync:
             is_extend = lambda b: b and b.is_extend_in_batch
         else:
@@ -1399,9 +1467,9 @@ class Scheduler(
             and last_batch_is_extend
         )
 
-        # We do not support overlap + spec + grammar yet,
-        # so we need to turn off overlap for this batch.
-        # TODO(lsyin): support overlap + spec + grammar
+        # 我们尚不支持 overlap + spec + grammar 的组合，
+        # 因此需要对本批次关闭 overlap。
+        # TODO(lsyin): 支持 overlap + spec + grammar
         need_grammar_sync = (
             batch
             and batch.is_spec_v2
@@ -1413,6 +1481,7 @@ class Scheduler(
         return disable_overlap_for_batch or need_grammar_sync
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
+        """判断本次轮询接收的请求数是否达到上限（max_recv_per_poll，<0 表示不限制）。"""
         if self.max_recv_per_poll < 0:
             return False
         return num_recv_reqs >= self.max_recv_per_poll
@@ -1420,7 +1489,9 @@ class Scheduler(
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:
-        """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
+        """在 tp_rank = 0 处接收结果，并广播给所有其他 TP rank。"""
+        # 仅在入口 rank 上从 ZMQ 接收请求与 RPC，然后通过广播分发给其他 TP/PP rank；
+        # 同时处理 DP attention 下的工作请求/控制请求拆分、EPD 分离的多模态接收以及共享内存特征的解包。
 
         if self.recv_skipper is not None:
             last_forward_mode = (
@@ -1507,7 +1578,7 @@ class Scheduler(
                 src=self.tp_group.ranks[0],
             )
 
-        # Process MM requests under EPD-disaggregation mode
+        # 在 EPD 分离部署模式下处理多模态（MM）请求
         if (
             self.pp_rank == 0
             and self.server_args.language_only
@@ -1524,24 +1595,20 @@ class Scheduler(
                 prepare_abort(req, error_msg, status_code=status_code)
                 self.stream_output([req], req.return_logprob)
 
-        # Unwrap shared memory features AFTER all broadcasts complete,
-        # so that ShmPointerMMData metadata (not full tensor data) is what
-        # gets serialized during broadcast_pyobj.
+        # 在所有广播完成之后再解包共享内存特征，
+        # 这样在 broadcast_pyobj 期间被序列化的只是 ShmPointerMMData 的元数据，
+        # 而非完整的张量数据。
         if recv_reqs:
-            # Barrier for the non-DP-attention path only: there is a single
-            # broadcast_pyobj on tp_cpu_group where the source rank returns
-            # the original objects immediately while other ranks are still in
-            # pickle.loads (-> __setstate__ -> shm_open).  Without a barrier
-            # the source can call materialize() / shm_unlink before others
-            # open the segment.  recv_reqs is consistent across all ranks
-            # here (same broadcast), so the guard is deadlock-free.
+            # 仅在非 DP-attention 路径上需要 barrier：tp_cpu_group 上只有一次
+            # broadcast_pyobj，源 rank 会立即返回原始对象，而其他 rank 仍处于
+            # pickle.loads（-> __setstate__ -> shm_open）中。如果没有 barrier，
+            # 源 rank 可能在其他 rank 打开该段之前就调用 materialize() / shm_unlink。
+            # 此处的 recv_reqs 在所有 rank 上是一致的（同一次广播），因此该保护不会死锁。
             #
-            # Under DP-attention no barrier is needed: the control_reqs
-            # broadcast on tp_cpu_group (step 3) is a collective that forces
-            # every rank to complete the earlier attn_tp / attn_cp work_reqs
-            # deserializations (steps 1-2, which call shm_open) before any
-            # rank returns from step 3.  POSIX guarantees shm_unlink only
-            # removes the name; already-open handles stay valid.
+            # 在 DP-attention 下则无需 barrier：tp_cpu_group 上的 control_reqs
+            # 广播（步骤 3）是一个集合通信，它会强制每个 rank 在从步骤 3 返回之前
+            # 先完成此前的 attn_tp / attn_cp work_reqs 反序列化（步骤 1-2，它们会调用
+            # shm_open）。POSIX 保证 shm_unlink 只移除名字，已打开的句柄仍然有效。
             if (
                 not self.server_args.enable_dp_attention
                 and self.tp_size > 1
@@ -1555,6 +1622,10 @@ class Scheduler(
         return recv_reqs
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
+        """将接收到的请求拆分为工作请求（生成/embedding）与控制请求（其他管理类）两类。
+
+        用于 DP attention 下区分广播范围：工作请求在 attn_tp 组广播，控制请求在全 tp 组广播。
+        """
         work_reqs = [
             req
             for req in recv_reqs
@@ -1584,10 +1655,11 @@ class Scheduler(
         return work_reqs, control_reqs
 
     def process_input_requests(self, recv_reqs: List):
+        """逐个处理接收到的请求：跳过繁忙时的健康检查，经分发器路由到对应处理函数，并回传输出。"""
         now = time.monotonic()
         self.session_controller.maybe_reap(now)
         for recv_req in recv_reqs:
-            # Skip health check when server is busy — ongoing requests already carry health info.
+            # 服务繁忙时跳过健康检查——正在处理的请求本身已携带健康信息。
             if is_health_check_generate_req(recv_req) and not self.is_fully_idle(
                 for_health_check=True
             ):
@@ -1607,6 +1679,7 @@ class Scheduler(
         self._check_pending_flush()
 
     def init_req_max_new_tokens(self, req):
+        """根据模型最大长度与输入长度，限制/修正请求的 max_new_tokens。"""
         req.sampling_params.max_new_tokens = min(
             (
                 req.sampling_params.max_new_tokens
@@ -1620,17 +1693,17 @@ class Scheduler(
         self,
         raw_mm_inputs: Optional[dict],
     ):
-        """Materialize MultimodalInputs once on the entry rank and broadcast to others.
+        """在入口 rank 上一次性物化 MultimodalInputs，并广播给其他 rank。
 
-        Entry rank:
-        - constructs MultimodalInputs.from_dict(raw_mm_inputs) once
-        - broadcasts to other ranks in self.cpu_group (if world_size > 1)
+        入口 rank：
+        - 只调用一次 MultimodalInputs.from_dict(raw_mm_inputs) 构造对象
+        - 广播给 self.cpu_group 中的其他 rank（当 world_size > 1 时）
 
-        Non-entry ranks:
-        - receive the object via broadcast (if world_size > 1)
-        - otherwise (single-rank / no group) fall back to local from_dict
+        非入口 rank：
+        - 当 world_size > 1 时，通过广播接收该对象
+        - 否则（单 rank / 无通信组）回退到本地 from_dict 构造
 
-        Returns:
+        返回：
             MultimodalInputs | None
         """
         if raw_mm_inputs is None:
@@ -1651,16 +1724,14 @@ class Scheduler(
                 f"Failed to get world size in mm_inputs handling with {e}, fallback to 1."
             )
 
-        # In case tp size > 1, all the Scheduler TP ranks runs the duplicated computing
-        # process in CPU which occupies the main thread CPU cycle. This computing logic
-        # merely needs to be run on TP0 and be broadcast to other TP ranks.
-        # Since the Scheduler is single-threaded, any large CPU cost will impact
-        # handling of other messages. For example, CPU hits 99.9% can significantly
-        # increase the CUDA kernel launch time.
+        # 当 tp size > 1 时，所有 Scheduler 的 TP rank 都会在 CPU 上重复执行同样的计算，
+        # 占用主线程的 CPU 时间。而这段计算逻辑其实只需要在 TP0 上运行一次，再广播给其他 TP rank。
+        # 由于 Scheduler 是单线程的，任何较大的 CPU 开销都会影响其他消息的处理。
+        # 例如，CPU 占用打到 99.9% 会显著增加 CUDA kernel 的启动时间。
         if self.dp_tp_group.rank_in_group == 0:
-            # Only the entry rank materializes once from dict.
+            # 只有入口 rank 从 dict 物化一次。
             image_inputs = MultimodalInputs.from_dict(raw_mm_inputs)
-            # Broadcast to other TP ranks (use src=0 within the group).
+            # 广播给其他 TP rank（在组内使用 src=0）。
             if group_world_size > 1:
                 obj_list = [image_inputs]
                 torch.distributed.broadcast_object_list(
@@ -1670,7 +1741,7 @@ class Scheduler(
                 )
                 image_inputs = obj_list[0]
         else:
-            # Non-entry ranks: receive if group size > 1; otherwise materialize locally.
+            # 非入口 rank：组规模 > 1 时通过广播接收；否则在本地物化。
             if group_world_size > 1:
                 obj_list = [None]
                 torch.distributed.broadcast_object_list(
@@ -1685,13 +1756,14 @@ class Scheduler(
         return image_inputs
 
     def _get_multimodal_inputs(self, mm_inputs_dict: dict):
+        """获取多模态输入：根据配置选择在入口 rank 物化并广播，或直接本地 from_dict 构造。"""
         if self.server_args.enable_broadcast_mm_inputs_process:
             return self._process_and_broadcast_mm_inputs(mm_inputs_dict)
         else:
             return MultimodalInputs.from_dict(mm_inputs_dict)
 
     def _maybe_compute_mrope_positions(self, req) -> None:
-        """Compute M-RoPE positions when they are missing (e.g. gRPC preprocessed path)."""
+        """当 M-RoPE 位置缺失时（例如 gRPC 预处理路径）计算它们。"""
         if self._mm_processor is None:
             return
         mm = req.multimodal_inputs
@@ -1708,13 +1780,14 @@ class Scheduler(
             mm.mrope_position_delta = mrope_position_delta
 
     def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
+        """对已完成且非会话的请求，释放其多模态特征与输入以释放显存。"""
         for req in batch.reqs:
             if not req.finished() or not (mm_inputs := req.multimodal_inputs):
                 continue
-            # For session requests, keep mm_inputs for the next request
+            # 对于会话（session）请求，保留 mm_inputs 供下一个请求使用
             if req.session:
                 continue
-            # For non-session requests, clear features and mm_inputs
+            # 对于非会话请求，清除特征与 mm_inputs
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
@@ -1722,21 +1795,23 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
-        # Route: normal request / session request / session-not-found
+        """处理生成请求：构造 Req 对象，处理会话/多模态输入/PD 分离校验/长度校验/logprob 起始位置，
+        最终将请求加入 grammar 队列或等待队列。"""
+        # 路由：普通请求 / 会话请求 / 会话不存在
         session_id = (
             recv_req.session_params.id if recv_req.session_params is not None else None
         )
 
         if session_id is None:
-            # Normal non-session request
+            # 普通的非会话请求
             if recv_req.input_embeds is not None:
-                # Generate fake input_ids based on the length of input_embeds
+                # 根据 input_embeds 的长度生成占位的 input_ids
                 seq_length = len(recv_req.input_embeds)
                 fake_input_ids = [1] * seq_length
                 recv_req.input_ids = fake_input_ids
 
             if recv_req.bootstrap_port is None:
-                # Use default bootstrap port
+                # 使用默认的 bootstrap 端口
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
             req = Req(
@@ -1775,7 +1850,7 @@ class Scheduler(
             req.tokenizer = self.tokenizer
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
-                # Invalid request for disaggregated mode
+                # 分离部署模式下的非法请求
                 if (
                     recv_req.bootstrap_room is None
                     and self.transfer_backend != TransferBackend.FAKE
@@ -1793,7 +1868,7 @@ class Scheduler(
                     return
 
         elif session_id in self.session_controller:
-            # Session exists: create request from session
+            # 会话存在：从会话创建请求
             session = self.session_controller.get(session_id)
             req = session.create_req(
                 recv_req,
@@ -1801,7 +1876,7 @@ class Scheduler(
                 self.model_config.vocab_size,
                 eos_token_ids=self.model_config.hf_eos_token_id,
             )
-            # TODO: set trace context
+            # TODO: 设置 trace 上下文
             if self.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
             if isinstance(req.finished_reason, FINISH_ABORT):
@@ -1810,7 +1885,7 @@ class Scheduler(
                 return
 
         else:
-            # Session ID provided but session not found
+            # 提供了 session ID，但找不到对应的会话
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -1826,15 +1901,15 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        # Handle multimodal inputs
+        # 处理多模态输入
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
 
             SessionController.adjust_mm_offsets(recv_req, req, image_inputs)
 
-            # The following steps are already fast, execute locally on each rank.
-            # Expand a single image token into multiple dummy tokens for receiving image embeddings.
-            # The pad function is model-specific and can be None for some backends.
+            # 以下步骤本身已经很快，在每个 rank 上本地执行即可。
+            # 将单个 image token 扩展为多个占位 token，用于接收图像 embedding。
+            # pad 函数与具体模型相关，对某些后端可能为 None。
             if self.pad_input_ids_func:
                 req.origin_input_ids = self.pad_input_ids_func(
                     req.origin_input_ids, image_inputs
@@ -1853,10 +1928,10 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        # initialize before returning
+        # 返回前先初始化
         self.init_req_max_new_tokens(req)
 
-        # Validate prompt length
+        # 校验 prompt 长度
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
@@ -1868,20 +1943,20 @@ class Scheduler(
             return
 
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
-            # When return_logprob is False, logprob_start_len should be ignored
+            # 当 return_logprob 为 False 时，应忽略 logprob_start_len
             recv_req.logprob_start_len = -1
 
         if recv_req.logprob_start_len == -1:
             if recv_req.return_logprob and recv_req.token_ids_logprob is None:
-                # If logprob is required but neither token_ids_logprob nor logprob_start_len is
-                # set, return the logprobs for output tokens by default
+                # 如果需要 logprob，但既没有设置 token_ids_logprob 也没有设置 logprob_start_len，
+                # 则默认返回输出 token 的 logprob
                 req.logprob_start_len = len(req.origin_input_ids)
             elif req.is_prefill_only:
-                # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
-                # beyond input sequence to skip input logprob computation entirely
+                # 对于 logprob_start_len == -1 的 prefill-only 请求，将 logprob_start_len
+                # 设置到输入序列之外，从而完全跳过输入 logprob 的计算
                 req.logprob_start_len = len(req.origin_input_ids)
             else:
-                # If return_logprob is False, only the last token requires logprob computation
+                # 如果 return_logprob 为 False，则只有最后一个 token 需要计算 logprob
                 req.logprob_start_len = -1
         else:
             req.logprob_start_len = recv_req.logprob_start_len
@@ -1901,14 +1976,15 @@ class Scheduler(
         self,
         recv_req: BatchTokenizedGenerateReqInput,
     ):
-        """Handle optimized batch generate request."""
+        """处理经过优化的批量生成请求。"""
         logger.debug(f"Processing batch generate request with {len(recv_req)} requests")
 
-        # Process each request in the batch
+        # 逐个处理批次中的每个请求
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
+        """若启用分层缓存存储，则针对请求的新输入 token 从存储后端预取 KV 缓存。"""
         if self.enable_hicache_storage:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             last_host_node = req.last_host_node
@@ -1931,6 +2007,7 @@ class Scheduler(
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
+        """根据部署模式（普通/PD prefill/PD decode）将请求加入相应的队列，并记录时间统计。"""
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if not self._set_or_validate_priority(req):
                 return
@@ -1955,7 +2032,7 @@ class Scheduler(
             raise ValueError(f"Invalid {self.disaggregation_mode=}")
 
     def _set_or_validate_priority(self, req: Req) -> bool:
-        """Set the default priority value, or abort the request based on the priority scheduling mode."""
+        """设置默认优先级值，或根据优先级调度模式中止该请求。"""
         if self.enable_priority_scheduling and req.priority is None:
             if self.schedule_low_priority_values_first:
                 req.priority = sys.maxsize
@@ -1980,21 +2057,21 @@ class Scheduler(
         return True
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
-        """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
+        """当等待队列已满时，中止新进入的请求或某个已有请求。若新进入的请求被中止则返回 True。"""
         if (
             self.max_queued_requests is None
             or len(self.waiting_queue) + 1 <= self.max_queued_requests
         ):
             return False
 
-        # Reject the incoming request by default.
+        # 默认拒绝新进入的请求。
         req_to_abort = recv_req
         message = "The request queue is full."
         if self.enable_priority_scheduling:
-            # With priority scheduling, consider aboritng an existing request based on the priority.
-            # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
-            # max(...) + (direction * priority, queue_time_start) picks the least-preferred request.
-            # Tie: later queue_time_start (newer) is evicted first. Preempt only if strictly better.
+            # 启用优先级调度时，考虑根据优先级中止某个已有请求。
+            # direction = 1  => 数值越小优先级越高；-1 => 数值越大优先级越高。
+            # max(...) 以 (direction * priority, queue_time_start) 为键，挑出最不被偏好的请求。
+            # 平局时：queue_time_start 较晚（较新）的先被驱逐。仅当严格更优时才抢占。
             direction = 1 if self.schedule_low_priority_values_first else -1
             key_fn = lambda item: (
                 direction * item[1].priority,
@@ -2006,7 +2083,7 @@ class Scheduler(
             )
             if abort_existing_req:
                 if self.enable_hicache_storage:
-                    # Release prefetch events associated with the request
+                    # 释放与该请求关联的预取（prefetch）事件
                     self.tree_cache.release_aborted_request(candidate_req.rid)
                 elif self.enable_hierarchical_cache:
                     self.tree_cache.terminate_prefetch(candidate_req.rid)
@@ -2029,6 +2106,7 @@ class Scheduler(
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
+        """检查等待队列中超时的请求并中止它们（根据等待超时阈值）。"""
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:
             return
 
@@ -2038,7 +2116,7 @@ class Scheduler(
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
                 if self.enable_hicache_storage:
-                    # Release prefetch events associated with the request
+                    # 释放与该请求关联的预取（prefetch）事件
                     self.tree_cache.release_aborted_request(req.rid)
                 self.send_to_tokenizer.send_output(
                     AbortReq(
@@ -2062,6 +2140,7 @@ class Scheduler(
         self,
         recv_req: TokenizedEmbeddingReqInput,
     ):
+        """处理 embedding 请求：构造 Req、处理多模态输入与长度校验，并加入等待队列。"""
         req = Req(
             recv_req.rid,
             recv_req.input_text,
@@ -2077,13 +2156,13 @@ class Scheduler(
         )
         req.tokenizer = self.tokenizer
 
-        # Handle multimodal inputs
+        # 处理多模态输入
         if recv_req.image_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.image_inputs)
-            # Expand a single image token into multiple dummy tokens for receiving image embeddings
-            # The `pad_input_ids_func` is model-specific and may be None for
-            # embedding models or models not requiring special padding.
-            # If None, `req.origin_input_ids` is expected to be correctly populated already.
+            # 将单个 image token 扩展为多个占位 token，用于接收图像 embedding
+            # `pad_input_ids_func` 与具体模型相关，对 embedding 模型或不需要特殊 padding 的
+            # 模型可能为 None。
+            # 若为 None，则预期 `req.origin_input_ids` 已被正确填充。
             if self.pad_input_ids_func:
                 req.origin_input_ids = self.pad_input_ids_func(
                     req.origin_input_ids, image_inputs
@@ -2102,7 +2181,7 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        # Validate prompts length
+        # 校验 prompt 长度
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
@@ -2112,7 +2191,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        # Copy more attributes
+        # 复制更多属性
         req.logprob_start_len = -1
         self._add_request_to_queue(req)
 
@@ -2120,20 +2199,21 @@ class Scheduler(
         self,
         recv_req: BatchTokenizedEmbeddingReqInput,
     ):
-        """Handle optimized batch embedding request."""
+        """处理经过优化的批量 embedding 请求。"""
         logger.debug(
             f"Processing batch embedding request with {len(recv_req)} requests"
         )
 
-        # Process each request in the batch
+        # 逐个处理批次中的每个请求
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
+        """将分块预填充中未完成的请求暂存到 tree_cache（标记为 chunked）。"""
         self.tree_cache.cache_unfinished_req(req, chunked=True)
 
     def _build_hisparse_decode_batch(self, reqs):
-        """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
+        """为正从 staging 过渡到 decode 的 hisparse 请求构建一个 ScheduleBatch。"""
         device = self.device
 
         batch = ScheduleBatch.init_new(
@@ -2154,30 +2234,36 @@ class Scheduler(
         batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         batch.seq_lens_sum = sum(seq_lens)
-        # output_ids = last generated token, used as input_ids by prepare_for_decode
+        # output_ids = 最后生成的 token，会被 prepare_for_decode 用作 input_ids
         batch.output_ids = torch.tensor(
             [r.output_ids[-1] for r in reqs], dtype=torch.int64, device=device
         )
 
-        # Set logprob fields if any request needs them
+        # 若有任何请求需要 logprob，则设置相关字段
         if batch.return_logprob:
             batch.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
             batch.token_ids_logprobs = [list(r.origin_input_ids) for r in reqs]
 
-        # Build sampling info from scratch for these requests
+        # 为这些请求从头构建 sampling 信息
         batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
             batch, self.model_config.vocab_size
         )
-        # todo hisparse, maybe other info to contain for the new batch
+        # todo hisparse，新批次可能还需要包含其他信息
         return batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        """获取下一个要运行的批次。
+
+        先处理超时请求，然后尝试合并上一个 prefill 批次到运行批次；
+        优先返回新的 prefill 批次，否则返回更新后的 decode 批次。
+        同时处理 DP attention 同步、ngram embedding 等。
+        """
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
 
-        # Merge the prefill batch into the running batch
+        # 将 prefill 批次合并到运行批次中
         chunked_req_to_exclude = set()
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
@@ -2186,12 +2272,11 @@ class Scheduler(
                 self.stash_chunked_request(req)
 
         if self.chunked_req is not None:
-            # Move the chunked request out of the batch so that we can merge
-            # only finished requests to running_batch.
+            # 将 chunked 请求移出批次，这样我们就只把已完成的请求合并到 running_batch。
             chunked_req_to_exclude.add(self.chunked_req)
             self.stash_chunked_request(self.chunked_req)
 
-        # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
+        # HiSparse 有自己的 prefill-to-decode 过渡逻辑；跳过 last_batch 的合并。
         if self.enable_hisparse:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
@@ -2208,14 +2293,14 @@ class Scheduler(
             and self.last_batch.forward_mode.is_extend()
         ):
             if self.last_batch.chunked_req is not None:
-                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                # We need to discard it.
+                # 在上下文流水线并行（context pipeline parallelism）中，最后一个 chunk 之后，
+                # 当前 microbatch 仍然引用着过期的 chunked_req，需要将其丢弃。
                 chunked_req_to_exclude.add(self.last_batch.chunked_req)
 
             if self.dllm_config is not None and self.last_batch.reqs:
                 chunked_req_to_exclude.update(self.last_batch.reqs)
 
-            # Filter batch
+            # 过滤批次
             last_bs = self.last_batch.batch_size()
             self.last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
@@ -2223,19 +2308,18 @@ class Scheduler(
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
-            # Merge the new batch into the running batch.
+            # 将新批次合并到运行批次中。
             if not self.last_batch.is_empty():
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 else:
-                    # Merge running_batch with prefill batch
+                    # 将 running_batch 与 prefill 批次合并
                     self.running_batch.merge_batch(self.last_batch)
 
-        # For prefill-only batch, filter out finished requests since they
-        # won't go through the decode step. This keeps running_batch accurate
-        # for load reporting (num_running_reqs via /get_load).
-        # Runs outside the last_batch block so stale requests are cleaned
-        # even when no new batches arrive (e.g. traffic stops).
+        # 对于 prefill-only 批次，过滤掉已完成的请求，因为它们不会进入 decode 步骤。
+        # 这样可以保持 running_batch 的准确性，便于负载上报（通过 /get_load 上报 num_running_reqs）。
+        # 该逻辑放在 last_batch 代码块之外，这样即使没有新批次到来（例如流量停止）时，
+        # 过期请求也能被清理。
         if self.running_batch.is_prefill_only:
             self.running_batch.filter_batch()
 
@@ -2246,18 +2330,18 @@ class Scheduler(
 
         need_mlp_sync = self.require_mlp_sync
         if need_mlp_sync and not self.spec_algorithm.is_none():
-            # NOTE: This branch makes sure prefill and decode batches will not be mixed when spec and dp-attn is enabled.
-            # Before merging the new batch into running batch:
-            # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
-            # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
+            # NOTE: 该分支确保在同时启用 spec 与 dp-attn 时，prefill 与 decode 批次不会被混在一起。
+            # 在把新批次合并进运行批次之前：
+            # 1. 所有 new batch 都为 none -> need_mlp_sync 保持为 true（decode 批次需要同步）。
+            # 2. 所有 new batch 都非空（prefill / idle）-> 不需要再额外做一次 mlp sync 准备。
             new_batch = self.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
-            # Run prefill first if possible
+            # 如果可以，优先运行 prefill
             ret = new_batch
         else:
-            # Run decode (skip for prefill-only batches)
+            # 运行 decode（prefill-only 批次跳过）
             if (
                 not self.running_batch.is_empty()
                 and not self.running_batch.is_prefill_only
@@ -2267,10 +2351,10 @@ class Scheduler(
             else:
                 ret = None
 
-        # Handle DP attention and log stats
+        # 处理 DP attention 并记录统计信息
         ret = self.maybe_prepare_mlp_sync_batch(ret, need_sync=need_mlp_sync)
 
-        # Handle ngram embedding
+        # 处理 ngram embedding
         ret = self._maybe_prepare_ngram_embedding(ret)
 
         if ret:
@@ -2279,15 +2363,21 @@ class Scheduler(
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
+        """计算当前还可新增分配的请求数（受 PP 微批次上限与 token 池可用量限制）。"""
         res = get_global_server_args().pp_max_micro_batch_size - running_bs
         if self.pp_size > 1:
             res = min(res, self.req_to_token_pool.available_size())
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+        """从等待队列中组建一个新的 prefill（预填充）批次。
+
+        考虑 prefill 延迟器、动态分块、LoRA 限制、优先级抢占、分层缓存预取进度等因素，
+        返回可运行的新批次；若无可调度请求则返回 None。
+        """
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
-            # Get token usage from several pools
+            # 从多个池中获取 token 使用量
             token_usage = None
             if self.is_hybrid_swa:
                 _, _, full_token_usage, swa_token_usage, *_ = self._get_swa_token_info()
@@ -2321,7 +2411,7 @@ class Scheduler(
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
-        # Check if the grammar is ready in the grammar queue
+        # 检查 grammar 队列中的 grammar 是否已就绪
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
@@ -2331,7 +2421,7 @@ class Scheduler(
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption:
-            # Reset batch_is_full to try preemption with a prefill adder.
+            # 重置 batch_is_full，以便用 prefill adder 尝试抢占。
             self.running_batch.batch_is_full = False
 
         if (
@@ -2341,11 +2431,12 @@ class Scheduler(
 
         running_bs = len(self.running_batch.reqs)
 
-        # Ignore the check if self.chunked_req is not None.
-        # In the non-PP case, when self.chunked_req is not None, num_allocatable_reqs should always be greater than 0,
-        # as the space for the chunked requests has just been released.
-        # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
-        # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
+        # 当 self.chunked_req 不为 None 时忽略此检查。
+        # 在非 PP 情况下，当 self.chunked_req 不为 None 时，num_allocatable_reqs 应始终大于 0，
+        # 因为 chunked 请求所占的空间刚刚被释放。
+        # 在 PP 情况下，chunked 请求（或 dllm 请求）可能在一个 microbatch 中开始、在另一个 microbatch 中结束，
+        # 因此每个 microbatch 的 max_running_requests 不应是严格限制。
+        # 相反，我们应始终允许添加 chunked 请求，否则会导致显存泄漏。
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
             and self.chunked_req is not None
@@ -2354,16 +2445,15 @@ class Scheduler(
             self.running_batch.batch_is_full = True
             return None
 
-        # Get priority queue
+        # 获取优先级队列
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
-            # If we are testing retraction and the running batch size exceeds
-            # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
-            # in the waiting queue.
+            # 如果正在测试 retraction，且运行批次大小超过 TEST_RETRACT_NO_PREFILL_BS，
+            # 则跳过 prefill，让这些请求继续留在等待队列中。
             return None
 
-        # Determine chunked_prefill_size for this batch
+        # 确定本批次的 chunked_prefill_size
         chunked_prefill_size = self.chunked_prefill_size
         if self.chunked_req is not None and self.enable_dynamic_chunking:
             history_len = len(self.chunked_req.prefix_indices)
@@ -2371,7 +2461,7 @@ class Scheduler(
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
 
-        # Prefill policy
+        # Prefill 策略
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -2396,12 +2486,12 @@ class Scheduler(
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
 
-        # Get requests from the waiting queue to a new prefill batch
+        # 从等待队列中取出请求，组成新的 prefill 批次
         for req in self.waiting_queue:
             if self.enable_lora and req.lora_id not in running_loras:
                 if self.enable_lora_overlap_loading:
-                    # For overlapping loading of LoRA weights with computation, we will load each adapter one at a time,
-                    # as opposed to loading them in one batch
+                    # 为了让 LoRA 权重的加载与计算重叠，我们会逐个加载每个 adapter，
+                    # 而不是在一个批次里一次性加载它们
                     res = self.lora_overlap_loader.try_overlap_load_lora(
                         req.lora_id, running_loras
                     )
@@ -2418,8 +2508,8 @@ class Scheduler(
             if len(adder.can_run_list) >= self.get_num_allocatable_reqs(running_bs):
                 self.running_batch.batch_is_full = True
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                # In prefill mode, prealloc queue and transfer queue can also take memory,
-                # so we need to check if the available size for the actual available size.
+                # 在 prefill 模式下，prealloc 队列和 transfer 队列也会占用显存，
+                # 因此我们需要检查实际可用的空间大小。
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                     self.running_batch.batch_is_full = True
 
@@ -2433,9 +2523,9 @@ class Scheduler(
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
-                    # skip staging requests that are ongoing prefetch
+                    # 跳过仍在进行预取（prefetch）的 staging 请求
                     continue
-                # Pop the number of tokens loaded from storage (L3 hits)
+                # 取出从存储中加载的 token 数量（L3 命中）
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
                 )
@@ -2453,13 +2543,13 @@ class Scheduler(
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
-                        # Set batch_is_full after making sure there are requests that can be served
+                        # 在确认确实存在可服务的请求之后再设置 batch_is_full
                         self.running_batch.batch_is_full = len(
                             adder.can_run_list
                         ) > 0 or (not self.running_batch.is_empty())
                     else:
                         self.running_batch.batch_is_full = True
-                # revert matched mamba idx to avoid memory leak, if req is not added
+                # 如果该请求未被加入，则回退已匹配的 mamba idx，以避免显存泄漏
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added and req.mamba_pool_idx is not None:
                     self.tree_cache.req_to_token_pool.mamba_pool.free(
@@ -2468,7 +2558,7 @@ class Scheduler(
                     req.mamba_pool_idx = None
                 break
 
-        # Update waiting queue
+        # 更新等待队列
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
             return None
@@ -2480,21 +2570,21 @@ class Scheduler(
                 self._add_request_to_queue(req)
 
         if adder.new_chunked_req is not None:
-            # Update chunked prefill
+            # 更新分块预填充（chunked prefill）
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
         if self.chunked_req is not None:
             self.chunked_req.is_chunked += 1
 
-        # Record for logging prefill stats after forward
+        # 记录下来，便于在 forward 之后打印 prefill 统计日志
         self.adder = adder
         self.can_run_list = can_run_list
         self.running_bs = len(self.running_batch.reqs)
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
-        # Create a new batch
+        # 创建一个新批次
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
@@ -2507,27 +2597,27 @@ class Scheduler(
         )
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
-            # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+            # todo (zhiqiang): 如果触发了 hicache 加载，则禁用 CUDA graph 执行
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
 
         new_batch.prepare_for_extend()
 
-        # Record prefill stats for logging after forward
+        # 记录 prefill 统计信息，便于在 forward 之后打印日志
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder, self.running_batch.reqs, self.enable_priority_scheduling
         )
 
-        # Mixed-style chunked prefill
+        # 混合式（mixed-style）分块预填充
         if (
             self.is_mixed_chunk
             and not self.running_batch.is_empty()
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
-            # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
+            # mix_with_running 会拼接 input_ids，但不会拼接 input_embeds——否则 shape 会不匹配
             and new_batch.input_embeds is None
         ):
-            # TODO (lianmin): support return_logprob + mixed chunked prefill
+            # TODO (lianmin): 支持 return_logprob + 混合式分块预填充
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
@@ -2542,7 +2632,7 @@ class Scheduler(
         return new_batch
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
-        """Update the current running decoding batch."""
+        """更新当前正在运行的 decode 批次。"""
         initial_bs = batch.batch_size()
 
         batch.filter_batch(v1_spec_info_filtered=True)
@@ -2550,12 +2640,12 @@ class Scheduler(
             batch.batch_is_full = False
             return batch
 
-        # Eagerly release lock_ref on completed write-through nodes so they
-        # become evictable, improving batch scheduling headroom.
+        # 及时释放已完成 write-through 节点上的 lock_ref，使它们变为可驱逐，
+        # 从而为批次调度腾出更多余量。
         if self.enable_hierarchical_cache:
             self.tree_cache.flush_write_through_acks()
 
-        # Check if decode out of memory
+        # 检查 decode 是否会显存不足（OOM）
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
@@ -2617,16 +2707,17 @@ class Scheduler(
         if batch.is_empty():
             return batch
 
-        # Update batch tensors
+        # 更新批次张量
         batch.prepare_for_decode()
         return batch
 
     def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):
-        # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
-        # NOTE: More Reliable: record all tensors into the forward stream
-        # NOTE: - for all future tensors, we shall always read from future map
-        #       - for all non-future tensors (produced only by schedule stream),
-        #       we shall keep its reference not being release during all the forwarding pass
+        """在 overlap 调度下保留对批次张量的引用，避免 GPU 张量被 torch GC 提前释放。"""
+        # FIXME(lsyin): 这是一种 hacky 的做法，靠保留引用来避免 GPU 张量被 torch GC 释放
+        # NOTE: 更可靠的做法：把所有张量都记录到 forward stream 上
+        # NOTE: - 对于所有 future 张量，我们应始终从 future map 中读取
+        #       - 对于所有非 future 张量（仅由 schedule stream 产生的），
+        #       我们应在整个前向计算过程中保持其引用不被释放
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
@@ -2635,38 +2726,38 @@ class Scheduler(
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
-        """Run a batch."""
+        """运行一个批次。"""
         self.forward_ct += 1
 
-        # Whether to run the profiler
+        # 是否运行 profiler
         self._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
 
-        # Capture prefill start time for EXTEND mode
+        # 在 EXTEND 模式下记录 prefill 开始时间
         if batch.forward_mode == ForwardMode.EXTEND:
             set_time_batch(batch.reqs, "set_prefill_run_batch_start_time")
 
-        # Place holder handling for pd-disagg decode event loop
+        # 在 PD 分离的 decode 事件循环中处理占位（placeholder）批次
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
-        # Run forward
+        # 运行前向计算
         if self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:
-                # In most cases, we use the model worker batch to run the forward.
+                # 大多数情况下，我们使用 model worker batch 来运行前向计算。
                 worker_batch_or_batch = batch.get_model_worker_batch()
             else:
-                # In speculative decoding v1 (non-overlap) case, we use the batch directly.
-                # TODO(lsyin): delete this branch after unifying the abstraction.
+                # 在投机解码 v1（非 overlap）情况下，我们直接使用 batch。
+                # TODO(lsyin): 统一抽象之后删除这个分支。
                 worker_batch_or_batch = batch
 
             if self.enable_overlap:
                 model_worker_batch = worker_batch_or_batch
                 self.record_batch_in_overlap(model_worker_batch)
 
-                # Sampling info will be modified during forward, so we store a copy.
+                # Sampling 信息会在前向计算过程中被修改，因此我们保存一份副本。
                 model_worker_batch.sampling_info = (
                     model_worker_batch.sampling_info.copy_for_forward()
                 )
@@ -2680,9 +2771,9 @@ class Scheduler(
                     with self.record_forward_metrics(batch):
                         batch_result = self.model_worker.forward_batch_generation(
                             model_worker_batch
-                            # here pp is not compatible with overlap
+                            # 这里 pp 与 overlap 不兼容
                         )
-                    # FIXME(lsyin): maybe move this to forward_batch_generation
+                    # FIXME(lsyin): 也许可以把这一步移到 forward_batch_generation 里
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
                         self.future_map.store_to_map(future_indices, batch_result)
@@ -2690,12 +2781,12 @@ class Scheduler(
                     else:
                         batch_result.future_indices = future_indices
 
-                # FIXME(lsyin): move this assignment elsewhere
+                # FIXME(lsyin): 把这个赋值移到别处
                 future_indices_or_next_token_ids = -future_indices.indices
 
                 if batch.is_spec_v2:
-                    # FIXME(lsyin): tmp code for spec v2
-                    # We only keep future indices for next draft input
+                    # FIXME(lsyin): 这是 spec v2 的临时代码
+                    # 我们只为下一次 draft 输入保留 future indices
 
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
@@ -2705,8 +2796,8 @@ class Scheduler(
                     #     verify_done=batch_result.next_draft_input.verify_done,
                     # )
 
-                    # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
+                    # future 值，通常用于下一个批次的准备
+                    # 当前实现严格同步 seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
@@ -2724,15 +2815,14 @@ class Scheduler(
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
-            # NOTE: future_indices_or_next_token_ids is used in ScheduleBatch,
-            #       which can probably be replaced by future_indices later [TODO(lsyin)].
-            #       we shall still keep the original outputs, e.g. next_token_ids
-            #       in the GenerationBatchOutput for processing after copy_done.
+            # NOTE: future_indices_or_next_token_ids 用于 ScheduleBatch，
+            #       将来可能会用 future_indices 来替代它 [TODO(lsyin)]。
+            #       我们仍应在 GenerationBatchOutput 中保留原始输出（例如 next_token_ids），
+            #       以便在 copy_done 之后用于处理。
             batch.output_ids = future_indices_or_next_token_ids
 
-            # These 2 values are needed for processing the output, but the values can be
-            # modified by overlap schedule. So we have to copy them here so that
-            # we can use the correct values in output processing.
+            # 这 2 个值在处理输出时需要用到，但它们可能会被 overlap 调度修改。
+            # 因此我们必须在此处复制它们，以便在输出处理时使用正确的值。
             if batch.return_logprob:
                 batch_result.extend_input_len_per_req = [
                     req.extend_input_len for req in batch.reqs
@@ -2745,7 +2835,7 @@ class Scheduler(
                 batch_result.extend_logprob_start_len_per_req = None
 
             ret = batch_result
-        else:  # embedding or reward model
+        else:  # embedding 或 reward 模型
             model_worker_batch = batch.get_model_worker_batch()
 
             if self.enable_overlap:
@@ -2761,7 +2851,7 @@ class Scheduler(
                 embeddings = self.tp_worker.forward_batch_embedding(model_worker_batch)
                 ret = EmbeddingBatchResult(embeddings=embeddings)
 
-        # Capture prefill end time for EXTEND mode
+        # 在 EXTEND 模式下记录 prefill 结束时间
         if batch.forward_mode == ForwardMode.EXTEND:
             set_time_batch(batch.reqs, "set_prefill_run_batch_end_time")
 
@@ -2769,7 +2859,7 @@ class Scheduler(
             self.server_args.enable_dp_attention
             and self.server_args.elastic_ep_backend is not None
         ):
-            # Get the tensors indicating rank activeness
+            # 获取标记各 rank 是否处于活跃状态的张量
             tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
             tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
             tp_active_ranks &= tp_active_ranks_cpu
@@ -2783,8 +2873,9 @@ class Scheduler(
     def launch_batch_sample_if_needed(
         self, batch_result: GenerationBatchResult
     ) -> Union[GenerationBatchResult]:
-        # TODO(lsyin): make the delayed sample a default behavior after
-        # unifying the forward_batch_generation interface (related to spec V2).
+        """若批次结果需要延迟采样，则执行采样函数，并及时释放不再需要的闭包与大 GPU 张量以避免显存泄漏。"""
+        # TODO(lsyin): 在统一 forward_batch_generation 接口之后（与 spec V2 相关），
+        # 将延迟采样（delayed sample）设为默认行为。
         if batch_result is None or batch_result.delay_sample_func is None:
             return
 
@@ -2795,12 +2886,11 @@ class Scheduler(
             self.future_map.store_to_map(batch_result.future_indices, batch_result)
             batch_result.copy_to_cpu(return_logprob=self.cur_batch.return_logprob)
 
-        # Release the closure and large GPU tensors that are no longer needed.
-        # The delay_sample_func closure captures forward_batch (which holds
-        # sampling_info with vocab_mask) and logits_output (which holds
-        # next_token_logits). Without clearing these, they stay alive via
-        # batch_result in result_queue and batch_record_buf until the next
-        # iteration, causing a steady VRAM leak with structured output.
+        # 释放不再需要的闭包和大型 GPU 张量。
+        # delay_sample_func 闭包捕获了 forward_batch（其中持有带 vocab_mask 的 sampling_info）
+        # 和 logits_output（其中持有 next_token_logits）。如果不清除它们，它们会通过
+        # result_queue 和 batch_record_buf 中的 batch_result 一直存活到下一次迭代，
+        # 在结构化输出场景下造成持续的显存（VRAM）泄漏。
         batch_result.delay_sample_func = None
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
@@ -2810,6 +2900,7 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        """根据批次的前向模式（decode/extend/prebuilt/idle 等）分发到对应的结果处理函数。"""
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
@@ -2829,10 +2920,11 @@ class Scheduler(
         self.maybe_send_health_check_signal()
 
     def maybe_send_health_check_signal(self):
+        """若有待响应的健康检查，则发送健康信号（避免被长上下文 prefill 阻塞）。"""
         if self.return_health_check_ipcs:
-            # Return some signal for the health check.
-            # This is used to prevent the health check signal being blocked by long context prefill.
-            # However, one minor issue is that this code path does not check the status of detokenizer manager.
+            # 为健康检查返回某种信号。
+            # 这用于防止健康检查信号被长上下文 prefill 阻塞。
+            # 不过有一个小问题：这条代码路径不会检查 detokenizer manager 的状态。
             self.send_to_tokenizer.send_output(
                 HealthCheckOutput(
                     http_worker_ipc=self.return_health_check_ipcs.popleft()
@@ -2840,6 +2932,7 @@ class Scheduler(
             )
 
     def _check_pending_flush(self):
+        """检查是否有被延迟的 flush_cache 请求：一旦调度器完全空闲则执行清缓存，超时则返回失败。"""
         if self._pending_flush is None:
             return
 
@@ -2868,6 +2961,7 @@ class Scheduler(
     def flush_cache_wrapped(
         self, recv_req: FlushCacheReqInput
     ) -> Optional[FlushCacheReqOutput]:
+        """处理清空缓存请求：若当前空闲则立即清空，否则按超时时间延迟到空闲时再执行。"""
         if self._pending_flush is not None:
             return FlushCacheReqOutput(
                 success=False,
@@ -2885,6 +2979,7 @@ class Scheduler(
         return None
 
     def clear_hicache_storage_wrapped(self, recv_req: ClearHiCacheReqInput):
+        """处理清空分层缓存存储后端的请求（仅在启用分层缓存时生效）。"""
         if self.enable_hierarchical_cache:
             self.tree_cache.clear_storage_backend()
             logger.info("Hierarchical cache cleared successfully!")
@@ -2895,12 +2990,17 @@ class Scheduler(
         return ClearHiCacheReqOutput(success=if_success)
 
     def is_fully_idle(self, for_health_check=False) -> bool:
-        # Health check piggybacks on running requests in process_output.
-        # Only running_batch + waiting_queue guarantee active GPU processing;
-        # disagg queues (bootstrap/prealloc/transfer) may have items without
-        # any request actually running on GPU — e.g. stuck handshake, full
-        # KV cache, or stalled transfer — so they can't carry health info.
-        # Batch running status
+        """判断调度器是否完全空闲。
+
+        综合检查运行批次、等待队列、分块请求、overlap 结果队列以及（非健康检查时）
+        grammar 队列、PD 分离队列与 HiCache 在飞异步操作是否均已清空。
+        """
+        # 健康检查在 process_output 中搭载于正在运行的请求之上。
+        # 只有 running_batch + waiting_queue 才能保证 GPU 正在活跃处理；
+        # 分离部署的队列（bootstrap/prealloc/transfer）中可能有条目，但并没有任何
+        # 请求真正在 GPU 上运行——例如握手卡住、KV cache 满，或传输停滞——
+        # 因此它们不能承载健康信息。
+        # 批次运行状态
         idle = (
             self.running_batch.is_empty()
             and self.chunked_req is None
@@ -2911,12 +3011,12 @@ class Scheduler(
             and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
         )
 
-        # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
+        # 等待中的各队列：waiting + bootstrapping + preallocation + kv transfer（decode）
         idle &= len(self.waiting_queue) == 0
 
         if not for_health_check:
-            # Grammar queue and prefill inflight queue may not produce batch
-            # results instantly, but they still indicate the server is not idle.
+            # grammar 队列和 prefill inflight 队列可能不会立即产出批次结果，
+            # 但它们仍然表明服务器并不空闲。
             idle &= len(self.grammar_manager.grammar_queue) == 0
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 idle &= len(self.disagg_prefill_inflight_queue) == 0
@@ -2926,8 +3026,8 @@ class Scheduler(
                 idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
                 idle &= len(self.disagg_decode_transfer_queue.queue) == 0
 
-            # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
-            # destructive operations like attach/detach/flush_cache.
+            # HiCache：在执行 attach/detach/flush_cache 等破坏性操作之前，
+            # 必须先排空在飞的异步操作（GPU↔Host↔L3）。
             if self.enable_hierarchical_cache:
                 tc = self.tree_cache
                 idle &= len(tc.ongoing_write_through) == 0
@@ -2941,6 +3041,7 @@ class Scheduler(
     def attach_hicache_storage_wrapped(
         self, recv_req: AttachHiCacheStorageReqInput
     ) -> AttachHiCacheStorageReqOutput:
+        """动态挂载分层缓存存储后端（要求调度器处于空闲状态）。"""
         if not self.enable_hierarchical_cache:
             return AttachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
@@ -2994,6 +3095,7 @@ class Scheduler(
     def detach_hicache_storage_wrapped(
         self, recv_req: DetachHiCacheStorageReqInput
     ) -> DetachHiCacheStorageReqOutput:
+        """动态卸载分层缓存存储后端（幂等操作，要求调度器空闲）。"""
         if not self.enable_hierarchical_cache:
             return DetachHiCacheStorageReqOutput(
                 success=False, message="Hierarchical cache is not enabled."
@@ -3015,8 +3117,8 @@ class Scheduler(
                 message="Current tree_cache implementation does not support dynamic detach.",
             )
 
-        # Idempotent detach: even if scheduler thinks storage is disabled, we still
-        # attempt best-effort cleanup in tree_cache (it may have leftover state).
+        # 幂等的 detach：即使 scheduler 认为存储已被禁用，我们仍会在 tree_cache 中
+        # 尽力做一次清理（它可能残留有状态）。
         try:
             ok, msg = self.tree_cache.detach_storage_backend()
         except Exception as e:
@@ -3024,7 +3126,7 @@ class Scheduler(
             return DetachHiCacheStorageReqOutput(success=False, message=str(e))
 
         if ok or (not self.enable_hicache_storage):
-            # Treat "already disabled / nothing to do" as success for idempotence.
+            # 出于幂等性考虑，将“已禁用 / 无事可做”也视为成功。
             self.enable_hicache_storage = False
             self.server_args.hicache_storage_backend = None
             self.server_args.hicache_storage_backend_extra_config = None
@@ -3036,7 +3138,7 @@ class Scheduler(
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
     def flush_cache(self):
-        """Flush the memory pool and cache."""
+        """清空显存池与缓存。"""
         if self.is_fully_idle():
             self.cur_batch = None
             self.last_batch = None
@@ -3049,7 +3151,7 @@ class Scheduler(
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
 
-            # TODO: allow optional empty cache
+            # TODO: 允许按需选择是否清空 cache
             torch.cuda.empty_cache()
             logger.info("Cache flushed successfully!")
             success = True
@@ -3063,6 +3165,7 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
+        """获取调度器内部状态：含服务参数、吃吐吞、显存使用、投机接受长度等信息。"""
         ret = vars(get_global_server_args())
         ret["last_gen_throughput"] = self.last_gen_throughput
         ret["memory_usage"] = {
@@ -3083,12 +3186,13 @@ class Scheduler(
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
 
-        # This field is not serializable.
+        # 该字段不可序列化。
         ret.pop("model_config", None)
 
         return GetInternalStateReqOutput(internal_state=ret)
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
+        """设置调度器内部状态：仅允许更新白名单中的参数（如 PP 微批次大小、投机接受阈值）。"""
         server_args_dict = recv_req.server_args
         args_allow_update = set(
             [
@@ -3129,7 +3233,8 @@ class Scheduler(
         )
 
     def handle_rpc_request(self, recv_req: RpcReqInput):
-        # Handle RPC requests
+        """处理 RPC 请求：根据方法名反射调用对应方法，并在各 rank 间 barrier 同步后返回结果。"""
+        # 处理 RPC 请求
         logger.info(
             f"handle_rpc_request: {recv_req.method}, param: {recv_req.parameters}"
         )
@@ -3151,35 +3256,40 @@ class Scheduler(
         return RpcReqOutput(success, "" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
-        # todo hisparse, release resources for abort requests in hisparse coordinator
-        # Delete requests in the waiting queue
+        """中止请求。
+
+        采用三种中止方式：直接从等待队列弹出；对 grammar 队列调用 set_finish_with_abort；
+        对运行中请求设置 to_finish。同时处理 PD 分离各队列中请求的资源释放。
+        """
+        # todo hisparse，在 hisparse coordinator 中为被中止的请求释放资源
+        # 删除等待队列中的请求
         to_del = []
         for i, req in enumerate(self.waiting_queue):
             if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                 to_del.append(i)
 
-        # Sort in reverse order to avoid index issues when deleting
+        # 逆序处理，避免删除时出现索引错位问题
         for i in reversed(to_del):
-            # Abort method 1: directly pop from the queue
-            # This only works for requests that have not started anything.
-            # We still need to send something back to TokenizerManager to clean up the state.
+            # 中止方式 1：直接从队列中弹出
+            # 这种方式仅适用于尚未开始任何处理的请求。
+            # 我们仍需向 TokenizerManager 回传一些信息以清理其状态。
             req = self.waiting_queue.pop(i)
             if self.enable_hicache_storage:
-                # to release prefetch events associated with the request
+                # 释放与该请求关联的预取（prefetch）事件
                 self.tree_cache.release_aborted_request(req.rid)
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
-            # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
+            # 在分离部署的 decode 模式下，等待队列中的请求已经分配了 KV cache。
             if self.disaggregation_mode == DisaggregationMode.DECODE:
                 if self.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
-            # For disaggregation prefill mode, free the metadata buffer index
+            # 在分离部署的 prefill 模式下，释放 metadata buffer 索引
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 release_req_to_metadata_buffer(
                     req, self.req_to_metadata_buffer_idx_allocator
                 )
 
-            # For mamba radix cache
+            # 针对 mamba radix cache
             if (
                 req.mamba_pool_idx is not None
                 and self.disaggregation_mode != DisaggregationMode.DECODE
@@ -3187,22 +3297,22 @@ class Scheduler(
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
-        # Delete the requests in the grammar queue
-        # Abort method 2: call `set_finish_with_abort`
-        # The request will still run one prefill forward pass.
-        # In this case, we change the input_ids to be only one token to make this prefill cheap.
+        # 删除 grammar 队列中的请求
+        # 中止方式 2：调用 `set_finish_with_abort`
+        # 该请求仍会运行一次 prefill 前向计算。
+        # 这种情况下，我们把 input_ids 改成只有一个 token，使这次 prefill 开销很小。
         self.grammar_manager.abort_requests(recv_req)
 
-        # Delete requests not in the waiting queue when PD disaggregation is enabled
+        # 启用 PD 分离部署时，删除不在等待队列中的请求
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # Abort requests that have not yet been bootstrapped
+            # 中止尚未完成 bootstrap 的请求
             for req in self.disagg_prefill_bootstrap_queue.queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort bootstrap queue request. {req.rid=}")
                     if hasattr(req.disagg_kv_sender, "abort"):
                         req.disagg_kv_sender.abort()
 
-            # Abort in-flight requests
+            # 中止在飞（in-flight）的请求
             for req in self.disagg_prefill_inflight_queue:
                 if recv_req.abort_all or req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort inflight queue request. {req.rid=}")
@@ -3210,19 +3320,19 @@ class Scheduler(
                         req.disagg_kv_sender.abort()
 
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            # Abort requests that have not yet finished preallocation
+            # 中止尚未完成预分配（preallocation）的请求
             for decode_req in self.disagg_decode_prealloc_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
 
-            # Abort requests waiting for kvcache to release tree cache
+            # 中止正在等待 kvcache 释放 tree cache 的请求
             for decode_req in self.disagg_decode_transfer_queue.queue:
                 if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
                     logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
                     decode_req.kv_receiver.abort()
 
-            # Abort requests already retracted to CPU cache
+            # 中止已被回退（retract）到 CPU cache 的请求
             if self.disagg_decode_prealloc_queue.retracted_queue:
                 remaining_retracted = []
                 for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
@@ -3236,7 +3346,7 @@ class Scheduler(
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
 
-        # Delete requests in the running batch
+        # 删除运行批次中的请求
         if self.cur_batch is self.running_batch or self.cur_batch is None:
             reqs = self.running_batch.reqs
         else:
@@ -3246,30 +3356,30 @@ class Scheduler(
             if not req.finished() and (
                 recv_req.abort_all or req.rid.startswith(recv_req.rid)
             ):
-                # Abort method 3: set `to_finish`
-                # The request will still run one decode forward pass.
-                # Then we reuse all existing code to clean up the KV cache allocation.
+                # 中止方式 3：设置 `to_finish`
+                # 该请求仍会运行一次 decode 前向计算。
+                # 之后我们复用所有现有代码来清理 KV cache 的分配。
                 logger.debug(f"Abort running request. {req.rid=}")
                 req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
+        """暂停引擎的底层实现（由子类/Mixin 覆写）。"""
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
+        """暂停生成。支持原地暂停、合并 last_batch、或回退（retract）重新入队等多种模式。"""
         self._engine_paused = True
 
         if recv_req.mode == "in_place":
-            # In-place pause: just set the flag and return immediately.
-            # All scheduler state (running_batch, last_batch, chunked_req,
-            # result_queue) is left untouched. On resume, the normal event
-            # loop (get_next_batch_to_run) handles last_batch merge,
-            # chunked_req cleanup, and overlap result processing through
-            # the standard code paths. This avoids duplicating batch
-            # manipulation logic and the accounting bugs that come with it.
+            # 原地暂停：只设置标志位并立即返回。
+            # 所有调度器状态（running_batch、last_batch、chunked_req、result_queue）
+            # 都保持不变。恢复时，正常的事件循环（get_next_batch_to_run）会通过标准代码路径
+            # 处理 last_batch 合并、chunked_req 清理以及 overlap 结果处理。
+            # 这样可以避免重复实现批次操作逻辑，以及随之而来的计数错误（accounting bug）。
             return
 
         if self.enable_overlap and self.last_batch:
-            # Process the results of the last batch
+            # 处理上一个批次的结果
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
@@ -3298,12 +3408,13 @@ class Scheduler(
             self.chunked_req = None
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
+        """恢复生成（解除暂停标记）。"""
         self._engine_paused = False
 
     def load_lora_adapter(
         self, recv_req: LoadLoRAAdapterReqInput
     ) -> LoadLoRAAdapterReqOutput:
-        """In-place loading a new lora adapter from disk or huggingface."""
+        """从磁盘或 huggingface 原地加载一个新的 lora adapter。"""
 
         result = self.tp_worker.load_lora_adapter(recv_req)
         return result
@@ -3311,7 +3422,7 @@ class Scheduler(
     def load_lora_adapter_from_tensors(
         self, recv_req: LoadLoRAAdapterFromTensorsReqInput
     ) -> LoadLoRAAdapterFromTensorsReqOutput:
-        """In-place loading a new lora adapter from serialized tensors."""
+        """从序列化的张量原地加载一个新的 lora adapter。"""
 
         result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
         return result
@@ -3319,7 +3430,7 @@ class Scheduler(
     def unload_lora_adapter(
         self, recv_req: UnloadLoRAAdapterReqInput
     ) -> UnloadLoRAAdapterReqOutput:
-        """Unload the lora adapter."""
+        """卸载 lora adapter。"""
 
         result = self.tp_worker.unload_lora_adapter(recv_req)
         return result
@@ -3327,7 +3438,7 @@ class Scheduler(
     def init_weights_send_group_for_remote_instance(
         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput
     ):
-        """Init the seed and client instance communication group."""
+        """初始化 seed 实例与 client 实例之间的通信组。"""
         success, message = self.tp_worker.init_weights_send_group_for_remote_instance(
             recv_req
         )
@@ -3336,11 +3447,12 @@ class Scheduler(
     def send_weights_to_remote_instance(
         self, recv_req: SendWeightsToRemoteInstanceReqInput
     ):
-        """Send the seed instance weights to the destination instance."""
+        """将 seed 实例的权重发送给目标实例。"""
         success, message = self.tp_worker.send_weights_to_remote_instance(recv_req)
         return SendWeightsToRemoteInstanceReqOutput(success, message)
 
     def slow_down(self, recv_req: SlowDownReqInput):
+        """设置每次前向后的休眠时间以人为减速（用于调试/限流）。"""
         t = recv_req.forward_sleep_time
         if t is not None and t <= 0:
             t = None
@@ -3348,6 +3460,7 @@ class Scheduler(
         return SlowDownReqOutput()
 
     def expert_distribution_handle(self, recv_req: ExpertDistributionReq):
+        """处理专家分布记录请求：开始/停止/导出记录（用于 MoE 专家负载分析）。"""
         action = recv_req.action
         if action == ExpertDistributionReqType.START_RECORD:
             get_global_expert_distribution_recorder().start_record()
@@ -3360,12 +3473,15 @@ class Scheduler(
         return ExpertDistributionReqOutput()
 
     def open_session(self, recv_req: OpenSessionReqInput):
+        """打开一个会话（用于多轮对话的状态复用）。"""
         return self.session_controller.open(recv_req)
 
     def close_session(self, recv_req: CloseSessionReqInput):
+        """关闭指定会话。"""
         self.session_controller.close(recv_req)
 
     def maybe_sleep_on_idle(self):
+        """若启用了空闲休眠器，则在空闲时休眠以降低 CPU 功耗。"""
         if self.idle_sleeper is not None:
             self.idle_sleeper.maybe_sleep()
 
@@ -3376,6 +3492,7 @@ class Scheduler(
         return None
 
     def handle_dumper_control(self, recv_req: DumperControlReqInput):
+        """处理 dumper 控制请求（调试转储工具）：仅在 rank 0 上执行并返回响应。"""
         from sglang.srt.debug_utils.dumper import dumper
 
         try:
@@ -3401,6 +3518,7 @@ class Scheduler(
     def update_cache_from_scheduler(
         self, schedule_batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
+        """供子类/Mixin 覆写的占位方法：根据调度结果更新缓存。"""
         pass
 
 
@@ -3417,6 +3535,7 @@ class IdleSleeper:
     """
 
     def __init__(self, sockets):
+        """注册需要监听的套接字，并记录上次清理缓存的时间。"""
         self.poller = zmq.Poller()
         self.last_empty_time = real_time()
         for s in sockets:
@@ -3425,6 +3544,7 @@ class IdleSleeper:
         self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
 
     def maybe_sleep(self):
+        """阻塞轮询套接字（最多 1s）以让出 CPU；并按间隔定期清空 CUDA 缓存。"""
         self.poller.poll(1000)
         if (
             self.empty_cache_interval > 0
@@ -3435,11 +3555,13 @@ class IdleSleeper:
 
 
 def is_health_check_generate_req(recv_req):
+    """判断一个生成请求是否为健康检查请求（通过 rid 前缀识别）。"""
     rid = getattr(recv_req, "rid", None)
     return rid is not None and rid.startswith(HEALTH_CHECK_RID_PREFIX)
 
 
 def is_work_request(recv_req):
+    """判断是否为工作请求（生成/embedding 及其批量版本）。"""
     return isinstance(
         recv_req,
         (
@@ -3451,6 +3573,7 @@ def is_work_request(recv_req):
     )
 
 
+# ZMQ 发送套接字的轻量包装：socket 为 None 时发送操作为空，并处理多 HTTP worker 场景的 IPC 透传。
 class SenderWrapper:
     def __init__(self, socket: zmq.Socket):
         self.socket = socket
@@ -3475,6 +3598,7 @@ class SenderWrapper:
 
 
 def dispatch_event_loop(scheduler: Scheduler):
+    """根据部署模式（普通/PD prefill/PD decode）与是否启用 pdmux/PP/overlap，分发到对应的事件循环。"""
     # Dispatch to the appropriate event loop based on the disaggregation mode
     server_args = scheduler.server_args
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
@@ -3559,10 +3683,16 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    """调度器进程的入口函数。
+
+    负责配置进程（日志/进程名/CPU 亲和性/NUMA/追踪），创建 Scheduler 实例，
+    通过管道向父进程回传初始化信息，并运行事件循环直到关闭；出错时通知父进程。
+    """
     dp_rank = configure_scheduler(
         server_args, tp_rank, attn_cp_rank, moe_dp_rank, moe_ep_rank, pp_rank, dp_rank
     )
 
+    # 当父进程死亡时让本进程也随之退出，避免产生僵尸进程。
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 

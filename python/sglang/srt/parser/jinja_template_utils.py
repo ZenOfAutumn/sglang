@@ -26,14 +26,16 @@ logger = logging.getLogger(__name__)
 
 
 def _is_var_access(node: jinja2.nodes.Node, varname: str) -> bool:
-    """Check if node is a variable access like {{ varname }}"""
+    """判断节点是否为“读取变量”访问，如 {{ varname }}。"""
+    # Name 节点且 ctx==load（读取上下文）、名称匹配。
     if isinstance(node, jinja2.nodes.Name):
         return node.ctx == "load" and node.name == varname
     return False
 
 
 def _is_attr_access(node: jinja2.nodes.Node, varname: str, key: str) -> bool:
-    """Check if node is an attribute access like {{ varname['key'] }} or {{ varname.key }}"""
+    """判断节点是否为属性/下标访问，如 {{ varname['key'] }} 或 {{ varname.key }}。"""
+    # 下标形式：varname['key']。
     if isinstance(node, jinja2.nodes.Getitem):
         return (
             _is_var_access(node.node, varname)
@@ -41,6 +43,7 @@ def _is_attr_access(node: jinja2.nodes.Node, varname: str, key: str) -> bool:
             and node.arg.value == key
         )
 
+    # 属性形式：varname.key。
     if isinstance(node, jinja2.nodes.Getattr):
         return _is_var_access(node.node, varname) and node.attr == key
 
@@ -52,25 +55,37 @@ def _is_var_or_elems_access(
     varname: str,
     key: str = None,
 ) -> bool:
-    """Check if node accesses varname or varname[key] with filters/tests"""
+    """判断节点是否（透过过滤器/测试/切片）访问了 varname 或 varname[key]。
+
+    递归剖开 Jinja 中常见的包裹：
+      - Filter：如 message['content'] | selectattr(...)
+      - Test：如 ... is ...
+      - Slice：如 message['content'][1:]
+    最终落到“属性访问”或“变量访问”的判断。
+    """
+    # 过滤器：继续看其被过滤的对象。
     if isinstance(node, jinja2.nodes.Filter):
         return node.node is not None and _is_var_or_elems_access(
             node.node, varname, key
         )
+    # 测试表达式：继续看其左侧对象。
     if isinstance(node, jinja2.nodes.Test):
         return _is_var_or_elems_access(node.node, varname, key)
 
+    # 切片：继续看被切片的对象。
     if isinstance(node, jinja2.nodes.Getitem) and isinstance(
         node.arg, jinja2.nodes.Slice
     ):
         return _is_var_or_elems_access(node.node, varname, key)
 
+    # 有 key 时判断属性/下标访问；否则判断变量访问。
     return _is_attr_access(node, varname, key) if key else _is_var_access(node, varname)
 
 
 def _try_extract_ast(chat_template: str):
-    """Try to parse the Jinja template into an AST"""
+    """尝试将 Jinja 模板解析为 AST（抽象语法树），失败返回 None。"""
     try:
+        # 复用 HuggingFace 的模板编译器，再拿环境去 parse 出 AST。
         jinja_compiled = hf_chat_utils._compile_jinja_template(chat_template)
         return jinja_compiled.environment.parse(chat_template)
     except Exception as e:
@@ -80,41 +95,42 @@ def _try_extract_ast(chat_template: str):
 
 def detect_jinja_template_content_format(chat_template: str) -> str:
     """
-    Detect whether a chat template expects 'string' or 'openai' content format.
+    检测聊天模板期望的内容格式是 'string' 还是 'openai'。
 
-    - 'string': content is a simple string (like DeepSeek templates)
-    - 'openai': content is a list of structured dicts (like Llama4 templates)
+    - 'string'：content 是简单字符串（如 DeepSeek 模板）。
+    - 'openai'：content 是结构化 dict 列表（如 Llama4 模板）。
 
-    Detection logic:
-    - If template has loops like {%- for content in message['content'] -%} → 'openai'
-    - Otherwise → 'string'
+    检测逻辑：
+    - 若模板含如 {%- for content in message['content'] -%} 的循环 → 'openai'。
+    - 否则 → 'string'。
     """
-    # Shortcut for multimodal templates
+    # 多模态模板快捷判断：含 image/audio/video/vision 关键字则直接当作 openai 格式。
     if any(
         keyword in chat_template for keyword in ["image", "audio", "video", "vision"]
     ):
         return "openai"
 
+    # 解析 AST；解析失败则保守返回 string。
     jinja_ast = _try_extract_ast(chat_template)
     if jinja_ast is None:
         return "string"
 
     try:
-        # Look for patterns like: {%- for content in message['content'] -%}
+        # 遍历所有 for 循环，查找对 content 的迭代。
         for loop_ast in jinja_ast.find_all(jinja2.nodes.For):
             loop_iter = loop_ast.iter
 
-            # Check if iterating over message['content'] or similar
+            # 是否在迭代 message['content']（或带过滤器/切片的变体）。
             if _is_var_or_elems_access(loop_iter, "message", "content"):
-                return "openai"  # Found content iteration → openai format
+                return "openai"  # 发现内容迭代 → openai 格式
 
-            # Also check for patterns like: {%- for item in msg.content -%} or {%- for item in m.content -%}
+            # 也检查 msg.content / m.content 这类变量名（如 glm4v 模板）。
             if _is_var_or_elems_access(
                 loop_iter, "msg", "content"
             ) or _is_var_or_elems_access(loop_iter, "m", "content"):
-                return "openai"  # Found content iteration → openai format (glm4v)
+                return "openai"  # 发现内容迭代 → openai 格式（glm4v）
 
-        return "string"  # No content loops found → string format
+        return "string"  # 未发现内容循环 → string 格式
     except Exception as e:
         logger.debug(f"Error when parsing AST of Jinja template: {e}")
         return "string"
@@ -130,27 +146,26 @@ def process_content_for_template_format(
     use_dpsk_v32_encoding: bool = False,
 ) -> dict:
     """
-    Process message content based on detected template format.
+    根据检测到的模板格式处理消息内容（并抽取多模态数据）。
 
-    Args:
-        msg_dict: Message dictionary with content
-        content_format: 'string' or 'openai' (detected via AST analysis)
-        image_data: List to append extracted image URLs
-        video_data: List to append extracted video URLs
-        audio_data: List to append extracted audio URLs
-        modalities: List to append modalities
-        use_dpsk_v32_encoding: If True, extract multimodal data and convert content to string (for DeepSeek-V3.2 encoding)
+    参数：
+        msg_dict: 含 content 的消息字典。
+        content_format: 'string' 或 'openai'（由 AST 分析得出）。
+        image_data: 输出参数，追加提取出的图像。
+        video_data: 输出参数，追加提取出的视频。
+        audio_data: 输出参数，追加提取出的音频。
+        modalities: 输出参数，追加模态信息。
+        use_dpsk_v32_encoding: 为 True 时，抽出多模态数据并把 content 转为字符串（用于 DeepSeek-V3.2 编码）。
 
-    Returns:
-        Processed message dictionary
+    返回：处理后的消息字典。
     """
     if not isinstance(msg_dict.get("content"), list):
-        # Already a string or None, no processing needed
+        # content 已是字符串或 None，无需处理；顺便过滤掉值为 None 的字段。
         return {k: v for k, v in msg_dict.items() if v is not None}
 
     if content_format == "openai" or use_dpsk_v32_encoding:
-        # OpenAI format: preserve structured content list, normalize types
-        # V32 encoding: extract multimodal data but convert content to string
+        # openai 格式：保留结构化内容列表，并将类型归一化（image_url → image 等）。
+        # V32 编码：抽出多模态数据，但把 content 压成纯文本字符串。
         processed_content_parts = []
         text_parts = []
         for chunk in msg_dict["content"]:
@@ -158,6 +173,7 @@ def process_content_for_template_format(
                 chunk_type = chunk.get("type")
 
                 if chunk_type == "image_url":
+                    # 提取图像 URL、detail、max_dynamic_patch，存入 image_data。
                     image_obj = chunk.get("image_url") or {}
                     mdp = image_obj.get("max_dynamic_patch", None)
                     # Also allow flat style: chunk["max_dynamic_patch"]
@@ -171,9 +187,10 @@ def process_content_for_template_format(
 
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
-                    # Normalize to simple 'image' type for template compatibility
+                    # 归一化为简单的 'image' 类型以兼容模板。
                     processed_content_parts.append({"type": "image"})
                 elif chunk_type == "video_url":
+                    # 视频：无 max_dynamic_patch 时只存 url；有时保留结构信息供后端使用。
                     video_obj = chunk.get("video_url") or {}
                     mdp = video_obj.get("max_dynamic_patch", None)
                     if mdp is None:
@@ -188,38 +205,40 @@ def process_content_for_template_format(
                         )
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
-                    # Normalize to simple 'video' type for template compatibility
+                    # 归一化为简单的 'video' 类型以兼容模板。
                     processed_content_parts.append({"type": "video"})
                 elif chunk_type == "audio_url":
                     audio_data.append(chunk["audio_url"]["url"])
-                    # Normalize to simple 'audio' type
+                    # 归一化为简单的 'audio' 类型。
                     processed_content_parts.append({"type": "audio"})
                 elif chunk_type == "text":
-                    # For v32 encoding, collect text parts separately
+                    # V32 编码：文本单独收集，稍后拼接为一个字符串。
                     if use_dpsk_v32_encoding:
                         text_parts.append(chunk["text"])
                     else:
-                        # Keep text content as-is for openai format
+                        # openai 格式：文本块原样保留。
                         processed_content_parts.append(chunk)
 
+        # 重建消息：除 content 外的非空字段原样保留。
         new_msg = {
             k: v for k, v in msg_dict.items() if v is not None and k != "content"
         }
         if use_dpsk_v32_encoding:
+            # V32：content 是拼接后的纯文本。
             new_msg["content"] = " ".join(text_parts) if text_parts else ""
         else:
+            # openai：content 是归一化后的结构化列表。
             new_msg["content"] = processed_content_parts
         return new_msg
 
     elif content_format == "string":
-        # String format: flatten to text only (for templates like DeepSeek)
+        # string 格式：只保留文本，展平为纯文本（适用于 DeepSeek 等模板）。
         text_parts = []
         for chunk in msg_dict["content"]:
             if isinstance(chunk, dict) and chunk.get("type") == "text":
                 text_parts.append(chunk["text"])
-            # Note: For string format, we ignore images/audio since the template
-            # doesn't expect structured content - multimodal placeholders would
-            # need to be inserted differently
+            # 注：string 格式下忽略图像/音频，因为模板不期望结构化内容；
+            # 多模态占位符需以其他方式插入。
 
         new_msg = msg_dict.copy()
         new_msg["content"] = " ".join(text_parts) if text_parts else ""
@@ -227,4 +246,5 @@ def process_content_for_template_format(
         return new_msg
 
     else:
+        # 未知格式：报错。
         raise ValueError(f"Invalid content format: {content_format}")

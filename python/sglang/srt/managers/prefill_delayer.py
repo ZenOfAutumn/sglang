@@ -18,23 +18,53 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class _State:
+    """PrefillDelayer 的内部不可变状态：记录某次延迟决策过程中的累计信息。
+
+    当调度器决定推迟一次 prefill 时，会创建/更新该状态，用于跟踪已经连续推迟了多少轮，
+    以及本次等待从何时开始（便于统计等待耗时与判断是否超过最大延迟轮数）。
+    """
+
+    # 已经连续推迟 prefill 的轮数（forward pass 次数）。
     delayed_count: int = 0
+    # 本次等待的起始时间戳（用于统计等待了多久）。
     start_time: float = field(default_factory=time.perf_counter)
 
     def bump_delayed_count(self) -> "_State":
+        """返回一个 delayed_count 加 1 的新状态（frozen 不可变，故用 replace 复制）。"""
         return dataclasses.replace(self, delayed_count=self.delayed_count + 1)
 
 
 class _NegotiateOutput(NamedTuple):
+    """一次“是否允许 prefill”协商的输出结果。
+
+    协商会跨所有 DP/TP rank 汇总各自的可 prefill 状态，统一给出本轮决策。
+    """
+
+    # 协商后应保存的新状态；None 表示无需继续等待、清空状态。
     next_state: Optional[_State]
+    # 对全局可 prefill 情况的估计："all" / "none" / "mixed"。
     input_estimation: str
+    # 本轮是否允许执行 prefill。
     output_allow: bool
+    # 决策原因（no_wait / wait_success / delay / wait_timeout / token_watermark 等），用于打点。
     output_reason: str
+    # 全局可 prefill 的 rank 数量。
     num_prefillable: int
+    # 因 token 使用率低于水位线而强制放行的 rank 数量。
     num_token_watermark_force_allow: int
 
 
 class PrefillDelayer:
+    """Prefill 延迟器：在 PD 不分离 + overlap 调度下，决定是否推迟本轮 prefill。
+
+    背景：prefill 与正在运行的 decode 合批时，若过早插入 prefill，会让 decode 批次
+    达不到最大 batch size，从而降低整体吞吐。该组件在每轮调度跨所有 rank 协商，
+    在“稍等几轮以攒出更大 batch”与“不能等太久（最大延迟轮数 / token 水位线兜底）”
+    之间做权衡。
+
+    约束：仅在 disaggregation_mode == "null"（PD 不分离）且启用 overlap 调度时可用。
+    """
+
     def __init__(
         self,
         dp_size: int,
@@ -235,6 +265,12 @@ class PrefillDelayer:
 
 
 class PrefillDelayerSinglePassExecutor:
+    """单轮（single pass）执行器：封装某一轮调度内对 PrefillDelayer 的一次性使用。
+
+    保证每轮最多真正协商一次（结果缓存到 _result），并在 finalize 时上报本轮指标；
+    若本轮从未调用协商，finalize 会以 local_prefillable=False 补一次默认协商。
+    """
+
     def __init__(self, prefill_delayer: PrefillDelayer, token_usage: float):
         self._prefill_delayer = prefill_delayer
         self._token_usage = token_usage

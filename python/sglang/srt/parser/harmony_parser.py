@@ -1,3 +1,19 @@
+# =============================================================================
+# Harmony 格式解析器（GPT-OSS 使用的 T4 / harmony 输出格式）
+#
+# Harmony 是 GPT-OSS 系列模型的结构化输出格式，用一组特殊标记把模型输出
+# 划分为不同“频道（channel）”：
+#   - analysis：推理（reasoning）内容
+#   - commentary：评注 / 工具调用冗余文本
+#   - final：最终回复（normal）内容
+# 结构标记如 <|start|> <|channel|> <|message|> <|end|> <|call|> <|return|> 等。
+#
+# 本模块提供两种解析策略：
+#   - CanonicalStrategy：解析带结构标记的标准 harmony 格式。
+#   - TextStrategy：当输出不带结构标记、仅有 analysis/assistantfinal 等关键词时的降级解析。
+# HarmonyParser 作为门面，根据输入自动选择策略，并支持流式增量解析。
+# =============================================================================
+
 import re
 from dataclasses import dataclass
 from typing import Iterator, List, Optional, Tuple
@@ -5,26 +21,27 @@ from typing import Iterator, List, Optional, Tuple
 
 @dataclass
 class Event:
-    """Represents a parsed event from the Harmony stream."""
+    """解析出的事件。event_type 为 reasoning / normal / tool_call 之一。"""
 
-    event_type: str
-    content: str
-    raw_text: str = None  # Original text including structural markers
+    event_type: str  # 事件类型：reasoning（推理）/ normal（正文）/ tool_call（工具调用）
+    content: str  # 事件文本内容
+    raw_text: str = None  # 原始文本（含结构标记），供后续函数调用解析器识别
 
 
 @dataclass
 class Token:
-    """A structural token in the Harmony format."""
+    """Harmony 格式中的一个结构 token（由类型与在原文中的起止位置描述）。"""
 
-    type: str
-    start: int
-    end: int
+    type: str  # token 类型（TEXT / START / CHANNEL / MESSAGE / END / CALL / RETURN 等）
+    start: int  # 在原文中的起始下标
+    end: int  # 在原文中的结束下标
 
 
 def prefix_hold(text: str, tokens: List[str]) -> Tuple[str, str]:
-    """
-    Holds back the longest suffix of `text` that could be a prefix of any token.
-    Returns (emit_now, keep_for_later).
+    """流式防切断：保留 text 末尾那段“可能是某个标记前缀”的最长后缀。
+
+    例如 text 以 "<|cha" 结尾，可能是下一 chunk 的 "<|channel|>"，需暂时扣住。
+    返回 (可立即输出的部分, 需留到下次的部分)。
     """
     if not text:
         return "", ""
@@ -44,7 +61,11 @@ def prefix_hold(text: str, tokens: List[str]) -> Tuple[str, str]:
 
 
 def iter_tokens(text: str, start_pos: int = 0) -> Iterator[Token]:
-    """Iterate over structural tokens in left-to-right order."""
+    """从左到右扫描文本，产出结构 token 与普通 TEXT token。
+
+    处理三种情况：已知结构标记、不完整的部分标记（扣住）、未知标记（如 <|weird|>）。
+    """
+    # 已知结构标记字面量 → token 类型。
     TOKENS = {
         "<|start|>": "START",
         "<|channel|>": "CHANNEL",
@@ -121,9 +142,10 @@ def iter_tokens(text: str, start_pos: int = 0) -> Iterator[Token]:
 
 
 class CanonicalStrategy:
-    """Parses the canonical Harmony format with channel markers."""
+    """解析带频道标记的标准 Harmony 格式。"""
 
     def __init__(self):
+        # guard_tokens：流式解析时需防止被切断的结构标记集合。
         self.guard_tokens = [
             "<|start|>",
             "<|channel|>",
@@ -201,7 +223,7 @@ class CanonicalStrategy:
     def _parse_partial_analysis(
         self, text: str, tokens: List[Token], start_pos: int
     ) -> Optional[Tuple[Event, str]]:
-        """Try to parse partial analysis content for incremental streaming."""
+        """尝试解析“部分” analysis 内容，用于增量流式输出推理文本。仅 analysis 频道可提前流出。"""
         pos = start_pos
 
         # Skip <|start|> if present
@@ -244,7 +266,7 @@ class CanonicalStrategy:
         return Event("reasoning", content), remaining_text
 
     def _extract_channel_type(self, header_text: str) -> Optional[str]:
-        """Extract channel type from header, ignoring other attributes like to=... or <|constrain|>..."""
+        """从频道头部提取频道类型（analysis/commentary/final），忽略 to=... 或 <|constrain|> 等其他属性。"""
         # Look for channel type at the start of the header (case insensitive)
         header_clean = header_text.strip()
 
@@ -260,7 +282,7 @@ class CanonicalStrategy:
     def _parse_block(
         self, text: str, tokens: List[Token], start_pos: int
     ) -> Optional[Tuple[Optional[Event], int]]:
-        """Parse a channel block. Returns (event, next_pos) or None if incomplete."""
+        """解析一个完整频道块。返回 (事件, 下一位置)；块不完整时返回 None。"""
         pos = start_pos
 
         # Skip <|start|> if present
@@ -364,7 +386,7 @@ class CanonicalStrategy:
     def _is_commentary_filler_between_blocks(
         self, text: str, tokens: List[Token], pos: int
     ) -> bool:
-        """Check if this is commentary filler text or problematic structural tokens in malformed sequences."""
+        """判断是否为块之间的 commentary 冗余填充文本，或畸形序列中应被过滤的结构标记。"""
         current_token = tokens[pos]
         current_text = text[current_token.start : current_token.end].strip()
 
@@ -402,7 +424,7 @@ class CanonicalStrategy:
         return False
 
     def _is_standalone_structural_token(self, content: str) -> bool:
-        """Check if content is just a standalone structural token that should be filtered."""
+        """判断内容是否仅为一个独立的结构标记（应被过滤掉，不作为正文输出）。"""
         content_stripped = content.strip()
         structural_tokens = [
             "<|start|>",
@@ -417,10 +439,11 @@ class CanonicalStrategy:
 
 
 class TextStrategy:
-    """Parses the text-based Harmony fallback format."""
+    """解析基于纯文本的 Harmony 降级格式（无结构标记，仅靠 analysis/assistantfinal 等关键词）。"""
 
     def __init__(self):
         self.buffer_context = ""
+        # 三种文本模式的正则：先推理后结论 / 仅结论 / 仅推理。
         self.patterns = {
             "analysis_then_final": re.compile(
                 r"^\s*(?:assistant)?\s*(analysis|commentary)(.*?)\s*assistantfinal\s*(.*)\s*$",
@@ -439,8 +462,10 @@ class TextStrategy:
         self.buffer_context = buffer
 
     def parse(self, text: str) -> Tuple[List[Event], str]:
+        """解析纯文本降级格式，返回 (事件列表, 需保留的剩余文本)。"""
         events = []
 
+        # 模式一：analysis/commentary + assistantfinal，同时含推理与最终结论。
         m = self.patterns["analysis_then_final"].match(text)
         if m:
             channel, reasoning, final = m.groups()
@@ -452,7 +477,7 @@ class TextStrategy:
                 events.append(Event("normal", final.strip()))
             return events, ""
 
-        # If assistantfinal appears to be incomplete (e.g., 'assistantfin'), hold entire buffer
+        # assistantfinal 可能不完整（如 'assistantfin'），此时扣住整个缓冲等后续。
         if re.search(
             r"(?:^|\s)(?:assistant)?\s*(analysis|commentary)", text, re.IGNORECASE
         ):
@@ -499,7 +524,7 @@ class TextStrategy:
 
 
 class HarmonyParser:
-    """Facade for parsing Harmony format, switching between strategies."""
+    """Harmony 解析门面：根据输入自动选择策略，并维护跨 chunk 的缓冲与 commentary 过滤状态。"""
 
     def __init__(self):
         self.strategy = None
@@ -514,6 +539,7 @@ class HarmonyParser:
     def parse(self, chunk: str) -> List[Event]:
         self._buffer += chunk
 
+        # 首次根据缓冲内容决定策略：有结构标记用 Canonical，只有关键词用 Text。
         if self.strategy is None:
             if "<|channel|>" in self._buffer or "<|start|>" in self._buffer:
                 self.strategy = CanonicalStrategy()
@@ -524,7 +550,7 @@ class HarmonyParser:
             ):
                 self.strategy = TextStrategy()
             else:
-                # Not yet determined, hold
+                # 尚无法判定格式，先扣住等更多文本。
                 return []
 
         if hasattr(self.strategy, "set_buffer_context"):
@@ -533,12 +559,13 @@ class HarmonyParser:
 
         events, remaining = self.strategy.parse(self._buffer)
 
-        # Check if we should start filtering commentary (after <|call|> token or tool_call event)
+        # 是否需要开始过滤 commentary（在 <|call|> 标记或 tool_call 事件之后）。
         buffer_has_call_token = self._buffer.rstrip().endswith("<|call|>")
 
+        # 未解析完的剩余文本留到下次。
         self._buffer = remaining
 
-        # Filter events for streaming case
+        # 流式场景下过滤事件：在工具调用后过滤掉独立的 "commentary" 填充词。
         filtered_events = []
         for event in events:
             should_filter = False

@@ -60,6 +60,8 @@ logger = logging.getLogger(__name__)
 
 
 def _extract_max_dynamic_patch(request: ChatCompletionRequest):
+    # 从多模态消息中提取图像/视频的 max_dynamic_patch（动态分块上限）。
+    # 分别收集 image_url / video_url 中携带的值，最后取最小值作为全局限制。
     img_vals = []
     vid_vals = []
     for msg in request.messages or []:
@@ -67,7 +69,7 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
         if not isinstance(content, list):
             continue
         for part in content:
-            # pydantic object or dict type
+            # part 可能是 pydantic 对象或 dict 类型
             if getattr(part, "type", None) == "image_url":
                 iu = getattr(part, "image_url", None)
                 mdp = getattr(iu, "max_dynamic_patch", None) if iu else None
@@ -79,15 +81,17 @@ def _extract_max_dynamic_patch(request: ChatCompletionRequest):
                 if mdp is not None:
                     vid_vals.append(int(mdp))
 
-    # TODO(yuan-luo): per-item max_dynamic_patch for both image and video
+    # TODO(yuan-luo): 为 image 和 video 实现 per-item 的 max_dynamic_patch
+    # 取最小值：多个图/视频取最保守（最小）的分块上限。
     img_max_dynamic_patch = min(img_vals) if img_vals else None
     vid_max_dynamic_patch = min(vid_vals) if vid_vals else None
     return img_max_dynamic_patch, vid_max_dynamic_patch
 
 
 class OpenAIServingChat(OpenAIServingBase):
-    """Handler for /v1/chat/completions requests"""
+    """/v1/chat/completions 请求的处理器。继承自 OpenAIServingBase。"""
 
+    # 类级标志：默认采样参数只打印一次日志。
     _default_sampling_params_logged = False
 
     def __init__(
@@ -97,10 +101,12 @@ class OpenAIServingChat(OpenAIServingBase):
     ):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
+        # 工具调用解析器类型（如 llama3 / qwen / mistral 等）。
         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
+        # 推理（reasoning）解析器类型。
         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
 
-        # Get default sampling parameters from model's generation config
+        # 从模型的 generation config 获取默认采样参数。
         self.default_sampling_params = (
             self.tokenizer_manager.model_config.get_default_sampling_params()
         )
@@ -113,7 +119,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             OpenAIServingChat._default_sampling_params_logged = True
 
-        # Check if the model is a GPT-OSS model
+        # 判断是否为 GPT-OSS 模型（harmony 格式，需保留特殊 token）。
         self.is_gpt_oss = (
             hasattr(self.tokenizer_manager.model_config, "hf_config")
             and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
@@ -128,35 +134,35 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
     ) -> tuple[List[Dict[str, Any]], Optional[str]]:
         """
-        Handle continue_final_message feature: separate final assistant message.
+        处理 continue_final_message 特性：分离最后一条 assistant 消息。
 
-        If continue_final_message is enabled and the last message is from assistant,
-        extract its content and remove it from the message list.
-        If continue_final_message is False and the last message is from assistant,
-        convert it to a user message to ensure the last message is always from user.
+        如果启用了 continue_final_message 且最后一条消息来自 assistant，
+        则提取其内容并从消息列表中移除（后续作为生成前缀续写）。
+        如果 continue_final_message 为 False 且最后一条消息来自 assistant，
+        则把它转换为 user 消息，以确保最后一条消息始终来自 user。
 
-        Only processes text-based content (strings), ignoring multimodal content (lists).
+        仅处理纯文本内容（字符串），忽略多模态内容（列表）。
 
         Args:
-            messages: List of message dictionaries
-            request: ChatCompletionRequest with continue_final_message flag
+            messages: 消息字典列表
+            request: 携带 continue_final_message 标志的 ChatCompletionRequest
 
         Returns:
-            Tuple of (processed_messages, assistant_prefix)
-            - processed_messages: Messages with last assistant message handled appropriately
-            - assistant_prefix: Content of the last assistant message (string only), or None
+            元组 (processed_messages, assistant_prefix)
+            - processed_messages: 已对最后一条 assistant 消息做妥善处理的消息列表
+            - assistant_prefix: 最后一条 assistant 消息的内容（仅字符串），否则为 None
         """
         assistant_prefix = None
         if messages and messages[-1].get("role") == "assistant":
             last_content = messages[-1].get("content")
-            # Only process string content, ignore multimodal content (lists)
+            # 仅处理字符串内容，忽略多模态内容（列表）
             if isinstance(last_content, str):
                 if request.continue_final_message:
-                    # Extract content and remove the assistant message
+                    # 提取内容并移除该 assistant 消息
                     assistant_prefix = last_content
                     messages = messages[:-1]
                 else:
-                    # Convert the last assistant message to user message
+                    # 把最后一条 assistant 消息转换为 user 消息
                     messages[-1] = {"role": "user", "content": last_content}
         return messages, assistant_prefix
 
@@ -164,21 +170,24 @@ class OpenAIServingChat(OpenAIServingBase):
         self, prompt_ids: List[int], assistant_prefix: str
     ) -> List[int]:
         """
-        Append assistant prefix to prompt_ids.
+        把 assistant 前缀追加到 prompt_ids（用于续写最后一条 assistant 消息）。
 
         Args:
-            prompt_ids: Current prompt token IDs
-            assistant_prefix: Assistant message content to append
+            prompt_ids: 当前的 prompt token ID 列表
+            assistant_prefix: 要追加的 assistant 消息内容
 
         Returns:
-            Updated prompt_ids with assistant prefix appended
+            追加 assistant 前缀后的 prompt_ids
         """
         encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
+        # 由于前缀是拼接在已有 prompt 之后，需去掉编码结果开头多出的 BOS token，避免重复。
         if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
             encoded = encoded[1:]
         return prompt_ids + encoded
 
     def _use_dpsk_v32_encoding(self) -> bool:
+        # 判断是否需要使用 DeepSeek V3.2 的专用编码：
+        # 当模型是 DeepseekV3 架构且没有内置 chat_template 时启用。
         has_chat_template = (
             self.tokenizer_manager.tokenizer is not None
             and self.tokenizer_manager.tokenizer.chat_template is not None
@@ -191,7 +200,8 @@ class OpenAIServingChat(OpenAIServingBase):
         return "chatcmpl-"
 
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
-        """Validate that the input is valid."""
+        """校验请求合法性（消息非空、工具选择与工具定义、输出长度、json_schema 等）。返回错误信息或 None。"""
+        # 消息不能为空。
         if not request.messages:
             return "Messages cannot be empty."
 
@@ -210,7 +220,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if not tool_exists:
                 return f"Tool '{tool_name}' not found in tools list."
 
-        # Validate tool definitions
+        # 校验工具定义：检查每个工具的 parameters 是否为合法的 JSON Schema
         for i, tool in enumerate(request.tools or []):
             if tool.function.parameters is None:
                 continue
@@ -243,11 +253,14 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
+        # 把 OpenAI 的 ChatCompletionRequest 转换为内部 GenerateReqInput。
+        # 从 chat_template_kwargs 中弹出 reasoning_effort（推理强度）。
         reasoning_effort = (
             request.chat_template_kwargs.pop("reasoning_effort", None)
             if request.chat_template_kwargs
             else None
         )
+        # GPT-OSS（harmony）不支持 reasoning_effort=none。
         if self.is_gpt_oss and reasoning_effort == "none":
             raise ValueError(
                 f"Harmony does not support reasoning effort {reasoning_effort}"
@@ -256,20 +269,20 @@ class OpenAIServingChat(OpenAIServingBase):
         if reasoning_effort is not None:
             request.reasoning_effort = reasoning_effort
 
-        """Convert OpenAI chat completion request to internal format"""
+        # 是否为多模态模型（决定后续传 text 还是 input_ids）。
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
-        # Process messages and apply chat template
+        # 处理消息并套用聊天模板（得到 prompt / prompt_ids / 多模态数据等）。
         processed_messages = self._process_messages(request, is_multimodal)
 
-        # Build sampling parameters
+        # 构建采样参数（含停止串与工具调用约束）。
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
             model_generation_config=self.default_sampling_params,
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
 
-        # Handle single vs multiple requests
+        # 多模态走 text；纯文本视 prompt_ids 是字符串还是 token id 列表分别传 text/input_ids。
         if is_multimodal:
             prompt_kwargs = {"text": processed_messages.prompt}
         else:
@@ -278,19 +291,20 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
 
-        # Extract custom labels from raw request headers
+        # 从请求头提取自定义标签（用于监控/追踪）。
         custom_labels = self.extract_custom_labels(raw_request)
 
-        # Extract routed_dp_rank from header (has higher priority than body)
+        # 从请求头提取 routed_dp_rank（优先级高于请求体）。
         effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
             raw_request, request.routed_dp_rank
         )
 
-        # Resolve LoRA adapter from model parameter or explicit lora_path
+        # 解析 LoRA adapter（来自 model 参数的 base:adapter 语法或显式 lora_path）。
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
         img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
             request
         )
+        # 组装内部生成请求对象，把 OpenAI 字段映射到 SGLang 内部字段。
         adapted_request = GenerateReqInput(
             **prompt_kwargs,
             image_data=processed_messages.image_data,
@@ -328,16 +342,17 @@ class OpenAIServingChat(OpenAIServingBase):
     def _process_messages(
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
-        """Process chat messages and apply chat template"""
-        # GptOss model needs to keep special tokens for harmony parsing
+        """处理聊天消息并套用聊天模板，返回含 prompt/多模态数据/工具约束的结果。"""
+        # GPT-OSS 模型需保留特殊 token 以供 harmony 解析。
         if self.is_gpt_oss:
             request.skip_special_tokens = False
 
+        # Mistral 的特殊 token 处理补丁。
         self._patch_mistral_skip_special_tokens(request)
 
         tool_call_constraint = None
 
-        # Apply chat template and its stop strings
+        # 若有工具且 tool_choice != none，则准备工具定义并保留特殊 token。
         tools = None
         if request.tools and request.tool_choice != "none":
             request.skip_special_tokens = False
@@ -350,12 +365,13 @@ class OpenAIServingChat(OpenAIServingBase):
             else:
                 tools = [item.model_dump() for item in request.tools]
             if self.tool_call_parser:
+                # 通过函数调用解析器获取结构约束（用于约束解码）。
                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
-            # Handle JSON schema constraint directly for required or named tool choice
+            # 对 required 或指定工具的选择，直接用 JSON schema 约束。
             if request.tool_choice == "required" or isinstance(
                 request.tool_choice, ToolChoice
             ):
@@ -366,7 +382,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 tool_call_constraint = ("json_schema", json_schema)
 
-        # Use chat template
+        # 选择模板：无自定义模板名时用 Jinja 模板；否则用内置会话模板。
         if self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
         else:
@@ -381,7 +397,7 @@ class OpenAIServingChat(OpenAIServingBase):
         tools: Optional[List[Dict]],
         is_multimodal: bool,
     ) -> MessageProcessingResult:
-        """Apply Jinja chat template"""
+        """套用 HuggingFace tokenizer 自带的 Jinja 聊天模板，把消息渲染为 prompt token。"""
         prompt = ""
         prompt_ids = []
         openai_compatible_messages = []
@@ -415,20 +431,20 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 msg.update(processed_msg)
 
-            # Handle continue_final_message: separate final assistant message
+            # 处理 continue_final_message：分离最后一条 assistant 消息
             messages, assistant_prefix = self._handle_last_assistant_message(
                 messages, request
             )
 
             if messages[0]["role"] != "system":
-                # insert an empty system prompt to help render tool system prompt
+                # 插入一个空的 system prompt，便于渲染工具相关的 system 提示
                 messages.insert(0, {"role": "system", "content": ""})
             if request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
             real_input = encode_messages(messages, thinking_mode=thinking_mode)
             prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
 
-            # Append assistant prefix if continue_final_message is enabled
+            # 若启用了 continue_final_message，则追加 assistant 前缀以续写
             if assistant_prefix:
                 prompt_ids = self._append_assistant_prefix_to_prompt_ids(
                     prompt_ids, assistant_prefix
@@ -439,7 +455,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     message.content = ""
                 msg_dict = message.model_dump()
 
-                # Process content based on detected template format
+                # 根据检测到的模板内容格式处理消息内容（提取多模态数据等）
                 processed_msg = process_content_for_template_format(
                     msg_dict,
                     template_content_format,
@@ -449,11 +465,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     modalities,
                 )
 
-                # per the Transformers docs & maintainers, tool call arguments in
-                # assistant-role messages with tool_calls need to be dicts not JSON str -
-                # this is how tool-use chat templates will expect them moving forwards
-                # so, for messages that have tool_calls, parse the string (which we get
-                # from openAI format) to dict
+                # 根据 Transformers 官方文档与维护者的说明：assistant 角色消息中
+                # tool_calls 的参数（arguments）需要是 dict 而非 JSON 字符串——
+                # 这是工具调用聊天模板未来期望的格式。
+                # 因此对带 tool_calls 的消息，把（来自 OpenAI 格式的）字符串解析为 dict
                 if (
                     processed_msg["role"] == "assistant"
                     and "tool_calls" in processed_msg
@@ -469,7 +484,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 openai_compatible_messages.append(processed_msg)
 
-            # Handle continue_final_message: separate final assistant message
+            # 处理 continue_final_message：分离最后一条 assistant 消息
             openai_compatible_messages, assistant_prefix = (
                 self._handle_last_assistant_message(openai_compatible_messages, request)
             )
@@ -490,8 +505,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     **extra_template_kwargs,
                 )
             except Exception as e:
-                # If the first attempt fails, try with flat function-only format.
-                # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
+                # 若第一次尝试失败，则改用扁平的「仅 function」格式重试。
+                # 某些模板（如 Mistral）期望 tools 不带 OpenAI 的外层包装。
                 tools = (
                     [t["function"] if "function" in t else t for t in tools]
                     if tools
@@ -507,11 +522,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         **extra_template_kwargs,
                     )
                 except jinja2.TemplateError as template_error:
-                    # Template errors (e.g., from raise_exception in Jinja templates)
-                    # should be treated as client errors (400 BadRequest)
+                    # 模板错误（如 Jinja 模板中的 raise_exception）应视为客户端错误（400）。
                     raise ValueError(str(template_error)) from template_error
 
-            # Append assistant prefix if continue_final_message is enabled
+            # 若启用了 continue_final_message，则追加 assistant 前缀以续写
             if assistant_prefix:
                 prompt_ids = self._append_assistant_prefix_to_prompt_ids(
                     prompt_ids, assistant_prefix
@@ -540,23 +554,23 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         is_multimodal: bool,
     ) -> MessageProcessingResult:
-        """Apply conversation template"""
+        """套用 SGLang 内置的会话（conversation）模板渲染 prompt。"""
         prompt = ""
         prompt_ids = []
         conv = generate_chat_conv(request, self.template_manager.chat_template_name)
 
-        # If we should continue the final assistant message, adjust the conversation.
+        # 若需要续写最后一条 assistant 消息，则相应调整会话结构。
         if (
             request.continue_final_message
             and request.messages
             and request.messages[-1].role == "assistant"
         ):
-            # Remove the auto-added blank assistant turn, if present.
+            # 移除自动添加的空 assistant 轮次（若存在）。
             if conv.messages and conv.messages[-1][1] is None:
                 conv.messages.pop()
-            # Rebuild the prompt from the conversation.
+            # 从会话重新生成 prompt。
             prompt = conv.get_prompt()
-            # Strip trailing stop tokens or separators that indicate end-of-assistant.
+            # 去掉末尾表示 assistant 结束的 stop token 或分隔符，以便续写。
             if isinstance(conv.stop_str, list):
                 for stop_token in conv.stop_str:
                     if prompt.endswith(stop_token):
@@ -569,11 +583,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt = prompt[: -len(conv.sep2)]
         else:
             prompt = conv.get_prompt()
+            # 如需推理且解析器不是 qwen3/glm4（它们内部思考、无需前置 <think>），则手动追加 <think>。
             if self._get_reasoning_from_request(
                 request
             ) and self.reasoning_parser not in ["qwen3", "qwen3-thinking", "glm4"]:
-                # qwen3 and glm4 think internally without a leading <think> token
-                prompt += "<think>"  # Note(Xinyuan): hard code thinking token
+                # qwen3 与 glm4 在内部进行思考，无需前置的 <think> token
+                prompt += "<think>"  # Note(Xinyuan): 硬编码 thinking token
 
         image_data = conv.image_data if conv.image_data else None
         video_data = conv.video_data if conv.video_data else None
@@ -606,12 +621,11 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request,
     ) -> Union[StreamingResponse, ErrorResponse]:
-        """Handle streaming chat completion request"""
+        """处理流式（SSE）聊天请求。"""
         generator = self._generate_chat_stream(adapted_request, request, raw_request)
 
-        # Kick-start the generator to trigger validation before HTTP 200 is sent.
-        # If validation fails (e.g., context length exceeded), we can still return
-        # a proper HTTP 400 error response instead of streaming it as SSE payload.
+        # 预先拉取第一个 chunk 以触发校验：在返回 HTTP 200 之前发现错误
+        # （如上下文超长）时，能返回正常的 400 错误响应，而不是把错误当作 SSE 负载。
         try:
             first_chunk = await generator.__anext__()
         except ValueError as e:
@@ -634,19 +648,19 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request,
     ) -> AsyncGenerator[str, None]:
-        """Generate streaming chat completion response"""
-        # Parsers for tool calls and reasoning
+        """生成流式聊天响应（逐 chunk yield SSE 文本）。"""
+        # 工具调用与推理的解析器（按 index/多路并行分别维护）。
         parser_dict = {}
         reasoning_parser_dict = {}
 
-        # State tracking for streaming
+        # 流式状态跟踪：是否首块、已输出缓冲、已处理 logprob 数、是否有工具调用、结束原因。
         is_firsts = {}
         stream_buffers = {}
         n_prev_tokens = {}
         has_tool_calls = {}
         finish_reasons = {}
 
-        # Usage tracking
+        # 用量（token 统计）跟踪。
         prompt_tokens = {}
         completion_tokens = {}
         cached_tokens = {}
@@ -655,6 +669,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         stream_started = False
         try:
+            # 逐个消费 tokenizer_manager 产出的增量结果。
             async for content in self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ):
@@ -668,7 +683,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
-                # Handle logprobs
+                # 处理 logprobs：仅输出新增部分的 logprob。
                 choice_logprobs = None
                 if request.logprobs:
                     n_prev_token = n_prev_tokens.get(index, 0)
@@ -684,9 +699,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
 
-                # Track finish_reason for each index
+                # 记录每个 index 的结束原因。
                 if finish_reason_type:
-                    # If the abort is from scheduler.
+                    # 若是调度器主动 abort（中止）。
                     if finish_reason_type == "abort":
                         code = finish_reason.get(
                             "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
@@ -701,7 +716,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     else:
                         finish_reasons[index] = finish_reason
 
-                # First chunk with role
+                # 首块：先发送含 role=assistant 的空内容 delta（符合 OpenAI 流格式）。
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
                     delta = DeltaMessage(role="assistant", content="")
@@ -720,11 +735,12 @@ class OpenAIServingChat(OpenAIServingBase):
                     yield f"data: {chunk.model_dump_json()}\n\n"
                     stream_started = True
 
+                # 计算本次增量 delta = 新文本 - 已缓冲文本。
                 stream_buffer = stream_buffers.get(index, "")
                 delta = content["text"][len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
 
-                # Handle reasoning content
+                # 处理推理内容：若启用推理解析且要求分离，把 reasoning 部分单独输出为 reasoning_content。
                 if self.reasoning_parser and request.separate_reasoning:
                     reasoning_text, delta = self._process_reasoning_stream(
                         index, delta, reasoning_parser_dict, content, request
@@ -742,7 +758,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             model=request.model,
                         )
 
-                        # Add usage stats if continuous_usage_stats is enabled
+                        # 若启用了 continuous_usage_stats，在每个 chunk 中附带用量统计
                         if (
                             request.stream_options
                             and request.stream_options.continuous_usage_stats
@@ -754,7 +770,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
-                # Handle tool calls
+                # 处理工具调用：增量解析 delta，按需输出工具调用 chunk。
                 if (
                     request.tool_choice != "none"
                     and request.tools
@@ -771,7 +787,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         if chunk:
                             yield chunk
 
-                    # Send any remaining tool call arguments when generation finishes
+                    # 生成结束时，补发尚未输出的工具调用参数。
                     if finish_reason_type is not None and index in parser_dict:
                         parser = parser_dict[index]
                         remaining_chunk = self._check_for_unstreamed_tool_args(
@@ -781,7 +797,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             yield remaining_chunk
 
                 else:
-                    # Regular content
+                    # 普通文本内容（无工具调用）。
                     if delta:
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
@@ -797,7 +813,7 @@ class OpenAIServingChat(OpenAIServingBase):
                             model=request.model,
                         )
 
-                        # Add usage stats if continuous_usage_stats is enabled
+                        # 若启用了 continuous_usage_stats，在每个 chunk 中附带用量统计
                         if (
                             request.stream_options
                             and request.stream_options.continuous_usage_stats
@@ -809,11 +825,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
                         yield f"data: {chunk.model_dump_json()}\n\n"
 
-            # Send finish_reason chunks for each index that completed
+            # 为每个完成的 index 发送带 finish_reason 的 chunk。
             for idx, finish_reason_data in finish_reasons.items():
                 finish_reason_type = finish_reason_data["type"]
 
-                # Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
+                # 若有工具调用且是自然 stop，则把 finish_reason 改为 tool_calls。
                 final_finish_reason = finish_reason_type
                 if has_tool_calls.get(idx, False) and finish_reason_type == "stop":
                     final_finish_reason = "tool_calls"
@@ -821,7 +837,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 finish_reason_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"][
                         "id"
-                    ],  # NOTE: openai uses the same chatcmpl-id for all indices
+                    ],  # NOTE: OpenAI 对所有 index（多路采样）使用相同的 chatcmpl-id
                     created=int(time.time()),
                     choices=[
                         ChatCompletionResponseStreamChoice(
@@ -840,7 +856,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 yield f"data: {finish_reason_chunk.model_dump_json()}\n\n"
 
-            # Send hidden states if requested
+            # 若请求要求返回 hidden states，则发送
             if request.return_hidden_states and hidden_states:
                 for index, choice_hidden_states in hidden_states.items():
                     if choice_hidden_states:
@@ -858,7 +874,7 @@ class OpenAIServingChat(OpenAIServingBase):
                                     delta=DeltaMessage(
                                         hidden_states=last_token_hidden_states
                                     ),
-                                    finish_reason=None,  # Hidden states don't need finish_reason
+                                    finish_reason=None,  # hidden states 无需 finish_reason
                                 )
                             ],
                             model=request.model,
@@ -866,7 +882,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         yield f"data: {hidden_states_chunk.model_dump_json()}\n\n"
 
             if request.return_routed_experts and routed_experts:
-                # Get first non-None routed_experts value
+                # 取第一个非 None 的 routed_experts 值
                 first_routed_experts = next(
                     (v for v in routed_experts.values() if v is not None), None
                 )
@@ -874,13 +890,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     routed_experts_chunk = ChatCompletionStreamResponse(
                         id=content["meta_info"]["id"],
                         created=int(time.time()),
-                        choices=[],  # sglext is at response level
+                        choices=[],  # sglext 位于响应级别，不属于某个 choice
                         model=request.model,
                         sglext=SglExt(routed_experts=first_routed_experts),
                     )
                     yield f"data: {routed_experts_chunk.model_dump_json()}\n\n"
 
-            # Additional usage chunk
+            # 额外的 usage chunk：若请求 include_usage，在最后补发累计 token 用量。
             if request.stream_options and request.stream_options.include_usage:
                 usage = UsageProcessor.calculate_streaming_usage(
                     prompt_tokens,
@@ -892,18 +908,20 @@ class OpenAIServingChat(OpenAIServingBase):
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
-                    choices=[],  # Empty choices array as per OpenAI spec
+                    choices=[],  # 按 OpenAI 规范，usage chunk 的 choices 为空数组
                     model=request.model,
                     usage=usage,
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
         except ValueError as e:
+            # 若流还未开始，抛出交由上层转为 400；否则以 SSE 错误事件输出。
             if not stream_started:
                 raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
 
+        # OpenAI SSE 结束标志。
         yield "data: [DONE]\n\n"
 
     async def _handle_non_streaming_request(
@@ -912,8 +930,9 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         raw_request: Request,
     ) -> Union[ChatCompletionResponse, ErrorResponse, ORJSONResponse]:
-        """Handle non-streaming chat completion request"""
+        """处理非流式聊天请求（一次性返回完整响应）。"""
         try:
+            # 非流式只取生成器的最终一个结果（包含完整输出）。
             ret = await self.tokenizer_manager.generate_request(
                 adapted_request, raw_request
             ).__anext__()
@@ -937,10 +956,10 @@ class OpenAIServingChat(OpenAIServingBase):
         ret: List[Dict[str, Any]],
         created: int,
     ) -> Union[ChatCompletionResponse, ORJSONResponse]:
-        """Build chat completion response from generation results"""
+        """从生成结果构建完整的 ChatCompletionResponse（逐 choice 组装）。"""
         choices = []
 
-        # Build sglext at response level (from first ret_item, as these are per-request)
+        # 在响应级别构建 sglext（取第一个 ret，因为这些是整个请求级别的）。
         first_ret = ret[0]
         routed_experts = process_routed_experts_from_ret(first_ret, request)
         cached_tokens_details = process_cached_tokens_details_from_ret(
@@ -953,19 +972,20 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens_details=cached_tokens_details,
             )
 
+        # 逐个 choice（多路采样 n>1 时多个）组装。
         for idx, ret_item in enumerate(ret):
-            # Process logprobs
+            # 处理 logprobs。
             choice_logprobs = None
             if request.logprobs:
                 choice_logprobs = self._process_response_logprobs(ret_item)
 
-            # Handle hidden states
+            # 处理 hidden states。
             hidden_states = process_hidden_states_from_ret(ret_item, request)
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
             text = ret_item["text"]
 
-            # Handle reasoning content
+            # 处理推理内容：把 reasoning 从正文中分离出来。
             reasoning_text = None
             reasoning_parser = self.reasoning_parser
             if reasoning_parser and request.separate_reasoning:
@@ -989,7 +1009,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         status_code=500,
                     )
 
-            # Handle tool calls
+            # 处理工具调用：从文本中解析出工具调用并从正文剔除。
             tool_calls = None
             if (
                 request.tool_choice != "none"
@@ -1024,7 +1044,7 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             choices.append(choice_data)
 
-        # Calculate usage
+        # 计算 token 用量。
         usage = UsageProcessor.calculate_response_usage(
             ret,
             n_choices=request.n,
@@ -1044,11 +1064,11 @@ class OpenAIServingChat(OpenAIServingBase):
     def _process_logprobs_tokens(
         self, logprobs: LogProbs, use_token_index: bool = False
     ) -> List[ChatCompletionTokenLogprob]:
-        """Common helper to process logprobs tokens for both streaming and non-streaming
+        """流式与非流式共用的辅助方法，把 logprobs 中的 token 转为 OpenAI 结构。
 
         Args:
-            logprobs: LogProbs data from model
-            use_token_index: True for non-streaming (use token_idx), False for streaming (use index 0)
+            logprobs: 来自模型的 LogProbs 数据
+            use_token_index: 非流式为 True（按 token_idx 取完整数据），流式为 False（取 index 0 的已切片数据）
         """
         token_logprobs = []
 
@@ -1058,8 +1078,8 @@ class OpenAIServingChat(OpenAIServingBase):
             token_bytes = list(token.encode("utf-8"))
             top_logprobs = []
             if logprobs.top_logprobs:
-                # - Non-streaming (use_token_index=True): uses token_idx for full data
-                # - Streaming (use_token_index=False): uses index 0 for pre-sliced data
+                # - 非流式（use_token_index=True）：用 token_idx 索引完整数据
+                # - 流式（use_token_index=False）：数据已预先切片，固定取 index 0
                 top_logprobs_idx = token_idx if use_token_index else 0
                 for top_token, top_logprob in logprobs.top_logprobs[
                     top_logprobs_idx
@@ -1084,7 +1104,7 @@ class OpenAIServingChat(OpenAIServingBase):
         return token_logprobs
 
     def _process_response_logprobs(self, ret_item: Dict[str, Any]) -> ChoiceLogprobs:
-        """Process logprobs for non-streaming response"""
+        """处理非流式响应的 logprobs，转为 OpenAI 风格。"""
         logprobs = to_openai_style_logprobs(
             output_token_logprobs=ret_item["meta_info"]["output_token_logprobs"],
             output_top_logprobs=ret_item["meta_info"].get("output_top_logprobs", None),
@@ -1098,15 +1118,15 @@ class OpenAIServingChat(OpenAIServingBase):
         call_item: ToolCallItem,
         history_tool_calls_cnt: int,
     ) -> str:
-        """Process for generating a new and unique `tool_call_id`"""
+        """生成唯一的 tool_call_id（Kimi-K2 需用 functions.{name}:{index} 格式）。"""
         if self.tool_call_parser != "kimi_k2":
-            # A simple uuid is sufficient for all models except for Kimi-K2.
+            # 除 Kimi-K2 外，所有模型用一个简单的 uuid 即可。
             tool_call_id = f"call_{uuid.uuid4().hex[:24]}"
             return tool_call_id
         else:
-            # Align with Kimi-K2 format: functions.{name}:{index}
-            # Kimi-K2 allows multiple tool_calls in one message; SGLang sets call_item.tool_index to the *local* position inside that message.
-            # Therefore, the index must be corrected by using `history_tool_calls_cnt + call_item.tool_index` to ensure globally unique and properly ordered.
+            # 对齐 Kimi-K2 格式：functions.{name}:{index}
+            # Kimi-K2 允许一条消息中包含多个 tool_calls；SGLang 把 call_item.tool_index 设为该消息内部的*局部*位置。
+            # 因此需用 `history_tool_calls_cnt + call_item.tool_index` 修正 index，以保证全局唯一且顺序正确。
             tool_call_id = f"functions.{call_item.name}:{history_tool_calls_cnt+call_item.tool_index}"
             logger.debug(
                 f"Process tool call idx, parser: {self.tool_call_parser}, tool_call_id: {tool_call_id}, history_cnt: {history_tool_calls_cnt}"
@@ -1121,24 +1141,24 @@ class OpenAIServingChat(OpenAIServingBase):
         tool_choice: Optional[Union[str, ToolChoice]] = None,
         history_tool_calls_cnt: int = 0,
     ) -> ToolCallProcessingResult:
-        """Process tool calls in the response"""
+        """从响应文本中解析工具调用（非流式）。"""
 
-        # Handle required or named tool choice
+        # 处理 required 或指定工具：此时输出被 JSON schema 约束，直接解析 JSON 数组。
         if tool_choice == "required" or (
             isinstance(tool_choice, ToolChoice) and tool_choice.type == "function"
         ):
-            # Set finish reason to tool_calls since we're processing tool calls
+            # 既然在处理工具调用，把 finish_reason 设为 tool_calls
             if finish_reason["type"] == "stop":
                 finish_reason["type"] = "tool_calls"
                 finish_reason["matched"] = None
             try:
-                # For required tool choice, we expect a JSON array of tool calls
+                # 对 required 的 tool_choice，预期输出是一个工具调用的 JSON 数组
                 tool_call_data = orjson.loads(text)
                 tool_calls = []
                 for i, tool in enumerate(tool_call_data):
-                    # Create a ToolCallItem from the JSON data
+                    # 从 JSON 数据构建 ToolCallItem
                     call_info = ToolCallItem(
-                        tool_index=i,  # Use the loop index as tool_index
+                        tool_index=i,  # 用循环下标作为 tool_index
                         name=tool["name"],
                         parameters=json.dumps(tool["parameters"], ensure_ascii=False),
                     )
@@ -1162,7 +1182,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 logger.error(f"Tool call parsing error: {e}")
                 return ToolCallProcessingResult(None, text, finish_reason)
 
-        # Use parser since output is not constrained by JSON schema
+        # 非约束情况：输出未被 JSON schema 约束，用函数调用解析器从文本中提取。
         parser = FunctionCallParser(tools, self.tool_call_parser)
         if parser.has_tool_call(text):
             if finish_reason["type"] == "stop":
@@ -1187,7 +1207,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 return ToolCallProcessingResult(tool_calls, text, finish_reason)
             except Exception as e:
                 logger.error(f"Tool call parsing error: {e}")
-                # Return error but don't fail the whole request
+                # 返回解析失败结果，但不让整个请求失败
                 return ToolCallProcessingResult(None, text, finish_reason)
 
         return ToolCallProcessingResult(None, text, finish_reason)
@@ -1198,7 +1218,7 @@ class OpenAIServingChat(OpenAIServingBase):
         n_prev_token: int,
         total_output_logprobs: int,
     ) -> ChoiceLogprobs:
-        """Process logprobs for streaming response"""
+        """处理流式响应的 logprobs（只取 [n_prev_token, total] 区间的增量）。"""
         logprobs = to_openai_style_logprobs(
             output_token_logprobs=content["meta_info"]["output_token_logprobs"][
                 n_prev_token:total_output_logprobs
@@ -1219,7 +1239,8 @@ class OpenAIServingChat(OpenAIServingBase):
         content: Dict[str, Any],
         request: ChatCompletionRequest,
     ) -> tuple[Optional[str], str]:
-        """Process reasoning content in streaming response"""
+        """处理流式响应中的推理内容，返回 (reasoning_text, 剩余正文)。"""
+        # 按 index 懒初始化推理解析器。
         if index not in reasoning_parser_dict:
             is_force_reasoning = (
                 self.template_manager.force_reasoning
@@ -1235,16 +1256,16 @@ class OpenAIServingChat(OpenAIServingBase):
         return reasoning_parser.parse_stream_chunk(delta)
 
     def _get_history_tool_calls_cnt(self, request: ChatCompletionRequest) -> int:
-        """Counts the number of tool calls in the request's message history.
+        """统计请求消息历史中已有的工具调用数量。
 
-        NOTE: This method is only useful for models that include self-increasing
-        history tool call idx in tool calls id, such as kimi-k2
+        NOTE: 该方法仅对在 tool_calls id 中包含「自增的历史工具调用下标」的模型有用，
+        例如 kimi-k2。
 
         Args:
-            request: The chat completion request object.
+            request: 聊天补全请求对象。
 
         Returns:
-            The total number of tool calls in the history, or 0 if not applicable.
+            历史中工具调用的总数；若不适用则返回 0。
         """
         messages = getattr(request, "messages", [])
         idx = 0
@@ -1257,8 +1278,8 @@ class OpenAIServingChat(OpenAIServingBase):
     def _patch_mistral_skip_special_tokens(
         self, request: ChatCompletionRequest
     ) -> None:
-        """Mistral uses special tokens ([THINK]/[/THINK]) for reasoning markers,
-        which get stripped when skip_special_tokens=True."""
+        """Mistral 用特殊 token（[THINK]/[/THINK]）作为推理标记，
+        skip_special_tokens=True 时会被剔除，故需关闭该选项。"""
         if (
             self.reasoning_parser in ["mistral"]
             and request.reasoning_effort is not None
@@ -1267,43 +1288,41 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
 
     def _get_reasoning_from_request(self, request: ChatCompletionRequest) -> bool:
-        """Judge whether the request needs reasoning for hybrid reasoning models
-        NOTE: This is predefined based on model's chat template
-        """
+        """判断混合推理模型是否需要开启推理（不同模型默认行为与开关字段不同）。"""
         if not self.reasoning_parser:
             return False
         if self.reasoning_parser in ["deepseek-v3"]:
-            # Models that require explicit enable thinking (thinking=True)
+            # 需显式开启思考的模型（thinking=True）
             return (
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("thinking") is True
             )
         if self.reasoning_parser in ["kimi_k2"]:
-            # Models that thinking by default, and can be disabled by setting thinking=False
+            # 默认思考、可通过 thinking=False 关闭的模型
             return (
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("thinking") is not False
             )
         if self.reasoning_parser in ["qwen3", "glm45", "nemotron_3", "interns1"]:
-            # Models that thinking by default, and can be disabled by setting enable_thinking=False
+            # 默认思考、可通过 enable_thinking=False 关闭的模型
             return (
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("enable_thinking") is not False
             )
         if self.reasoning_parser in ["mimo"]:
-            # Models that require explicit enable thinking (enable_thinking=True)
+            # 需显式开启思考的模型（enable_thinking=True）
             return (
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("enable_thinking") is True
             )
         if self.reasoning_parser in ["mistral"]:
-            # Mistral models only reason when reasoning_effort is explicitly
-            # set to a value other than None/"none" (typically "high").
+            # Mistral 模型仅当 reasoning_effort 被显式设为非 None/"none" 的值
+            # （通常为 "high"）时才进行推理。
             return (
                 request.reasoning_effort is not None
                 and request.reasoning_effort != "none"
             )
-        return True  # default
+        return True  # 默认开启推理
 
     async def _process_tool_call_stream(
         self,
@@ -1314,9 +1333,9 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         has_tool_calls: Dict[int, bool],
     ):
-        """Process tool calls in streaming response"""
+        """处理流式响应中的工具调用（增量 yield 正文与工具调用 chunk）。"""
         if index not in parser_dict:
-            # Use JSON detector directly for required or named tool choice
+            # required 或指定工具时直接用 JSON 数组解析器。
             if request.tool_choice == "required" or isinstance(
                 request.tool_choice, ToolChoice
             ):
@@ -1329,14 +1348,14 @@ class OpenAIServingChat(OpenAIServingBase):
 
         parser = parser_dict[index]
 
-        # Handle both FunctionCallParser and JsonArrayParser
+        # 同时兼容 FunctionCallParser 与 JsonArrayParser 两种解析器。
         if isinstance(parser, JsonArrayParser):
             result = parser.parse_streaming_increment(delta, request.tools)
             normal_text, calls = result.normal_text, result.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
 
-        # Yield normal text
+        # 先输出被工具解析器“退出”的普通文本。
         if normal_text:
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
@@ -1350,7 +1369,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 model=request.model,
             )
 
-            # Add usage stats if continuous_usage_stats is enabled
+            # 若启用了 continuous_usage_stats，在每个 chunk 中附带用量统计
             if request.stream_options and request.stream_options.continuous_usage_stats:
                 prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
@@ -1361,21 +1380,21 @@ class OpenAIServingChat(OpenAIServingBase):
 
             yield f"data: {chunk.model_dump_json()}\n\n"
 
-        # Yield tool calls
+        # 再输出解析出的工具调用增量。
         history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
         for call_item in calls:
-            # Mark that this choice has tool calls
+            # 标记该 choice 含有工具调用。
             has_tool_calls[index] = True
 
-            # Tool call ID should be generated only once per tool call
+            # tool_call_id 每个工具调用只生成一次。
             if call_item.name:
-                # First chunk: include ID and function name
+                # 首块：包含 ID 与函数名。
                 tool_call_id = self._process_tool_call_id(
                     call_item, history_tool_calls_cnt
                 )
                 function_name = call_item.name
             else:
-                # Subsequent chunks: null ID and name for argument deltas
+                # 后续块：只传参数增量，ID 与 name 为空。
                 tool_call_id = None
                 function_name = None
 
@@ -1400,7 +1419,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 model=request.model,
             )
 
-            # Add usage stats if continuous_usage_stats is enabled
+            # 若启用了 continuous_usage_stats，在每个 chunk 中附带用量统计
             if request.stream_options and request.stream_options.continuous_usage_stats:
                 prompt_tokens = content["meta_info"].get("prompt_tokens", 0)
                 completion_tokens = content["meta_info"].get("completion_tokens", 0)
@@ -1418,15 +1437,12 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         index: int,
     ) -> Optional[str]:
-        """
-        Check for any remaining tool call arguments that need to be streamed
-        when generation finishes. This ensures tool calls are properly completed
-        even if the model generates the final arguments in the last chunk.
-        """
-        # Get the detector - either from FunctionCallParser or directly if json detector
+        """生成结束时，检查是否还有未输出的工具调用参数需补发，
+        确保即使模型在最后一块才生成完整参数也能被正确输出。"""
+        # 获取检测器：来自 FunctionCallParser.detector 或直接是 json 检测器。
         detector = parser.detector if hasattr(parser, "detector") else parser
 
-        # Only check if we have tool calls and the detector has tracked data
+        # 仅当存在工具调用且检测器已跟踪到数据时才检查
         if (
             not hasattr(detector, "prev_tool_call_arr")
             or not detector.prev_tool_call_arr
@@ -1439,17 +1455,17 @@ class OpenAIServingChat(OpenAIServingBase):
         ):
             return None
 
-        # Get the last tool call that was being processed
+        # 取正在处理的最后一个工具调用
         tool_index = len(detector.prev_tool_call_arr) - 1
         if tool_index < 0 or tool_index >= len(detector.streamed_args_for_tool):
             return None
 
-        # Get expected vs actual arguments
+        # 比较期望参数与实际已输出参数
         expected_args = detector.prev_tool_call_arr[tool_index].get("arguments", {})
         expected_call = json.dumps(expected_args, ensure_ascii=False)
         actual_call = detector.streamed_args_for_tool[tool_index]
 
-        # Check if there are remaining arguments to send
+        # 计算剩余未输出的参数部分。
         remaining_call = (
             expected_call.replace(actual_call, "", 1)
             if actual_call in expected_call
@@ -1457,12 +1473,12 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         if remaining_call:
-            # Create tool call chunk with remaining arguments
+            # 用剩余参数构建一个工具调用 chunk
             tool_call = ToolCall(
-                id=None,  # No ID for argument deltas
+                id=None,  # 参数增量块不携带 ID
                 index=tool_index,
                 function=FunctionResponse(
-                    name=None,  # No name for argument deltas
+                    name=None,  # 参数增量块不携带 name
                     arguments=remaining_call,
                 ),
             )
@@ -1470,7 +1486,7 @@ class OpenAIServingChat(OpenAIServingBase):
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
                 delta=DeltaMessage(tool_calls=[tool_call]),
-                finish_reason=None,  # Don't send finish_reason with this chunk
+                finish_reason=None,  # 该 chunk 不发送 finish_reason
             )
 
             chunk = ChatCompletionStreamResponse(

@@ -12,19 +12,19 @@
 # limitations under the License.
 # ==============================================================================
 """
-Store information about a forward batch.
+存储一次前向（forward）所需的信息。
 
-The following is the flow of data structures for a batch:
+一个批次（batch）的数据结构流转如下：
 
 ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
-- ScheduleBatch is managed by `scheduler.py::Scheduler`.
-  It contains high-level scheduling data. Most of the data is on the CPU.
-- ModelWorkerBatch is managed by `tp_worker.py::TpModelWorker`.
-  It is a subset of `ScheduleBatch` that only contains data related to the model forward on GPU.
-  It will be transformed from CPU scheduler to GPU model runner.
-- ForwardBatch is managed by `model_runner.py::ModelRunner`.
-  It contains low-level tensor data. Most of the data consists of GPU tensors.
+- ScheduleBatch 由 `scheduler.py::Scheduler` 管理。
+  它包含高层的调度数据，大部分数据在 CPU 上。
+- ModelWorkerBatch 由 `tp_worker.py::TpModelWorker` 管理。
+  它是 `ScheduleBatch` 的子集，仅包含与 GPU 上模型前向相关的数据，
+  会从 CPU 调度器转换给 GPU 模型运行器。
+- ForwardBatch 由 `model_runner.py::ModelRunner` 管理。
+  它包含底层的张量数据，大部分是 GPU 张量。
 """
 
 from __future__ import annotations
@@ -79,34 +79,37 @@ _is_npu = is_npu()
 
 
 class ForwardMode(IntEnum):
-    # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
-    # It is also called "prefill" in common terminology.
+    """前向模式：描述本次前向是 prefill、decode、混合，还是投机解码/PD/dLLM 等特殊场景。"""
+
+    # 扩展一个序列。序列开头部分的 KV 缓存可能已计算（如系统提示词）。
+    # 俗称为 "prefill"。
     EXTEND = auto()
-    # Decode one token.
+    # 解码一个 token。
     DECODE = auto()
-    # Contains both EXTEND and DECODE when doing chunked prefill.
+    # 做 chunked prefill 时同时包含 EXTEND 与 DECODE（混合分块）。
     MIXED = auto()
-    # No sequence to forward. For data parallel attention, some workers will be IDLE if no sequence are allocated.
+    # 无序列可前向。在数据并行注意力下，某些 worker 若未分配序列则为 IDLE。
     IDLE = auto()
 
-    # Used in speculative decoding: verify a batch in the target model.
+    # 用于投机解码：在目标模型中验证一个批次。
     TARGET_VERIFY = auto()
-    # Used in speculative decoding: extend a batch in the draft model.
+    # 用于投机解码：在草稿模型中扩展一个批次。
     DRAFT_EXTEND = auto()
 
-    DRAFT_EXTEND_V2 = auto()
+    DRAFT_EXTEND_V2 = auto()  # EAGLE v2 草稿扩展（固定形状的 logits 输出）
 
-    # Used in disaggregated decode worker
-    # Represent a batch of requests having their KV cache ready to start decoding
+    # 用于 PD 分离的 decode worker：
+    # 表示一批 KV 缓存已就绪、可直接开始解码的请求。
     PREBUILT = auto()
 
-    # Split Prefill for PD multiplexing
+    # 用于 PD 复用（multiplexing）的拆分 prefill。
     SPLIT_PREFILL = auto()
 
-    # Used in dLLM
+    # 用于扩散式 LLM（dLLM）。
     DLLM_EXTEND = auto()
 
     def is_prefill(self):
+        """是否为 prefill（等价于 is_extend）。"""
         return self.is_extend()
 
     def is_extend(self, include_draft_extend_v2: bool = False):
@@ -132,18 +135,23 @@ class ForwardMode(IntEnum):
         )
 
     def is_decode(self):
+        """是否为解码模式。"""
         return self == ForwardMode.DECODE
 
     def is_mixed(self):
+        """是否为混合（prefill+decode）模式。"""
         return self == ForwardMode.MIXED
 
     def is_idle(self):
+        """是否为空闲模式（无序列可前向）。"""
         return self == ForwardMode.IDLE
 
     def is_decode_or_idle(self):
+        """是否为解码或空闲模式。"""
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
     def is_target_verify(self):
+        """是否为投机解码的目标验证模式。"""
         return self == ForwardMode.TARGET_VERIFY
 
     def is_draft_extend(self, include_v2: bool = False):
@@ -152,7 +160,7 @@ class ForwardMode(IntEnum):
         )
 
     def is_draft_extend_v2(self):
-        # For fixed shape logits output in eagle v2 worker
+        # 用于 eagle v2 worker 中固定形状的 logits 输出
         return self == ForwardMode.DRAFT_EXTEND_V2
 
     def is_extend_or_draft_extend_or_mixed(self, include_draft_extend_v2: bool = False):
@@ -165,6 +173,7 @@ class ForwardMode(IntEnum):
         )
 
     def is_cuda_graph(self):
+        """是否可使用 CUDA Graph（仅固定形状的 decode/verify/idle/dllm 模式）。"""
         return (
             self == ForwardMode.DECODE
             or self == ForwardMode.TARGET_VERIFY
@@ -186,28 +195,35 @@ class ForwardMode(IntEnum):
         )
 
     def is_prebuilt(self):
+        """是否为预构建模式（PD 分离 decode 端 KV 已就绪）。"""
         return self == ForwardMode.PREBUILT
 
     def is_dllm_extend(self):
+        """是否为扩散式 LLM 的扩展模式。"""
         return self == ForwardMode.DLLM_EXTEND
 
 
 @total_ordering
 class CaptureHiddenMode(IntEnum):
-    # Do not capture anything.
+    """隐藏状态捕获模式：控制是否以及如何保存隐藏状态（供投机解码等使用）。"""
+
+    # 不捕获任何隐藏状态。
     NULL = 0
-    # Capture a hidden state of the last token.
+    # 捕获最后一个 token 的隐藏状态。
     LAST = 1
-    # Capture hidden states of all tokens.
+    # 捕获所有 token 的隐藏状态。
     FULL = 2
 
     def need_capture(self):
+        """是否需要捕获隐藏状态。"""
         return self != CaptureHiddenMode.NULL
 
     def is_full(self):
+        """是否捕获所有 token。"""
         return self == CaptureHiddenMode.FULL
 
     def is_last(self):
+        """是否仅捕获最后一个 token。"""
         return self == CaptureHiddenMode.LAST
 
     def __lt__(self, other):
@@ -236,7 +252,7 @@ def compute_local_num_token_non_padded(
 
 @dataclass
 class NgramEmbeddingInfo:
-    """Ngram embedding state for LongCat models."""
+    """LongCat 模型的 Ngram embedding 状态。"""
 
     token_table: torch.Tensor
     column_starts: torch.Tensor
@@ -278,158 +294,186 @@ class NgramEmbeddingInfo:
 
 @dataclass
 class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
-    """Store all inputs of a forward pass."""
+    """存储一次前向的所有输入（大部分为 GPU 张量）。
 
-    # The forward mode
+    最核心参数示例（假设同时处理 2 个请求 reqA / reqB）：
+
+    场景一：Prefill（首次处理，reqA 输入 3 个 token，reqB 输入 2 个 token）
+        forward_mode    = ForwardMode.EXTEND       # prefill 路径
+        batch_size      = 2                        # 2 个序列
+        input_ids       = [a0, a1, a2, b0, b1]     # 两请求 token 拼接，shape=[5]
+        seq_lens        = [3, 2]                   # 各序列当前总长度
+        seq_lens_sum    = 5                        # token 总数（=input_ids 长度）
+        req_pool_indices= [0, 1]                   # reqA/reqB 在请求池中的槽位
+        positions       = [0, 1, 2, 0, 1]          # 各 token 在各自序列内的位置
+        out_cache_loc   = [10, 11, 12, 13, 14]     # 这 5 个 token 的 KV 写入位置
+        # extend 专属：
+        extend_num_tokens  = 5                     # 本次新增 token 数
+        extend_seq_lens    = [3, 2]                # 各请求本次新增长度
+        extend_prefix_lens = [0, 0]                # 无历史缓存前缀
+
+    场景二：Decode（已各生成若干 token，本步每个请求各解码 1 个新 token）
+        forward_mode    = ForwardMode.DECODE       # decode 路径
+        batch_size      = 2
+        input_ids       = [a_last, b_last]         # 每请求仅 1 个新 token，shape=[2]
+        seq_lens        = [4, 3]                   # 序列已增长（含本步前的长度）
+        seq_lens_sum    = 7
+        req_pool_indices= [0, 1]
+        positions       = [3, 2]                   # = seq_lens - 1
+        out_cache_loc   = [15, 16]                 # 本步 2 个新 token 的 KV 写入位置
+        # 无需 extend_* 字段
+
+    两种场景都依赖：sampling_info（采样）、attn_backend（注意力计算）、
+    req_to_token_pool / token_to_kv_pool（KV 缓存寻址）。
+    """
+
+    # ★核心：前向模式（prefill/decode/mixed/...），决定本次前向的整体执行路径
     forward_mode: ForwardMode
-    # The batch size
+    # ★核心：批次大小（序列数）
     batch_size: int
-    # The input ids
+    # ★核心：输入 token id（模型前向的实际输入）
     input_ids: torch.Tensor
-    # The indices of requests in the req_to_token_pool
+    # ★核心：各请求在 req_to_token_pool 中的索引（定位每个请求的 KV 槽位）
     req_pool_indices: torch.Tensor
-    # The sequence length
+    # ★核心：各序列长度（注意力计算与位置编码的基础）
     seq_lens: torch.Tensor
-    # The indices of output tokens in the token_to_kv_pool
+    # ★核心：输出 token 在 token_to_kv_pool 中的索引（本次新 KV 的存放位置）
     out_cache_loc: torch.Tensor
 
-    # The sum of all sequence lengths
+    # ★核心：所有序列长度之和（即本次 token 总数，决定多数张量的第 0 维）
     seq_lens_sum: int
 
-    # The original sequence length without being chunked. Qwen-1M related.
+    # 未被分块前的原始序列长度（与 Qwen-1M 相关）
     orig_seq_lens: Optional[torch.Tensor] = None
 
-    # The indices of output tokens in the token_to_kv_pool_swa
+    # 输出 token 在 token_to_kv_pool_swa（滑动窗口池）中的索引
     out_cache_loc_swa: Optional[torch.Tensor] = None
-    # The indices to track mamba state with
-    mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
-    # The mask to track mamba state if needed
-    mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
-    # The seqlens to track mamba state if masked, prefill only.
-    mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+    # 用于跟踪 mamba 状态的索引
+    mamba_track_indices: Optional[torch.Tensor] = None  # 形状: [b], int64
+    # 跟踪 mamba 状态的掩码（如需）
+    mamba_track_mask: Optional[torch.Tensor] = None  # 形状: [b], bool
+    # 被掩码时跟踪 mamba 状态的序列长，仅 prefill 使用
+    mamba_track_seqlens: Optional[torch.Tensor] = None  # 形状: [b], int64
 
-    # Optional seq_lens on cpu
+    # 可选的 CPU 端 seq_lens
     seq_lens_cpu: Optional[torch.Tensor] = None
 
-    # For logprob
-    return_logprob: bool = False
-    top_logprobs_nums: Optional[List[int]] = None
-    token_ids_logprobs: Optional[List[List[int]]] = None
+    # logprob 相关
+    return_logprob: bool = False  # 是否返回 logprob
+    top_logprobs_nums: Optional[List[int]] = None  # 各请求要返回的 top-k logprob 个数
+    token_ids_logprobs: Optional[List[List[int]]] = None  # 指定要返回 logprob 的 token id
 
-    # For logits and logprobs post processing
-    next_token_logits_buffer: torch.Tensor = None
-    temp_scaled_logprobs: bool = False
-    temperature: torch.Tensor = None
-    top_p_normalized_logprobs: bool = False
-    top_p: torch.Tensor = None
+    # logits 与 logprob 后处理
+    next_token_logits_buffer: torch.Tensor = None  # 下一个 token 的 logits 缓冲区
+    temp_scaled_logprobs: bool = False  # 是否用温度缩放 logprob
+    temperature: torch.Tensor = None  # 采样温度
+    top_p_normalized_logprobs: bool = False  # 是否对 logprob 做 top-p 归一化
+    top_p: torch.Tensor = None  # top-p 采样参数
 
-    # Position information
-    positions: torch.Tensor = None
+    # 位置信息
+    positions: torch.Tensor = None  # ★核心：各 token 的位置索引（旋转位置编码 RoPE 依赖）
 
-    # For extend
-    extend_num_tokens: Optional[int] = None
-    extend_seq_lens: Optional[torch.Tensor] = None
-    extend_prefix_lens: Optional[torch.Tensor] = None
-    extend_start_loc: Optional[torch.Tensor] = None
-    extend_prefix_lens_cpu: Optional[List[int]] = None
-    extend_seq_lens_cpu: Optional[List[int]] = None
-    extend_logprob_start_lens_cpu: Optional[List[int]] = None
-    extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    # extend（prefill）相关
+    extend_num_tokens: Optional[int] = None  # ★核心(extend)：本次扩展的 token 总数
+    extend_seq_lens: Optional[torch.Tensor] = None  # ★核心(extend)：各请求本次扩展的长度
+    extend_prefix_lens: Optional[torch.Tensor] = None  # ★核心(extend)：各请求已缓存的前缀长度
+    extend_start_loc: Optional[torch.Tensor] = None  # 各请求在扩展张量中的起始偏移
+    extend_prefix_lens_cpu: Optional[List[int]] = None  # 前缀长度（CPU 端）
+    extend_seq_lens_cpu: Optional[List[int]] = None  # 扩展长度（CPU 端）
+    extend_logprob_start_lens_cpu: Optional[List[int]] = None  # 各请求 logprob 起始位置（CPU 端）
+    extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None  # 输入 logprob 对应的 token id（GPU 端）
 
-    # For split prefill
-    # intermediate values for split prefill
-    hidden_states: torch.Tensor = None
-    residual: torch.Tensor = None
-    model_specific_states: Dict[str, any] = None
-    # current split index of layer
-    split_index: int = 0
+    # 拆分 prefill 相关：拆分 prefill 的中间值
+    hidden_states: torch.Tensor = None  # 隐藏状态
+    residual: torch.Tensor = None  # 残差
+    model_specific_states: Dict[str, any] = None  # 模型特定的中间状态
+    split_index: int = 0  # 当前拆分到的层索引
 
-    # For multimodal
-    mm_inputs: Optional[List[MultimodalInputs]] = None
+    # 多模态相关
+    mm_inputs: Optional[List[MultimodalInputs]] = None  # 多模态输入
 
-    # Encoder-decoder
-    encoder_cached: Optional[List[bool]] = None
-    encoder_lens: Optional[torch.Tensor] = None
-    encoder_lens_cpu: Optional[List[int]] = None
-    encoder_out_cache_loc: Optional[torch.Tensor] = None
+    # 编码器-解码器（encoder-decoder）相关
+    encoder_cached: Optional[List[bool]] = None  # 各请求的 encoder 输出是否已缓存
+    encoder_lens: Optional[torch.Tensor] = None  # 各请求 encoder 部分长度
+    encoder_lens_cpu: Optional[List[int]] = None  # encoder 长度（CPU 端）
+    encoder_out_cache_loc: Optional[torch.Tensor] = None  # encoder 输出在 KV 池中的位置
 
-    # For LoRA
-    lora_ids: Optional[List[str]] = None
+    # LoRA 相关
+    lora_ids: Optional[List[str]] = None  # 各请求使用的 LoRA 适配器 id
 
-    # For input embeddings
+    # 输入 embedding（直接传入嵌入而非 token id）
     input_embeds: Optional[torch.Tensor] = None
 
-    # For cross-encoder model
+    # 交叉编码器（cross-encoder）模型的 token 类型 id
     token_type_ids: Optional[torch.Tensor] = None
 
-    # Sampling info
+    # ★核心：采样信息（温度、top-p、top-k 等，决定如何从 logits 采样出下一个 token）
     sampling_info: SamplingBatchInfo = None
 
-    # Attention backend
-    req_to_token_pool: ReqToTokenPool = None
-    token_to_kv_pool: KVCache = None
-    attn_backend: AttentionBackend = None
+    # 注意力后端与显存池
+    req_to_token_pool: ReqToTokenPool = None  # ★核心：请求->token 映射池
+    token_to_kv_pool: KVCache = None  # ★核心：token->KV 缓存池
+    attn_backend: AttentionBackend = None  # ★核心：注意力后端实现（实际执行 attention 计算）
 
-    # For DP attention
-    original_global_num_tokens_cpu: Optional[List[int]] = None
-    global_num_tokens_cpu: Optional[List[int]] = None
-    global_num_tokens_gpu: Optional[torch.Tensor] = None
-    # Has to be None when cuda graph is captured.
-    global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
-    global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
-    # The padding mode for DP attention
+    # DP（数据并行）注意力相关
+    original_global_num_tokens_cpu: Optional[List[int]] = None  # 原始全局 token 数（CPU 端）
+    global_num_tokens_cpu: Optional[List[int]] = None  # 全局 token 数（CPU 端）
+    global_num_tokens_gpu: Optional[torch.Tensor] = None  # 全局 token 数（GPU 端）
+    # 在捕获 cuda graph 时必须为 None
+    global_num_tokens_for_logprob_cpu: Optional[List[int]] = None  # 用于 logprob 的全局 token 数（CPU）
+    global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None  # 用于 logprob 的全局 token 数（GPU）
+    # DP 注意力的填充模式
     dp_padding_mode: Optional[DpPaddingMode] = None
-    # for extend, local start pos and num tokens is different in logits processor
-    # this will be computed in get_dp_local_info
-    # this will be recomputed in LogitsMetadata.from_forward_batch
-    dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
-    dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
-    global_dp_buffer_len: Optional[int] = None
-    is_extend_in_batch: bool = False
-    all_extend_in_batch: bool = False
-    can_run_dp_cuda_graph: bool = False
-    global_forward_mode: Optional[ForwardMode] = None
+    # 对于 extend，logits 处理器中的本地起始位置与 token 数不同；
+    # 会在 get_dp_local_info 中计算，并在 LogitsMetadata.from_forward_batch 中重算
+    dp_local_start_pos: Optional[torch.Tensor] = None  # 运行时缓存信息
+    dp_local_num_tokens: Optional[torch.Tensor] = None  # 运行时缓存信息
+    global_dp_buffer_len: Optional[int] = None  # 全局 DP 缓冲区长度
+    is_extend_in_batch: bool = False  # 本批次是否含 extend
+    all_extend_in_batch: bool = False  # 本批次是否全为 extend
+    can_run_dp_cuda_graph: bool = False  # 是否可跑 DP 的 CUDA Graph
+    global_forward_mode: Optional[ForwardMode] = None  # 全局前向模式
 
-    # Whether this batch is prefill-only (no token generation needed)
+    # 本批次是否仅 prefill（无需生成 token）
     is_prefill_only: bool = False
 
-    # Speculative decoding
-    spec_info: Optional[SpecInput] = None
-    spec_algorithm: SpeculativeAlgorithm = None
-    mm_input_embeds: Optional[torch.Tensor] = None
-    capture_hidden_mode: CaptureHiddenMode = None
+    # 投机解码相关
+    spec_info: Optional[SpecInput] = None  # 投机解码输入信息
+    spec_algorithm: SpeculativeAlgorithm = None  # 投机解码算法
+    mm_input_embeds: Optional[torch.Tensor] = None  # 多模态输入嵌入
+    capture_hidden_mode: CaptureHiddenMode = None  # 隐藏状态捕获模式
 
-    # For padding
-    padded_static_len: int = -1  # -1 if not padded
-    num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
-    num_token_non_padded_cpu: int = None
+    # 填充（padding）相关
+    padded_static_len: int = -1  # 静态填充后的长度，-1 表示未填充
+    num_token_non_padded: Optional[torch.Tensor] = None  # 非填充 token 数（标量张量）
+    num_token_non_padded_cpu: int = None  # 非填充 token 数（CPU 端）
 
-    # For Qwen2-VL
+    # Qwen2-VL 的 mrope 位置
     mrope_positions: torch.Tensor = None
 
-    # For two-batch overlap
-    tbo_split_seq_index: Optional[int] = None
-    tbo_parent_token_range: Optional[Tuple[int, int]] = None
-    tbo_padded_len: Optional[int] = None
-    tbo_children: Optional[List[ForwardBatch]] = None
+    # 双批重叠（two-batch overlap）相关
+    tbo_split_seq_index: Optional[int] = None  # 拆分点所在的序列索引
+    tbo_parent_token_range: Optional[Tuple[int, int]] = None  # 在父批次中的 token 区间
+    tbo_padded_len: Optional[int] = None  # 填充后长度
+    tbo_children: Optional[List[ForwardBatch]] = None  # 拆分出的子批次
 
-    # For matryoshka embeddings
+    # Matryoshka embedding 的输出维度
     dimensions: Optional[list[int]] = None
 
-    attn_cp_metadata: Optional[ContextParallelMetadata] = None
-    # Record the split metadata of the sequence number of NSA context parallels.
+    attn_cp_metadata: Optional[ContextParallelMetadata] = None  # 注意力上下文并行元数据
+    # 记录 NSA 上下文并行的序列拆分元数据
     nsa_cp_metadata: Optional[NSAContextParallelMetadata] = None
 
-    # For hidden states before normal
+    # 是否返回归一化前的隐藏状态
     return_hidden_states_before_norm: bool = False
 
-    # For hisparse
+    # HiSparse 协调器
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
-    # For ngram embedding
+    # Ngram embedding 信息（LongCat）
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
 
-    # For dumper: request IDs for cross-step sequence tracking
+    # 供 dumper 使用：跨步序列跟踪的请求 id 列表
     rids: Optional[List[str]] = None
 
     @classmethod
@@ -438,6 +482,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         batch: ModelWorkerBatch,
         model_runner: ModelRunner,
     ):
+        """从 ModelWorkerBatch 与 ModelRunner 构造一个新的 ForwardBatch（填充各字段并准备前向所需元数据）。"""
         ret = cls(
             forward_mode=batch.forward_mode,
             batch_size=len(batch.seq_lens),
@@ -493,12 +538,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
         ret.num_token_non_padded_cpu = num_tokens
 
-        # For MLP sync
+        # 用于 MLP 同步（DP 注意力下各 rank 对齐 token 数）
         if batch.global_num_tokens is not None:
             assert batch.global_num_tokens_for_logprob is not None
 
-            # process global_num_tokens and global_num_tokens_for_logprob
+            # 处理 global_num_tokens 与 global_num_tokens_for_logprob
             if batch.spec_info is not None:
+                # 投机解码下需按草稿 token 数做相应调整
                 spec_info: SpecInput = batch.spec_info
                 global_num_tokens, global_num_tokens_for_logprob = (
                     spec_info.get_spec_adjusted_global_num_tokens(batch)
@@ -519,13 +565,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ).to(device, non_blocking=True)
 
         if ret.forward_mode.is_idle():
+            # 空闲模式：无序列，位置张量为空
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
             return ret
 
-        # Override the positions with diffusion LLM or spec_info
+        # 用扩散式 LLM 或投机信息覆盖 positions
         if batch.dllm_config is not None:
+            # 扩散式 LLM：按块（block）偏移生成位置
             block_size = batch.dllm_config.block_size
-            # Use int64 for AMD rotary embedding kernel compatibility
+            # 使用 int64 以兼容 AMD 的旋转位置编码 kernel
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
             ret.positions = torch.tensor(
                 [
@@ -541,11 +589,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             ret.positions = ret.spec_info.positions
 
-        # Init position information
+        # 初始化位置信息
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
+            # 解码/目标验证：位置即各序列当前长度
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
         else:
+            # extend（prefill）：根据前缀长度与扩展长度计算各 token 位置
             assert isinstance(batch.extend_seq_lens, list)
             assert isinstance(batch.extend_prefix_lens, list)
             ret.extend_seq_lens = torch.tensor(
@@ -568,9 +618,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
 
         if model_runner.use_ngram_embedding:
+            # LongCat 等模型：初始化 ngram embedding 信息
             ret._init_ngram_embedding_info(batch, model_runner, device)
 
         if model_runner.model_is_mrope:
+            # mrope 模型（如 Qwen2-VL）：计算多维旋转位置
             if (
                 ret.spec_info is not None
                 and getattr(ret.spec_info, "positions", None) is not None
@@ -579,7 +631,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             else:
                 ret._compute_mrope_positions(model_runner, batch)
 
-        # Precompute SWA cache location once for all SWA layers
+        # 为所有 SWA 层一次性预计算滑动窗口缓存位置
         if model_runner.is_hybrid_swa and ret.out_cache_loc is not None:
             ret.out_cache_loc_swa = (
                 model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -587,10 +639,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
             )
 
-        # Init lora information
+        # 初始化 LoRA 信息
         if model_runner.server_args.enable_lora:
-            # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
-            # as a batch, right before running the batch
+            # 非 LoRA 重叠加载时，在运行批次前一次性把所需 LoRA 适配器取入显存池
             if not model_runner.server_args.enable_lora_overlap_loading:
                 model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
 
@@ -599,7 +650,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         return ret
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
-        """Make num_token_non_padded local to this attention-TP rank."""
+        """将 num_token_non_padded 转为当前注意力-TP rank 的本地值。"""
         from sglang.srt.utils.common import require_mlp_tp_gather
 
         dp_rank = get_attention_dp_rank()
@@ -616,29 +667,27 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
-        """
-        Merge all multimodal inputs in the batch into a single MultiModalInputs object.
+        """将批次中所有多模态输入合并为单个 MultiModalInputs 对象。
 
-        Returns:
-            if none, current batch contains no multimodal input
-
+        返回：若为 None，表示当前批次不含多模态输入。
         """
         if not self.mm_inputs or all(x is None for x in self.mm_inputs):
             return None
-        # Filter out None values
+        # 过滤掉 None
         valid_inputs = [x for x in self.mm_inputs if x is not None]
 
-        # TODO: is it expensive?
-        # a workaround to avoid importing `MultimodalInputs`
+        # TODO: 这是否开销较大？
+        # 一个避免导入 `MultimodalInputs` 的权宜做法
         merged = valid_inputs[0].__class__(mm_items=[])
 
-        # Merge remaining inputs
+        # 合并其余输入
         for mm_input in valid_inputs:
             merged.merge(mm_input)
 
         return merged
 
     def contains_image_inputs(self) -> bool:
+        """是否含图像输入。"""
         if self.mm_inputs is None:
             return False
         return any(
@@ -647,6 +696,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
 
     def contains_audio_inputs(self) -> bool:
+        """是否含音频输入。"""
         if self.mm_inputs is None:
             return False
         return any(
@@ -655,6 +705,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
 
     def contains_video_inputs(self) -> bool:
+        """是否含视频输入。"""
         if self.mm_inputs is None:
             return False
         return any(
@@ -663,6 +714,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         )
 
     def contains_mm_inputs(self) -> bool:
+        """是否含任意多模态（图/音/视频）输入。"""
         return (
             self.contains_audio_inputs()
             or self.contains_video_inputs()
@@ -687,7 +739,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _compute_spec_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
-        # TODO support batched deltas
+        """投机解码场景下计算 mrope（多维旋转位置编码）位置。"""
+        # TODO 支持批量化的 deltas
         batch_size = self.seq_lens.shape[0]
         device = model_runner.device
         mm_inputs = batch.multimodal_inputs
@@ -741,7 +794,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         mm_input: MultimodalInputs,
         seq_len: int,
     ) -> torch.Tensor:
-        # doing below compute on cpu to avoid frequent small kernels
+        """从多模态输入的 mrope_position_delta 扩展出当前序列长对应的 mrope 位置。"""
+        # 在 CPU 上做以下计算，避免频繁的小 kernel 调用
         if mm_input.mrope_position_delta_repeated_cache is None:
             mm_input.mrope_position_delta_repeated_cache = (
                 (mm_input.mrope_position_delta - 1).flatten().unsqueeze(0).repeat(3, 1)
@@ -752,7 +806,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _compute_mrope_positions(
         self, model_runner: ModelRunner, batch: ModelWorkerBatch
     ):
-        # batch_size * [3 * seq_len]
+        """计算 mrope（多维旋转位置编码）位置，逐请求区分 decode 与 extend、纯文本与多模态。"""
+        # 形状为 batch_size * [3 * seq_len]
         batch_size = self.seq_lens_cpu.shape[0]
         mrope_positions_list = [[]] * batch_size
         for batch_idx in range(batch_size):
@@ -774,6 +829,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     )
                     mrope_positions_list[batch_idx] = mrope_positions
             elif self.forward_mode.is_extend(include_draft_extend_v2=True):
+                # extend（prefill）：按前缀长度与扩展长度取位置区间
                 extend_seq_len, extend_prefix_len = (
                     batch.extend_seq_lens[batch_idx],
                     batch.extend_prefix_lens[batch_idx],
@@ -782,7 +838,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     mm_input is None
                     or get_global_server_args().rl_on_policy_target is not None
                 ):
-                    # text only
+                    # 纯文本
                     mrope_positions = torch.tensor(
                         [
                             [
@@ -812,6 +868,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
+        """将张量在第 0 维填充到指定大小（填充值默认为 0）。"""
         if value == 0:
             return torch.cat(
                 [tensor, tensor.new_zeros(size - tensor.shape[0], *tensor.shape[1:])],
@@ -827,6 +884,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
     def prepare_mlp_sync_batch(self, model_runner: ModelRunner):
+        """为 DP 注意力下的 MLP 同步准备批次：对齐各 rank 的 token 数、确定填充模式并填充输入。"""
         from sglang.srt.batch_overlap.two_batch_overlap import TboForwardBatchPreparer
 
         assert self.global_num_tokens_cpu is not None
@@ -837,11 +895,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         attn_tp_size = get_attention_tp_size()
 
         for i in range(sync_group_size):
-            # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
-            # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
+            # 保证填充后长度能被 attn_tp_size 整除，因为可能需要在 attn_tp 维上做 reduce-scatter。
+            # LM logprob 不做 reduce-scatter，所以无需为 logprob 调整填充长度。
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
 
-        # make sure that each rank has the same number of tokens to do collective communication.
+        # 保证各 rank 的 token 数相同，以便集体通信。
         attn_cp_size = get_attention_cp_size()
         for i in range(sync_group_size):
             global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_cp_size)
@@ -852,10 +910,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.dp_padding_mode = dp_padding_mode
 
         if dp_padding_mode.is_max_len():
-            # when DP gather mode is all gather, we will use
-            # all_gather_into_tensor to gather hidden states, where transferred
-            # tokens should be padded to the same length. We will also use
-            # reduce-scatter instead of all-reduce after MLP.
+            # 当 DP gather 模式为 all-gather 时，会用 all_gather_into_tensor 收集隐藏状态，
+            # 传输的 token 需填充到相同长度；MLP 后也会用 reduce-scatter 而非 all-reduce。
             max_num_tokens = max(global_num_tokens)
             global_num_tokens = [max_num_tokens] * sync_group_size
             buffer_len = max_num_tokens * sync_group_size
@@ -923,7 +979,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
 
     def _pad_inputs_to_size(self, model_runner: ModelRunner, num_tokens, bs):
-        # padding
+        """将各输入张量填充到目标 token 数/批次大小（供 CUDA Graph 与 DP 同步使用）。"""
+        # 填充
         self.input_ids = self._pad_tensor_to_size(self.input_ids, num_tokens)
         self.req_pool_indices = self._pad_tensor_to_size(self.req_pool_indices, bs)
         self.lora_ids.extend((bs - len(self.lora_ids)) * [None])
@@ -977,7 +1034,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.extend_seq_lens = self._pad_tensor_to_size(self.extend_seq_lens, bs)
 
         if self.spec_info is not None and self.spec_info.is_draft_input():
-            # FIXME(lsyin): remove this isinstance logic
+            # 投机解码：同步填充草稿信息（topk、accept_length、隐藏状态等）
+            # FIXME(lsyin): 移除这个 isinstance 逻辑
             spec_info = self.spec_info
             self.output_cache_loc_backup = self.out_cache_loc
             self.hidden_states_backup = spec_info.hidden_states
@@ -996,6 +1054,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
     def prepare_attn_tp_scatter_input(self, model_runner: ModelRunner):
+        """在注意力-TP scatter 输入模式下，将 token 填充到 rank_size 的整数倍。"""
         from sglang.srt.layers.communicator import get_attn_tp_context
 
         attn_tp_context = get_attn_tp_context()
@@ -1009,7 +1068,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self._pad_inputs_to_size(model_runner, tokens_padded, self.batch_size)
 
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
-
+        """MLP 同步的后处理：恢复原始前向模式/批次大小，并按模式裁剪 logits/隐藏状态去除填充部分。"""
         self.forward_mode = getattr(self, "_original_forward_mode", self.forward_mode)
         self.batch_size = getattr(self, "_original_batch_size", self.batch_size)
         bs = self.batch_size
@@ -1063,22 +1122,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     @property
     def can_run_tbo(self):
+        """是否可运行双批重叠（存在拆分点时为真）。"""
         return self.tbo_split_seq_index is not None
 
 
 def enable_num_token_non_padded(server_args):
+    """是否需跟踪非填充 token 数（仅当 MoE 专家并行大小>1 时）。"""
     return get_moe_expert_parallel_world_size() > 1
 
 
 class PPProxyTensors:
-    # adapted from https://github.com/vllm-project/vllm/blob/d14e98d924724b284dc5eaf8070d935e214e50c0/vllm/sequence.py#L1103
+    """流水线并行（PP）中跨 rank 传递中间张量的代理容器。"""
+
+    # 改编自 https://github.com/vllm-project/vllm/blob/d14e98d924724b284dc5eaf8070d935e214e50c0/vllm/sequence.py#L1103
     tensors: Dict[str, torch.Tensor]
 
     def __init__(self, tensors):
-        # manually define this function, so that
-        # Dynamo knows `IntermediateTensors()` comes from this file.
-        # Otherwise, dataclass will generate this function by evaluating
-        # a string, and we will lose the information about the source file.
+        # 手动定义此函数，使 Dynamo 知道 `IntermediateTensors()` 来自本文件；
+        # 否则 dataclass 会通过求值字符串生成此函数，从而丢失源文件信息。
         self.tensors = tensors
 
     def __getitem__(self, key: Union[str, slice]):
@@ -1106,6 +1167,7 @@ def compute_position(
     extend_seq_lens: torch.Tensor,
     extend_seq_lens_sum: int,
 ):
+    """计算 extend 的位置与起始偏移：支持 triton 时走 triton 融合 kernel，否则走 torch 实现。"""
     if support_triton(attn_backend):
         positions, extend_start_loc = compute_position_triton(
             extend_prefix_lens,
@@ -1178,6 +1240,7 @@ def compute_position_kernel(
 def compute_position_torch(
     extend_prefix_lens: torch.Tensor, extend_seq_lens: torch.Tensor
 ):
+    """纯 torch 实现：拼接各请求的位置区间并计算各请求起始偏移。"""
     positions = torch.cat(
         [
             torch.arange(
@@ -1193,6 +1256,7 @@ def compute_position_torch(
 
 
 def _clamp_position_native(seq_lens):
+    """原生实现：返回各序列“当前长度-1”作为解码位置（下限 0）。"""
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
 
