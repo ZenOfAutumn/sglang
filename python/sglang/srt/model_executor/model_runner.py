@@ -308,52 +308,72 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         draft_model_idx: Optional[int] = None,
     ):
         # Parse args
+        # ===== 第一步:把构造参数落到实例属性,后续初始化都依赖这些字段 =====
+        # 静态显存占比:权重 + KV cache 预留的显存上限,剩余显存留给激活值/临时缓冲
         self.mem_fraction_static = mem_fraction_static
-        self.device = server_args.device
-        self.gpu_id = gpu_id
+        self.device = server_args.device  # 运行设备:cuda / cpu / npu 等
+        self.gpu_id = gpu_id  # 本进程绑定的物理 GPU 序号
+        # ---- 以下是各并行维度的 (rank, size),决定本 worker 在分布式拓扑中的位置 ----
+        # TP 张量并行:同一层的权重切分到多卡,前向时做 all-reduce 合并
         self.tp_rank = tp_rank
         self.tp_size = tp_size
+        # MoE EP 专家并行:MoE 层的专家分散到不同卡,token 按路由分发
         self.moe_ep_rank = moe_ep_rank
         self.moe_ep_size = moe_ep_size
+        # DP attention 数据并行:仅在 enable_dp_attention 时 >1,否则恒为 1
         self.dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
+        # PP 流水线并行:按层(stage)切分到不同卡,层间传递 hidden state
         self.pp_rank = pp_rank
         self.pp_size = pp_size
+        # CP 上下文并行:长序列在序列维度上切分,缓解单卡长上下文压力
         self.attn_cp_rank = attn_cp_rank
         self.attn_cp_size = server_args.attn_cp_size
+        # MoE 的数据并行维度(与上面的 EP 正交)
         self.moe_dp_rank = moe_dp_rank
         self.moe_dp_size = server_args.moe_dp_size
-        self.model_config = model_config
-        self.dist_port = nccl_port
+        self.model_config = model_config  # 模型结构/超参配置(从 HF config 解析而来)
+        self.dist_port = nccl_port  # NCCL/分布式通信端口
         self.server_args = server_args
+        # 是否为投机解码的 draft worker(小模型),影响后续多处分支
         self.is_draft_worker = is_draft_worker
-        self.memory_pool_config = memory_pool_config
-        self.is_generation = model_config.is_generation
-        self.is_multimodal = model_config.is_multimodal
+        self.memory_pool_config = memory_pool_config  # 外部可注入的显存池配置
+        self.is_generation = model_config.is_generation  # 是否生成式模型(对应 embedding 类模型)
+        self.is_multimodal = model_config.is_multimodal  # 是否多模态(含视觉/音频编码器)
+        # 多模态模型是否支持 chunked prefill(分块预填充)
         self.is_multimodal_chunked_prefill_supported = (
             model_config.is_multimodal_chunked_prefill_supported
         )
+        # 解析投机解码算法(EAGLE / EAGLE3 / NGRAM / NONE 等)
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
-        self.page_size = server_args.page_size
+        self.page_size = server_args.page_size  # KV cache 分页大小(每页 token 数)
+        # KV cache 两级映射的内存池:req->token 索引表 与 token->KV 分配器
+        # 若外部已传入则复用(如 draft/target 共享),否则后续 initialize 时新建
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        # 是否混合滑动窗口注意力(部分层用 SWA,部分层用全局 attention)
         self.is_hybrid_swa = model_config.is_hybrid_swa
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
+        # 是否使用 MLA 后端(DeepSeek 系列的多头潜在注意力)
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
-        self.attention_chunk_size = model_config.attention_chunk_size
-        self.forward_pass_id = 0
-        self.init_new_workspace = False
-        self.draft_model_idx = draft_model_idx
-        self.enable_hisparse = server_args.enable_hisparse
+        self.attention_chunk_size = model_config.attention_chunk_size  # 注意力分块大小
+        self.forward_pass_id = 0  # 前向计数器,每次 forward 自增,用于日志/调试
+        self.init_new_workspace = False  # 是否为 attention backend 重建 workspace 的标志
+        self.draft_model_idx = draft_model_idx  # 多 draft 模型场景下的索引
+        self.enable_hisparse = server_args.enable_hisparse  # 是否启用分层稀疏(hisparse)
 
+        # 远程实例权重传输引擎(用于跨实例热加载权重,默认不启用)
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
         self.remote_instance_transfer_engine_weight_info = None
         # auxiliary hidden capture mode. TODO: expose this to server args?
+        # EAGLE3 投机解码:是否需要捕获 target 模型的「辅助隐藏态」喂给 draft 模型。
+        # 仅在 EAGLE3 且当前是 target worker(非 draft)时才需要解析这套配置。
         self.eagle_use_aux_hidden_state = False
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             # load draft config
+            # 加载 draft(小)模型配置,从中读取它需要 target 的哪几层隐藏态
             draft_model_config = ModelConfig.from_server_args(
                 server_args,
                 model_path=(server_args.speculative_draft_model_path),
@@ -364,17 +384,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             try:
                 # get the aux layer from draft model config
+                # 从 draft 配置的 eagle_config 中取出辅助隐藏态相关设置
                 eagle_config = getattr(
                     draft_model_config.hf_config, "eagle_config", None
                 )
                 self.eagle_use_aux_hidden_state = eagle_config.get(
                     "use_aux_hidden_state", True
                 )
+                # 需要捕获的 target 层 id 列表(供 draft 模型对齐使用)
                 self.eagle_aux_hidden_state_layer_ids = eagle_config[
                     "eagle_aux_hidden_state_layer_ids"
                 ]
             except:
                 # if there is no aux layer, set to None
+                # 配置缺失则置空,表示不使用指定的辅助层
                 self.eagle_aux_hidden_state_layer_ids = None
 
         # Apply the rank zero filter to logger
@@ -382,64 +405,83 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             enable_show_time_cost()
 
         # Model-specific adjustment
+        # ===== 第二步:进入实际初始化流程(顺序敏感,不要随意调整) =====
+        # 针对特定模型族做适配(如调整量化/注意力等开关),需在分布式初始化前完成
         self.model_specific_adjustment()
 
         # Set the global server_args in the scheduler process
+        # 把 server_args 设为调度进程级全局,供后续各组件无需透传即可读取
         set_global_server_args_for_scheduler(server_args)
         global_server_args = get_global_server_args()
 
         # FIXME: hacky set `use_mla_backend`
+        # 临时写法:把 MLA 后端标志同步到全局,供下游 kernel 选择路径
         global_server_args.use_mla_backend = self.use_mla_backend
 
         # Init OpenMP threads binding for CPU
+        # CPU 设备时绑定 OpenMP 线程,避免线程在核间漂移影响性能
         if self.device == "cpu":
             self.init_threads_binding()
 
         # Initialize MooncakeTransferEngine
+        # 初始化 Mooncake 传输引擎(PD 分离 / 跨实例 KV 传输用)
         self.init_shared_mooncake_transfer_engine()
 
         # Get available memory before model loading
+        # 初始化 torch 分布式(建进程组),并返回加载模型前的可用显存基线,
+        # 后续据此推算可分配给 KV cache 的显存量
         pre_model_load_memory = self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
+        # 单独的前向 stream,用于 overlap 调度时计算与调度开销重叠
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
         # CPU offload
+        # 按配置创建 offloader,支持把部分权重/状态卸载到 CPU 以省显存
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
 
-        self._weight_checker = WeightChecker(model_runner=self)
+        self._weight_checker = WeightChecker(model_runner=self)  # 权重一致性校验工具
 
+        # 可选:检测慢 rank(排查分布式中拖后腿的节点)
         if envs.SGLANG_DETECT_SLOW_RANK.get():
             slow_rank_detector.execute()
 
         # Init mindspore running environment when model impl is "mindspore"
+        # 若模型实现为 MindSpore,初始化其分布式通信环境
         self.init_mindspore_runner()
 
         # Update deep gemm configure
+        # 启用 DeepGEMM JIT 时,按 GPU 更新其配置
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id, server_args)
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
+        # hisparse 协调器须在 initialize() 前置空,确保 CUDA graph 捕获时能看到该字段
         self.hisparse_coordinator = None
 
         # Initialize the model runner
+        # 核心初始化:加载模型权重、建 KV cache 显存池、选 attention 后端、捕获 CUDA graph
         self.initialize(pre_model_load_memory)
-        self.check_quantized_moe_compatibility()
+        self.check_quantized_moe_compatibility()  # 校验量化 MoE 的兼容性
 
+        # 多模态模型:检查 pad/shift 取值与词表大小是否冲突
         if self.is_multimodal:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
 
         # Temporary cached values
+        # 缓存:该模型的 forward 是否接收 pp_proxy_tensors 参数(即是否支持流水线并行)
         self.support_pp = (
             "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
         )
 
+        # 开启 PP 时,模型必须支持 pp_proxy_tensors,否则直接报错
         if self.pp_size > 1:
             assert (
                 self.support_pp
             ), "Pipeline Parallel is not compatible with this model."
 
         # For weight updates
+        # 权重热更新用的通信组缓存(运行时按 group_name 动态建组)
         self._model_update_group = {}
         self._weights_send_group = {}
 

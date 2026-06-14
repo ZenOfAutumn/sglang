@@ -524,57 +524,72 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             rids=[req.rid for req in batch.reqs],
         )
+        # 目标设备（如 cuda:0）；后续所有张量都会异步搬到该设备
         device = model_runner.device
 
+        # 若需要返回输入 token 的 logprob，则把对应的 token id 异步搬到 GPU
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
                 batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
             )
 
+        # 本批次实际 token 总数（input_ids 长度）；无 input_ids 时记为 0
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
+        # 仅当开启 MoE 专家并行（EP>1）时，才需要把非填充 token 数放到 GPU 供 kernel 使用
         if enable_num_token_non_padded(model_runner.server_args):
             ret.num_token_non_padded = torch.tensor(num_tokens, dtype=torch.int32).to(
                 device, non_blocking=True
             )
+        # CPU 侧始终记录非填充 token 数，供调度/统计逻辑使用
         ret.num_token_non_padded_cpu = num_tokens
 
         # 用于 MLP 同步（DP 注意力下各 rank 对齐 token 数）
+        # global_num_tokens 记录每个 DP rank 的 token 数；仅在启用 DP 注意力时非空
         if batch.global_num_tokens is not None:
+            # 二者必须同时存在：logprob 版本用于对齐计算 logprob 时的 token 数
             assert batch.global_num_tokens_for_logprob is not None
 
             # 处理 global_num_tokens 与 global_num_tokens_for_logprob
             if batch.spec_info is not None:
-                # 投机解码下需按草稿 token 数做相应调整
+                # 投机解码下，实际跑的 token 数会受草稿 token 影响，需重新调整
                 spec_info: SpecInput = batch.spec_info
                 global_num_tokens, global_num_tokens_for_logprob = (
                     spec_info.get_spec_adjusted_global_num_tokens(batch)
                 )
             else:
+                # 非投机：直接采用批次中给定的全局 token 数
                 global_num_tokens = batch.global_num_tokens
                 global_num_tokens_for_logprob = batch.global_num_tokens_for_logprob
 
+            # 保留调整前的原始全局 token 数（CPU 侧），便于后续还原/对照
             ret.original_global_num_tokens_cpu = batch.global_num_tokens
+            # CPU 侧保存（可能已被投机调整后的）各 DP rank token 数
             ret.global_num_tokens_cpu = global_num_tokens
+            # GPU 侧版本：用于 kernel/通信时的 token 数对齐，异步搬运
             ret.global_num_tokens_gpu = torch.tensor(
                 global_num_tokens, dtype=torch.int64
             ).to(device, non_blocking=True)
 
+            # CPU 侧保存计算 logprob 所需的各 rank token 数
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
+            # GPU 侧版本，异步搬运
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
                 global_num_tokens_for_logprob, dtype=torch.int64
             ).to(device, non_blocking=True)
 
+        # 空闲模式（无任何请求，仅占位以保持 DP 各 rank 步调一致）
         if ret.forward_mode.is_idle():
-            # 空闲模式：无序列，位置张量为空
+            # 无序列可处理，位置张量置为空，并提前返回
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
             return ret
 
         # 用扩散式 LLM 或投机信息覆盖 positions
         if batch.dllm_config is not None:
-            # 扩散式 LLM：按块（block）偏移生成位置
+            # 扩散式 LLM：以固定块为单位生成位置
             block_size = batch.dllm_config.block_size
-            # 使用 int64 以兼容 AMD 的旋转位置编码 kernel
+            # 使用 int64 以兼容 AMD（HIP）/NPU 的旋转位置编码 kernel，否则用 int32
             positions_dtype = torch.int64 if is_hip() or _is_npu else torch.int32
+            # 对每个块的起始偏移展开出 block_size 个连续位置，拼接成完整 positions
             ret.positions = torch.tensor(
                 [
                     i
@@ -587,51 +602,65 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
         ):
+            # 投机解码：草稿/验证阶段已预先算好 positions，直接复用
             ret.positions = ret.spec_info.positions
 
-        # 初始化位置信息
+        # 初始化位置信息（若上面未被 dllm/spec 覆盖）
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
-            # 解码/目标验证：位置即各序列当前长度
+            # 解码/目标验证：每个序列只新增 1 个 token，位置即该序列当前长度
             if ret.positions is None:
+                # clamp_position 会把位置下限钳到 0，避免空序列出现负数索引
                 ret.positions = clamp_position(batch.seq_lens)
         else:
-            # extend（prefill）：根据前缀长度与扩展长度计算各 token 位置
+            # extend（prefill/分块预填充）：需为每个新增 token 计算其绝对位置
+            # 断言：extend 元数据必须是 Python list（CPU 侧原始数据）
             assert isinstance(batch.extend_seq_lens, list)
             assert isinstance(batch.extend_prefix_lens, list)
+            # 各请求本次新增的 token 数，转为 int32 张量并异步搬到 GPU
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
+            # 各请求已有的前缀长度（已在 KV cache 中的部分），同样搬到 GPU
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
             ).to(device, non_blocking=True)
+            # 本批 extend 的 token 总数
             ret.extend_num_tokens = batch.extend_num_tokens
+            # 由前缀长度+扩展长度计算每个 token 的位置，以及各请求在拼接序列中的起始偏移
             positions, ret.extend_start_loc = compute_position(
                 model_runner.server_args.attention_backend,
                 ret.extend_prefix_lens,
                 ret.extend_seq_lens,
                 ret.extend_num_tokens,
             )
+            # 若位置未被前面的 dllm/spec 分支覆盖，则采用此处计算结果
             if ret.positions is None:
                 ret.positions = positions
+            # 在 CPU 侧保留前缀长度，供后续逻辑（如 logprob 计算）使用
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
+            # CPU 侧保留各请求扩展长度
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
+            # CPU 侧保留各请求 logprob 的起始位置
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
 
+        # LongCat 等使用 ngram embedding 的模型：构建本批次的 ngram embedding 信息
         if model_runner.use_ngram_embedding:
-            # LongCat 等模型：初始化 ngram embedding 信息
             ret._init_ngram_embedding_info(batch, model_runner, device)
 
+        # mrope 模型（如 Qwen2-VL 多模态）：需计算多维（3D）旋转位置编码
         if model_runner.model_is_mrope:
-            # mrope 模型（如 Qwen2-VL）：计算多维旋转位置
             if (
                 ret.spec_info is not None
                 and getattr(ret.spec_info, "positions", None) is not None
             ):
+                # 投机解码路径下的 mrope 位置计算（基于 spec_info.positions）
                 ret._compute_spec_mrope_positions(model_runner, batch)
             else:
+                # 常规路径下的 mrope 位置计算
                 ret._compute_mrope_positions(model_runner, batch)
 
-        # 为所有 SWA 层一次性预计算滑动窗口缓存位置
+        # 混合 SWA（滑动窗口注意力）模型：把 full KV cache 的写入位置一次性
+        # 翻译为 SWA 窗口内的位置，避免每个 SWA 层重复计算
         if model_runner.is_hybrid_swa and ret.out_cache_loc is not None:
             ret.out_cache_loc_swa = (
                 model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -641,12 +670,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         # 初始化 LoRA 信息
         if model_runner.server_args.enable_lora:
-            # 非 LoRA 重叠加载时，在运行批次前一次性把所需 LoRA 适配器取入显存池
+            # 未开启「重叠加载」时，需在跑这批之前同步把所需 LoRA 适配器取入显存池
             if not model_runner.server_args.enable_lora_overlap_loading:
                 model_runner.lora_manager.fetch_new_loras(set(ret.lora_ids))
 
+            # 为本批次准备 LoRA（如构建按请求的适配器索引/批信息）
             model_runner.lora_manager.prepare_lora_batch(ret)
 
+        # 返回构造并初始化完成的 ForwardBatch
         return ret
 
     def adjust_num_token_non_padded_for_attn_tp(self, server_args) -> None:
