@@ -35,16 +35,11 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 from typing_extensions import Literal
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.utils import ImageData, read_system_prompt_from_file
+from sglang.srt.utils import ImageData, VideoData, read_system_prompt_from_file
 
 
 class SeparatorStyle(IntEnum):
-    """分隔符风格枚举。
-
-    每种风格对应一种拼接 system / 角色 / 消息 / 分隔符的方式，
-    在 Conversation.get_prompt 中根据该枚举选择不同的拼接逻辑。
-    不同模型（LLaMA2/3/4、ChatGLM、ChatML、Qwen 等）有各自的提示词格式。
-    """
+    """Separator styles."""
 
     ADD_COLON_SINGLE = auto()
     ADD_COLON_TWO = auto()
@@ -76,37 +71,33 @@ class SeparatorStyle(IntEnum):
 
 @dataclasses.dataclass
 class Conversation:
-    """管理提示词模板并保存整个对话历史的类。
+    """A class that manages prompt templates and keeps all conversation history."""
 
-    一个 Conversation 实例描述某个模型的聊天模板（角色名、分隔符、多模态占位符等），
-    并能把累积的消息通过 get_prompt() 拼接成最终输入模型的提示词。
-    """
-
-    # 模板名称。
+    # The name of this template
     name: str
-    # system 提示词的模板（{system_message} 会被填充）。
+    # The template of the system prompt
     system_template: str = "{system_message}"
-    # 实际的 system 消息内容。
+    # The system message
     system_message: str = ""
-    # 两个角色名（通常为 用户 与 助手）。
+    # The names of two roles
     roles: Tuple[str] = ("USER", "ASSISTANT")
-    # 所有消息，每项为 [role, message]。
+    # All messages. Each item is (role, message).
     messages: List[List[str]] = ()
-    # few-shot 示例数量（转换为 chatbot 格式时跳过前 offset 条）。
+    # The number of few shot examples
     offset: int = 0
-    # 分隔符风格及其配置。
+    # The separator style and configurations
     sep_style: SeparatorStyle = SeparatorStyle.ADD_COLON_SINGLE
     sep: str = "\n"
     sep2: str = None
-    # 停止条件（默认为 EOS token）。
+    # Stop criteria (the default one is EOS token)
     stop_str: Union[str, List[str]] = None
-    # 提示词中表示图像/视频/音频的占位 token。
+    # The string that represents an image token in the prompt
     image_token: str = "<image>"
     video_token: str = "<video>"
     audio_token: str = "<audio>"
 
     image_data: Optional[List[ImageData]] = None
-    video_data: Optional[List[str]] = None
+    video_data: Optional[List[Union[str, VideoData]]] = None
     modalities: Optional[List[str]] = None
     stop_token_ids: Optional[int] = None
 
@@ -114,13 +105,7 @@ class Conversation:
     image_token_at_prefix: bool = False
 
     def get_prompt(self) -> str:
-        """根据分隔符风格，把 system 与所有消息拼接成用于生成的最终提示词。
-
-        下面一大串 if/elif 分支对应 SeparatorStyle 的每种风格，逻辑雷同但分隔符/
-        角色标记细节不同；未填写（message 为空）的最后一条通常是助手占位，
-        用于提示模型从此处开始生成。
-        """
-        # 先把 system 消息填入 system 模板。
+        """Get the prompt for generation."""
         system_prompt = self.system_template.format(system_message=self.system_message)
         if self.sep_style == SeparatorStyle.ADD_COLON_SINGLE:
             ret = system_prompt + self.sep
@@ -148,7 +133,11 @@ class Conversation:
                     ret += role + ": "  # must be end with a space
             return ret
         elif self.sep_style == SeparatorStyle.ADD_NEW_LINE_SINGLE:
-            ret = "" if system_prompt == "" else system_prompt + self.sep
+            ret = (
+                ""
+                if (not self.system_message or system_prompt == "")
+                else system_prompt + self.sep
+            )
             for role, message in self.messages:
                 if message:
                     ret += role + "\n" + message + self.sep
@@ -410,38 +399,43 @@ class Conversation:
                     ret += role + ": "  # must be end with a space
             return ret
         else:
-            # 未知风格，报错。
             raise ValueError(f"Invalid style: {self.sep_style}")
 
     def set_system_message(self, system_message: str):
-        """设置 system 消息。"""
+        """Set the system message."""
         self.system_message = system_message
 
     def append_message(self, role: str, message: str):
-        """追加一条消息（message 为 None 表示待生成的占位）。"""
+        """Append a new message."""
         self.messages.append([role, message])
 
     def append_image(self, image: str, detail: Literal["auto", "low", "high"]):
-        """追加一张图像数据。"""
+        """Append a new image."""
         self.image_data.append(ImageData(url=image, detail=detail))
 
-    def append_video(self, video: str):
-        """追加一段视频数据。"""
-        self.video_data.append(video)
+    def append_video(self, video: str, preprocess_kwargs: Optional[Dict] = None):
+        """Append a new video."""
+        if preprocess_kwargs:
+            self.video_data.append(
+                VideoData(video, preprocess_kwargs=preprocess_kwargs)
+            )
+        else:
+            self.video_data.append(video)
 
     def append_audio(self, audio: str):
-        """追加一段音频数据。"""
+        """Append a new audio."""
         self.audio_data.append(audio)
 
     def update_last_message(self, message: str):
-        """原地更新最后一条消息。
+        """Update the last output.
 
-        构造提示词时最后一条通常为 None（占位），拿到模型响应后需原地填回。
+        The last message is typically set to be None when constructing the prompt,
+        so we need to update it in-place after getting the response from a model.
         """
         self.messages[-1][1] = message
 
     def to_gradio_chatbot(self):
-        """将对话转换为 gradio chatbot 格式（[[用户, 助手], ...]）。"""
+        """Convert the conversation to gradio chatbot format."""
         ret = []
         for i, (role, msg) in enumerate(self.messages[self.offset :]):
             if i % 2 == 0:
@@ -451,7 +445,7 @@ class Conversation:
         return ret
 
     def to_openai_api_messages(self):
-        """将对话转换为 OpenAI chat completion 的 messages 格式。"""
+        """Convert the conversation to OpenAI chat completion format."""
         if self.system_message == "":
             ret = []
         else:
@@ -493,14 +487,13 @@ class Conversation:
         }
 
 
-# 全局对话模板注册表：模板名 → Conversation。
+# A global registry for all conversation templates
 chat_templates: Dict[str, Conversation] = {}
-# 模型路径 → 模板名 的匹配函数列表（依次尝试）。
 matching_function_registry: List[Callable] = []
 
 
 def register_conv_template(template: Conversation, override: bool = False):
-    """注册一个对话模板；默认不允许重复注册（override=True 可覆盖）。"""
+    """Register a new conversation template."""
     if not override:
         assert (
             template.name not in chat_templates
@@ -510,12 +503,10 @@ def register_conv_template(template: Conversation, override: bool = False):
 
 
 def register_conv_template_matching_function(func):
-    """注册一个“模型路径 → 模板名”的匹配函数（可作装饰器使用）。"""
     matching_function_registry.append(func)
 
 
 def get_conv_template_by_model_path(model_path):
-    """依次尝试所有匹配函数，返回第一个命中的模板名；都未命中返回 None。"""
     for matching_func in matching_function_registry:
         conv_name = matching_func(model_path)
         if conv_name is not None:
@@ -524,14 +515,12 @@ def get_conv_template_by_model_path(model_path):
 
 
 def chat_template_exists(template_name: str) -> bool:
-    """判断指定名称的对话模板是否已注册。"""
     return template_name in chat_templates
 
 
 def generate_embedding_convs(
     texts: List[str], images: List[str], videos: List[str], template_name: str
 ) -> List[Conversation]:
-    """为 embedding 场景批量构造对话：每组 (text, image, video) 生成一个只有用户输入的对话。"""
     conv_template = chat_templates[template_name].copy()
     convs = []
     for text, image, video in zip(texts, images, videos):
@@ -585,12 +574,9 @@ _MODELS_REQUIRING_MODALITY_SUPPLEMENT = {"deepseek-vl2"}
 def _get_full_multimodal_text_prompt(
     modality_token: str, modality_count: int, text_prompt: str
 ) -> str:
-    """为多模态模型补全缺失的模态占位 token。
+    """Combine multimodal prompts for a multimodal language model."""
 
-    当实际多模态输入数（modality_count）多于文本中已有的占位 token 数时，
-    在提示词开头补上缺少的 token；若占位多于实际数据则报错。
-    """
-    # 文本中已有的占位保留不动，只计算还缺多少个。
+    # For any existing placeholder in the text prompt, we leave it as is
     left: int = modality_count - text_prompt.count(modality_token)
     if left < 0:
         raise ValueError(
@@ -606,11 +592,6 @@ def _get_full_multimodal_text_prompt(
 def generate_chat_conv(
     request: ChatCompletionRequest, template_name: str
 ) -> Conversation:
-    """根据 ChatCompletion 请求与指定模板名，构造并填充一个 Conversation。
-
-    处理 system / user / assistant 三种角色的消息，并在 user 消息中插入
-    图像/视频/音频占位 token，最后追加一条空助手消息作为生成占位。
-    """
     conv = chat_templates[template_name].copy()
     conv = Conversation(
         name=conv.name,
@@ -662,7 +643,7 @@ def generate_chat_conv(
                         conv.modalities.append(content.modalities)
                 image_token = (
                     conv.image_token + "\n"
-                    if conv.name != "qwen2-vl"
+                    if conv.name not in ("qwen2-vl", "moss-vl")
                     else conv.image_token
                 )
                 add_token_as_needed: bool = (
@@ -716,16 +697,10 @@ def generate_chat_conv(
         else:
             raise ValueError(f"Unknown role: {msg_role}")
 
-    # 追加一条空的助手消息，作为模型生成的起点占位。
+    # Add a blank message for the assistant.
     conv.append_message(conv.roles[1], None)
     return conv
 
-
-# =============================================================================
-# 以下为各流行模型预注册的内置对话模板。
-# 每个 register_conv_template(...) 描述一个模型的角色名、system 模板、
-# 分隔符风格、停止词与多模态占位 token 等。结构雷同，不逐个注释。
-# =============================================================================
 
 # llama2 template
 # reference: https://github.com/lm-sys/FastChat/blob/main/fastchat/conversation.py
@@ -1049,6 +1024,20 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
+        name="moss-vl",
+        system_message="",
+        system_template="<|im_start|>system\n{system_message}",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=["<|im_end|>"],
+        image_token="<|image|>",
+        video_token="<|video|>",
+    )
+)
+
+register_conv_template(
+    Conversation(
         name="points-v15-chat",
         system_message="",
         system_template="",
@@ -1078,7 +1067,6 @@ register_conv_template(
     )
 )
 
-# config.json 中的 model_type → 对话模板名的映射（供匹配函数兼底使用）。
 MODEL_TYPE_TO_TEMPLATE = {
     "internvl_chat": "internvl-2-5",
     "deepseek_vl_v2": "deepseek-vl2",
@@ -1086,17 +1074,11 @@ MODEL_TYPE_TO_TEMPLATE = {
     "phi4mm": "phi-4-mm",
     "minicpmv": "minicpmv",
     "minicpmo": "minicpmo",
+    "moss_vl": "moss-vl",
     "deepseek-ocr": "deepseek-ocr",
     "paddleocr_vl": "paddle-ocr",
     "whisper": "whisper",
 }
-
-
-# =============================================================================
-# 以下为模型路径匹配函数：用 @register_conv_template_matching_function 注册，
-# get_conv_template_by_model_path 会依次调用它们。每个函数先按模型名关键词
-# （正则）匹配，命中则返回模板名；否则兼底用 config.json 的 model_type 查映射表。
-# =============================================================================
 
 
 @register_conv_template_matching_function
@@ -1106,8 +1088,15 @@ def match_points_v15_chat(model_path: str):
         return "points-v15-chat"
 
 
+@register_conv_template_matching_function
+def match_moss_vl(model_path: str):
+    if re.search(r"moss.*vl|moss-vl", model_path, re.IGNORECASE):
+        return "moss-vl"
+    model_type = get_model_type(model_path)
+    return MODEL_TYPE_TO_TEMPLATE.get(model_type)
+
+
 def get_model_type(model_path: str) -> Optional[str]:
-    """读取模型目录下的 config.json 并返回其 model_type；读不到或解析失败返回 None。"""
     config_path = os.path.join(model_path, "config.json")
     if not os.path.exists(config_path):
         return None
@@ -1161,10 +1150,19 @@ def match_qwen_chat_ml(model_path: str):
 
 @register_conv_template_matching_function
 def match_minicpm(model_path: str):
+    # MiniCPM-V 4.6+ uses its own chat_template.jinja with `<|image_pad|>` and
+    # must NOT fall back to the legacy `minicpmv` conv template (which encodes
+    # the old `(<image>./</image>)` placeholder used by 2.x/4.0/4.5).
+    model_type = get_model_type(model_path)
+    if model_type == "minicpmv4_6":
+        return None
+    # For HF-hub paths (where config.json isn't on local disk yet), fall back
+    # to a path-version check: exclude 4.6 and later, match only legacy 2.x/4.0/4.5.
+    if re.search(r"minicpm-(v|o)-4[._]6", model_path, re.IGNORECASE):
+        return None
     match = re.search(r"minicpm-(v|o)", model_path, re.IGNORECASE)
     if match:
         return f"minicpm{match.group(1).lower()}"
-    model_type = get_model_type(model_path)
     return MODEL_TYPE_TO_TEMPLATE.get(model_type)
 
 

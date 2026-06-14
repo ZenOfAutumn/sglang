@@ -483,10 +483,13 @@ __global__ void Marlin(
   constexpr int b_sh_stage = b_sh_stride * thread_k_blocks;
   constexpr int b_sh_wr_iters = b_sh_stage / b_sh_wr_delta;
 
-  // Scale sizes/strides without act_order
-  // FP4 (kFE2M1f) uses FP8 scales (1 byte/element), others use FP16 (2 bytes)
-  int s_gl_stride = prob_n / (w_type == host::kFE2M1f ? 16 : 8);
-  constexpr int s_sh_stride = 16 * thread_n_blocks / (w_type == host::kFE2M1f ? 16 : 8);
+  // Scale sizes/strides without act_order.
+  // NVFP4 packs FP8 (8-bit) scales into shared/global memory at twice the
+  // density of the half-precision scale path, so the strides scale with the
+  // element size.
+  constexpr bool is_8bit_scale = w_type == host::kFE2M1f;
+  int s_gl_stride = prob_n / (is_8bit_scale ? 16 : 8);
+  constexpr int s_sh_stride = 16 * thread_n_blocks / (is_8bit_scale ? 16 : 8);
   constexpr int s_tb_groups =
       !has_act_order && group_blocks != -1 && group_blocks < thread_k_blocks ? thread_k_blocks / group_blocks : 1;
   constexpr int s_sh_stage = s_tb_groups * s_sh_stride;

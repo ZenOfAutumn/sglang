@@ -56,8 +56,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_npu
@@ -982,6 +982,9 @@ def _prepare_presharded_weights(
     hf_weights_files = []
     for pattern in allow_patterns:
         hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
+
+    if not hf_weights_files:
+        return old_prepare_weights(self, model_name_or_path, revision, fall_back_to_pt)
 
     if hf_weights_files[0].endswith("safetensors"):
         use_safetensors = True

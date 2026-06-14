@@ -15,6 +15,7 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptFp4Config,
     ModelOptMixedPrecisionConfig,
 )
 from sglang.srt.model_loader.loader import ModelOptModelLoader
@@ -30,7 +31,7 @@ CALIBRATION_BATCH_SIZE = 36
 CALIBRATION_NUM_SAMPLES = 512
 DEFAULT_DEVICE = "cuda:0"
 
-register_cuda_ci(est_time=11, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestModelOptModelLoader(CustomTestCase):
@@ -646,10 +647,9 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
         )
 
     def test_mixed_precision_uses_nvfp4_min_capability(self):
-        """NVFP4 supports SM75+ (Turing) via Marlin fallback; min_capability must be >= 75."""
-        cap = ModelOptMixedPrecisionConfig.get_min_capability()
-        self.assertGreaterEqual(
-            cap, 75, f"NVFP4 requires SM75+ (Marlin fallback); got min_capability={cap}"
+        self.assertEqual(
+            ModelOptMixedPrecisionConfig.get_min_capability(),
+            ModelOptFp4Config.get_min_capability(),
         )
 
     def test_mixed_precision_quant_layer_resolution_after_mapping(self):
