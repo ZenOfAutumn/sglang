@@ -381,143 +381,265 @@ class ServerArgs:
     """
 
     # Model and tokenizer
+    # 中译：模型权重路径或 HuggingFace 模型 ID（必填）。
     model_path: str
+    # 中译：分词器路径；为 None 时默认与 model_path 相同。
     tokenizer_path: Optional[str] = None
+    # 中译：分词器加载模式。"auto" 优先用快速分词器，"slow" 强制使用慢速分词器。
     tokenizer_mode: str = "auto"
+    # 中译：分词器后端实现，默认 "huggingface"。
     tokenizer_backend: str = "huggingface"
+    # 中译：分词（tokenize）工作进程数,>1 时启用多进程并行分词以提升吞吐。
     tokenizer_worker_num: int = 1
+    # 中译：反分词（detokenize）工作进程数。
     detokenizer_worker_num: int = 1
+    # 中译：跳过分词器初始化，直接以 token id 作为输入/输出（适合已在外部完成分词的场景）。
     skip_tokenizer_init: bool = False
+    # 中译：权重加载格式（auto/pt/safetensors/npcache/dummy/gguf 等）。"auto" 自动探测。
     load_format: str = "auto"
+    # 中译：传给模型加载器的额外配置（JSON 字符串）。
     model_loader_extra_config: str = "{}"
+    # 中译：是否信任并执行 HF 仓库中的远程自定义代码（trust_remote_code）。
     trust_remote_code: bool = False
+    # 中译：手动覆盖模型最大上下文长度；为 None 时取模型配置中的值。
     context_length: Optional[int] = None
+    # 中译：是否作为 embedding（向量化）模型运行,而非生成模型。
     is_embedding: bool = False
+    # 中译：prefill-only 模式下禁用 KV 缓存（用于纯打分/embedding 等无需复用 KV 的场景）。
     prefill_only_disable_kv_cache: bool = False
+    # 中译：是否启用多模态支持；None 表示按模型自动判定。
     enable_multimodal: Optional[bool] = None
+    # 中译：从 HF Hub 加载时指定的模型版本/分支/commit（revision）。
     revision: Optional[str] = None
+    # 中译：模型实现来源选择（auto/sglang/transformers），决定优先用 SGLang 原生实现还是 transformers 实现。
     model_impl: str = "auto"
+    # 中译：模型配置解析器选择,"auto" 自动选择对应的 config parser。
     model_config_parser: str = "auto"
 
     # HTTP server
+    # 中译：HTTP 服务监听地址,默认仅本机 127.0.0.1。
     host: str = "127.0.0.1"
+    # 中译：HTTP 服务监听端口。
     port: int = 30000
+    # 中译：FastAPI 的根路径前缀（部署在反向代理子路径下时使用）。
     fastapi_root_path: str = ""
+    # 中译：以 gRPC 模式运行（而非 HTTP）。
     grpc_mode: bool = False
+    # 中译：跳过服务启动时的 warmup（预热前向）步骤。
     skip_server_warmup: bool = False
+    # 中译：自定义 warmup 请求配置（JSON）。
     warmups: Optional[str] = None
+    # 中译：NCCL 通信端口；为 None 时自动选择。
     nccl_port: Optional[int] = None
+    # 中译：使用 checkpoint-engine 时,在服务标记为就绪前先等待权重加载完成。
     checkpoint_engine_wait_weights_before_ready: bool = False
 
     # SSL/TLS
+    # 中译：SSL 私钥文件路径（启用 HTTPS 时使用）。
     ssl_keyfile: Optional[str] = None
+    # 中译：SSL 证书文件路径。
     ssl_certfile: Optional[str] = None
+    # 中译：用于校验客户端证书的 CA 证书路径（双向 TLS）。
     ssl_ca_certs: Optional[str] = None
+    # 中译：SSL 私钥的解密口令。
     ssl_keyfile_password: Optional[str] = None
+    # 中译：是否启用 SSL 证书热刷新（证书更新后无需重启）。
     enable_ssl_refresh: bool = False
+    # 中译：是否启用 HTTP/2。
     enable_http2: bool = False
 
     # Quantization and data type
+    # 中译：模型计算精度（auto/half/float16/bfloat16/float32）。"auto" 按模型配置选择。
     dtype: str = "auto"
+    # 中译：在线/权重量化方法（如 fp8、awq、gptq、mxfp4 等）；None 表示不额外量化。
     quantization: Optional[str] = None
+    # 中译：量化缩放因子（scale）等参数文件路径（部分量化方法需要）。
     quantization_param_path: Optional[str] = None
+    # 中译：KV 缓存数据类型（auto/fp8_e5m2/fp8_e4m3 等）。fp8 可显著降低 KV 显存占用。
     kv_cache_dtype: str = "auto"
+    # 中译：是否将 lm_head（输出投影）保持在 fp32 精度,以提升数值稳定性。
     enable_fp32_lm_head: bool = False
+    # 中译：使用 NVIDIA ModelOpt 进行量化的配置（字符串或字典）。
     modelopt_quant: Optional[Union[str, Dict]] = None
+    # 中译：ModelOpt 量化 checkpoint 的恢复（restore）路径。
     modelopt_checkpoint_restore_path: Optional[str] = None
+    # 中译：ModelOpt 量化 checkpoint 的保存路径。
     modelopt_checkpoint_save_path: Optional[str] = None
+    # 中译：ModelOpt 量化结果的导出路径。
     modelopt_export_path: Optional[str] = None
+    # 中译：先就地量化再启动服务（quantize-and-serve 一体化流程）。
     quantize_and_serve: bool = False
-    rl_quant_profile: Optional[str] = None  # For flash_rl load format
+    rl_quant_profile: Optional[str] = None  # For flash_rl load format  # 中译：flash_rl 加载格式所用的量化 profile。
 
     # Memory and scheduling
+    # 中译：静态显存占比（权重 + KV 缓存等固定占用上限,占 GPU 总显存比例）；None 时自动推断。
     mem_fraction_static: Optional[float] = None
+    # 中译：并发运行中的最大请求数（运行批的上限）。
     max_running_requests: Optional[int] = None
+    # 中译：等待队列中允许排队的最大请求数,超出则拒绝。
     max_queued_requests: Optional[int] = None
+    # 中译：KV 缓存可容纳的最大 token 总数；None 时按显存自动推算。
     max_total_tokens: Optional[int] = None
+    # 中译：分块 prefill 的块大小（一次 prefill 处理的最大 token 数）；None 时自动设置。
     chunked_prefill_size: Optional[int] = None
+    # 中译：是否启用动态分块（根据负载动态调整 chunked prefill 大小）。
     enable_dynamic_chunking: bool = False
+    # 中译：单次 prefill 前向允许的最大 token 数。
     max_prefill_tokens: int = 16384
+    # 中译：单次 prefill 批中允许的最大请求数。
     prefill_max_requests: Optional[int] = None
+    # 中译：调度策略（fcfs 先来先服务 / lpm 最长前缀匹配 / dfs-weight 等）。
     schedule_policy: str = "fcfs"
+    # 中译：是否启用基于优先级的调度。
     enable_priority_scheduling: bool = False
+    # 中译：禁用优先级抢占（高优先级请求不抢占低优先级正在运行的请求）。
     disable_priority_preemption: bool = False
+    # 中译：请求未显式指定优先级时的默认优先级值。
     default_priority_value: Optional[int] = None
+    # 中译：未启用优先级调度时,若请求携带优先级则直接中止报错（而非忽略）。
     abort_on_priority_when_disabled: bool = False
+    # 中译：是否让“优先级数值更小”的请求先被调度（默认数值大者优先）。
     schedule_low_priority_values_first: bool = False
+    # 中译：触发优先级抢占的阈值（优先级差超过该值才抢占）。
     priority_scheduling_preemption_threshold: int = 10
+    # 中译：调度保守系数,越大越保守（预留更多显存,降低 OOM/重算风险）。
     schedule_conservativeness: float = 1.0
+    # 中译：KV 缓存分页大小（每页 token 数）；None 时自动选择。
     page_size: Optional[int] = None
+    # 中译：滑动窗口注意力（SWA）下,full-attention 层 token 预算占比。
     swa_full_tokens_ratio: float = 0.8
+    # 中译：禁用 SWA 混合内存布局优化。
     disable_hybrid_swa_memory: bool = False
+    # 中译：radix（基数树前缀缓存）的淘汰策略,默认 lru。
     radix_eviction_policy: str = "lru"
+    # 中译：是否启用 prefill 延迟器（在高负载下延后 prefill 以保护 decode 的 ITL）。
     enable_prefill_delayer: bool = False
+    # 中译：prefill 延迟器最多延迟的前向（forward pass）次数。
     prefill_delayer_max_delay_passes: int = 30
+    # 中译：触发延迟的 KV token 占用率低水位线。
     prefill_delayer_token_usage_low_watermark: Optional[float] = None
+    # 中译：prefill 延迟器“延迟前向次数”指标的直方图分桶。
     prefill_delayer_forward_passes_buckets: Optional[List[float]] = None
+    # 中译：prefill 延迟器“等待秒数”指标的直方图分桶。
     prefill_delayer_wait_seconds_buckets: Optional[List[float]] = None
+    # 中译：触发延迟所需的队列最小占比。
     prefill_delayer_queue_min_ratio: Optional[float] = None
+    # 中译：prefill 延迟器允许的最大延迟时间（毫秒）。
     prefill_delayer_max_delay_ms: Optional[float] = None
 
     # Runtime options
+    # 中译：运行设备（cuda/hip/cpu/xpu 等）；None 时自动探测。
     device: Optional[str] = None
+    # 中译：张量并行（Tensor Parallel）规模。
     tp_size: int = 1
+    # 中译：流水线并行（Pipeline Parallel）规模（stage 数）。
     pp_size: int = 1
+    # 中译：流水线并行中单个 micro-batch 的最大大小。
     pp_max_micro_batch_size: Optional[int] = None
+    # 中译：流水线并行异步批处理深度（in-flight micro-batch 数），0 表示同步。
     pp_async_batch_depth: int = 0
+    # 中译：流式输出时每多少个解码 token 向客户端推送一次。
     stream_interval: int = 1
+    # 中译：批量通知大小（调度器向 detokenizer 批量通知的粒度）。
     batch_notify_size: int = 16
+    # 中译：流式响应是否默认包含 usage（token 计数）信息。
     stream_response_default_include_usage: bool = False
+    # 中译：增量式流式输出（只发送新增片段而非累积全文）。
     incremental_streaming_output: bool = False
+    # 中译：是否启用流式会话（streaming session）。
     enable_streaming_session: bool = False
+    # 中译：随机种子,用于结果可复现。
     random_seed: Optional[int] = None
+    # 中译：约束式 JSON 生成时允许的空白字符正则模式。
     constrained_json_whitespace_pattern: Optional[str] = None
+    # 中译：约束式 JSON 生成时禁止任意空白字符（生成更紧凑的 JSON）。
     constrained_json_disable_any_whitespace: bool = False
+    # 中译：看门狗超时时间（秒）。前向卡死超过该时长会触发崩溃自检。
     watchdog_timeout: float = 300
+    # 中译：软看门狗超时（秒）,达到后仅告警而不直接崩溃。
     soft_watchdog_timeout: Optional[float] = None
-    dist_timeout: Optional[int] = None  # timeout for torch.distributed
+    dist_timeout: Optional[int] = None  # timeout for torch.distributed  # 中译：torch.distributed 集合通信的超时时间。
+    # 中译：模型下载缓存目录。
     download_dir: Optional[str] = None
+    # 中译：模型权重校验和（用于校验下载/加载的权重完整性）。
     model_checksum: Optional[str] = None
+    # 中译：本进程使用的起始 GPU 编号。
     base_gpu_id: int = 0
+    # 中译：分配 GPU 时的步长（gpu_id 递增间隔）。
     gpu_id_step: int = 1
+    # 中译：空闲时让 GPU 进入休眠以省电/省显存。
     sleep_on_idle: bool = False
+    # 中译：加载快照（snapshot）进度的发布间隔（秒）。
     load_snapshot_publish_interval: int = 15
+    # 中译：是否使用 Ray 作为分布式后端。
     use_ray: bool = False
+    # 中译：自定义 SIGQUIT 信号处理函数（仅供嵌入式 Python 调用,无 CLI 入口）。
     custom_sigquit_handler: Optional[Callable] = None
 
     # Logging
+    # 中译：全局日志级别（debug/info/warning/error）。
     log_level: str = "info"
+    # 中译：HTTP 访问日志的独立级别；None 时跟随 log_level。
     log_level_http: Optional[str] = None
+    # 中译：是否记录每个请求的输入/输出内容。
     log_requests: bool = False
+    # 中译：请求日志的详细级别（0~3,越大越详细）。
     log_requests_level: int = 2
+    # 中译：请求日志格式（text/json）。
     log_requests_format: str = "text"
+    # 中译：请求日志输出目标列表。
     log_requests_target: Optional[List[str]] = None
+    # 中译：uvicorn 访问日志中需排除（不记录）的 URL 路径前缀（如健康检查端点）。
     uvicorn_access_log_exclude_prefixes: List[str] = dataclasses.field(
         default_factory=lambda: list(DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES)
     )
+    # 中译：崩溃转储（crash dump）输出目录。
     crash_dump_folder: Optional[str] = None
+    # 中译：是否打印各阶段耗时统计。
     show_time_cost: bool = False
+    # 中译：是否启用 Prometheus 指标采集。
     enable_metrics: bool = False
+    # 中译：gRPC 模式下用于暴露 HTTP 指标的 sidecar 端口。
     grpc_http_sidecar_port: Optional[int] = None
+    # 中译：是否采集 MFU（Model FLOPs Utilization,模型算力利用率）指标。
     enable_mfu_metrics: bool = False
+    # 中译：是否为所有 scheduler（而非仅一个）采集指标。
     enable_metrics_for_all_schedulers: bool = False
+    # 中译：从请求头读取自定义指标标签时使用的 header 名。
     tokenizer_metrics_custom_labels_header: str = "x-custom-labels"
+    # 中译：允许作为指标标签的自定义标签白名单。
     tokenizer_metrics_allowed_custom_labels: Optional[List[str]] = None
+    # 中译：附加到所有指标上的额外静态标签。
     extra_metric_labels: Optional[Dict[str, str]] = None
+    # 中译：TTFT（首 token 延迟）指标的直方图分桶。
     bucket_time_to_first_token: Optional[List[float]] = None
+    # 中译：ITL（token 间延迟）指标的直方图分桶。
     bucket_inter_token_latency: Optional[List[float]] = None
+    # 中译：端到端请求延迟指标的直方图分桶。
     bucket_e2e_request_latency: Optional[List[float]] = None
+    # 中译：prompt token 数指标的直方图分桶。
     prompt_tokens_buckets: Optional[List[str]] = None
+    # 中译：生成 token 数指标的直方图分桶。
     generation_tokens_buckets: Optional[List[str]] = None
+    # 中译：单次 GC 耗时超过该秒数时打印告警；0 表示不告警。
     gc_warning_threshold_secs: float = 0.0
+    # 中译：decode 阶段每多少步打印一次日志。
     decode_log_interval: int = 40
+    # 中译：是否记录请求各阶段耗时统计日志。
     enable_request_time_stats_logging: bool = False
+    # 中译：KV 缓存事件（KV events）发布配置。
     kv_events_config: Optional[str] = None
+    # 中译：是否采集前向（forward pass）级别的指标。
     enable_forward_pass_metrics: bool = False
+    # 中译：前向指标关联的 worker 标识。
     forward_pass_metrics_worker_id: str = ""
+    # 中译：前向指标 IPC 通道名。
     forward_pass_metrics_ipc_name: Optional[str] = None
+    # 中译：是否启用分布式链路追踪（tracing）。
     enable_trace: bool = False
+    # 中译：参与追踪的模块（如 "request"）。
     trace_modules: str = "request"
+    # 中译：OTLP trace 上报端点地址。
     otlp_traces_endpoint: str = "localhost:4317"
 
     # RequestMetricsExporter configuration
@@ -533,118 +655,202 @@ class ServerArgs:
     stat_loggers: Optional[Dict[str, type]] = None
 
     # API related
+    # 中译：访问 API 所需的鉴权密钥；为 None 时不鉴权。
     api_key: Optional[str] = None
+    # 中译：管理类接口（如权重更新）所需的管理员密钥。
     admin_api_key: Optional[str] = None
+    # 中译：对外暴露的模型名（出现在 /v1/models 等响应中）；None 时用 model_path。
     served_model_name: Optional[str] = None
+    # 中译：权重版本标识,用于热更新权重时区分版本。
     weight_version: str = "default"
+    # 中译：聊天模板（chat template）名称或文件路径,用于多轮对话拼接。
     chat_template: Optional[str] = None
+    # 中译：直接指定 HF 内置 chat template 的名称。
     hf_chat_template_name: Optional[str] = None
+    # 中译：补全（completion）场景使用的模板。
     completion_template: Optional[str] = None
+    # 中译：文件存储路径（上传文件、缓存等）。
     file_storage_path: str = "sglang_storage"
+    # 中译：是否在响应中报告前缀缓存命中情况。
     enable_cache_report: bool = False
+    # 中译：推理（reasoning/thinking）内容解析器（如 deepseek-r1、qwen3 等）。
     reasoning_parser: Optional[str] = None
+    # 中译：是否从 KV 缓存中剥离 thinking 段（避免缓存复用思考过程）。
     strip_thinking_cache: bool = False
+    # 中译：启用严格 thinking 模式。
     enable_strict_thinking: bool = False
+    # 中译：工具调用（function/tool call）解析器（如 qwen25、llama3、mistral 等）。
     tool_call_parser: Optional[str] = None
+    # 中译：外部工具服务器地址（用于内置工具调用）。
     tool_server: Optional[str] = None
+    # 中译：采样参数默认值来源,"model" 表示取模型 generation_config。
     sampling_defaults: str = "model"
+    # 中译：ASR（语音识别）单会话最大缓冲音频时长（秒）。
     asr_max_buffer_seconds: int = 60
+    # 中译：ASR 最大并发会话数。
     asr_max_concurrent_sessions: int = 32
 
     # Data parallelism
+    # 中译：数据并行（Data Parallel）规模。
     dp_size: int = 1
+    # 中译：DP 负载均衡方法（auto/round_robin/shortest_queue 等）。
     load_balance_method: str = "auto"
 
+    # 中译：注意力上下文并行（attention Context Parallel）规模。
     attn_cp_size: int = 1
+    # 中译：MoE 数据并行规模。
     moe_dp_size: int = 1
 
     # Multi-node distributed serving
+    # 中译：多节点分布式初始化地址（master 节点的 host:port）。
     dist_init_addr: Optional[str] = None
+    # 中译：参与服务的节点总数。
     nnodes: int = 1
+    # 中译：当前节点的编号（rank）。
     node_rank: int = 0
 
     # Model override args in JSON
+    # 中译：以 JSON 覆盖模型配置项（如 rope_scaling 等）。
     json_model_override_args: str = "{}"
+    # 中译：偏好的采样参数（JSON）,作为请求级采样参数的默认底。
     preferred_sampling_params: Optional[str] = None
 
     # LoRA
+    # 中译：是否启用 LoRA；None 时按是否提供 lora_paths 自动判定。
     enable_lora: Optional[bool] = None
+    # 中译：是否启用 LoRA 适配器加载与计算的重叠（overlap）以降低切换开销。
     enable_lora_overlap_loading: Optional[bool] = None
+    # 中译：LoRA 的最大秩（rank）,用于预分配缓冲区。
     max_lora_rank: Optional[int] = None
+    # 中译：应用 LoRA 的目标模块集合（如 q_proj、v_proj 等）。
     lora_target_modules: Optional[Union[set[str], List[str]]] = None
+    # 中译：LoRA 适配器路径,支持多种形式（单个、列表、name->path 字典、LoRARef 列表）。
     lora_paths: Optional[
         Union[dict[str, str], List[dict[str, str]], List[str], List[LoRARef]]
     ] = None
+    # 中译：常驻显存中可同时加载的 LoRA 适配器最大数量。
     max_loaded_loras: Optional[int] = None
+    # 中译：单个批次中可同时生效的 LoRA 适配器最大数量。
     max_loras_per_batch: int = 8
+    # 中译：LoRA 适配器的淘汰策略,默认 lru。
     lora_eviction_policy: str = "lru"
+    # 中译：LoRA 计算后端（如 csgmv、triton 等）。
     lora_backend: str = "csgmv"
+    # 中译：LoRA 计算的最大分块大小。
     max_lora_chunk_size: Optional[int] = 16
+    # 中译：共享专家是否走外层 LoRA 循环（MoE + LoRA 相关优化）。
     experts_shared_outer_loras: Optional[bool] = None
+    # 中译：是否将 LoRA 当作“虚拟专家”处理（MoE + LoRA 实现方式）。
     lora_use_virtual_experts: bool = False
+    # 中译：LoRA 严格加载模式（权重/形状不匹配时直接报错）。
     lora_strict_loading: bool = False
+    # 中译：卸载 LoRA 前等待在途请求排空（drain）的阈值。
     lora_drain_wait_threshold: float = 0.0
 
     # Kernel backend
+    # 中译：注意力计算后端（flashinfer/triton/fa3/torch_native 等）；None 时自动选择。
     attention_backend: Optional[str] = None
+    # 中译：仅 decode 阶段使用的注意力后端（可与 prefill 分开指定）。
     decode_attention_backend: Optional[str] = None
+    # 中译：仅 prefill 阶段使用的注意力后端。
     prefill_attention_backend: Optional[str] = None
+    # 中译：采样（sampling）后端（flashinfer/pytorch）。
     sampling_backend: Optional[str] = None
+    # 中译：约束解码的语法（grammar）后端（outlines/xgrammar/llguidance 等）。
     grammar_backend: Optional[str] = None
     # Name of a custom radix-cache factory registered via
     # register_radix_cache_backend. Leave unset (by default) to use the
     # built-in default cache selection chain.
+    # 中译：通过 register_radix_cache_backend 注册的自定义 radix-cache 工厂名；
+    #       默认不设,使用内置的缓存选择链。
     radix_cache_backend: Optional[str] = None
+    # 中译：多模态部分使用的注意力后端。
     mm_attention_backend: Optional[str] = None
+    # 中译：FP8 GEMM 的执行后端,"auto" 自动选择。
     fp8_gemm_runner_backend: str = "auto"
+    # 中译：FP4 GEMM 的执行后端,"auto" 自动选择。
     fp4_gemm_runner_backend: str = "auto"
     dsa_prefill_backend: Optional[str] = (
-        None  # None = auto-detect based on hardware/kv_cache_dtype
+        None  # None = auto-detect based on hardware/kv_cache_dtype  # 中译：DSA（DeepSeek 稀疏注意力）prefill 后端；None 时按硬件/KV dtype 自动探测。
     )
     dsa_decode_backend: Optional[str] = (
-        None  # auto-detect based on hardware/kv_cache_dtype
+        None  # auto-detect based on hardware/kv_cache_dtype  # 中译：DSA decode 后端；None 时按硬件/KV dtype 自动探测。
     )
+    # 中译：DSA top-k 选择算子的后端,默认 sgl-kernel。
     dsa_topk_backend: str = "sgl-kernel"
+    # 中译：禁用 FlashInfer 的自动调优（autotune）。
     disable_flashinfer_autotune: bool = False
+    # 中译：Mamba/线性注意力算子后端,默认 triton。
     mamba_backend: str = "triton"
 
     # Speculative decoding
+    # 中译：投机解码算法（EAGLE/EAGLE3/NEXTN/STANDALONE/NGRAM 等）；None 表示不启用。
     speculative_algorithm: Optional[str] = None
+    # 中译：草稿（draft）模型路径。
     speculative_draft_model_path: Optional[str] = None
+    # 中译：草稿模型的 HF revision。
     speculative_draft_model_revision: Optional[str] = None
+    # 中译：草稿模型的权重加载格式。
     speculative_draft_load_format: Optional[str] = None
+    # 中译：投机解码每轮的草稿步数（draft 一次性预测的深度）。
     speculative_num_steps: Optional[int] = None
+    # 中译：EAGLE 草稿树每层展开的 top-k 分支数。
     speculative_eagle_topk: Optional[int] = None
+    # 中译：每轮提交给目标模型校验的草稿 token 总数。
     speculative_num_draft_tokens: Optional[int] = None
+    # 中译：dflash 草稿算法的块大小。
     speculative_dflash_block_size: Optional[int] = None
+    # 中译：单 token 接受阈值（接受草稿 token 的概率门限）。
     speculative_accept_threshold_single: float = 1.0
+    # 中译：累积接受阈值（沿草稿路径累计的概率门限）。
     speculative_accept_threshold_acc: float = 1.0
+    # 中译：EAGLE token 映射文件路径（草稿词表到目标词表的映射）。
     speculative_token_map: Optional[str] = None
+    # 中译：草稿前向使用的注意力模式（prefill/decode）。
     speculative_attention_mode: str = "prefill"
+    # 中译：草稿模型使用的注意力后端。
     speculative_draft_attention_backend: Optional[str] = None
+    # 中译：草稿模型注意力的滑动窗口大小。
     speculative_draft_window_size: Optional[int] = None
+    # 中译：草稿模型 MoE 算子执行后端。
     speculative_moe_runner_backend: Optional[str] = None
+    # 中译：草稿模型 MoE all-to-all 通信后端。
     speculative_moe_a2a_backend: Optional[str] = None
+    # 中译：草稿模型的量化方式。
     speculative_draft_model_quantization: Optional[str] = None
+    # 中译：投机解码时跳过 DP 下的 MLP 同步（优化项）。
     speculative_skip_dp_mlp_sync: bool = False
 
     # Speculative decoding (ngram)
+    # 中译：ngram 投机的 BFS 最小展开宽度。
     speculative_ngram_min_bfs_breadth: int = 1
+    # 中译：ngram 投机的 BFS 最大展开宽度。
     speculative_ngram_max_bfs_breadth: int = 10
+    # 中译：ngram 匹配类型,BFS（广度优先）或 PROB（按概率）。
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
+    # 中译：ngram 前缀树（trie）的最大深度。
     speculative_ngram_max_trie_depth: int = 18
+    # 中译：ngram 缓存容量（最多缓存的 ngram 条目数）。
     speculative_ngram_capacity: int = 10 * 1000 * 1000
+    # 中译：外部 ngram 语料库路径（用于预热草稿匹配）。
     speculative_ngram_external_corpus_path: Optional[str] = None
+    # 中译：外部语料构建后缀自动机（SAM）的预算,0 表示不使用。
     speculative_ngram_external_sam_budget: int = 0
+    # 中译：从外部语料读取的最大 token 数。
     speculative_ngram_external_corpus_max_tokens: int = 10000000
+    # 中译：是否启用多层 EAGLE（multi-layer eagle）。
     enable_multi_layer_eagle: bool = False
 
     # Adaptive speculative decoding
+    # 中译：是否启用自适应投机解码（按运行时接受率动态调整草稿参数）。
     speculative_adaptive: bool = False
+    # 中译：自适应投机解码的配置（JSON）。
     speculative_adaptive_config: Optional[str] = None
 
     # Expert parallelism
+    # 中译：MoE 专家并行（Expert Parallel）规模。
     ep_size: int = 1
+    # 中译：MoE all-to-all 分发（dispatch/combine）通信后端。
     moe_a2a_backend: Literal[
         "none",
         "deepep",
@@ -655,82 +861,141 @@ class ServerArgs:
         "flashinfer",
         "megamoe",
     ] = "none"
+    # 中译：MoE 算子执行后端,"auto" 自动选择。
     moe_runner_backend: str = "auto"
+    # 中译：FlashInfer mxfp4 MoE 的计算精度（default 或 bf16）。
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
+    # 中译：启用 FlashInfer 的 allreduce 融合（通信与计算融合优化）。
     enable_flashinfer_allreduce_fusion: bool = False
+    # 中译：强制禁用 FlashInfer allreduce 融合（覆盖自动启用）。
     enforce_disable_flashinfer_allreduce_fusion: bool = False
+    # 中译：启用 AITER（AMD）的 allreduce 融合。
     enable_aiter_allreduce_fusion: bool = False
+    # 中译：DeepEP 运行模式（auto/normal/low_latency）。low_latency 适合小批低延迟解码。
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
+    # 中译：DeepEP 分发器输出 dtype（auto/bf16/fp8/int8/nvfp4）。
     deepep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8", "int8", "nvfp4"] = (
         "auto"
     )
+    # 中译：每个 EP rank 上的冗余专家数（用于负载均衡）。
     ep_num_redundant_experts: int = 0
+    # 中译：EP 专家分发算法（static/dynamic/fake）。
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
+    # 中译：专家初始放置策略（trivial 表示按朴素方式分布）。
     init_expert_location: str = "trivial"
+    # 中译：是否启用 EPLB（Expert Parallelism Load Balancer,专家并行负载均衡）。
     enable_eplb: bool = False
+    # 中译：EPLB 重平衡算法,"auto" 自动选择。
     eplb_algorithm: str = "auto"
+    # 中译：EPLB 重平衡的迭代次数。
     eplb_rebalance_num_iterations: int = 1000
+    # 中译：EPLB 每次重平衡处理的层数（分块大小）。
     eplb_rebalance_layers_per_chunk: Optional[int] = None
+    # 中译：触发 EPLB 重平衡的最小利用率阈值。
     eplb_min_rebalancing_utilization_threshold: float = 1.0
+    # 中译：专家分布记录器模式（stat/stat_approx/per_pass/per_token）,用于分析专家负载。
     expert_distribution_recorder_mode: Optional[
         Literal["stat", "stat_approx", "per_pass", "per_token"]
     ] = None
+    # 中译：专家分布记录器的缓冲区大小。
     expert_distribution_recorder_buffer_size: Optional[int] = None
+    # 中译：是否导出专家分布指标。
     enable_expert_distribution_metrics: bool = False
+    # 中译：DeepEP 的额外配置（JSON）。
     deepep_config: Optional[str] = None
+    # 中译：MoE 中稠密（dense）部分的 TP 规模,可与专家部分不同。
     moe_dense_tp_size: Optional[int] = None
+    # 中译：弹性 EP（elastic expert parallel）通信后端（mooncake/nixl）；None 表示不启用。
     elastic_ep_backend: Literal[None, "mooncake", "nixl"] = None
+    # 中译：启用弹性 EP 的专家备份（节点故障时可由备份接管）。
     enable_elastic_expert_backup: bool = False
+    # 中译：Mooncake 使用的 InfiniBand 设备名。
     mooncake_ib_device: Optional[str] = None
+    # 中译：启用 DeepEP waterfill（瀑布式填充）调度优化。
     enable_deepep_waterfill: bool = False
+    # 中译：弹性 EP 节点恢复后重新加入（rejoin）通信组。
     elastic_ep_rejoin: bool = False
 
     # Mamba cache
+    # 中译：Mamba 状态缓存的最大条目数。
     max_mamba_cache_size: Optional[int] = None
+    # 中译：Mamba SSM 状态的数据类型。
     mamba_ssm_dtype: Optional[str] = None
+    # 中译：Mamba 缓存可用显存占比。
     mamba_full_memory_ratio: float = 0.9
+    # 中译：Mamba 缓存的调度策略,"auto" 自动选择。
     mamba_scheduler_strategy: str = "auto"
+    # 中译：Mamba 缓存使用情况的追踪间隔（步数）。
     mamba_track_interval: int = 256
+    # 中译：线性注意力计算后端,默认 triton。
     linear_attn_backend: str = "triton"
+    # 中译：decode 阶段线性注意力后端（可单独指定）。
     linear_attn_decode_backend: Optional[str] = None
+    # 中译：prefill 阶段线性注意力后端（可单独指定）。
     linear_attn_prefill_backend: Optional[str] = None
 
     # Hierarchical cache
+    # 中译：启用分层（GPU/CPU/存储多级）KV 缓存。
     enable_hierarchical_cache: bool = False
+    # 中译：分层缓存中 CPU 层相对 GPU 层的容量倍率。
     hicache_ratio: float = 2.0
+    # 中译：分层缓存大小（0 表示按 ratio 自动推算）。
     hicache_size: int = 0
+    # 中译：分层缓存写策略（write_through 写穿 / write_back 写回）。
     hicache_write_policy: str = "write_through"
+    # 中译：分层缓存的 IO 后端（kernel/direct 等），决定 GPU↔CPU 拷贝方式。
     hicache_io_backend: str = "kernel"
+    # 中译：分层缓存内存布局（layer_first 等）。
     hicache_mem_layout: str = "layer_first"
+    # 中译：分层缓存的持久化存储后端（如 mooncake、file 等）；None 表示不落盘。
     hicache_storage_backend: Optional[str] = None
+    # 中译：从存储后端预取 KV 的策略（timeout 等）。
     hicache_storage_prefetch_policy: str = "timeout"
+    # 中译：存储后端的额外配置（JSON）。
     hicache_storage_backend_extra_config: Optional[str] = None
 
     # Hierarchical sparse attention
+    # 中译：启用分层稀疏注意力（hierarchical sparse attention）。
     enable_hisparse: bool = False
+    # 中译：分层稀疏注意力的配置（JSON）。
     hisparse_config: Optional[str] = None
 
     # LMCache
+    # 中译：启用 LMCache（外部 KV 缓存系统）集成。
     enable_lmcache: bool = False
+    # 中译：LMCache 配置文件路径。
     lmcache_config_file: Optional[str] = None
 
     # Ktransformers/AMX expert parallelism
+    # 中译：KTransformers 权重路径（CPU/AMX 专家卸载方案）。
     kt_weight_path: Optional[str] = None
+    # 中译：KTransformers 方法/算子选择。
     kt_method: Optional[str] = None
+    # 中译：KTransformers CPU 推理（cpuinfer）的线程数。
     kt_cpuinfer: Optional[int] = None
+    # 中译：KTransformers 线程池数量。
     kt_threadpool_count: Optional[int] = None
+    # 中译：放在 GPU 上的专家数量（其余在 CPU）。
     kt_num_gpu_experts: Optional[int] = None
+    # 中译：每个 token 允许延迟（defer 到 CPU）计算的最大专家数。
     kt_max_deferred_experts_per_token: Optional[int] = None
 
     # Diffusion LLM
+    # 中译：扩散式 LLM（diffusion LLM）的解码算法；None 表示不启用。
     dllm_algorithm: Optional[str] = None
+    # 中译：扩散式 LLM 算法的配置（JSON）。
     dllm_algorithm_config: Optional[str] = None
 
     # Offloading
+    # 中译：卸载到 CPU 的权重显存量（GB）,用于显存不足时换出权重。
     cpu_offload_gb: int = 0
+    # 中译：卸载分组大小,-1 表示不分组。
     offload_group_size: int = -1
+    # 中译：每组中常驻 GPU 的数量。
     offload_num_in_group: int = 1
+    # 中译：卸载预取步数（提前多少步把权重搬回 GPU）。
     offload_prefetch_step: int = 1
+    # 中译：卸载目标位置（cpu/disk 等）。
     offload_mode: str = "cpu"
 
     # Scoring configuration
@@ -738,186 +1003,318 @@ class ServerArgs:
     # into a single sequence for efficient batch processing. Item boundaries are
     # determined by pre-computed delimiter indices (from item lengths), not by the
     # placeholder token. See MIS_DELIMITER_TOKEN_ID for details.
+    # 中译：启用多项打分（Multi-Item Scoring）优化。把 query 与多个候选项拼成单条序列以高效批处理；
+    #       候选项边界由预先计算的分隔符索引（来自各项长度）决定,而非占位 token。详见 MIS_DELIMITER_TOKEN_ID。
     enable_mis: bool = False
 
     # Optimization/debug options
+    # 中译：禁用 radix（基数树）前缀缓存。
     disable_radix_cache: bool = False
+    # 中译：禁用 CUDA Graph 的 batch 维度 padding（padding 用于复用同一张图）。
     disable_cuda_graph_padding: bool = False
+    # 中译：启用对 CUDA Graph 捕获过程的性能剖析。
     enable_profile_cuda_graph: bool = False
+    # 中译：在 CUDA Graph 捕获期间启用 GC。
     enable_cudagraph_gc: bool = False
+    # 中译：CUDA Graph 调试模式（逐图校验,定位捕获/replay 问题）。
     debug_cuda_graph: bool = False
 
     # Accepts dict (CLI JSON / SDK) at construction time; normalized to
     # CudaGraphConfig by _parse_cuda_graph_config.
+    # 中译：CUDA Graph 总配置。构造时可接收 dict（CLI JSON / SDK）,随后由
+    #       _parse_cuda_graph_config 规整为 CudaGraphConfig 对象。
     cuda_graph_config: Optional[CudaGraphConfig] = None
 
     # Per-phase convenience CLI inputs that fold into cuda_graph_config.
+    # 中译：以下为按阶段（decode/prefill）拆分的便捷 CLI 输入,最终会合并进 cuda_graph_config。
+    # 中译：decode 阶段的 CUDA Graph 后端模式（full 全图 / breakable 可打断 / tc_piecewise 分段 / disabled 关闭）。
     cuda_graph_backend_decode: Optional[
         Literal["full", "breakable", "tc_piecewise", "disabled"]
     ] = None
+    # 中译：prefill 阶段的 CUDA Graph 后端模式。
     cuda_graph_backend_prefill: Optional[
         Literal["breakable", "tc_piecewise", "disabled"]
     ] = None
+    # 中译：decode 阶段 CUDA Graph 捕获的最大 batch size。
     cuda_graph_max_bs_decode: Optional[int] = None
+    # 中译：prefill 阶段 CUDA Graph 捕获的最大 batch size。
     cuda_graph_max_bs_prefill: Optional[int] = None
+    # 中译：decode 阶段需捕获的 batch size 列表（显式枚举）。
     cuda_graph_bs_decode: Optional[List[int]] = None
+    # 中译：prefill 阶段需捕获的 batch size 列表。
     cuda_graph_bs_prefill: Optional[List[int]] = None
+    # 中译：tc_piecewise 模式下使用的编译器（eager / inductor）。
     cuda_graph_tc_compiler: Optional[Literal["eager", "inductor"]] = None
     # Boolean per-phase off-switches; convenience for
     # --cuda-graph-backend-{prefill,decode}=disabled.
+    # 中译：按阶段关闭 CUDA Graph 的布尔开关,等价于 --cuda-graph-backend-{prefill,decode}=disabled。
     disable_prefill_cuda_graph: bool = False
     disable_decode_cuda_graph: bool = False
 
     # Legacy CLI inputs that fold into cuda_graph_config (with a CLI
     # deprecation warning). Internal-only after parsing.
+    # 中译：遗留 CLI 输入,会折叠进 cuda_graph_config（并给出弃用告警）；解析后仅内部使用。
+    # 中译：全局禁用 CUDA Graph。
     disable_cuda_graph: bool = False
+    # 中译：启用逐层 NVTX 标记（便于在 Nsight 中按层分析）。
     enable_layerwise_nvtx_marker: bool = False
+    # 中译：启用 NCCL NVLS（NVLink SHARP）集合通信加速。
     enable_nccl_nvls: bool = False
+    # 中译：启用对称内存（symmetric memory）通信优化。
     enable_symm_mem: bool = False
+    # 中译：禁用 FlashInfer CUTLASS MoE fp4 的 all-gather 路径。
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
+    # 中译：启用分词器批量编码（一次编码多条请求）。
     enable_tokenizer_batch_encode: bool = False
+    # 中译：禁用反分词器的批量解码。
     disable_tokenizer_batch_decode: bool = False
+    # 中译：禁用 outlines 语法编译结果的磁盘缓存。
     disable_outlines_disk_cache: bool = False
+    # 中译：禁用自定义 all-reduce 内核（回退到 NCCL）。
     disable_custom_all_reduce: bool = False
+    # 中译：启用 MSCCL++ 通信库。
     enable_mscclpp: bool = False
+    # 中译：启用 torch 对称内存。
     enable_torch_symm_mem: bool = False
+    # 中译：预热 NCCL/RCCL 以降低 P99 TTFT 冷启动延迟（AMD/HIP 默认 True,其余默认 False）。
     pre_warm_nccl: bool = dataclasses.field(
         default_factory=lambda: is_hip()
     )  # Pre-warm NCCL/RCCL to reduce P99 TTFT cold-start latency (default: True for AMD/HIP, False for others)
+    # 中译：禁用 overlap 调度（计算与调度/通信的重叠）。
     disable_overlap_schedule: bool = False
+    # 中译：启用混合分块（prefill 与 decode 混合到同一批）。
     enable_mixed_chunk: bool = False
+    # 中译：启用 DP attention（注意力数据并行）。
     enable_dp_attention: bool = False
+    # 中译：DP attention 下使用本地控制信息广播（优化项）。
     enable_dp_attention_local_control_broadcast: bool = False
+    # 中译：启用 DP 下的 lm_head（输出层数据并行）。
     enable_dp_lm_head: bool = False
+    # 中译：启用双批重叠（two-batch overlap,TBO）以提升吞吐。
     enable_two_batch_overlap: bool = False
+    # 中译：启用单批重叠（single-batch overlap,SBO）。
     enable_single_batch_overlap: bool = False
+    # 中译：TBO 的 token 分布阈值（决定如何把 token 切到两个重叠批）。
     tbo_token_distribution_threshold: float = 0.48
+    # 中译：启用 torch.compile 编译加速。
     enable_torch_compile: bool = False
+    # 中译：torch.compile 调试模式。
     enable_torch_compile_debug_mode: bool = False
+    # 中译：torch.compile 生效的最大 batch size（超过则走 eager）。
     torch_compile_max_bs: int = 32
+    # 中译：TorchAO 量化/优化配置。
     torchao_config: str = ""
+    # 中译：启用 GPU 间 P2P 可达性检查。
     enable_p2p_check: bool = False
+    # 中译：Triton 注意力中以 fp32 做归约以提升数值精度。
     triton_attention_reduce_in_fp32: bool = False
+    # 中译：Triton 注意力沿 KV 维度的切分数（影响并行度/性能）。
     triton_attention_num_kv_splits: int = 8
+    # 中译：Triton 注意力切分 tile 大小。
     triton_attention_split_tile_size: Optional[int] = None
+    # 中译：连续 decode 步数（一次调度连续解码多少步以减少调度开销）。
     num_continuous_decode_steps: int = 1
+    # 中译：加载完成后删除本地 checkpoint 文件以释放磁盘。
     delete_ckpt_after_loading: bool = False
+    # 中译：启用显存节省器（torch memory saver,支持 sleep/wake 释放显存）。
     enable_memory_saver: bool = False
+    # 中译：在 CPU 上备份权重（便于快速恢复/热更新）。
     enable_weights_cpu_backup: bool = False
+    # 中译：在 CPU 上备份草稿模型权重。
     enable_draft_weights_cpu_backup: bool = False
+    # 中译：输入超过上下文长度时允许自动截断（而非报错）。
     allow_auto_truncate: bool = False
+    # 中译：启用自定义 logit 处理器（请求可携带自定义 logits 处理逻辑）。
     enable_custom_logit_processor: bool = False
+    # 中译：禁用 FlashInfer MLA 的 ragged（变长）路径。
     flashinfer_mla_disable_ragged: bool = False
+    # 中译：禁用共享专家融合（shared experts fusion）优化。
     disable_shared_experts_fusion: bool = False
+    # 中译：强制启用共享专家融合（覆盖自动判定）。
     enforce_shared_experts_fusion: bool = False
+    # 中译：禁用分块前缀缓存（chunked prefix cache）。
     disable_chunked_prefix_cache: bool = False
+    # 中译：禁用快速图像处理器（回退到慢速 HF 处理器）。
     disable_fast_image_processor: bool = False
+    # 中译：将多模态特征保留在设备（GPU）上而不回传 CPU。
     keep_mm_feature_on_device: bool = False
+    # 中译：在响应中返回隐藏状态（hidden states）。
     enable_return_hidden_states: bool = False
+    # 中译：在响应中返回 MoE 路由命中的专家。
     enable_return_routed_experts: bool = False
+    # 中译：在响应中返回 indexer 的 top-k 结果（DSA 相关）。
     enable_return_indexer_topk: bool = False
+    # 中译：启用 DeepSeek V4 的 fp4 indexer。
     enable_deepseek_v4_fp4_indexer: bool = False
+    # 中译：scheduler 接收消息的轮询间隔（步数）。
     scheduler_recv_interval: int = 1
+    # 中译：绑定的 NUMA 节点列表。
     numa_node: Optional[List[int]] = None
+    # 中译：启用确定性推理（牺牲部分性能换取可复现结果）。
     enable_deterministic_inference: bool = False
+    # 中译：RL on-policy 训练目标（用于强化学习场景的权重对齐）。
     rl_on_policy_target: Optional[str] = None
+    # 中译：启用注意力 TP 输入散射（input scattered）优化。
     enable_attn_tp_input_scattered: bool = False
+    # 中译：禁用注意力 TP 的 gather（与上一项配套的通信优化）。
     disable_attn_tp_gather: bool = False
+    # 中译：Python GC 阈值（gen0/1/2 三档）。
     gc_threshold: Optional[List[int]] = None
+    # 中译：KV canary 校验模式（用于检测 KV 缓存损坏/串扰）；"none" 关闭。
     kv_canary: str = "none"
+    # 中译：KV canary 使用真实数据进行校验的模式。
     kv_canary_real_data: str = "none"
+    # 中译：KV canary 的扫描间隔；0 表示不扫描。
     kv_canary_sweep_interval: int = 0
+    # 中译：启用 QK norm 与 RoPE 的融合算子。
     enable_fused_qk_norm_rope: bool = False
+    # 中译：启用更精确的 embedding 插值（多模态位置编码相关）。
     enable_precise_embedding_interpolation: bool = False
+    # 中译：启用 fused MoE sum + all-reduce 融合算子。
     enable_fused_moe_sum_all_reduce: bool = False
 
     # Context parallelism (unified API)
+    # 中译：启用 prefill 阶段的上下文并行（Context Parallel,按序列长度切分到多卡）。
     enable_prefill_cp: bool = False
     # "zigzag" is former in-seq-split; "interleave" is former round-robin-split.
+    # 中译：上下文并行的切分策略。"zigzag"（原 in-seq-split）/"interleave"（原 round-robin-split）。
     cp_strategy: Optional[str] = None
 
     # Context parallelism (deprecated aliases)
+    # 中译：以下为上下文并行的弃用别名,保留以兼容旧 CLI。
+    # 中译：（弃用）启用 DSA prefill 上下文并行。
     enable_dsa_prefill_context_parallel: bool = False
+    # 中译：（弃用）DSA prefill 上下文并行的切分模式。
     dsa_prefill_cp_mode: str = "round-robin-split"
+    # 中译：（弃用）启用 prefill 上下文并行。
     enable_prefill_context_parallel: bool = False
+    # 中译：（弃用）prefill 上下文并行的切分模式。
     prefill_cp_mode: str = "in-seq-split"
 
     # Dynamic batch tokenizer
+    # 中译：启用动态批量分词（把并发到达的分词请求动态攒批）。
     enable_dynamic_batch_tokenizer: bool = False
+    # 中译：动态批量分词的批大小。
     dynamic_batch_tokenizer_batch_size: int = 32
+    # 中译：动态批量分词的攒批超时（秒）,到时即发车。
     dynamic_batch_tokenizer_batch_timeout: float = 0.002
 
     # Debug tensor dumps
+    # 中译：调试用张量转储的输出目录。
     debug_tensor_dump_output_folder: Optional[str] = None
     # None means dump all layers.
+    # 中译：需要转储张量的层索引列表；None 表示转储所有层。
     debug_tensor_dump_layers: Optional[List[int]] = None
     # TODO(guoyuhong): clean the old dumper code.
+    # 中译：转储调试的输入文件（用于复现特定输入）。
     debug_tensor_dump_input_file: Optional[str] = None
+    # 中译：是否注入（inject）转储的张量进行对拍。
     debug_tensor_dump_inject: bool = False
 
     # PD disaggregation: can be "null" (not disaggregated), "prefill" (prefill-only), or "decode" (decode-only)
+    # 中译：PD 分离（prefill/decode 分离部署）模式：null 不分离 / prefill 仅做 prefill / decode 仅做 decode。
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
+    # 中译：PD 分离下 KV 缓存的传输后端（mooncake/nixl 等）。
     disaggregation_transfer_backend: str = "mooncake"
+    # 中译：PD 分离的 bootstrap（建联/握手）端口。
     disaggregation_bootstrap_port: int = 8998
+    # 中译：PD 分离 KV 传输使用的 InfiniBand 设备。
     disaggregation_ib_device: Optional[str] = None
+    # 中译：PD 分离的 decode 节点上启用 radix 前缀缓存。
     disaggregation_decode_enable_radix_cache: bool = False
+    # 中译：PD 分离的 decode 节点上启用 KV 缓存卸载。
     disaggregation_decode_enable_offload_kvcache: bool = False
-    num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
+    num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD  # 中译：PD 分离中为 decode KV 缓存卸载预留的 token 数。
     # FIXME: hack to reduce ITL when decode bs is small
+    # 中译：（FIXME 临时手段）decode batch 较小时降低 ITL 的轮询间隔。
     disaggregation_decode_polling_interval: int = 1
+    # 中译：乐观 prefill 重试次数（PD 分离中 prefill 失败时的乐观重试）。
     optimistic_prefill_retries: int = 0
 
     # Encode prefill disaggregation
+    # 中译：仅作为编码器（encoder）节点运行（encode/prefill 分离部署）。
     encoder_only: bool = False
+    # 中译：仅作为语言模型节点运行（不含视觉编码器）。
     language_only: bool = False
+    # 中译：编码器与语言模型间特征传输的后端。
     encoder_transfer_backend: str = ENCODER_TRANSFER_BACKEND_CHOICES[0]
+    # 中译：编码器节点的地址列表。
     encoder_urls: List[str] = dataclasses.field(default_factory=list)
     # Port of the standalone EncoderBootstrapServer started by the language-only
     # tokenizer manager.  Encoder workers register here.
+    # 中译：language-only 的 tokenizer manager 启动的独立 EncoderBootstrapServer 端口,编码器 worker 在此注册。
     encoder_bootstrap_port: int = 8997
+    # 中译：编码器主动注册到语言节点时使用的地址列表。
     encoder_register_urls: List[str] = dataclasses.field(default_factory=list)
+    # 中译：启用向编码器的自适应分发（按负载动态选择编码器）。
     enable_adaptive_dispatch_to_encoder: bool = False
 
     # For model weight update and weight loading
+    # 中译：自定义权重加载器（按完整类路径指定,可多个）。
     custom_weight_loader: Optional[List[str]] = None
+    # 中译：加载权重时禁用 mmap（改为直接读入内存）。
     weight_loader_disable_mmap: bool = False
+    # 中译：预取（prefetch）checkpoint 文件以加速加载。
     weight_loader_prefetch_checkpoints: bool = False
+    # 中译：权重预取使用的线程数。
     weight_loader_prefetch_num_threads: int = 4
+    # 中译：加载完成后清理页缓存（drop cache）以释放内存。
     weight_loader_drop_cache_after_load: bool = False
+    # 中译：远程实例权重加载——种子实例（seed instance）的 IP。
     remote_instance_weight_loader_seed_instance_ip: Optional[str] = None
+    # 中译：远程实例权重加载——种子实例的服务端口。
     remote_instance_weight_loader_seed_instance_service_port: Optional[int] = None
+    # 中译：远程实例权重加载——发送权重的通信组端口列表。
     remote_instance_weight_loader_send_weights_group_ports: Optional[List[int]] = None
+    # 中译：远程实例权重加载后端（transfer_engine/nccl/modelexpress）。
     remote_instance_weight_loader_backend: Literal[
         "transfer_engine", "nccl", "modelexpress"
     ] = "nccl"
+    # 中译：通过 transfer_engine 启动种子实例。
     remote_instance_weight_loader_start_seed_via_transfer_engine: bool = False
+    # 中译：引擎信息（engine info）bootstrap 端口。
     engine_info_bootstrap_port: int = 6789
+    # 中译：ModelExpress 权重加载配置。
     modelexpress_config: Optional[str] = None
 
     # For PD-Multiplexing
+    # 中译：启用 PD 复用（PD-Multiplexing,prefill 与 decode 在同卡上按 SM 分组复用）。
     enable_pdmux: bool = False
+    # 中译：PD 复用配置文件路径。
     pdmux_config_path: Optional[str] = None
+    # 中译：PD 复用的 SM 分组数（把 GPU 的 SM 划成几组）。
     sm_group_num: int = 8
 
     # For Multi-Modal
+    # 中译：将多模态输入的预处理结果广播到各 worker（避免重复处理）。
     enable_broadcast_mm_inputs_process: bool = False
+    # 中译：启用多模态前缀缓存（复用相同图像/视频特征）。
     enable_prefix_mm_cache: bool = False
+    # 中译：多模态编码器使用数据并行。
     mm_enable_dp_encoder: bool = False
+    # 中译：多模态预处理配置。
     mm_process_config: Optional[Dict[str, Any]] = None
+    # 中译：单请求多模态数据数量上限（如最多几张图）；可为字符串或 {模态: 上限} 字典。
     limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
+    # 中译：启用多模态全局缓存（跨请求复用多模态特征）。
     enable_mm_global_cache: bool = False
 
     # For checkpoint decryption
+    # 中译：解密后的模型配置文件路径（加密 checkpoint 场景）。
     decrypted_config_file: Optional[str] = None
+    # 中译：解密后的草稿模型配置文件路径。
     decrypted_draft_config_file: Optional[str] = None
 
     # For forward hooks
+    # 中译：前向钩子（forward hooks）列表,用于在前向过程中插入自定义回调。
     forward_hooks: Optional[List[dict[str, Any]]] = None
 
     # For communications compression
+    # 中译：启用通信量化压缩（对集合通信数据做量化以减少带宽）。
     enable_quant_communications: Optional[bool] = False
 
     # For msProbe
+    # 中译：msProbe（精度/性能探针工具）的转储配置。
     msprobe_dump_config: Optional[str] = None
 
     def __post_init__(self):

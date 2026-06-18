@@ -26,25 +26,35 @@
 一切执行都围绕 `ForwardBatch` 展开,必须先读它。
 
 - 精读 `forward_batch_info.py`
-  - `ForwardMode`(forward_batch_info.py:81):区分 `EXTEND`/`DECODE`/`IDLE`/`TARGET_VERIFY` 等前向模式,这是后续所有分支逻辑的总开关。
-  - `ForwardBatch`:逐字段理解它承载的张量元数据(input_ids、positions、seq_lens、KV 索引、attention 元信息等)。
-  - `CaptureHiddenMode`(forward_batch_info.py:196)、`PPProxyTensors`:理解隐藏态捕获与流水线并行的代理张量。
+  - `ForwardMode`(forward_batch_info.py:83):区分 `EXTEND`/`DECODE`/`IDLE`/`TARGET_VERIFY` 等前向模式,这是后续所有分支逻辑的总开关。
+  - `ForwardBatch`(:304):逐字段理解它承载的张量元数据(input_ids、positions、seq_lens、KV 索引、attention 元信息等)。
+  - `CaptureHiddenMode`(:220)、`PPProxyTensors`(:1430):理解隐藏态捕获与流水线并行的代理张量。
 - 自测问题:`ModelWorkerBatch`(在 `managers/schedule_batch.py`)和 `ForwardBatch` 的边界在哪?谁负责把前者转成后者?
 
 ### 阶段二:执行主线 —— ModelRunner 的生命周期(1~2 天)
 
-`model_runner.py` 是本目录的核心(3000 行),不要逐行读,按"初始化 → 加载 → 前向"三条主线抓主干。
+`model_runner.py` 是本目录的核心(3000+ 行),不要逐行读,按"初始化 → 加载 → 前向"三条主线抓主干。
 
-- 初始化链路:`__init__`(model_runner.py:288)→ `initialize`(:460)→ `init_torch_distributed`(:881)→ `load_model`(:1063)→ `init_attention_backend`(:1918)。
-- 前向入口(最终目标):`forward_decode`(:2597)、`forward_extend`(:2620)、`forward_idle`(:2660)。对照阶段一的 `ForwardMode` 看分发逻辑。
-- `_dummy_run`(:2087):理解预热/捕获时如何构造假批次。
+- 初始化链路(按调用顺序):
+  - `__init__`(model_runner.py:395):保存 server_args、设备/并行 rank 等基础字段,初始化各类占位属性,随后调用 `initialize`。
+  - `initialize`(:741):核心初始化流程。依次完成内存节省器创建、专家位置/分布记录初始化、加载模型、计算有效层范围、应用量化/张量并行/LoRA,并推导 KV cache dtype。
+  - `init_torch_distributed`(:1294):初始化 torch 分布式环境。绑定设备、选择通信后端、设置 all-reduce 策略、初始化各并行组(TP/PP/EP/DP)、预热 NCCL/RCCL,并返回模型加载前的可用显存。
+  - `load_model`(:1504):加载模型权重。包含设备能力检查与 dtype 回退、准备模型配置、调用对应 loader 加载权重。
+  - `init_backends`(:992):初始化注意力后端并捕获 CUDA Graph 的**统一入口**,按设备(cuda/cpu/npu/其他)分支,内部依次调用下面的 `init_attention_backend` 与 `init_decode_cuda_graph`/`init_prefill_cuda_graph`。
+  - `init_attention_backend`(:2627):初始化注意力核后端本身,按是否启用 PDMux / 双 batch overlap 走不同分支。
+- 前向入口(最终目标),对照阶段一的 `ForwardMode` 看分发逻辑:
+  - `forward_decode`(:3563):执行一次解码(decode)前向的 eager 路径(未命中 CUDA Graph 时)。
+  - `forward_extend`(:3619):执行一次 EXTEND(预填/拓展)前向,返回 `(输出, 是否命中分段 CUDA Graph)`。
+  - `forward_idle`(:3725):执行空闲(IDLE)前向;DP attention 下用于 MLP 同步的(可能被 padding 的)空批次。
+- `_dummy_run`(:2900):运行一次虚拟(dummy)前向,用于预热/profiling,可通过 `forward_mode_override` 强制 EXTEND/DECODE 模式。
 - 暂时跳过:权重热更新(`update_weights_from_*`)、LoRA、各类模型特化 config,用到再回看。
 - 自测问题:`TpModelWorker`(`managers/tp_worker.py`)如何调用 `ModelRunner` 的 forward?(连接上一轮关于 worker 的认知)
 
 ### 阶段三:显存与 KV cache(1 天)
 
 - 精读 `model_runner_kv_cache_mixin.py`:`ModelRunnerKVCacheMixin` 与 `MemoryPoolConfig`,理解 MHA/MLA/双稀疏/混合线性/FP4 等不同 KV cache 池的创建与差异。
-- `configure_kv_cache_dtype`(model_runner.py:1861)、`max_token_pool_size`(:1838):显存预算如何决定可容纳的 token 数。
+- `configure_kv_cache_dtype`(model_runner.py:2567):根据 `--kv-cache-dtype` 与模型量化配置确定 KV cache 的实际数据类型(auto/fp8_e5m2/fp8_e4m3/bf16/fp4_e2m1 等),HIP 与非 HIP 平台取用不同的 fp8 表示。
+- `max_token_pool_size`(:2525):返回考虑了混合 SWA 设置后的最大 token 池大小,即显存预算最终决定可容纳的 token 数。
 - 自测问题:为什么 MLA 模型的 KV cache 布局和标准 MHA 不同?
 
 ### 阶段四:性能优化 —— 图捕获与重放(1~2 天)
@@ -54,7 +64,9 @@
 - `cuda_graph_runner.py`:`CudaGraphRunner` 与 `DecodeInputBuffers`,decode 阶段的捕获/重放。先理解"固定 shape 才能 replay"这一约束。
 - `piecewise_cuda_graph_runner.py`:`PiecewiseCudaGraphRunner`,配合 torch.compile 处理变长 prefill。
 - `input_buffers.py`:`ForwardInputBuffers`,跨批次复用的输入缓冲池(图捕获依赖固定地址)。
-- `init_device_graphs`(model_runner.py:2393)、`init_piecewise_cuda_graphs`(:2439):捕获的触发入口。
+- `init_decode_cuda_graph`(model_runner.py:3200):decode 阶段设备图(CUDA/CPU/NPU graph)的捕获入口,仅对生成类模型生效。(旧名 `init_device_graphs`)
+- `init_prefill_cuda_graph`(:3262):prefill 阶段分段(piecewise)CUDA Graph runner 的初始化入口,从模型中收集注意力层/MoE 层/indexer 后在满足条件时捕获,多种不支持场景下提前返回。(旧名 `init_piecewise_cuda_graphs`)
+- 两者均由阶段二的 `init_backends`(:992) 统一触发。
 - `cpu_graph_runner.py`:CPU torch.compile 版本,接口对齐 CUDA Graph,可对照理解抽象边界。
 
 ### 阶段五:特化与扩展(按需,0.5 天)

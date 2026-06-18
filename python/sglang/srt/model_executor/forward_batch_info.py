@@ -81,35 +81,53 @@ _is_npu = is_npu()
 
 
 class ForwardMode(IntEnum):
+    # 中译：ForwardMode 描述一个前向批次（batch）处于哪种计算阶段/场景，
+    #       它决定了注意力后端、CUDA Graph、位置编码等的处理方式。继承 IntEnum，取值由 auto() 递增生成。
+
     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
     # It is also called "prefill" in common terminology.
+    # 中译：EXTEND（扩展）——处理输入提示词阶段。序列开头部分的 KV cache 可能已经算好（如系统提示/前缀缓存），
+    #       只需补算剩余部分。即通常所说的 "prefill"。
     EXTEND = auto()
     # Decode one token.
+    # 中译：DECODE（解码）——自回归生成阶段，每步只前向一个新 token（复用已有 KV cache）。
     DECODE = auto()
     # Contains both EXTEND and DECODE when doing chunked prefill.
+    # 中译：MIXED（混合）——做 chunked prefill（分块预填充）时，同一批次里同时包含 EXTEND 和 DECODE 的请求。
     MIXED = auto()
     # No sequence to forward. For data parallel attention, some workers will be IDLE if no sequence are allocated.
+    # 中译：IDLE（空转）——本次没有序列需要前向。在 DP 注意力下，某些 worker 若未分到请求就会处于 IDLE（仍需参与集体通信以保持同步）。
     IDLE = auto()
 
     # Used in speculative decoding: verify a batch in the target model.
+    # 中译：TARGET_VERIFY——推测解码（speculative decoding）中，用「目标模型」对草稿 token 进行一次性验证的批次。
     TARGET_VERIFY = auto()
     # Used in speculative decoding: extend a batch in the draft model.
+    # 中译：DRAFT_EXTEND_V2——推测解码中，「草稿模型」（如 EAGLE v2）对批次做 extend 的阶段。
     DRAFT_EXTEND_V2 = auto()
 
     # Used in disaggregated decode worker
     # Represent a batch of requests having their KV cache ready to start decoding
+    # 中译：PREBUILT（预构建）——用于 PD 分离（disaggregation）的 decode worker：
+    #       表示一批请求的 KV cache 已准备就绪（由 prefill 节点传来），可直接开始 decode。
     PREBUILT = auto()
 
     # Split Prefill for PD multiplexing
+    # 中译：SPLIT_PREFILL——用于 PD 复用（multiplexing）场景的分段 prefill，把 prefill 拆成多段以与 decode 交替执行。
     SPLIT_PREFILL = auto()
 
     # Used in dLLM
+    # 中译：DLLM_EXTEND——用于扩散式 LLM（Diffusion LLM）的 extend 阶段（按 block 块为单位去噪生成）。
     DLLM_EXTEND = auto()
 
     def is_prefill(self, include_draft_extend_v2: bool = False):
+        # 中译：是否为 prefill 阶段。语义上等价于 is_extend（prefill 是 extend 的通俗叫法）。
         return self.is_extend(include_draft_extend_v2=include_draft_extend_v2)
 
     def is_extend(self, include_draft_extend_v2: bool = False):
+        # 中译：是否为「扩展类」批次。广义的 extend 涵盖多种需要「一次前向多个 token」的场景：
+        #       EXTEND / MIXED / TARGET_VERIFY / SPLIT_PREFILL / DLLM_EXTEND；
+        #       是否把 DRAFT_EXTEND_V2 也算在内，由参数 include_draft_extend_v2 控制。
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
@@ -120,6 +138,8 @@ class ForwardMode(IntEnum):
         )
 
     def is_context_parallel_extend(self, include_draft_extend_v2: bool = False):
+        # 中译：是否为「上下文并行（context parallel）」适用的 extend。
+        #       仅 EXTEND / MIXED（以及可选的 DRAFT_EXTEND_V2）才适用 CP 切分。
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
@@ -131,25 +151,33 @@ class ForwardMode(IntEnum):
         )
 
     def is_decode(self):
+        # 中译：是否为 DECODE（逐 token 解码）阶段。
         return self == ForwardMode.DECODE
 
     def is_mixed(self):
+        # 中译：是否为 MIXED（extend 与 decode 混合，即 chunked prefill）。
         return self == ForwardMode.MIXED
 
     def is_idle(self):
+        # 中译：是否为 IDLE（空转，无序列可前向）。
         return self == ForwardMode.IDLE
 
     def is_decode_or_idle(self):
+        # 中译：是否为 DECODE 或 IDLE。两者在张量 shape/CUDA Graph 处理上常被同等看待。
         return self == ForwardMode.DECODE or self == ForwardMode.IDLE
 
     def is_target_verify(self):
+        # 中译：是否为 TARGET_VERIFY（推测解码的目标模型验证阶段）。
         return self == ForwardMode.TARGET_VERIFY
 
     def is_draft_extend_v2(self):
         # For fixed shape logits output in eagle v2 worker
+        # 中译：是否为 DRAFT_EXTEND_V2。用于 EAGLE v2 worker 中输出固定 shape 的 logits。
         return self == ForwardMode.DRAFT_EXTEND_V2
 
     def is_extend_or_draft_extend_or_mixed(self, include_draft_extend_v2: bool = False):
+        # 中译：是否为 EXTEND / MIXED / SPLIT_PREFILL（以及可选的 DRAFT_EXTEND_V2）。
+        #       注意：与 is_extend 不同，此处不包含 TARGET_VERIFY 与 DLLM_EXTEND。
         return (
             self == ForwardMode.EXTEND
             or self == ForwardMode.MIXED
@@ -158,6 +186,8 @@ class ForwardMode(IntEnum):
         )
 
     def is_cuda_graph(self):
+        # 中译：该模式是否可使用 CUDA Graph。这些模式输入 shape 固定/可推导，适合图捕获加速：
+        #       DECODE / TARGET_VERIFY / IDLE / DLLM_EXTEND。
         return (
             self == ForwardMode.DECODE
             or self == ForwardMode.TARGET_VERIFY
@@ -166,18 +196,23 @@ class ForwardMode(IntEnum):
         )
 
     def is_cpu_graph(self):
+        # 中译：该模式是否可使用 CPU 图（仅 DECODE）。
         return self == ForwardMode.DECODE
 
     def is_split_prefill(self):
+        # 中译：是否为 SPLIT_PREFILL（PD 复用的分段 prefill）。
         return self == ForwardMode.SPLIT_PREFILL
 
     def is_extend_without_speculative(self):
+        # 中译：是否为「不含推测」的 extend：是 extend 但不是 TARGET_VERIFY。
         return self.is_extend() and not self.is_target_verify()
 
     def is_prebuilt(self):
+        # 中译：是否为 PREBUILT（PD 分离中 KV cache 已就绪、可直接 decode）。
         return self == ForwardMode.PREBUILT
 
     def is_dllm_extend(self):
+        # 中译：是否为 DLLM_EXTEND（扩散式 LLM 的 extend 阶段）。
         return self == ForwardMode.DLLM_EXTEND
 
 

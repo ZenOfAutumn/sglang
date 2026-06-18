@@ -77,7 +77,6 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_round_robin_input_ids,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
-    prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import RadixAttention
@@ -112,9 +111,6 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
 )
 from sglang.srt.models.deepseek_common.utils import _use_aiter_bpreshuffle_gfx95
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
-from sglang.srt.models.triton_ops.deepseek_v4 import (
-    rms_normalize_triton as rms_normalize_triton,
-)
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -260,6 +256,24 @@ bcg_deepseek_v4_attention_with_output = eager_on_graph(True)(
 
 
 class MQALayer(nn.Module):
+    """中译：DeepSeek-V4 的注意力层（MQA = Multi-Query Attention 风格，共享 KV 头）。
+
+    负责单个 Transformer 层的自注意力计算，并集成了 DeepSeek-V4 特有的几项机制：
+    - 「压缩（Compressor）+ 索引器（C4Indexer）」：根据每层的 compress_ratio（0/4/128）对 KV 做稀疏/压缩注意力，
+      降低长上下文的计算与显存开销；
+    - 「RoPE 旋转位置编码」：使用 deepseek_yarn 缩放，并预计算 freqs_cis（复数频率表）；
+    - 「多流并行（multi-stream overlap）」：可选地用多个 CUDA Stream 重叠计算以提速；
+    - 「上下文并行（DSA prefill CP）」：在 prefill 阶段可按上下文并行切分序列。
+
+    关键参数：
+        config：DeepSeek-V4 模型配置。
+        layer_id：层编号（决定该层的 compress_ratio 等）。
+        quant_config：量化配置（可选）。
+        prefix：参数名前缀，用于权重加载时的命名。
+        alt_streams：用于多流重叠的备用 CUDA Stream 列表。
+        compress_ratio_override：强制覆盖该层的压缩比（可选）。
+    """
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -1014,6 +1028,20 @@ class MQALayer(nn.Module):
 
 
 class DeepseekV4DecoderLayer(nn.Module):
+    """中译：DeepSeek-V4 的单个解码器层（Decoder Layer）。
+
+    一个标准 Transformer 块，把上面的 MQALayer（自注意力）与 MoE/MLP 组合起来，包含：
+    - self_attn：MQALayer 自注意力；
+    - mlp：DeepseekV2MoE 专家混合（MoE）层（复用 deepseek_v2 实现，is_deepseek_v4=True）；
+    - input_layernorm / post_attention_layernorm：两个 RMSNorm 归一化；
+    - hc_*（hyper-connection 超连接相关参数）：用于层间残差/路由的加权混合（配合 Sinkhorn 迭代）。
+
+    关键参数：
+        config / layer_id / quant_config / prefix / alt_streams / compress_ratio_override：含义同 MQALayer。
+        moe_quant_config_override：单独覆盖 MoE 部分的量化配置（可选）。
+        is_nextn：是否为 NextN（多 token 预测 / MTP）层。
+    """
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -1532,6 +1560,17 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 class DeepseekV4Model(nn.Module):
+    """中译：DeepSeek-V4 的主干网络（不含语言建模头）。
+
+    负责把输入 token 嵌入并依次过所有 DeepseekV4DecoderLayer，最后输出隐藏状态：
+    - embed_tokens：词表嵌入（仅流水线 PP 首 rank 有，其余 rank 为 PPMissingLayer 占位）；
+    - layers：由 make_layers 按流水线切分构造的解码器层区间 [start_layer, end_layer)；
+    - norm：最终 RMSNorm（仅流水线末 rank 有）；
+    - alt_streams：预分配的多 CUDA Stream 池，供各层多流重叠复用。
+
+    类属性 fall_back_to_pt_during_load：加载权重时是否回退到 PyTorch 原生加载（这里为 False）。
+    """
+
     fall_back_to_pt_during_load = False
 
     def __init__(
@@ -1719,6 +1758,17 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
+    """中译：DeepSeek-V4 用于因果语言建模（Causal LM）的顶层入口类。
+
+    是整个模型对外的总装配，SGLang 加载模型时实例化的就是这个类，包含：
+    - model：DeepseekV4Model 主干；
+    - lm_head：语言建模头（仅流水线末 rank 有；可与 embed_tokens 共享权重）；
+    - logits_processor：把隐藏状态映射为词表 logits；
+    - 专家相关：处理融合共享专家（fused shared experts）与专家权重的惰性获取（LazyValue）。
+
+    关键参数：config 模型配置；quant_config 量化配置；prefix 权重命名前缀。
+    """
+
     def __init__(
         self,
         config: DeepSeekV4Config,

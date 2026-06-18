@@ -77,9 +77,20 @@ class AttentionArch(IntEnum):
 
 
 class ModelImpl(str, Enum):
+    """模型实现后端枚举：决定用哪一套建模代码来构建/运行模型。
+
+    继承 `str`，因此既可当字符串使用，也可作为枚举比较。
+    具体的解析与回退逻辑见 `model_loader/utils.py`。
+    """
+
+    # 自动选择：优先使用 SGLang 原生实现，若该架构未被原生支持则回退到
+    # HuggingFace Transformers 实现(也会根据架构识别 MindSpore)。
     AUTO = "auto"
+    # 强制使用 SGLang 原生实现(性能最优，但仅限已适配的模型架构)。
     SGLANG = "sglang"
+    # 强制使用 HuggingFace Transformers 的建模实现(兼容性最好，覆盖面最广)。
     TRANSFORMERS = "transformers"
+    # 使用 MindSpore(华为昇思)后端的建模实现。
     MINDSPORE = "mindspore"
 
 
@@ -158,26 +169,52 @@ def get_num_indexer_layers(config) -> int:
 
 
 class ModelConfig:
+    """模型配置类。
+
+    封装从模型路径加载的 HuggingFace 配置(`hf_config`)，并在其基础上推导出
+    SGLang 运行时所需的各类元信息(注意力架构、隐藏层维度、头数、上下文长度、
+    量化方式、多模态/嵌入开关等)，是模型加载与执行链路的核心配置载体。
+    """
+
     def __init__(
         self,
+        # 模型路径或 HF 模型 ID(本地目录、HF Hub 仓库名，或 runai 对象存储 URI)。
         model_path: str,
+        # 是否信任并执行模型仓库中自带的远程代码(自定义建模文件)。
         trust_remote_code: bool = True,
+        # 模型版本(HF 的分支名/标签/commit hash)，None 表示使用默认主分支。
         revision: Optional[str] = None,
+        # 强制指定最大上下文长度；None 时从 hf_config 自动推导。
         context_length: Optional[int] = None,
+        # 覆盖 hf_config 字段的 JSON 字符串，会在加载后合并进配置。
         model_override_args: str = "{}",
+        # 是否以 embedding(嵌入/检索)模式加载；None 时按模型架构自动判定。
         is_embedding: Optional[bool] = None,
+        # 是否启用多模态(视觉/音频)；None 时按架构自动判定(部分模型默认关闭)。
         enable_multimodal: Optional[bool] = None,
+        # 权重计算精度("auto"/"float16"/"bfloat16"/"float32" 等)，auto 跟随模型默认。
         dtype: str = "auto",
+        # 量化方法(如 "fp8"/"awq"/"gptq" 等)，None 表示不额外量化。
         quantization: Optional[str] = None,
+        # 额外的配置文件路径，用于覆盖默认的 config.json。
         override_config_file: Optional[str] = None,
+        # 是否为投机解码中的草稿(draft)模型，影响层重映射等处理。
         is_draft_model: bool = False,
+        # 模型实现后端(AUTO/SGLANG/TRANSFORMERS/MINDSPORE)，决定走哪套建模代码。
         model_impl: Union[str, ModelImpl] = ModelImpl.AUTO,
+        # 采样默认值来源("openai" 表示对齐 OpenAI 默认采样参数)。
         sampling_defaults: str = "openai",
+        # 是否"先量化再服务"：加载后在线量化并直接对外提供服务。
         quantize_and_serve: bool = False,
+        # 是否为多层 EAGLE 投机解码的草稿模型(需特殊的 MTP 权重处理)。
         is_multi_layer_eagle: bool = False,
+        # 是否仅加载编码器(用于纯 encoder 模型，跳过解码器部分)。
         encoder_only: bool = False,
+        # 是否仅加载语言部分(对多模态模型只取其语言塔，忽略视觉/音频)。
         language_only: bool = False,
+        # 是否关闭混合滑动窗口注意力(SWA)的显存优化布局。
         disable_hybrid_swa_memory: bool = False,
+        # 模型配置解析器选择("auto" 表示自动选择合适的解析逻辑)。
         model_config_parser: str = "auto",
     ) -> None:
         # Parse args
