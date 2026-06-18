@@ -8,6 +8,10 @@
 > **重要澄清**：SGLang 代码库中 `nsa/` 目录实现的是 **DeepSeek-V3.2 的 DSA**，
 > 即只有「选择性 top-k」一条稀疏分支，**不包含**原始 NSA 论文的压缩分支与滑窗分支。
 > 下文先讲原始 NSA 概念，再聚焦 SGLang 真正实现的 DSA。
+>
+> **后续演进**：DeepSeek-V4-Pro（代码中称 DSv4）又把压缩分支与滑窗加了回来，做成「滑窗 +
+> 压缩 + 稀疏选择」的多路融合，并把索引器从 FP8 下探到 FP4。详见
+> [`DeepSeekV4_attention.md`](./DeepSeekV4_attention.md)。
 
 ## 目录
 
