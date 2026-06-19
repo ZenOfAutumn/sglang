@@ -121,3 +121,48 @@ $$
 - **通用启动预热**：服务启动时由后台线程执行（见 `model_runner.py` 同级 entrypoints 中的 `_wait_and_warmup` / `_execute_server_warmup`）——先轮询 `/model_info` 等待服务就绪，再发送一个真实推理请求把上述开销跑通，日志打印 `Warmup ended`。
 - **自定义预热任务**：通过 `--warmups` 指定（如 `voice_chat` 等），由 `entrypoints/warmup.py` 的 `execute_warmups` 按名称注册并执行，可针对特定场景（多模态、PD 分离等）定制预热流量。
 
+## 多 tokenizer 模式（Multi-Tokenizer / Multi-HTTP-Worker Mode）
+
+指用**多个进程并行承担 HTTP 接入 + 分词/反分词（tokenize / detokenize）** 的部署模式，用来突破单进程 Python（GIL）与单 HTTP server 的吞吐瓶颈。通过命令行参数 `--tokenizer-worker-num`（分词进程数）和 `--detokenizer-worker-num`（反分词进程数）开启，二者大于 1 时即进入该模式。
+
+**为什么需要：**
+默认情况下整个前端（HTTP 接收、请求校验、分词、把结果反分词成字符串再返回）都在单进程内完成。当并发请求很多、或分词/反分词本身较重（长文本、多模态）时，单进程会成为瓶颈，GPU 反而“吃不饱”。多 tokenizer 模式把这部分 CPU 密集工作横向扩展到多个进程，从而提升整体吞吐、降低排队延迟。
+
+**架构（见 `python/sglang/srt/managers/multi_tokenizer_mixin.py`）：**
+
+- **`TokenizerWorker`**：继承自 `TokenizerManager` 的工作进程，每个进程独立处理一部分 HTTP 请求并完成分词；启动时向路由注册自己的 IPC 地址。
+- **`MultiTokenizerRouter`**：位于多个 worker 与 scheduler/detokenizer 之间的路由进程。前向：`worker → router → scheduler`；后向：`detokenizer → router → 对应 worker`；同时把 pause/continue 等控制广播给所有 worker，保证状态一致。
+- **`MultiDetokenizerRouter` / `MultiHttpWorkerDetokenizerMixin`**：反分词侧的对应路由与混入逻辑，把调度器产出的 token 结果分发给多个反分词进程并行处理。
+- 进程间通过 **ZMQ**（PUSH/PULL）通信，部分一次性资源（如 load snapshot 的 PULL socket）由单一 router 进程持有并经共享内存（SHM）下发给各 worker，避免多进程重复绑定。
+
+**约束与注意事项（见 `python/sglang/srt/server_args.py`）：**
+
+- 与 `--skip-tokenizer-init` 互斥：跳过分词器初始化时会强制把 worker 数重置为 1。
+- 暂不支持与 `--enable-http2` 同时使用（`tokenizer_worker_num > 1` 会报错）。
+- 请求需要由 router 正确路由回**发起该请求的那个 worker**，以便把反分词后的字符串结果返回给对应的 HTTP 连接。
+
+## 反向解码的边界问题（Detokenization Edge Cases）
+
+「反向解码（detokenization）」指把 token id 还原成文本字符串。它的**边界问题**指：在 **token 与 token 的交界处、文本片段的拼接处**，增量解码结果可能出错（乱码、多/少空格、特殊符号异常等）。这是因为「一个字符 ↔ 一个 token」并非一一对应——一个字符可能跨多个 token，文本也不是简单把每个 token 的解码结果拼接起来。
+
+### 两类典型边界问题
+
+**1. 跨 token 的字符被截断（UTF-8 边界问题）**
+
+一个字符（尤其中文、emoji）可能由多个 token 编码而成。增量（流式）解码时若只解码到该字符的一半，会得到不完整的字节，显示为乱码 `�`。
+
+SGLang 的处理方式（见 `python/sglang/srt/managers/detokenizer_manager.py` 的 `_decode_batch_token_id_output`）：
+
+- **多带一段上下文 token（`surr`）一起解码**：每次解码 `[surr_offset, 末尾]` 得到 `read` 文本，同时解码 `[surr_offset, read_offset)` 得到 `surr` 文本，本次真正新增的文本 = `read` 去掉 `surr` 前缀。多带上下文是为了让跨 token 的字符能正确拼接。
+- **`�` 检测 + 延迟提交**：若新增文本以 `�` 结尾，说明字符不完整，则只发送可打印前缀（`find_printable_text`）、**不推进 offset**，等下一批 token 到达后再重试解码，避免把乱码发给用户。
+
+**2. 批量解码 vs 逐行解码结果不一致**
+
+某些 tokenizer（如 **gpt-oss**）在 `batch_decode`（多行一起解码）与单行 `decode` 下，对特殊 token、token 间空格的处理存在细微差异，导致批量路径在边界处产生错误文本。
+
+SGLang 的处理方式：提供 `--disable-tokenizer-batch-decode` 开关（`server_args.disable_tokenizer_batch_decode`）。开启后改为**逐行解码**来规避此类问题；默认走批量解码以获得更高性能。
+
+### 小结
+
+边界问题 = **多个 token 拼接成文本时，在交界处产生的解码错误**，主要包括 UTF-8 字符被切断（靠 `surr` 上下文 + `�` 检测延迟提交解决）和批量解码的行为差异（靠禁用批量、逐行解码解决）。
+
