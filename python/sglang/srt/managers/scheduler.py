@@ -1625,12 +1625,14 @@ class Scheduler(
 
         def pop_and_process():
             # Process the results of the last batch
+            # 处理上一批的前向结果
             # 中译：取出并处理队首（即上一批）的前向结果。
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
             # Receive requests
+            # 接收请求
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
@@ -1643,6 +1645,7 @@ class Scheduler(
                 self.schedule_stream.wait_stream(self.forward_stream)
 
             # Get the next batch to run
+            # 选出下一个要跑的批次
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
             # 中译：判断本批是否需要"关闭重叠"（例如连续两个 prefill、或 spec+grammar 组合），
@@ -1651,10 +1654,12 @@ class Scheduler(
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
+            # 如果本批无需与上一批重叠，可以立即处理上一批的结果。
             if disable_overlap_for_batch:
                 pop_and_process()
 
             # Launch the current batch
+            # 启动当前批次
             if batch:
                 # 中译：启动本批前向，但不立即处理结果——把它（连同 batch 的副本）压入队列，
                 #       下一轮再处理，从而实现 CPU/GPU 重叠。batch.copy() 是为了快照本批状态。
@@ -1664,22 +1669,26 @@ class Scheduler(
                 batch_result = None
 
             # Process the last batch
+            # 处理上一批
             if self.last_batch:
                 # 中译：常规重叠路径——处理上一轮压入队列的批次结果（此时本批前向已在 GPU 上跑着）。
                 if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
+                # 服务器空闲时：做自检并重置部分状态
                 self.on_idle()
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
+            # 它依赖上一批的结果（如语法约束），故须在上一批处理完后再执行。
             # 中译：对本批执行（可能被推迟的）采样。采样可能依赖上一批的结果（如语法约束的状态），
             #       所以必须放在上一批结果处理完之后再做。
             if self.is_generation:
                 self.launch_batch_sample_if_needed(batch_result)
 
             # Update last_batch
+            # 更新 last_batch
             self.last_batch = batch
 
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
@@ -1960,22 +1969,37 @@ class Scheduler(
         # 中译：为请求确定 max_new_tokens 的安全上限。必须保证该请求即便跑满也不会超出
         #       max_req_len 和 max_total_num_tokens 的预算，否则会出现"能入队却永远无法被调度"
         #       的请求，堵死队列、最终拖垮健康检查。这里取用户值与两个硬上限的最小值（且非负）。
+        # 中译：prompt（输入）的真实 token 数。后面所有预算都要在它之上再留出生成空间。
         input_len = len(req.origin_input_ids)
         # Keep this bound consistent with PrefillAdder's admission budget:
         # ceil_page(input_len) + max_new_tokens + page_size must be strictly
         # smaller than max_total_num_tokens. Otherwise a request can be accepted
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
+        # 中译：这里的上限必须和 PrefillAdder 的准入预算保持一致——
+        #       ceil_page(input_len) + max_new_tokens + page_size 必须严格小于 max_total_num_tokens。
+        #       否则会出现"请求能进等待队列、却永远无法被调度"的死锁：它既不释放资源也跑不动，
+        #       堵住队列，最终把健康检查也拖垮。
+        # 中译：把 input_len 向上取整到 page_size 的整数倍。KV cache 以 page（页）为粒度分配，
+        #       一条不满整页的 prompt 也会占用一整页，所以预算要按"取整后的页长"来算。
+        #       -(-a // b) 是整数向上取整的惯用写法（等价 ceil(a/b)），再乘 page_size 还原成 token 数。
         paged_input_len = -(-input_len // self.page_size) * self.page_size
+        # 中译：最终 max_new_tokens = max(0, min(用户请求值, 单请求长度上限, 总显存预算上限))。
+        #       三者取最小保证"跑满也不越界"，外层 max(0, ...) 防止上限算出负数时把值变成负。
         req.sampling_params.max_new_tokens = max(
             0,
             min(
                 (
+                    # 中译：用户显式指定的 max_new_tokens；没指定（None）时用 1<<30（约 10 亿）
+                    #       作为"无限大"占位，让真正起约束作用的是下面两个硬上限。
                     req.sampling_params.max_new_tokens
                     if req.sampling_params.max_new_tokens is not None
                     else 1 << 30
                 ),
+                # 中译：单请求长度上限。input + 生成 不得超过 max_req_len，留 1 个 token 余量。
                 self.max_req_len - input_len - 1,
+                # 中译：全局 KV cache 预算上限。扣掉本请求取整后的 prompt 页长、再预留一个 page_size
+                #       的安全余量和 1 个 token，确保它不会吃光 max_total_num_tokens 这块共享池。
                 self.max_total_num_tokens - paged_input_len - self.page_size - 1,
             ),
         )
@@ -2133,8 +2157,12 @@ class Scheduler(
 
             if recv_req.bootstrap_port is None:
                 # Use default bootstrap port
+                # 中译：PD 分离（Prefill/Decode 分离）下用 bootstrap 端口在 P、D 实例间建立 KV 传输连接；
+                #       请求没带端口时回退到服务端配置的默认端口。
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            # 中译：把传输层的 TokenizedGenerateReqInput 转成调度器内部使用的 Req 对象，
+            #       承载采样参数、logprob/hidden_states 等返回开关、PD 路由信息、指标采集器等全部上下文。
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -2179,6 +2207,9 @@ class Scheduler(
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
+                # 中译：PD 分离模式下，每条请求必须带 bootstrap_room（P/D 两端据此配对同一请求的 KV）。
+                #       缺失即非法（FAKE 传输后端是测试用例外，可放行），构造一个带中止原因的 Req
+                #       直接经正常输出通道回传错误后返回。
                 if (
                     recv_req.bootstrap_room is None
                     and self.transfer_backend != TransferBackend.FAKE
@@ -2200,6 +2231,8 @@ class Scheduler(
             and not self.session_controller.get(session_id).close_on_finish
         ):
             # Session exists and is not closing: create request from session
+            # 中译：会话复用路径。会话存在且未处于"用完即关"状态时，由 session 基于历史上下文
+            #       创建新 Req（会把之前轮次的 token 接续进来），实现多轮对话的前缀复用。
             session = self.session_controller.get(session_id)
             req = session.create_req(
                 recv_req,
@@ -2210,6 +2243,8 @@ class Scheduler(
             # TODO: set trace context
             if self.metrics_reporter.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
+            # 中译：create_req 内部若已判定请求非法（如续接位置越界），会把 finished_reason 设成
+            #       FINISH_ABORT；此时直接入队让错误经正常出口回传，不再走后续校验。
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
@@ -2217,6 +2252,8 @@ class Scheduler(
 
         else:
             # Session not found, or session is closing
+            # 中译：会话不存在、或会话正在关闭。两种情况都属于非法请求，
+            #       构造带对应错误信息的中止 Req 入队回传。
             if session_id in self.session_controller:
                 error_msg = (
                     f"Invalid request: close was requested for session {session_id}"
@@ -2237,6 +2274,8 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        # 中译：DFlash 投机解码算法对请求有额外约束（与 overlap 调度的兼容性等），
+        #       不满足则中止该请求。
         if self.spec_algorithm.is_dflash():
             error_msg = validate_dflash_request(req, self.enable_overlap)
             if error_msg is not None:
@@ -2265,6 +2304,8 @@ class Scheduler(
             req.extend_image_inputs(image_inputs)
             self._maybe_compute_mrope_positions(req)
 
+            # 中译：图像占位 token 扩展后 prompt 可能暴涨，这里校验扩展后的真实长度是否超出
+            #       单请求输入上限，超了就中止（错误信息里同时给出扩展前后长度便于排查）。
             if len(req.origin_input_ids) >= self.max_req_input_len:
                 req.set_finish_with_abort(
                     error_msg=(
@@ -2277,9 +2318,13 @@ class Scheduler(
                 return
 
         # initialize before returning
+        # 中译：在做后续长度/logprob 校验之前，先把 max_new_tokens 收敛到安全上限
+        #       （见 init_req_max_new_tokens），保证即便后面提前 return 入队，该值也已就绪。
         self.init_req_max_new_tokens(req)
 
         # Validate prompt length
+        # 中译：校验 prompt 长度是否超过输入上限。若开启 allow_auto_truncate 会自动截断而非报错；
+        #       否则返回错误信息并中止请求。
         error_msg = validate_input_length(
             req,
             self.max_req_input_len,
@@ -2290,25 +2335,34 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        # 中译：以下确定 logprob_start_len——从输入序列的哪个位置开始计算并返回 logprob。
         if not recv_req.return_logprob and recv_req.logprob_start_len != -1:
             # When return_logprob is False, logprob_start_len should be ignored
+            # 中译：没要 logprob 却传了起点，忽略该起点（置 -1）。
             recv_req.logprob_start_len = -1
 
         if recv_req.logprob_start_len == -1:
+            # 中译：起点为 -1（未指定）时，按场景推断默认起点。
             if recv_req.return_logprob and recv_req.token_ids_logprob is None:
                 # If logprob is required but neither token_ids_logprob nor logprob_start_len is
                 # set, return the logprobs for output tokens by default
+                # 中译：要 logprob 但既没指定 token_ids 也没指定起点，默认只返回"输出 token"的 logprob，
+                #       即起点设在输入末尾（跳过对 prompt 部分算 logprob）。
                 req.logprob_start_len = len(req.origin_input_ids)
             elif req.is_prefill_only:
                 # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
                 # beyond input sequence to skip input logprob computation entirely
+                # 中译：prefill-only 请求把起点设到输入序列之外，完全跳过对输入的 logprob 计算。
                 req.logprob_start_len = len(req.origin_input_ids)
             else:
                 # If return_logprob is False, only the last token requires logprob computation
+                # 中译：其余情况只有最后一个 token 需要 logprob，用 -1 表示。
                 req.logprob_start_len = -1
         else:
+            # 中译：用户显式给定了起点，直接采用。
             req.logprob_start_len = recv_req.logprob_start_len
 
+        # 中译：起点不能超过输入 token 数，越界则中止。
         if req.logprob_start_len > len(req.origin_input_ids):
             error_msg = f"{req.logprob_start_len=} is higher than the number of input tokens {len(req.origin_input_ids)=}. Please use a smaller logprob_start_len."
             req.logprob_start_len = -1
@@ -2316,6 +2370,8 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        # 中译：若请求要返回 MoE 路由的 expert 选择（return_routed_experts），
+        #       校验其起始位置 routed_experts_start_len 落在 [0, 输入长度] 内，越界则中止。
         if recv_req.return_routed_experts:
             error_msg = None
             if recv_req.routed_experts_start_len < 0:

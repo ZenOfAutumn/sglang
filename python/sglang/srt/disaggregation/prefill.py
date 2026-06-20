@@ -514,7 +514,25 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         Adapted from process_batch_result_prefill
+
+        中译：PD 分离模式下 prefill 节点专用的"前向结果处理"方法（改编自普通的
+              process_batch_result_prefill）。核心职责：对本批前向（prefill）已完成的请求，
+              把首个 next token 落到请求上、缓存其 KV、然后通过 KV 传输把这些请求的 KV 缓存
+              发往 decode 节点，并将请求挪进 disagg_prefill_inflight_queue（在途传输队列）
+              等待传输完成。对仍在分块（chunked）中、尚未完成 prefill 的请求，则只递减
+              其剩余分块计数、按需发送中间 chunk 的 KV，并不产出 token。
+
+              与普通 prefill 的关键差异：
+              1) 不在本节点做 decode，产出首 token 后立刻把 KV 传给 decode 节点；
+              2) 引入"乐观（optimistic）bootstrap"机制——请求可能在握手未完成时就乐观地
+                 进入前向，这里在产生副作用前再次轮询 bootstrap 状态，失败则回退/重排队。
         """
+        # 中译：从前向结果对象里解包本方法需要的字段：
+        #   logits_output            —— 本批的 logits / logprob 输出；
+        #   next_token_ids           —— 采样出的下一 token（GPU 张量，后面会转成 list）；
+        #   extend_input_len_per_req —— 每个请求本次 extend(prefill) 实际处理的输入长度；
+        #   extend_logprob_start_len_per_req —— 每个请求开始计算 input logprob 的起点；
+        #   copy_done                —— D2H 异步拷贝完成事件（重叠模式下用于同步等待）。
         (
             logits_output,
             next_token_ids,
@@ -529,8 +547,11 @@ class SchedulerDisaggregationPrefillMixin:
             result.copy_done,
         )
 
+        # 中译：重叠模式下结果是异步拷回 CPU 的，这里先阻塞等待拷贝完成，确保后续读到的
+        #       CPU 张量数据有效。
         if copy_done is not None:
             copy_done.synchronize()
+        # 中译：finalize 并释放 MoE 路由专家输出 / indexer top-k 输出等附带产物，回收其占用。
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
@@ -538,14 +559,20 @@ class SchedulerDisaggregationPrefillMixin:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
 
+        # 中译：logprob_pt 是遍历各请求时在扁平化 logprob 张量里的游标（逐请求向后推进）。
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
+        # 中译：把采样出的 next token 从 GPU 张量转成 Python list，便于逐请求处理。
         next_token_ids = result.next_token_ids.tolist()
+        # 中译：把 logprob 相关张量搬到 CPU，供后续按请求切片、组装返回值。
         self.batch_result_processor.move_logprobs_to_cpu(
             batch=batch,
             logits_output=logits_output,
         )
 
+        # 中译：辅助函数——当某请求被提前跳过（如 bootstrap 失败、被中止）而未走正常的 logprob
+        #       累加路径时，仍需把 logprob_pt 游标按该请求应占的 input logprob 数量手动前移，
+        #       否则后续请求会读错切片位置。仅在该请求要返回 logprob 时才推进。
         def advance_logprob_pt(i: int, req: Req) -> None:
             nonlocal logprob_pt
             if not req.return_logprob or extend_input_len_per_req is None:
@@ -560,29 +587,43 @@ class SchedulerDisaggregationPrefillMixin:
         # during process_prefill_chunk is not checked again here.
         # If it becomes ready in the gap, we still retry the request to keep
         # chunked-prefill state management simple.
+        # 中译：轮询本批中的"乐观 prefill"请求的 bootstrap 状态。
+        #       注意：在重叠调度下，那些在 process_prefill_chunk 时仍处于 pending 的分块请求
+        #       不会在此处再次检查；即使它们在间隙中变为就绪，我们仍会重试该请求，
+        #       以保持分块 prefill 的状态管理足够简单。
         optimistic_polls = {}
+        # 中译：筛出"仍在等待 bootstrap 且已是最后一个 chunk"的乐观请求（带原始下标 i）。
         optimistic_reqs = [
             (i, req)
             for i, req in enumerate(batch.reqs)
             if req.pending_bootstrap and req.inflight_middle_chunks <= 0
         ]
         if optimistic_reqs:
+            # 中译：在 attn-CP / attn-TP 组内一致地轮询这些请求的 KV sender 状态，
+            #       并做 all-reduce 保证同组各 rank 拿到一致的 poll 结果（避免决策分歧）。
             polls = poll_and_all_reduce_attn_cp_tp_group(
                 [req.disagg_kv_sender for _, req in optimistic_reqs],
                 self.attn_cp_cpu_group,
                 self.attn_tp_cpu_group,
             )
+            # 中译：建立"请求下标 -> poll 结果"的映射，供下面主循环按 i 查询。
             optimistic_polls = {
                 idx: poll for (idx, _), poll in zip(optimistic_reqs, polls)
             }
 
+        # 中译：逐请求处理本批结果。strict=True 确保 reqs 与 next_token_ids 长度严格一致。
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
+            # 中译：inflight_middle_chunks <= 0 表示该请求的最后一个 chunk 也已完成，
+            #       即整个 prefill 真正结束，进入"产出首 token + 传输 KV"的主路径。
             if req.inflight_middle_chunks <= 0:
+                # 中译：记录该请求 prefill 完成的时间点（用于请求生命周期统计）。
                 req.time_stats.set_prefill_finished_time()
 
                 # For optimistic requests, check bootstrap before side effects
+                # 中译：对乐观请求，在产生任何副作用（追加 token、缓存、入队）之前先确认
+                #       bootstrap 是否真正成功；失败则推进 logprob 游标并跳过本请求。
                 if i in optimistic_polls:
                     if not self.handle_pending_bootstrap(
                         req, optimistic_polls[i], defer_release=False
@@ -590,9 +631,16 @@ class SchedulerDisaggregationPrefillMixin:
                         advance_logprob_pt(i, req)
                         continue
 
+                # 中译：把采样出的首个 next token 追加到请求的输出序列。
                 req.output_ids.append(next_token_id)
+                # 中译：把这个（尚未结束的）请求的 KV 写入 radix tree cache，以便前缀复用。
                 maybe_cache_unfinished_req(req, self.tree_cache)
+                # 中译：把请求加入"在途传输队列"，后续 process_disagg_prefill_inflight_queue
+                #       会轮询其 KV 传输是否完成。
                 self.disagg_prefill_inflight_queue.append(req)
+                # 中译：EAGLE 投机解码下，需要把 draft 所需的 top-k 概率/索引与 hidden states
+                #       一并随请求传给 decode 节点（hidden_states 拷回 CPU 并 clone 以脱离 GPU
+                #       生命周期）；否则不携带 hidden states。
                 if self.spec_algorithm.is_eagle() and batch.spec_info is not None:
                     req.output_topk_p = batch.spec_info.topk_p[i]
                     req.output_topk_index = batch.spec_info.topk_index[i]
@@ -601,6 +649,8 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                 else:
                     req.hidden_states_tensor = None
+                # 中译：若该请求需要返回 logprob，按其 input 区间组装 input/output logprob 返回值，
+                #       并相应前移 logprob_pt 游标。
                 if req.return_logprob:
                     assert extend_logprob_start_len_per_req is not None
                     assert extend_input_len_per_req is not None
@@ -616,9 +666,13 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
-                self.send_kv_chunk(req, last_chunk=True)
+                    # 中译：last_chunk=True，发送该请求最后一块（也即全部）KV 到 decode 节点。
+                    self.send_kv_chunk(req, last_chunk=True)
+                # 中译：记录请求进入"传输队列"的时间点（生命周期统计）。
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
+                # 中译：若启用了语法约束（grammar），让语法状态机吃掉首个 token；
+                #       accept 失败说明该 token 违反语法，释放其 KV 并标记请求中止。
                 if req.grammar is not None:
                     try:
                         req.grammar.accept_token(next_token_id)
@@ -633,9 +687,13 @@ class SchedulerDisaggregationPrefillMixin:
                     req.grammar.finished = req.finished()
             else:
                 # being chunked reqs' prefill is not finished
+                # 中译：进入此分支说明该请求还有后续 chunk 未跑完（prefill 尚未结束），
+                #       本轮不产出 token，仅递减剩余中间 chunk 计数。
                 req.inflight_middle_chunks -= 1
 
                 # Overlap deferred release for optimistic requests stopped in process_prefill_chunk
+                # 中译：重叠场景下，某乐观请求在 process_prefill_chunk 阶段被叫停后，其资源释放
+                #       被推迟到这里：执行延迟释放并重新入队，推进 logprob 游标后跳过。
                 if req.pending_bootstrap:
                     advance_logprob_pt(i, req)
                     self.optimistic_release_and_requeue(req)
@@ -644,11 +702,14 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # Optimistic bootstrap can fail while this overlapped chunk is
                 # already running. Drop aborted chunks instead of sending KV.
+                # 中译：乐观 bootstrap 可能在这个重叠 chunk 已经在跑时才失败；此时直接丢弃该
+                #       （已中止的）chunk，不再发送 KV。
                 if is_aborted(req):
                     advance_logprob_pt(i, req)
                     req.time_stats.set_last_chunked_prefill_finish_time()
                     continue
 
+                # 中译：中间 chunk 也可能需要累计 input logprob（仅当起点落在本 chunk 输入范围内）。
                 if req.return_logprob:
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
                     extend_input_len = extend_input_len_per_req[i]
@@ -664,13 +725,18 @@ class SchedulerDisaggregationPrefillMixin:
                         )
                         logprob_pt += num_input_logprobs
 
+                # 中译：重叠模式下，中间 chunk 跑完即可把这一块的 KV 先发出去（last_chunk=False，
+                #       end_idx 指明本块结束位置），让 KV 传输与后续计算重叠。
+                #       前提是该请求已分配 metadata buffer 槽位。
                 if self.enable_overlap:
                     assert (
                         req.metadata_buffer_index >= 0
                     ), f"Req {req.rid} does not have metadata buffer allocated"
                     self.send_kv_chunk(req, last_chunk=False, end_idx=req.tmp_end_idx)
+                # 中译：记录本（非最后）分块 prefill 完成的时间点。
                 req.time_stats.set_last_chunked_prefill_finish_time()
 
+        # 中译：上报本批 prefill 的统计指标（是否走 CUDA graph、DP 协同信息等）。
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
             batch=batch,

@@ -211,23 +211,35 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
-        # 中译：处理 prefill（extend）批次的前向结果。生成式与 embedding 模型走两条分支。
-        #       生成式：取出采样得到的首个 next token，逐请求 append、判完成态、按需做
-        #       logprob/hidden states/grammar 处理；正在分块（chunked）的请求 prefill 未完成，
-        #       本轮不流式输出（用 skip_stream_req 标记）。
-        skip_stream_req = None  # 本轮需要跳过流式输出的请求（仍在分块 prefill 中）
+        # 中译：处理 prefill（extend）批次的前向结果，是 prefill 阶段「前向算完之后」的收尾入口。
+        #       入参 batch 是本轮调度的请求批，result 是模型前向产出（生成式为 logits/采样结果，
+        #       embedding 为向量）。整体按模型类型分两条分支：
+        #         1) 生成式（is_generation）：取出采样得到的首个 next token，逐请求 append 到输出序列、
+        #            判定是否完成、按需做 logprob / hidden states / grammar 处理；
+        #         2) embedding / reward：产出的是向量而非 token，只把 embedding 落到请求上并填占位 token。
+        #       两条分支共同的特殊情形是「分块（chunked）prefill」：长输入被拆成多个 chunk 分多轮前向，
+        #       只有最后一个 chunk 算完才算 prefill 完成；中间 chunk 不产出有效 token，也不应流式输出。
+        skip_stream_req = None  # 本轮需要跳过流式输出的请求（仍在分块 prefill 中，尚无有效输出）
 
         if self.is_generation:
             # 中译：copy_done 是「结果 GPU→CPU 拷贝完成」事件，先同步确保数据已就绪。
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            # 中译：MoE 模型若开启了路由专家（routed experts）观测，前向产物是异步句柄，
+            #       finalize() 触发其落地后随即清空引用，避免长期持有大块显存/内存。
             if result.routed_experts_output is not None:
                 result.routed_experts_output.finalize()
                 result.routed_experts_output = None
+            # 中译：稀疏注意力 indexer 的 top-k 结果同理：落地后清空引用。
             if result.indexer_topk_output is not None:
                 result.indexer_topk_output.finalize()
                 result.indexer_topk_output = None
 
+            # 中译：从 result 解包本轮需要的四个字段：
+            #   logits_output                     —— 模型前向输出（含 logits、各类 logprob、hidden states）；
+            #   next_token_ids                    —— 每个请求采样得到的首个 next token（GPU 张量）；
+            #   extend_input_len_per_req          —— 各请求本轮 extend（prefill）的输入长度；
+            #   extend_logprob_start_len_per_req  —— 各请求 input logprob 的起始位置（从第几个 token 开始算）。
             (
                 logits_output,
                 next_token_ids,
@@ -246,6 +258,8 @@ class SchedulerBatchResultProcessor:
             next_token_ids = next_token_ids.tolist()
             self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
 
+            # 中译：流水线并行（PP）下，纯分块批次可跳过输出通信这一优化；此处校验其不变量，
+            #       防止占位的全零输出被误当作真实 token 消费（详见该方法 docstring）。
             self._validate_pp_skip_output_comm(batch, result)
 
             hidden_state_offset = 0  # 在拼接后的 hidden_states 中按请求顺序游走的偏移
@@ -268,8 +282,10 @@ class SchedulerBatchResultProcessor:
                     # 中译：prefill 完成后产生的首个 token，追加进该请求的输出序列。
                     req.output_ids.append(next_token_id)
 
+                    # 中译：若开启 reasoning，据该 token 更新「思考段/回答段」的边界统计。
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
+                    # 中译：根据最新输出更新完成态（命中 stop token / 达到 max_new_tokens 等）。
                     req.update_finish_state()
                     if req.finished():
                         # 中译：刚生成首 token 就触发停止：收集专家/indexer 信息并释放 KV。
@@ -283,8 +299,11 @@ class SchedulerBatchResultProcessor:
                         if self.server_args.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
+                    # 中译：收集模型自定义的逐请求附加信息（如有），按需累积到 req 上。
                     self._maybe_collect_customized_info(i, req, logits_output)
 
+                    # 中译：请求要求返回 logprob 时，切出本请求对应的 input/output logprob；
+                    #       logprob_pt 是扁平数组的读取游标，处理完后返回更新值供下个请求接续。
                     if batch.return_logprob:
                         logprob_pt = self._apply_prefill_logprobs(
                             req=req,
@@ -296,6 +315,8 @@ class SchedulerBatchResultProcessor:
                             logprob_pt=logprob_pt,
                         )
 
+                    # 中译：请求要求返回 hidden states 时，从拼接后的 hidden_states 中按偏移切出
+                    #       本请求的那一段，并返回更新后的偏移供下个请求接续。
                     if (
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
@@ -306,6 +327,8 @@ class SchedulerBatchResultProcessor:
                             hidden_state_offset=hidden_state_offset,
                         )
 
+                    # 中译：约束解码（grammar，如 JSON/正则）下，用刚生成的 token 推进语法状态机，
+                    #       以便下一步据语法约束屏蔽非法 token。
                     if req.grammar is not None:
                         self._apply_prefill_grammar(
                             req=req, next_token_id=next_token_id
