@@ -90,46 +90,78 @@ def autotune_dummy_run_mode():
 
 @dataclasses.dataclass
 class LogitsProcessorOutput:
+    """模型前向产出的「logits 处理器输出」容器，是 LogitsProcessor → Sampler → 调度器
+    这条链路上传递的核心结果对象。
+
+    按字段的赋值来源/用途分为 5 个部分（Part 1~5）：
+      - Part 1：由 LogitsProcessor 填充——下一个 token 的 logits 与（投机解码用的）隐藏状态。
+      - Part 2：由 Sampler 填充——输出 token 的各类 logprob（含 top-k、指定 token id）。
+      - Part 3：仅 prefill 阶段——输入 token 的各类 logprob。
+      - Part 4：仅扩散式 LLM（Diffusion LLM）使用的完整 logits。
+      - Part 5：自定义附加信息与多模态输入嵌入。
+
+    说明：很多字段是可选的，仅在请求开启了对应能力（如 return_logprob、top_logprobs_num、
+    指定 token_ids_logprob、投机解码、扩散式 LLM 等）时才被填充，否则为 None。
+    部分 logprob 字段可能直接持有 GPU 张量（延迟拷回 CPU 的优化），而非已转好的 list。
+    """
+
     ## Part 1: This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
+    # 中译：Part 1——由 LogitsProcessor 填充。
     # The logits of the next tokens.       shape: [#seq, vocab_size]
     # Can be None for certain prefill-only requests (e.g., multi-item scoring) that don't need next token generation
+    # 中译：下一个 token 的 logits，形状 [序列数, 词表大小]。对某些只做 prefill、不需要生成下一个
+    #       token 的请求（如 multi-item 打分），该值可能为 None。
     next_token_logits: Optional[torch.Tensor]
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
+    # 中译：最后一层的隐藏状态，供投机解码（EAGLE）等使用；未启用时为 None。
     hidden_states: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
+    # 中译：Part 2——由 Sampler 填充（输出位置的各类 logprob）。
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
+    # 中译：输出 token 的对数概率。是否取「应用温度前」的 logprob 由 SGLANG_RETURN_ORIGINAL_LOGPROB 控制。
     next_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
+    # 中译：输出位置 top-k token 的 logprob 值与对应 token id，形状 [序列数, k]。
     next_token_top_logprobs_val: Optional[List] = None
     next_token_top_logprobs_idx: Optional[List] = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed copy optimization in prefill-only requests)
+    # 中译：输出位置上「调用方指定的那批 token id」的 logprob 值与 id，形状 [序列数, n]（n 为指定的
+    #       token id 数）。可能是 list，也可能直接是 GPU 张量（prefill-only 请求的延迟拷贝优化）。
     next_token_token_ids_logprobs_val: Optional[
         List[Union[List[float], torch.Tensor]]
     ] = None
     next_token_token_ids_logprobs_idx: Optional[List] = None
 
     ## Part 3: Prefill-only. This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
+    # 中译：Part 3——仅 prefill 阶段使用，由 LogitsProcessor 填充（输入位置的各类 logprob）。
     # The logprobs of input tokens.        shape: [#token]
+    # 中译：输入 token 的对数概率，形状 [token 数]。
     input_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in input positions.  shape: [#seq, #token, k]
+    # 中译：输入位置 top-k token 的 logprob 值与 id，形状 [序列数, token 数, k]。
     input_top_logprobs_val: Optional[List] = None
     input_top_logprobs_idx: Optional[List] = None
     # The logprobs and ids of the requested token ids in input positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed GPU-to-CPU transfer optimization)
+    # 中译：输入位置上「调用方指定的那批 token id」的 logprob 值与 id，形状 [序列数, n]。
+    #       同样可能是 list 或 GPU 张量（延迟 GPU→CPU 拷贝优化）。
     input_token_ids_logprobs_val: Optional[List[Union[List[float], torch.Tensor]]] = (
         None
     )
     input_token_ids_logprobs_idx: Optional[List] = None
 
     ## Part 4: Diffusion LLM only.
+    # 中译：Part 4——仅扩散式 LLM（Diffusion LLM）使用的完整 logits。
     full_logits: Optional[torch.Tensor] = None
 
     ## Part 5: Customized Info
+    # 中译：Part 5——自定义附加信息（按 key 对应逐请求的值列表）。
     customized_info: Optional[Dict[str, List[Any]]] = None
 
+    # 中译：多模态输入嵌入（多模态场景下回传的输入 embedding）。
     mm_input_embeds: Optional[torch.Tensor] = None
 
 

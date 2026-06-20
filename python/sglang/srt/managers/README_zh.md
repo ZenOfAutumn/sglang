@@ -86,6 +86,60 @@ HTTP 请求
 - **自检**：① 为什么要拆三进程而不是单进程多线程？（结合 GIL 与 CPU/GPU 重叠）② `GenerateReqInput` 和 `TokenizedGenerateReqInput` 的分界点在哪个进程、由谁完成转换？
 - **产出物**：一张三进程 + ZMQ 队列方向的框图，标注每条边上流动的 `io_struct` 类型。
 
+#### 参考框图（三进程 + ZMQ 队列方向 + 每条边的 `io_struct` 类型）
+
+> 实线 `──▶` 为请求/输出的主数据流（沿请求生命周期单向流转）；
+> 双向 `◀──▶` 为控制面的请求-应答（权重更新、缓存清理、暂停/恢复、负载查询等）。
+> 三个进程之间均通过 ZMQ（PUSH/PULL，控制面为 REQ/REP 风格的请求-应答）解耦。
+
+```
+                          (HTTP / Engine 入口)
+                                  │
+                                  │  GenerateReqInput / EmbeddingReqInput
+                                  │  （未分词的原始请求，可为单条或批次）
+                                  ▼
+                    ┌─────────────────────────────┐
+                    │      TokenizerManager       │  前端进程（asyncio 事件循环）
+                    │  分词 + 请求分发 + 结果回收   │
+                    └─────────────────────────────┘
+                       │  ▲                       ▲
+   [ZMQ PUSH] 分词后下发 │  │ [ZMQ]                 │ [ZMQ] 控制面请求-应答
+   TokenizedGenerateReq │  │ 控制面应答             │ ◀──▶ UpdateWeightsFrom*ReqInput/Output
+   Input /              │  │ (RpcReqOutput 等)      │      FlushCacheReqInput/Output
+   TokenizedEmbedding   │  │                       │      PauseGenerationReqInput …
+   ReqInput /           │  │                       │      GetLoadsReqInput/Output
+   Batch* 版本          │  │                       │      （权重更新/缓存/暂停/负载等）
+                        ▼  │                       │
+                    ┌─────────────────────────────┐
+                    │         Scheduler           │  独立进程（连续批处理调度）
+                    │  组批 → run_batch → 采样后处理 │  ← 控制面请求也在此进程处理
+                    │  驱动 GPU 前向（TpModelWorker）│
+                    └─────────────────────────────┘
+                                  │
+   [ZMQ PUSH] 批次 token id 输出   │  BatchTokenIDOutput        （生成：含 decode_ids 等）
+                                  │  BatchEmbeddingOutput      （嵌入：原样透传，无需解码）
+                                  ▼
+                    ┌─────────────────────────────┐
+                    │     DetokenizerManager      │  独立进程
+                    │  反分词 + 增量可打印文本拼接   │  （嵌入输出仅透传）
+                    └─────────────────────────────┘
+                                  │
+   [ZMQ PUSH] 解码后字符串输出      │  BatchStrOutput            （含 output_strs，流式为增量）
+                                  │  BatchEmbeddingOutput      （透传回 TokenizerManager）
+                                  ▼
+                    ┌─────────────────────────────┐
+                    │      TokenizerManager       │  handle_loop 按 rid 收集，
+                    │  （回到前端，异步生成器返回）  │  以流式/非流式返回给 HTTP 调用方
+                    └─────────────────────────────┘
+```
+
+**要点：**
+
+- **前向主链单向流转**：`TokenizerManager ──▶ Scheduler ──▶ DetokenizerManager ──▶ TokenizerManager`，分别承载 `Tokenized*ReqInput` → `BatchTokenIDOutput` → `BatchStrOutput`。
+- **嵌入请求不经过反分词逻辑**：`BatchEmbeddingOutput` 在 DetokenizerManager 处仅原样透传（无 token→文本解码）。
+- **控制面单独成边**：权重更新、缓存清理、暂停/恢复、负载查询等走 `TokenizerManager ◀──▶ Scheduler` 的请求-应答，不与前向数据流混在同一条队列上。
+- **分界点**：`GenerateReqInput`（未分词）→ `TokenizedGenerateReqInput`（已分词）的转换发生在 **TokenizerManager 进程**，之后 Scheduler 只处理已分词的请求形态。
+
 ---
 
 ### 子阶段 B：TokenizerManager —— 请求入口（第 3–4 天）

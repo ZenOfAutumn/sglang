@@ -2408,15 +2408,19 @@ class GetLoadsReqOutput(BaseReq):
           其中部分字段（num_total_tokens 等）也被 DP 负载均衡用于决策。
     """
 
-    dp_rank: int  # 中译：本快照对应的 DP rank
-    timestamp: float  # 中译：采样时间戳
+    dp_rank: int  # 中译：本快照对应的 DP（数据并行）rank 编号
+    timestamp: float  # 中译：采样时间戳（Unix 秒），标识该负载快照的时刻
 
+    # 中译：正在运行（已进入 running_batch、占用 KV cache 做前向）的请求数。
     num_running_reqs: int = field(
         metadata={"metric": ("gauge", "Number of running requests")}
     )
+    # 中译：在等待队列中、尚未开始推理的请求数。
     num_waiting_reqs: int = field(
         metadata={"metric": ("gauge", "Number of waiting requests")}
     )
+    # 中译：等待队列中「未命中前缀缓存、仍需做 prefill 计算」的输入 token 数。
+    #       反映尚未处理的 prefill 计算压力（已命中缓存的 token 不计入）。
     num_waiting_uncached_tokens: int = field(
         metadata={
             "metric": (
@@ -2425,38 +2429,56 @@ class GetLoadsReqOutput(BaseReq):
             )
         }
     )
+    # 中译：当前正在使用（已占用 KV cache 槽位）的 token 数。
     num_used_tokens: int = field(
         metadata={"metric": ("gauge", "Number of tokens in use")}
     )
     # num_used_tokens + pending prefill tokens (waiting-queue seqlen, incl.
     # disagg bootstrap/prealloc/transfer queues). Used for DP balance.
+    # 中译：num_used_tokens 加上「待处理的 prefill token」（等待队列的序列长度，
+    #       含 PD 分离的 bootstrap/预分配/传输队列）。这是 DP 负载均衡的核心决策依据。
     num_total_tokens: int = field(
         metadata={"metric": ("gauge", "Used tokens plus pending prefill tokens")}
     )
+    # 中译：该 rank 的最大 token 容量（KV cache 可容纳的 token 上限）。
     max_total_num_tokens: int = field(
         metadata={"metric": ("gauge", "Maximum token capacity")}
     )
     # FIXME: token_usage is actually max usage across all pools (KV, SWA, mamba),
     # not just KV token usage. Rename requires API deprecation.
+    # 中译：token 池使用率。注意（见上方 FIXME）：它实际是所有池（KV、SWA、mamba）中
+    #       使用率的最大值，而非仅 KV 池；改名需走 API 弃用流程，故暂保留旧名。
     token_usage: float = field(metadata={"metric": ("gauge", "Token pool usage ratio")})
+    # 中译：生成吞吐（tokens/秒），衡量该 rank 当前的产出速度。
     gen_throughput: float = field(
         metadata={"metric": ("gauge", "Generation throughput tokens/sec")}
     )
+    # 中译：前缀缓存（prefix cache）命中率。
     cache_hit_rate: float = field(
         metadata={"metric": ("gauge", "Prefix cache hit rate")}
     )
+    # 中译：整体利用率（综合衡量该 rank 的繁忙程度）。
+    #       计算见 scheduler_components/metrics_reporter.py 的 _calculate_utilization：
+    #       - PD 分离的 prefill 节点：置 -1 表示 N/A，不参与该指标；
+    #       - 其余情况：取以下两者的较大值
+    #           max( num_running_reqs / max_running_requests_under_SLO,
+    #                token_usage / 0.9 )
+    #         即「请求并发维度」与「KV token 维度」中更紧张的那一个，作为综合利用率。
+    #       注：max_running_requests_under_SLO 目前缺少 setter，可能导致该值恒为 0（见 #22713）。
     utilization: float = field(
         metadata={"metric": ("gauge", "Overall utilization ratio")}
     )
+    # 中译：最大并发运行请求数（running_batch 的容量上限）。
     max_running_requests: int = field(
         metadata={"metric": ("gauge", "Maximum running requests capacity")}
     )
 
-    memory: Optional[MemoryMetrics] = None
-    speculative: Optional[SpeculativeMetrics] = None
-    lora: Optional[LoRAMetrics] = None
-    disaggregation: Optional[DisaggregationMetrics] = None
-    queues: Optional[QueueMetrics] = None
+    # 中译：以下为可选的分项细分指标，仅当对应 include 分区被请求时才填充，否则为 None。
+    memory: Optional[MemoryMetrics] = None  # 中译：显存占用细分（权重/KV/CUDA graph 等）
+    speculative: Optional[SpeculativeMetrics] = None  # 中译：推测解码指标（接受长度/接受率）
+    lora: Optional[LoRAMetrics] = None  # 中译：LoRA 适配器池指标（槽位使用/利用率）
+    disaggregation: Optional[DisaggregationMetrics] = None  # 中译：PD 分离相关指标
+    queues: Optional[QueueMetrics] = None  # 中译：各类队列长度等队列指标
 
 
 @dataclass

@@ -4023,23 +4023,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         Returns:
             A list of next_token_ids
+
+        中译：基于模型前向产出的 logits 采样下一个 token，并按需计算 logprob、就地更新
+              logits_output。这是 TpModelWorker 在前向之后调用的采样入口，真正的采样实现
+              委托给 self.sampler（应用温度/top-p/top-k、惩罚项等后从分布中采样）。
+
+        参数：
+            logits_output：模型前向输出的 logits（含 next_token_logits 等）。
+            forward_batch：产生该 logits 的前向批次，携带采样所需信息（sampling_info、
+                           是否返回 logprob、positions/seq_lens 等）。
+
+        返回：
+            next_token_ids：本批次每个请求采样得到的下一个 token id。
         """
+        # 中译：采样前对 logits 做预处理——更新正则/词表 mask、应用 logits bias，
+        #       并在 mask 用完后及时释放其显存（详见 _preprocess_logits）。
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
         # Sample the next tokens
+        # 中译：调用采样器采样下一个 token。最后一个参数是「取 logits 的位置」：
         next_token_ids = self.sampler(
             logits_output,
             forward_batch.sampling_info,
-            forward_batch.return_logprob,
-            forward_batch.top_logprobs_nums,
-            forward_batch.token_ids_logprobs,
+            forward_batch.return_logprob,  # 是否需要返回 logprob
+            forward_batch.top_logprobs_nums,  # 每个位置返回的 top-k logprob 数量
+            forward_batch.token_ids_logprobs,  # 额外指定要返回 logprob 的 token id 集合
             # For prefill, we only use the position of the last token.
+            # 中译：decode 模式逐 token 推进，直接用 positions；
+            #       prefill（extend）模式只需每条序列最后一个 token 的位置（seq_lens - 1），
+            #       因为只有最后一个位置才产出「下一个 token」的 logits。
             (
                 forward_batch.positions
                 if forward_batch.forward_mode.is_decode()
                 else forward_batch.seq_lens - 1
             ),
         )
+        # 中译：若模型使用 n-gram embedding，则把刚采样出的 token 写回其 token 表（供后续步使用）。
         self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
         return next_token_ids
 

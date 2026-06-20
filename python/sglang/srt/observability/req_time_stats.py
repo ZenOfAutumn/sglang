@@ -572,48 +572,63 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
     # Placeholder: not used currently
     # propagated from tokenizer/grpc_server or dp controller
-    created_time: float = 0.0
-    api_server_dispatch_time: float = 0.0
-    dpc_dispatch_time: float = 0.0
+    # 中译：占位字段，当前尚未使用；其取值由 tokenizer / grpc_server 或
+    # data parallel controller 沿请求链路向下游传播。
+    created_time: float = 0.0  # 中译：请求被创建的时间戳（请求生命周期的最早时刻）
+    api_server_dispatch_time: float = 0.0  # 中译：API server 将请求分发出去的时刻
+    dpc_dispatch_time: float = 0.0  # 中译：data parallel controller(DPC) 将请求分发到某个 DP rank 的时刻
 
     # common, get by time.perf_counter()
-    wait_queue_entry_time: float = 0.0
-    forward_entry_time: float = 0.0
-    prefill_finished_time: float = 0.0
-    completion_time: float = 0.0
+    # 中译：通用阶段时间戳（所有模式共有），均用 time.perf_counter() 采集单调时钟值。
+    wait_queue_entry_time: float = 0.0  # 中译：请求进入「等待队列(wait_queue)」的时刻，即开始排队等待被调度
+    forward_entry_time: float = 0.0  # 中译：请求进入「前向计算(forward)」阶段的时刻，即被调度进入模型执行
+    prefill_finished_time: float = 0.0  # 中译：该请求 prefill（预填充）完成的时刻
+    completion_time: float = 0.0  # 中译：请求整体完成（生成结束）的时刻，请求生命周期的终点
 
     # prefill node, get by time.perf_counter()
-    prefill_bootstrap_queue_entry_time: float = 0.0
-    prefill_transfer_queue_entry_time: float = 0.0
-    prefill_kv_transfer_finish_time: float = 0.0
+    # 中译：仅 PD 分离(Prefill/Decode disaggregation)下「prefill 节点」使用的时间戳，
+    # 用 time.perf_counter() 采集。prefill 节点流程：bootstrap_queue -> wait_queue
+    # -> forward -> transfer_queue -> completion。
+    prefill_bootstrap_queue_entry_time: float = 0.0  # 中译：进入 bootstrap 队列的时刻（与 decode 节点建链/握手前的排队起点）
+    prefill_transfer_queue_entry_time: float = 0.0  # 中译：prefill 完成后进入「KV 传输队列(transfer_queue)」的时刻，准备把 KV cache 发往 decode 节点
+    prefill_kv_transfer_finish_time: float = 0.0  # 中译：prefill 节点完成 KV cache 跨节点传输的时刻
 
     # decode node, get by time.perf_counter()
-    decode_prealloc_queue_entry_time: float = 0.0
-    decode_transfer_queue_entry_time: float = 0.0
-    decode_prebuilt_finish_time: float = 0.0
+    # 中译：仅 PD 分离下「decode 节点」使用的时间戳，用 time.perf_counter() 采集。
+    # decode 节点流程：prealloc_queue -> transfer_queue -> wait_queue -> forward
+    # -> completion。
+    decode_prealloc_queue_entry_time: float = 0.0  # 中译：进入「预分配队列(prealloc_queue)」的时刻，等待为接收 KV cache 预分配显存
+    decode_transfer_queue_entry_time: float = 0.0  # 中译：进入「KV 传输队列(transfer_queue)」的时刻，等待接收来自 prefill 节点的 KV cache
+    decode_prebuilt_finish_time: float = 0.0  # 中译：decode 节点完成「预构建(prebuilt)」（接收并落地 KV cache、构造好可解码状态）的时刻
 
     # bootstrap sub-phase tracking (PD disagg)
-    bootstrap_done_time: float = 0.0
+    # 中译：PD 分离场景下，对 bootstrap 阶段内部子阶段的细分追踪。
+    bootstrap_done_time: float = 0.0  # 中译：bootstrap（与对端节点握手/建链）子阶段完成的时刻
 
     # only for request tracing
-    scheduler_recv_time: float = 0.0
-    last_chunked_prefill_finish_time: float = 0.0
-    last_decode_finish_time: float = 0.0
-    decode_ct: int = 0
-    last_decode_scheduled_time: float = 0.0
-    last_forward_entry_time: float = 0.0
-    last_prefill_finished_time: float = 0.0
-    run_batch_cpu_start_time: float = 0.0
+    # 中译：以下字段仅用于请求链路追踪(request tracing)/可观测性细粒度打点，
+    # 不参与核心调度逻辑。
+    scheduler_recv_time: float = 0.0  # 中译：scheduler 进程实际接收到该请求的时刻
+    last_chunked_prefill_finish_time: float = 0.0  # 中译：最近一次「分块预填充(chunked prefill)」分片完成的时刻（chunked prefill 会多次切片执行）
+    last_decode_finish_time: float = 0.0  # 中译：最近一次 decode（单步解码）完成的时刻
+    decode_ct: int = 0  # 中译：decode 计数器，记录该请求已执行的解码步数(count)
+    last_decode_scheduled_time: float = 0.0  # 中译：最近一次该请求被调度进入 decode 的时刻
+    last_forward_entry_time: float = 0.0  # 中译：最近一次进入前向计算(forward)的时刻
+    last_prefill_finished_time: float = 0.0  # 中译：最近一次 prefill 分片完成的时刻
+    run_batch_cpu_start_time: float = 0.0  # 中译：run_batch 在 CPU 侧（提交 GPU kernel 之前的主机端逻辑）开始执行的时刻
 
     # speculative decoding
-    spec_draft_start_time: float = 0.0
-    spec_verify_start_time: float = 0.0
+    # 中译：投机解码(speculative decoding)相关时间戳。
+    spec_draft_start_time: float = 0.0  # 中译：草稿(draft)阶段开始的时刻，即草稿模型开始生成候选 token
+    spec_verify_start_time: float = 0.0  # 中译：验证(verify)阶段开始的时刻，即目标模型开始并行校验草稿 token
 
     # other
-    transfer_speed_gb_s: float = 0.0
-    transfer_total_mb: float = 0.0
+    # 中译：其他统计指标。
+    transfer_speed_gb_s: float = 0.0  # 中译：KV cache 跨节点传输速度，单位 GB/s
+    transfer_total_mb: float = 0.0  # 中译：本次 KV cache 传输的总数据量，单位 MB
 
     # Number of prefill retries for this request
+    # 中译：该请求的 prefill 重试次数。
     prefill_retry_count: int = 0
 
     def __getstate__(self) -> object:
