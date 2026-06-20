@@ -89,6 +89,100 @@ HTTP 请求
 5. → `ModelRunner.forward` (`model_executor/model_runner.py:2700`) 执行前向（可能走 CUDA Graph）。
 6. 采样 (`layers/sampler.py`) → 结果经 `process_batch_result` (`scheduler.py:2808`) → DetokenizerManager → 流式回传。
 
+### 2.2.1 一次请求的时间轴与监控
+
+下面以「时间轴」方式串起一个请求从进入到完成经历的**每个阶段、对应的时间戳采集点、以及暴露的监控指标**。所有时间戳的真相源是 `srt/observability/req_time_stats.py`，阶段名定义在 `RequestStage`，时间戳用 `time.perf_counter()`（单调时钟）采集，跨进程传播时再用 `convert_time_to_realtime*` 校准回真实时间。
+
+> 监控有两条互补通路：**Prometheus 指标**（`metrics_collector.observe_*`，用于聚合统计）与**分布式链路追踪 trace span**（`trace_slice`，用于单请求级火焰图，需开启 tracing）。下表「阶段名」即 trace span 名，「监控指标」标注是否会 `observe_per_stage_req_latency`（✅=该阶段单独上报 Prometheus 直方图）。
+
+#### 统一模式（非 PD 分离，`disagg_mode = unified`）
+
+```
+t0 ──────────► t1 ──────────► t2 ──────────► t3 ──────────► t4 ──────────► t5 ──────────► t6
+created    tokenize_     api_server_   scheduler_    wait_queue_   forward_     prefill_      completion
+_time      finish        dispatch      recv_time     entry_time    entry_time   finished      _time
+           _time         _finish_time                                           _time
+│           │             │             │             │             │            │              │
+│  Tokenizer 进程         │  跨 ZMQ      │        Scheduler 进程：排队 → 调度 → prefill → decode 循环  │
+└── 分词 ────┴── 分发 ────┴── 传输 ──────┴── 排队等待 ─┴── (前向计算) ┴─ 首 token ─┴── 解码循环 ──┴── 结束
+```
+
+按时间顺序的阶段与监控点：
+
+| # | 阶段（trace span / 含义） | 时间戳采集函数 | 进程 | 监控指标 |
+| - | --- | --- | --- | --- |
+| 1 | **请求创建** `created_time`：请求生命周期起点；同时开启 `tokenize` span | `APIServerReqTimeStats.set_created_time` | Tokenizer | 起点，`trace_req_start` |
+| 2 | **`tokenize`**：分词完成 | `set_tokenize_finish_time` | Tokenizer | trace span |
+| 3 | **`api_server_dispatch`**：API server 把请求经 ZMQ 分发给下游 | `set_api_server_dispatch_time` / `_finish_time` | Tokenizer | trace span |
+| 4 | **`request_process`**：Scheduler 收到请求（`scheduler_recv_time`）到进入等待队列 | `set_scheduler_recv_time` → `set_wait_queue_entry_time` | Scheduler | ✅ `request_process` |
+| 5 | **`prefill_waiting`**：在等待队列里排队，等待被组批调度（即排队时间 `queue_time`） | `set_forward_entry_time` | Scheduler | ✅ `observe_queue_time`（队列时间） |
+| 6 | **`prefill_forward`**：prefill 前向计算（首 token 产出）；chunked prefill 会拆成多个 `chunked_prefill` 子片 | `set_prefill_finished_time` / `set_last_chunked_prefill_finish_time` | Scheduler | ✅ `prefill_forward`、✅ `chunked_prefill` |
+| 7 | **`decode_loop`**：逐步解码循环，每步一个 `decode_forward`，`decode_ct` 记录步数 | `set_last_decode_finish_time` / `set_last_scheduled_time` | Scheduler | trace span（每步） |
+| 8 | **请求完成** `completion_time`：生成结束 | `set_completion_time`（或 `set_quick_finish_time`） | Scheduler | 终点，`trace_req_finish` |
+| 9 | **回传客户端** `response_sent_to_client_time`：结果经 Detokenizer 流式发回 | `set_response_sent_to_client_time` | Tokenizer | 出参 meta_info |
+
+由这些时间戳派生的**端到端延迟指标**（`APIServerReqTimeStats`）：
+
+- **TTFT（首 token 延迟）** = `first_token_time - created_time`（`get_first_token_latency`），trace 属性 `GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN`。
+- **E2E（端到端延迟）** = `finished_time - created_time`（`get_e2e_latency`）。
+- **解码延迟** = `finished_time - first_token_time`（`get_decode_latency`），并据此算 `decode_throughput`。
+- **排队时间** = `forward_entry_time - wait_queue_entry_time`（`get_queueing_time`）。
+- Scheduler 侧还会打印 `queue_duration` / `forward_duration`（`convert_to_duration`）。
+
+#### PD 分离模式（Prefill / Decode disaggregation）
+
+PD 分离把 prefill 与 decode 拆到不同节点，时间轴在中间多出 **KV cache 跨节点传输** 阶段（注释见 `SchedulerReqTimeStats` 文档串）：
+
+- **Prefill 节点**：`prefill_prepare` → `prefill_bootstrap`（与对端握手建链）→ `prefill_waiting` → `prefill_forward` → `prefill_transfer_kv_cache`（把 KV 发往 decode 节点）。
+  - 监控：✅ `prefill_bootstrap`、✅ `prefill_transfer_kv_cache`，以及 KV 传输速率 `transfer_speed_gb_s`、总量 `transfer_total_mb`（`compute_and_observe_kv_transfer_metrics`）。
+- **Decode 节点**：`decode_prepare`（预分配队列）→ `decode_bootstrap` → `decode_waiting`（接收 KV）→ `decode_transferred` → `decode_forward` 解码循环 → `completion`。
+  - 监控：✅ `decode_prepare`、✅ `decode_bootstrap`、✅ `decode_waiting`、✅ `decode_transferred`、✅ `fake_output`、✅ `quick_finish`。
+
+```
+[Prefill 节点]  bootstrap_queue ─► wait_queue ─► prefill_forward ─► transfer_queue ══(KV cache)══╗
+                                                                                                 ▼
+[Decode 节点]                         prealloc_queue ─► transfer_queue ─► wait_queue ─► decode_loop ─► completion
+```
+
+**名词解释（PD 分离）：** 整体架构见 `srt/disaggregation/README_zh.md`，prefill 端调度在 `disaggregation/prefill.py`、decode 端在 `disaggregation/decode.py`。核心思路是把请求的 **预填充（prefill）** 与 **解码（decode）** 拆到不同节点，prefill 算完后通过可插拔的 KV 传输后端（Mooncake / NIXL / MORI 等）把 KV cache 搬到 decode 节点继续解码。
+
+Prefill 节点各阶段：
+
+| 阶段 / 队列 | 名词解释 |
+| --- | --- |
+| **bootstrap（引导/建链）** | prefill 与对端 decode 节点**握手建链**的过程：交换元数据、确认 KV 传输通道就绪。`prefill_bootstrap_queue_entry_time` 标记进入 bootstrap 队列、`bootstrap_done_time` 标记建链完成。 |
+| **bootstrap_queue（引导队列）** | 等待与 decode 节点完成 bootstrap 握手的排队队列，是 prefill 端请求的第一个落点。 |
+| **wait_queue（等待队列）** | 握手完成后等待被组批做 prefill 前向计算的队列（与统一模式的等待队列同义）。 |
+| **prefill_forward（预填充前向）** | 真正执行 prefill 计算、产出 KV cache 与首 token 的阶段。 |
+| **transfer_queue（KV 传输队列）** | prefill 完成后，等待把 KV cache 通过传输后端发往 decode 节点的队列。`prefill_transfer_queue_entry_time` 进入、`prefill_kv_transfer_finish_time` 传输完成；伴随 `transfer_speed_gb_s`（速率）、`transfer_total_mb`（总量）指标。 |
+
+Decode 节点各阶段：
+
+| 阶段 / 队列 | 名词解释 |
+| --- | --- |
+| **prealloc_queue（预分配队列）** | decode 端请求的第一个落点：等待为「即将从 prefill 节点接收的 KV cache」**预分配显存**（KV 页 / token 槽位）。`decode_prealloc_queue_entry_time` 标记进入。 |
+| **bootstrap（建链）** | 与 prefill 端对应的握手过程，`bootstrap_done_time` 标记完成；prealloc 阶段内部又细分为 bootstrap 子阶段与 alloc 等待子阶段。 |
+| **transfer_queue（KV 传输队列）** | 显存预分配好后，等待**实际接收** prefill 节点发来的 KV cache 的队列。`decode_transfer_queue_entry_time` 标记进入。 |
+| **wait_queue（等待队列）** | KV cache 接收落地后，等待被调度进入解码的队列。 |
+| **prebuilt（预构建）** | decode 端**跳过 prefill 前向**、仅用接收到的 KV cache 与元数据直接构造出可解码状态（见 `decode_schedule_batch_mixin.py` 的「预构建 extend 批」）。`decode_prebuilt_finish_time` 标记完成，对应 trace span `fake_output`。 |
+| **decode_loop（解码循环）** | 正式逐步解码，直到 `completion`。 |
+| **quick_finish（快速结束）** | 特殊路径：某些请求（如刚接收完即满足结束条件）无需进入完整解码循环即可直接结束（`set_quick_finish_time`）。 |
+
+> 一句话对照：**prefill 节点**多出 bootstrap（建链）与 transfer（发送 KV）两类额外阶段；**decode 节点**多出 prealloc（预分配显存）、transfer（接收 KV）、prebuilt（用 KV 直接建状态、跳过 prefill）三类额外阶段。二者通过 KV cache 跨节点传输衔接。
+
+#### 投机解码（speculative decoding）
+
+在 decode 阶段内，每步进一步细分为两个 span：
+
+- **`spec_draft`**：草稿模型生成候选 token（`set_spec_draft_start_time` / `set_spec_draft_end_time`）。
+- **`spec_verify`**：目标模型并行校验，trace 属性记录 `num_correct_drafts`（接受的草稿数）（`set_spec_verify_start_time` / `set_spec_verify_end_time`）。
+
+#### 多模态（EPD encode）
+
+带图像/音频的请求在最前面多一个 **`mm_encode`** 阶段（`EncoderReqTimeStats.set_mm_encode_start_time` / `_end_time`），位于 tokenize 之后、进入 Scheduler 之前。
+
+> 小结：一个请求的时间轴 = `created → tokenize → dispatch → (scheduler) request_process → prefill_waiting → prefill_forward → decode_loop → completion → response_sent`；PD 分离在中间插入 KV 传输阶段，投机解码在 decode 内细分 draft/verify，多模态在最前插入 encode。每个阶段都有对应的 `set_*_time` 采集点、可选的 Prometheus 直方图（`metrics_is_observed=True` 的阶段）与 trace span，便于定位延迟瓶颈。
+
 ### 2.3 核心模块速查表
 
 
