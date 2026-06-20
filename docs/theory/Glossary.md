@@ -95,6 +95,46 @@ $$
 - 它也是 **KV cache 分页（paged）注意力**、**chunked prefill** 等机制能够分块/分页处理注意力的前提——因为可以按 KV 块逐步累积，无需一次性看到完整序列。
 - 与之相关的 “**log-sum-exp（LSE）**” 即上面的 $m + \log(l)$，在 speculative decoding、注意力结果跨设备/跨分块合并（如 ring attention、DP attention 的分块归并）时用于把多段局部 softmax 结果正确地拼接起来。
 
+## 对数 softmax（log_softmax）
+
+指对 softmax 的结果再取自然对数，即 $\log(\mathrm{softmax}(x))$，把一组 logits 转换成 **对数概率（log-probabilities）**。在 SGLang 中，采样器（`python/sglang/srt/layers/sampler.py`）用它来计算返回给用户的 token logprob，约束解码、speculative decoding 的接受判定等也依赖对数概率。
+
+### 定义
+
+对长度为 $K$ 的 logits 向量 $x=(x_1,\dots,x_K)$，第 $i$ 个分量的对数 softmax 为：
+
+$$
+\mathrm{log\_softmax}(x)_i = \log\frac{e^{x_i}}{\sum_{j=1}^{K} e^{x_j}} = x_i - \log\sum_{j=1}^{K} e^{x_j}.
+$$
+
+右边的 $\log\sum_j e^{x_j}$ 就是 **log-sum-exp（LSE）**。由于它是概率的对数，所有输出都 $\le 0$，且对同一维度 $\exp$ 后求和为 1。
+
+### 为什么不直接 `log(softmax(x))`
+
+朴素做法「先算 softmax 再取 log」有两个数值问题：
+
+- **指数溢出**：$x_j$ 较大时 $e^{x_j}$ 会上溢为 `inf`。
+- **log(0) 下溢**：softmax 结果中极小的概率会被舍入成 0，再取 $\log$ 得到 $-\infty$。
+
+`log_softmax` 通过 **减最大值（max-shift）** 的等价变形规避这两点。令 $m=\max_j x_j$：
+
+$$
+\mathrm{log\_softmax}(x)_i = (x_i - m) - \log\sum_{j=1}^{K} e^{x_j - m}.
+$$
+
+减去 $m$ 后，求和中至少有一项为 $e^0=1$，分母不会下溢为 0；同时所有指数项 $\le 1$，不会上溢。这个变形与原式**完全等价**（分子分母同乘 $e^{-m}$），但全程数值稳定——这也正是「在线 softmax」里维护 running max 的同一思想。
+
+### 与 softmax 的关系
+
+- $\mathrm{softmax}(x) = \exp(\mathrm{log\_softmax}(x))$，二者互为指数/对数关系。
+- 配合 `NLLLoss` 使用时，`log_softmax + NLLLoss` 等价于交叉熵损失，但比「softmax → log → 乘加」更稳更快，因此训练里常直接用 `log_softmax`。
+- 推理侧返回 logprob 时，对一批 logits 调用 `torch.nn.functional.log_softmax(logits, dim=-1)`，再按采样到的 token id 取出对应分量即可。
+
+### 在 SGLang 中的意义
+
+- **logprob 输出**：当请求开启 `return_logprob` 时，采样器对 logits 做 `log_softmax` 得到每个候选/选中 token 的对数概率返回给上层（见 `python/sglang/srt/layers/sampler.py`、`python/sglang/srt/layers/logits_processor.py`）。
+- **数值稳定的接受判定**：speculative decoding 在比较 draft / target 分布、约束解码在做 mask 归一时，都在对数空间运算以避免极小概率被舍成 0。
+
 ## 预热（Warmup）
 
 指服务启动后、正式对外提供服务之前，先用**少量构造好的请求**把整条推理链路完整地“跑通”几遍，让各种**一次性的、惰性触发（lazy）的初始化开销**提前发生，从而保证**真实用户的首个请求不会被这些首次开销拖慢**。
@@ -165,4 +205,175 @@ SGLang 的处理方式：提供 `--disable-tokenizer-batch-decode` 开关（`ser
 ### 小结
 
 边界问题 = **多个 token 拼接成文本时，在交界处产生的解码错误**，主要包括 UTF-8 字符被切断（靠 `surr` 上下文 + `�` 检测延迟提交解决）和批量解码的行为差异（靠禁用批量、逐行解码解决）。
+
+## 伪随机数生成器（PRNG）
+
+**伪随机数生成器（Pseudo-Random Number Generator, PRNG）** 是一种用**确定性算法**产生「看起来随机」数字序列的方法。它不依赖物理熵源（如热噪声），而是从一个初始的**种子（seed）** 出发，用固定的递推公式不断算出下一个数。因此 PRNG 产生的并非真随机，而是**伪随机**：序列完全由种子决定——相同种子必得相同序列，这正是「随机种子」可复现性的根基。
+
+### 基本原理：状态 + 递推 + 输出
+
+任何 PRNG 都可抽象为三部分：
+
+- **内部状态 $s$**：一段被持续更新的内存（从几十位到上千位不等）。
+- **状态转移函数 $s_{t+1}=f(s_t)$**：用确定性公式把当前状态推进到下一个状态。
+- **输出函数 $x_t=g(s_t)$**：从状态中提取出对外可见的随机数（常再归一化到 $[0,1)$）。
+
+种子的作用就是设定初始状态 $s_0$。由于状态空间有限，序列最终一定会循环，循环前的长度称为**周期（period）**，好的 PRNG 周期极长（如 $2^{19937}-1$）。
+
+### 衡量「随机性」的标准
+
+伪随机虽非真随机，但要求在统计上**不可区分于真随机**：
+
+- **均匀性**：输出在取值范围内近似均匀分布。
+- **独立性 / 无相关**：前后数之间无可察觉的规律，能通过 TestU01、Diehard 等统计测试。
+- **长周期**：避免在实际使用量级内重复。
+- 注意：常规 PRNG **不要求密码学安全**——已知部分输出可能反推状态。需要安全性时要用 CSPRNG（如基于 AES/ChaCha）。
+
+### 两类典型实现
+
+**1. 有状态、序列式（stateful）**——主流通用 PRNG
+
+- **线性同余（LCG）**：$s_{t+1}=(a\,s_t+c)\bmod m$，最简单但质量一般。
+- **Mersenne Twister（MT19937）**：周期 $2^{19937}-1$、统计性质优秀，是 NumPy 旧默认、CPython `random` 模块的底层。
+- **Philox / Threefry（counter-based，基于计数器）**：状态即「种子 + 计数器」，$x = f(\text{key},\ \text{counter})$。优点是**无需串行推进状态**，给定计数器即可并行、随机地直接算出第 $n$ 个数——非常适合 GPU。PyTorch 的 CUDA 随机数（`torch.multinomial`、dropout 等）正是基于 Philox。
+
+**2. 无状态、哈希式（stateless / hash-based）**
+
+不维护可变状态，而是把「种子 + 坐标（如位置、下标）」直接哈希成随机数：$x=\mathrm{hash}(\text{seed},\ \text{key})$。它本质上是 counter-based 思路的极端形式，天然可复现、可并行、与调用顺序无关。SGLang 的确定性采样用的 `murmur_hash32(seed, position, col)` 就属于此类（见下文「随机种子」与「Gumbel-Max」条目）。
+
+### 在 SGLang 中的意义
+
+- **全局 RNG（有状态）**：`torch.multinomial`、`torch.manual_seed` 等走 PyTorch 的全局生成器（CPU 用 MT19937，CUDA 用 Philox）。其状态随每次调用推进，因此在连续批处理下会被相邻请求「串扰」，难以按单个请求复现。
+- **无状态 PRNG（哈希式）**：为实现与 batch 组合 / 调度顺序无关的**确定性采样**，SGLang 改用 `murmur_hash32` 这一无状态 PRNG，把「请求种子 + token 位置 + 词表列」直接哈希成随机源，再转成 Gumbel 噪声做 Gumbel-Max 采样（见 `python/sglang/srt/layers/sampler.py` 的 `multinomial_with_seed`）。
+
+## 随机种子（Random Seed）
+
+**随机种子**是喂给伪随机数生成器（PRNG）的一个整数初值。计算机里的“随机”其实是**确定性算法**算出来的伪随机序列：给定相同的种子，就会得到**完全相同**的随机数序列。因此种子的核心价值是 **可复现性（reproducibility）**——固定种子后，同样的输入能稳定复现同样的输出，便于调试、对拍、回归测试与做基准评测。
+
+在 LLM 推理里，“随机”主要出现在**采样（sampling）**环节：当 `temperature > 0` 时，下一个 token 不是取概率最高的那个，而是按概率分布**随机抽样**得到，于是同一个 prompt 多次生成会得到不同结果。引入随机种子，就能让这种随机采样变得可控、可复现。
+
+SGLang 中的随机种子分两个层面：
+
+**1. 全局框架种子（`random_seed`）**
+
+服务级别的种子，用于框架初始化阶段各处的随机性（如部分权重初始化、调试用随机数据等）。
+
+- 见 `python/sglang/srt/server_args.py`：CLI 参数 `--random-seed`；字段 `random_seed`，**默认为 `None`，此时会随机取一个值** `random.randint(0, 1 << 30)`，所以不显式指定时每次启动的种子并不固定。
+
+**2. 请求级采样种子（`sampling_seed`）——确定性采样**
+
+每个请求可单独携带的采样种子，用于让该请求的 token 采样**确定可复现**。
+
+- 见 `python/sglang/srt/sampling/sampling_params.py`：`SamplingParams.sampling_seed`（请求级，默认 `None`）。
+- 见 `python/sglang/srt/sampling/sampling_batch_info.py`：批次内各请求的 `sampling_seed` 被收集成张量，随 batch 一起下发到采样 kernel。
+
+**确定性采样的实现原理（见 `python/sglang/srt/layers/sampler.py` 的 `multinomial_with_seed`）：**
+
+普通采样用 `torch.multinomial`，其随机性依赖**全局 RNG 状态**——在连续批处理（continuous batching）下，请求的批次组合、执行顺序随时变化，全局 RNG 状态会被“串扰”，导致同一请求难以复现。SGLang 用一种**无状态、按位置可复现**的方案替代：
+
+1. 用 `murmur_hash32(seed, positions, col_indices)` 把「请求种子 + token 在序列中的位置 + 词表列下标」哈希成一个均匀随机值——种子和位置一起参与哈希，保证每个位置都有**唯一且可复现**的随机源，且不依赖任何全局状态。
+2. 把哈希值映射到 $[0,1]$ 均匀分布，再转成 **Gumbel 噪声**（$-\log(-\log(x))$）。
+3. 给 logits 加上 Gumbel 噪声后取 `argmax`——这就是 **Gumbel-Max 技巧**，在数学上等价于按 softmax 概率分布做一次随机抽样，但全程确定（同样的种子+位置必得同样结果）。
+
+### Gumbel-Max 技巧为何等价于按 softmax 抽样
+
+**结论（Gumbel-Max 定理）：** 设有一组未归一化的对数概率（logits）$\ell_1,\dots,\ell_K$，对应的 softmax 概率为
+
+$$
+p_k = \frac{e^{\ell_k}}{\sum_{j=1}^{K} e^{\ell_j}}.
+$$
+
+独立地为每个类别采一份 Gumbel(0,1) 噪声 $g_k$，则
+
+$$
+\arg\max_k\ (\ell_k + g_k)
+$$
+
+所选中类别的分布**恰好就是** $\mathrm{Categorical}(p_1,\dots,p_K)$。也就是说，“加噪声取最大”与“直接按 $p_k$ 抽样”在分布上完全一致。
+
+**Gumbel 噪声怎么来：** 取 $x\sim\mathrm{Uniform}(0,1)$，令
+
+$$
+g = -\log(-\log x),
+$$
+
+得到的 $g$ 服从标准 Gumbel 分布。其累积分布函数（CDF）为 $F(g)=\exp(-e^{-g})$（这正对应代码里 `x.log_().neg_(); x.log_().neg_()` 两次 $-\log$ 的操作）。
+
+**证明：** 记 $z_k=\ell_k+g_k$。由 Gumbel 的 CDF 可得每个 $z_k$ 的 CDF 是平移后的 Gumbel：
+
+$$
+\Pr(z_k \le t)=\exp\!\big(-e^{-(t-\ell_k)}\big)=\exp\!\big(-e^{\ell_k}e^{-t}\big),
+$$
+
+对应密度为 $f_k(t)=e^{\ell_k}e^{-t}\exp(-e^{\ell_k}e^{-t})$。类别 $k$ 被选中，当且仅当 $z_k$ 是所有 $z_j$ 中的最大值，即对所有 $j\neq k$ 有 $z_j\le z_k$。对 $z_k=t$ 积分，并利用各 $z_j$ 相互独立：
+
+$$
+\begin{aligned}
+\Pr(k \text{ 最大})
+&= \int_{-\infty}^{\infty} f_k(t)\prod_{j\neq k}\Pr(z_j\le t)\,dt \\
+&= \int_{-\infty}^{\infty} e^{\ell_k}e^{-t}\exp\!\big(-e^{\ell_k}e^{-t}\big)\prod_{j\neq k}\exp\!\big(-e^{\ell_j}e^{-t}\big)\,dt \\
+&= \int_{-\infty}^{\infty} e^{\ell_k}e^{-t}\exp\!\Big(-\big(\textstyle\sum_{j} e^{\ell_j}\big)e^{-t}\Big)\,dt.
+\end{aligned}
+$$
+
+令 $S=\sum_j e^{\ell_j}$，并换元 $u=e^{-t}$（则 $du=-e^{-t}\,dt$，即 $e^{-t}\,dt=-du$，积分限 $t:-\infty\to\infty$ 对应 $u:\infty\to 0$）：
+
+$$
+\Pr(k \text{ 最大})
+= \int_{0}^{\infty} e^{\ell_k}\,e^{-S u}\,du
+= e^{\ell_k}\cdot\frac{1}{S}
+= \frac{e^{\ell_k}}{\sum_{j} e^{\ell_j}}
+= p_k.
+$$
+
+正好等于 softmax 概率 $p_k$，证毕。
+
+**为什么对确定性采样有用：** 抽样的全部随机性都被“外包”给了 Gumbel 噪声 $g_k$；而 SGLang 用 `murmur_hash32(seed, position, col)` 来**确定性地生成**这份噪声——只要 `seed` 和 token 位置相同，每个类别（词表列）拿到的 $g_k$ 就完全相同。于是 $\arg\max_k(\ell_k+g_k)$ 也完全确定。这样既保留了“按 softmax 概率分布抽样”的正确统计行为（不是贪心、不是近似），又彻底摆脱了对全局 RNG 状态的依赖，从而与 batch 组合、调度顺序无关。
+
+**两个实现细节：**
+
+- **温度（temperature）** 体现在 $\ell_k$ 上：采样前 logits 通常已除以温度（$\ell_k/T$）。$T\to 0$ 时分布趋于 one-hot，Gumbel-Max 退化为对原始 logits 取 argmax，即贪心解码；$T$ 越大分布越平、采样越随机。
+- **数值稳定**：代码中 Gumbel 噪声与 logits 的运算保持在 `float64`，并对 $-\log x$ 做了 `clamp`，避免 $x$ 极小时 $\log$ 溢出（见 `multinomial_with_seed` 的注释）。
+
+因此：**只要设定相同的 `sampling_seed`，无论该请求和哪些请求拼成一个 batch、batch 怎么调度，采样结果都完全一致**，从而在高吞吐的连续批处理下依然实现可复现的确定性推理。
+
+## 多项式采样（torch.multinomial）
+
+`torch.multinomial(input, num_samples)` 按给定的**概率权重分布**进行**有/无放回的随机抽样**，返回被抽中类别的**下标**。在 LLM 推理里，它是「随机采样」路径的核心算子：把模型输出经 softmax 得到的概率 $p=(p_1,\dots,p_K)$ 当作 input，抽出下一个 token 的词表下标。
+
+### 输入与语义
+
+- `input`：形状 $(K,)$ 或 $(B, K)$ 的**非负权重**张量，**不要求每行和为 1**（内部会自动归一化）；为 0 的项不会被抽中。
+- `num_samples`：每行抽取的样本数。SGLang 解码每步只需一个 token，故固定 `num_samples=1`。
+- `replacement`：是否放回，默认 `False`。当 `num_samples=1` 时放回与否无差别。
+- 返回被抽中类别的**下标**（不是概率值），再据此从词表/排序索引里取回真正的 token id。
+
+数学上，第 $i$ 类被抽中的概率为按权重归一化的结果：
+
+$$
+\Pr(\text{抽中 } i) = \frac{p_i}{\sum_{j=1}^{K} p_j}.
+$$
+
+### 实现原理：逆变换采样（inverse-CDF）
+
+无放回 / `num_samples=1` 时，常见实现是**累积分布 + 均匀随机数二分**：
+
+1. 归一化权重并求前缀和（CDF）：$C_i=\sum_{j\le i} p_j / \sum_j p_j$，得到单调递增、终值为 1 的序列。
+2. 从全局 RNG 取一个均匀随机数 $u\sim\mathrm{Uniform}(0,1)$。
+3. 找到第一个满足 $C_i \ge u$ 的下标 $i$（对 CDF 做二分查找），即为抽样结果。
+
+由于 $u$ 落入区间 $[C_{i-1}, C_i)$ 的概率正好等于该区间长度 $p_i/\sum_j p_j$，所以抽中第 $i$ 类的概率恰为其归一化权重——这就是「逆变换采样」。多样本有放回时则重复取 $u$；GPU 上 PyTorch 会用并行化的变体（如别名法 / 批量二分）实现。
+
+### 关键特性：依赖全局 RNG 状态
+
+`torch.multinomial` 的随机性来自步骤 2 的 $u$，而 $u$ 取自 **全局 RNG 状态**（CPU/CUDA generator）。这意味着：
+
+- **结果可被全局种子影响**：`torch.manual_seed` 会改变后续所有 `multinomial` 的输出。
+- **顺序敏感、难以按请求复现**：在连续批处理（continuous batching）下，请求每步拼成的 batch、执行顺序不断变化，全局 RNG 会被相邻请求「串扰」，导致同一请求难以稳定复现。这正是 SGLang 在需要确定性采样时改用 **Gumbel-Max + `murmur_hash32`**（见「随机种子」条目的 `multinomial_with_seed`）而非直接 `torch.multinomial` 的原因。
+
+### 在 SGLang 中的用法（见 `python/sglang/srt/layers/sampler.py`）
+
+- **简单情形（无截断）**：直接对 softmax 概率调用 `torch.multinomial(probs, num_samples=1)` 抽下一个 token。
+- **复杂情形（top-k / top-p / min-p）**：先对概率排序、按阈值做掩码置零并重归一化，再对处理后的 `probs_sort` 调 `torch.multinomial`，最后用 `torch.gather` 把排序下标映射回真实 token id。
+- **确定性采样开关**：当请求带 `sampling_seed` 时，对应分支改走 `multinomial_with_seed`（Gumbel-Max），与 `torch.multinomial` 在分布上等价，但**不依赖全局 RNG**，从而可复现。
 
