@@ -174,6 +174,69 @@ HTTP 请求
 - **自检**：① 用自己的话解释「为什么 overlap 模式能消除调度开销」，`FutureMap` 在其中扮演什么角色？② prefill 请求与 decode 请求是如何在「同一批」或「不同批」中被调度的？`get_next_batch_to_run` 的优先级是怎样的？
 - **产出物**：`event_loop_normal` 与 `event_loop_overlap` 的对比时序图，标出两者在「采样结果可用时刻」的差异。
 
+#### 配图：`event_loop_overlap` 的 CPU/GPU 重叠原理
+
+**核心思想**：`event_loop_normal`（非重叠）每轮严格串行——CPU 调度 → 启动 GPU 前向 → **同步等 GPU 算完** → CPU 处理结果，两者互相阻塞。`event_loop_overlap` 则把「处理结果」**延后一轮**：`run_batch` 启动前向后不等结果，只把 `(batch.copy(), batch_result)` 压入 `result_queue`，立刻进入下一轮做 CPU 调度。于是**第 N 轮的 CPU 工作叠在第 N-1 轮的 GPU 前向之上**。
+
+关键代码（`scheduler.py` 的 `event_loop_overlap`）：
+
+```python
+# Launch the current batch
+if batch:
+    batch_result = self.run_batch(batch)                    # 启动 GPU 前向，不等结果
+    self.result_queue.append((batch.copy(), batch_result))  # 入队，延后处理
+# Process the last batch
+if self.last_batch:
+    if not disable_overlap_for_batch:
+        pop_and_process()                                   # 处理上一轮的结果
+self.last_batch = batch
+```
+
+**时间轴对比：**
+
+```
+═════════ event_loop_normal（串行，CPU/GPU 互相等待）═════════
+CPU: [调度B1]          [调度B2]          [调度B3]
+GPU:         [前向B1]          [前向B2]          [前向B3]
+         └─等待─┘└等待┘ └─等待─┘└等待┘
+     ❌ CPU 调度时 GPU 空闲；GPU 前向时 CPU 空闲
+
+═════════ event_loop_overlap（流水线，CPU 叠在 GPU 上）═════════
+        轮1        轮2               轮3               轮4
+CPU: [调度B1] │[调度B2 + 处理B1结果]│[调度B3 + 处理B2结果]│[调度B4 + 处理B3结果]
+GPU:         │      [前向B1]       │      [前向B2]      │      [前向B3]
+     时间 ────┴────────────────────┴───────────────────┴────────►
+     ✅ 第N轮 CPU 工作 与 第N-1轮 GPU 前向 并行，CPU 开销被 GPU 时间隐藏
+```
+
+**单轮内部步骤（CPU 线程 vs GPU forward_stream）：**
+
+```
+┌────────────────────────── 第 N 轮 ──────────────────────────┐
+│  CPU 线程                                GPU (forward_stream) │
+│  1. recv_requests / process_input                            │
+│  2. get_next_batch_to_run() → 本批 B_N                        │
+│  3. run_batch(B_N) ───────────────────► [前向 B_N 在 GPU 运行] │
+│     result_queue.append((B_N, result))         │ 同时进行 ↓   │
+│  4. pop_and_process() → 处理上一轮 B_{N-1} 的结果 │            │
+│     (取 token、判结束、流式输出、回收 KV)         │            │
+│  5. launch_batch_sample_if_needed(B_N)          │            │
+│  6. last_batch = B_N                            │            │
+└──────────────────────────────────────────────────────────────┘
+        ↓ 进入第 N+1 轮，再处理 B_N 的结果……
+```
+
+**保证正确性的关键点：**
+
+- **`result_queue` 最多积压一批**：每轮压入一批、弹出一批，流水线深度固定为 1。
+- **`batch.copy()`**：入队时快照本批状态，避免后续修改污染待处理结果。
+- **`FutureMap` 中继**：弹出处理时 GPU 采样的 token 可能还没拷回 CPU，用 FutureMap 占位「未来 token id」，后续再解析真实值。
+- **采样放在处理完上一批之后**（步骤 5）：采样可能依赖上一批结果（如 grammar 约束状态）。
+- **WAR 屏障**：本轮调度若要写共享 GPU 缓冲，需 `schedule_stream.wait_stream(forward_stream)`，确保上一轮前向已读完，避免读写竞争。
+- **必要时关闭重叠**（`is_disable_overlap_for_batch`，如连续两个 prefill、spec+grammar 组合）：先 `pop_and_process()` 处理完上一批再启动本批，退化为串行以保证正确性。
+
+> 一句话总结：overlap 通过「**启动前向即返回 + 结果延后一轮处理**」，让第 N 轮的 CPU 调度与第 N-1 轮的 GPU 前向在时间上重叠，把 CPU 调度开销藏进 GPU 计算时间里——这就是 SGLang「zero-overhead 调度」的核心。
+
 ---
 
 ### 子阶段 D：批次数据流与组批预算（第 8–9 天）
