@@ -377,3 +377,45 @@ $$
 - **复杂情形（top-k / top-p / min-p）**：先对概率排序、按阈值做掩码置零并重归一化，再对处理后的 `probs_sort` 调 `torch.multinomial`，最后用 `torch.gather` 把排序下标映射回真实 token id。
 - **确定性采样开关**：当请求带 `sampling_seed` 时，对应分支改走 `multinomial_with_seed`（Gumbel-Max），与 `torch.multinomial` 在分布上等价，但**不依赖全局 RNG**，从而可复现。
 
+## WAR 屏障（Write-After-Read Barrier，写后读屏障）
+
+**WAR 屏障**是 SGLang 重叠调度（`event_loop_overlap`）中用来防止**「写后读」数据竞争（Write-After-Read hazard）**的一个 CUDA stream 间同步点。它确保「本轮调度对某块共享 GPU 缓冲的**写入**」一定发生在「上一轮前向对同一块缓冲的**读取**完成之后」。
+
+### 背景：两条并行的 CUDA stream
+
+重叠调度把工作拆到两条 stream 上并发执行（见「在线 softmax」无关，这里是流水线并行机制）：
+
+- **调度 stream（`schedule_stream`）**：跑 CPU 端调度准备所产生的 GPU 操作（如把下一批的输入写入共享缓冲）。
+- **前向 stream（`forward_stream`）**：跑模型前向计算。
+
+正是这种「第 N 轮调度」与「第 N-1 轮前向」并行（参见「`event_loop_overlap`」的重叠原理），才会引出跨 stream 的读写顺序问题。
+
+### 为什么需要它：WAR 冒险
+
+「写后读冒险」指：**一个读操作尚未完成，另一个写操作就抢先覆盖了它要读的数据**，导致读到被污染的新值。在重叠调度里：
+
+- 第 N-1 轮的**前向**还在 `forward_stream` 上**读取**某块共享 GPU 缓冲（如 input_ids / seq_lens 等暂存区）；
+- 第 N 轮的**调度**已在 `schedule_stream` 上准备**写入**同一块缓冲。
+
+两条 stream 各自异步执行，若不加约束，调度的写可能在前向的读还没做完时就发生，造成数据竞争、结果错误。
+
+### 实现：用 `wait_stream` 跨 stream 等待
+
+在每轮调度开始前插入一条屏障，让调度 stream 等待前向 stream 把上一轮的活干完：
+
+```python
+# WAR barrier: this iter's schedule writes to shared GPU buffers
+# wait for prev forward's reads.
+if self._war_barrier_enabled:
+    self.schedule_stream.wait_stream(self.forward_stream)
+```
+
+`wait_stream` 不阻塞 CPU，只是在 GPU 上让 `schedule_stream` 后续的操作排在 `forward_stream` 当前已入队操作之后执行，从而把「写」排到「读」之后。
+
+### 开关与例外（`_war_barrier_enabled`）
+
+- **默认在 CUDA 上开启**（或显式设 `SGLANG_ENABLE_WAR_BARRIER`）。
+- **DFLASH 投机解码下关闭**：DFLASH 用 `verify_done` / plan-stream 依赖等**更细粒度**的同步自行保护其对共享 `req_to_token` 的写入，无需这个**全局**屏障，关闭可减少不必要的串行化。
+
+> 注意区分方向：本屏障是「调度等前向」（写等读，WAR）；而 `run_batch` 里还有一处反向的 `forward_stream.wait_stream(schedule_stream)`，那是「前向等调度」，保证前向所依赖的调度准备已就绪（属于 RAW，读等写），两者配合维持跨 stream 的正确时序。
+
