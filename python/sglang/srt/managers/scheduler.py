@@ -1511,15 +1511,28 @@ class Scheduler(
 
     def _abort_on_running_timeout(self):
         # NOTE: this should be called before a batch is launched.
+        # 中译：中止"运行过久"的在途请求——即已进入 running_batch、正在 decode 的请求
+        #       从首次前向到现在耗时超过阈值的。必须在一个批次启动前调用（见 get_next_batch_to_run），
+        #       这样设置的中止标记能在本轮被及时处理，不会与正在进行的前向产生竞态。
+        # 中译：读取运行超时阈值（秒）。<=0 表示该功能关闭，直接返回。
         timeout_s = envs.SGLANG_REQ_RUNNING_TIMEOUT.get()
         if timeout_s <= 0:
             return
+        # 中译：running_batch 为空（无在途请求）时无需检查。
         if self.running_batch.is_empty():
             return
 
+        # 中译：deadline 是"截止时刻"——首次前向时间早于它的请求即视为超时。
+        #       用 (now - timeout_s) 与各请求的进入时间比较，等价于"已运行 > timeout_s"。
         deadline = time.perf_counter() - timeout_s
         for req in self.running_batch.reqs:
+            # 中译：forward_entry_time 是该请求首次进入前向的时刻；>0 表示已真正开始前向
+            #       （未开始的为 0，需排除）。已 finished 的请求也跳过。
             if not req.finished() and 0 < req.time_stats.forward_entry_time < deadline:
+                # 中译：不直接通知 tokenizer/移出批次，而是设置延迟中止标记 to_finish。
+                #       在途请求已占用 KV、可能正处于前向，直接删除不安全；改由后续正常的
+                #       完成/清理路径消费该标记（见 get_next_batch_to_run 中对 reqs_to_abort
+                #       的处理），统一发送 AbortReq 并释放 KV，避免资源泄漏与竞态。
                 req.to_finish = FINISH_ABORT(
                     "Request running timeout reached.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
@@ -2534,17 +2547,27 @@ class Scheduler(
         return req_to_abort.rid == recv_req.rid
 
     def _abort_on_waiting_timeout(self):
+        # 中译：中止"等待过久"的排队请求——即在 waiting_queue 中排队、尚未被调度进 prefill 的请求
+        #       从入队到现在耗时超过阈值的。与 _abort_on_running_timeout 不同：这些请求还没分配 KV、
+        #       没开始前向，可以直接中止并从队列移除，无需走延迟标记。
+        # 中译：读取等待超时阈值（秒）。<=0 表示功能关闭，直接返回（海象赋值顺带取值）。
         if (timeout_s := envs.SGLANG_REQ_WAITING_TIMEOUT.get()) <= 0:
             return
 
-        deleted_reqs = set()
+        deleted_reqs = set()  # 本轮被超时中止、待从队列剔除的请求集合
+        # 中译：deadline 同上——入队时间早于它即视为等待超时（已等待 > timeout_s）。
         deadline = time.perf_counter() - timeout_s
         for req in self.waiting_queue:
+            # 中译：wait_queue_entry_time 是该请求进入等待队列的时刻；>0 表示已正式入队。
             entry_time = req.time_stats.wait_queue_entry_time
             if 0 < entry_time < deadline:
                 if self.enable_hicache_storage:
                     # Release prefetch events associated with the request
+                    # 中译：开启分层缓存存储时，排队期间可能已发起 KV 预取（prefetch）；
+                    #       中止前需释放与该请求关联的预取事件，避免悬挂资源。
                     self.tree_cache.release_aborted_request(req.rid)
+                # 中译：等待中的请求无在途前向，可直接向 tokenizer 发送 AbortReq
+                #       （503 SERVICE_UNAVAILABLE），由其向客户端返回中止结果。
                 self.ipc_channels.send_to_tokenizer.send_output(
                     AbortReq(
                         finished_reason={
@@ -2558,6 +2581,7 @@ class Scheduler(
                 )
                 deleted_reqs.add(req)
 
+        # 中译：一次性重建等待队列，过滤掉所有被中止的请求（避免在遍历中修改列表）。
         if deleted_reqs:
             self.waiting_queue = [
                 req for req in self.waiting_queue if req not in deleted_reqs
@@ -2712,16 +2736,23 @@ class Scheduler(
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
             # only finished requests to running_batch.
+            # 中译：把分块请求移出批次，这样合并进 running_batch 的就只有真正 prefill 完成的请求。
+            #       分块请求只 prefill 了一个 chunk、尚未完成，不能进入 decode 阶段。
             chunked_req_to_exclude.add(self.chunked_req)
 
             # Stash (cache) the previous chunk only when it produced new KV
             # beyond what is already cached. A parked chunk (add_chunked_req
             # hybrid-SWA early-return) leaves fill_len == len(prefix_indices),
             # so there is nothing new to cache and stashing would be a no-op.
+            # 中译：仅当本 chunk 产生了超出已缓存范围的新 KV 时，才把它 stash（缓存）进 radix tree。
+            #       被搁置的 chunk（add_chunked_req 在 hybrid-SWA 下提前返回）会使
+            #       fill_len == len(prefix_indices)，即没有新 KV 可缓存，此时 stash 是无意义的空操作。
             if self.chunked_req.fill_len > len(self.chunked_req.prefix_indices):
                 self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
+        # 中译：HiSparse（分层稀疏注意力）有自己的 prefill→decode 转换逻辑，跳过常规的 last_batch 合并。
+        #       它通过 hisparse_coordinator 收集已就绪的请求，单独构建 decode 批并入 running_batch。
         if self.enable_hisparse:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
@@ -2732,6 +2763,7 @@ class Scheduler(
                     self.running_batch.merge_batch(new_batch)
                 self.running_batch.hisparse_coordinator = self.hisparse_coordinator
             # Reset batch_is_full so the scheduler can schedule more prefills.
+            # 中译：重置 batch_is_full 标记，让调度器后续还能继续攒入更多 prefill 请求。
             self.running_batch.batch_is_full = False
 
         if (
@@ -2742,16 +2774,20 @@ class Scheduler(
             if self.last_batch.chunked_req is not None:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
+                # 中译：在上下文流水线并行（context PP）下，最后一个 chunk 跑完后，当前微批仍可能持有
+                #       一个已过期的 chunked_req 引用，需要把它丢弃，避免误处理。
                 chunked_req_to_exclude.add(self.last_batch.chunked_req)
 
             if self.dllm_config is not None and self.last_batch.reqs:
                 chunked_req_to_exclude.update(self.last_batch.reqs)
 
             # Filter batch
+            # 中译：从上一批中过滤掉需要排除的分块请求，并记录过滤前后的批大小。
             last_bs = self.last_batch.batch_size()
             self.last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
+            # 中译：若批大小变小（有请求被过滤出去），说明腾出了名额，重置 batch_is_full。
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
@@ -2762,6 +2798,7 @@ class Scheduler(
                     self.running_batch = self.last_batch
                 else:
                     # Merge running_batch with prefill batch
+                    # 中译：running_batch 非空时，把上一批 prefill 完成的请求合并进去。
                     self.running_batch.merge_batch(self.last_batch)
 
         # For prefill-only batch, filter out finished requests since they
@@ -2769,6 +2806,10 @@ class Scheduler(
         # for load reporting (num_running_reqs via /v1/loads).
         # Runs outside the last_batch block so stale requests are cleaned
         # even when no new batches arrive (e.g. traffic stops).
+        # 中译：对于 prefill-only 批次（如纯 embedding 请求），其请求不会经过 decode 步骤，
+        #       需在此处主动过滤掉已完成的请求，使 running_batch 在负载上报（/v1/loads 的
+        #       num_running_reqs）时保持准确。该过滤放在 last_batch 块之外，确保即使没有新批次到来
+        #       （例如流量停止）也能及时清理掉陈旧请求。
         if self.running_batch.is_prefill_only:
             self.running_batch.filter_batch()
             if self.running_batch.is_empty():
@@ -2791,6 +2832,10 @@ class Scheduler(
             # Before merging the new batch into running batch:
             # 1. All new batches are none -> need_mlp_sync remains true (sync is needed for decode batch).
             # 2. All new batches are some (prefill / idle) -> we do not need prepare mlp sync one more time.
+            # 中译：当同时启用投机解码（spec）和 DP attention 时，本分支确保 prefill 批与 decode 批
+            #       不会被混在同一次同步里。在把新批并入 running batch 之前：
+            #       1. 所有 DP rank 的新批都为 None → need_mlp_sync 保持 True（decode 批仍需同步）；
+            #       2. 所有 DP rank 的新批都非 None（prefill 或 idle）→ 已经同步过，无需再次准备 MLP 同步。
             new_batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(new_batch)
             need_mlp_sync = new_batch is None
 
@@ -2812,18 +2857,23 @@ class Scheduler(
                 ret = None
 
         # Handle DP attention and log stats
+        # 中译：处理 DP attention 同步——若本轮仍需 MLP 同步（need_mlp_sync 为 True，通常是 decode 批），
+        #       在此为各 DP rank 准备同步批（必要时插入 idle 批，保证所有 rank 步调一致、避免死锁）。
         ret = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(
             ret, need_sync=need_mlp_sync
         )
 
         # Handle ngram embedding
+        # 中译：若启用了 ngram embedding，在前向之前填好 token 查找表。
         ret = self._maybe_prepare_ngram_embedding(ret)
 
+        # 中译：为最终选定的批记录调度时刻（用于时延统计）；启用 FPM 时还记录本批调度起始时间。
         if ret:
             set_schedule_time_batch(ret)
             if self.enable_fpm:
                 ret.fpm_start_time = self._fpm_batch_t0
 
+        # 中译：返回本轮要跑的批次。可能是 prefill 批、decode 批、DP 同步用的 idle 批，或 None（空闲）。
         return ret
 
     def get_num_allocatable_reqs(self, running_bs):
@@ -2884,11 +2934,15 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
+        # 中译：启用分层缓存（hierarchical cache）时，推进一次 HiCache 事件（主机↔设备间的
+        #       KV 加载/回写进度），以便后续判断哪些请求的前缀已准备好。
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
+            # 中译：启用优先级抢占或 hybrid-SWA 时，先重置 batch_is_full，以便后面用 PrefillAdder
+            #       尝试抢占（把低优先级请求踢出为高优先级请求腾出空间）。
             self.running_batch.batch_is_full = False
 
         # 中译：批已满 或 没有等待请求，且没有未完成的分块请求 → 本轮无新 prefill 可攒。
@@ -2897,6 +2951,8 @@ class Scheduler(
         ) and self.chunked_req is None:
             return None
 
+        # 中译：当前 running batch 大小。DFLASH 投机解码下，若正在“为攒批而延迟 prefill”（让
+        #       running batch 再多攒几个再一起跑），本轮就不出 prefill 批。
         running_bs = len(self.running_batch.reqs)
         if self._should_delay_dflash_prefill_for_batching(running_bs):
             return None
@@ -2906,6 +2962,11 @@ class Scheduler(
         # as the space for the chunked requests has just been released.
         # In PP case, chunked requests (or dllm requests) can start in one microbatch and end in another microbatch, so the max_running_requests per microbatch should not be strict.
         # Instead, we should always allow chunked requests to be added, otherwise, there will be a memory leak.
+        # 中译：可分配名额检查。若“可再接纳的请求数 <= 0”且无未完成分块请求、未开抢占，
+        #       则标记批已满并返回 None。但如果有 chunked_req 则跳过该检查：
+        #       - 非 PP 场景：chunked_req 存在时刚释放了其空间，num_allocatable_reqs 应总 > 0；
+        #       - PP 场景：分块/dllm 请求可能跨微批跳始跳终，每微批的 max_running_requests 不应严格限制，
+        #         必须始终允许分块请求加入，否则会造成显存泄漏。
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
             and self.chunked_req is None
@@ -2915,15 +2976,20 @@ class Scheduler(
             return None
 
         # Get priority queue
+        # 中译：按调度策略（FCFS/LPM/优先级等）对等待队列排序，决定接下来优先考虑哪些请求。
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
             # in the waiting queue.
+            # 中译：回退（retract）测试专用分支——当 running batch 大小超过阈值时跳过 prefill，
+            #       把请求留在等待队列里，从而人为造出“显存不足需回退”的场景供测试。
             return None
 
         # Determine chunked_prefill_size for this batch
+        # 中译：确定本批的分块大小。默认用静态配置 chunked_prefill_size；若启用了 PP 动态分块
+        #       且存在未完成分块请求，则根据已 prefill 的历史长度预测下一个 chunk 的最优大小。
         chunked_prefill_size = self.chunked_prefill_size
         if self.chunked_req is not None and self.enable_dynamic_chunking:
             history_len = len(self.chunked_req.prefix_indices)
@@ -2952,27 +3018,37 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
         )
 
+        # 中译：若存在未完成的分块请求，优先把它加进本批（继续 prefill 下一个 chunk），
+        #       避免分块请求被新请求饥饿。init_next_round_input 重算本轮要填的 token。
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
+        # 中译：LoRA 场景：统计当前 running batch 中未完成请求所用的 adapter 集合，后续用于限制
+        #       同一批内 adapter 数量（max_loras_per_batch）。
         if self.enable_lora:
             running_loras = {
                 req.lora_id for req in self.running_batch.reqs if not req.finished()
             }
             # Account for LoRAs that are already loaded in the adder, such as chunked requests
+            # 中译：把 adder 中已加载的 adapter（如分块请求的）也纳入集合。
             running_loras.update(req.lora_id for req in adder.can_run_list)
 
+            # 中译：LoRA drainer 负责公平调度：更新各 adapter 的“排空（draining）”状态，避免某个
+            #       adapter 长期占用位置、其他 adapter 请求饥饿。
             if self.lora_drainer:
                 self.lora_drainer.update_draining_state(
                     self.waiting_queue,
                     self.running_batch.reqs,
                 )
 
+        # 中译：Mamba/混合线性模型的状态空间分配器（若有）。alloc_group_begin/end 把本轮的
+        #       多个分配归为一组，便于失败时整组回滚。
         mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
+        # 中译：从等待队列中逐个取出请求去组装新的 prefill 批。
         # 中译：遍历等待队列，逐个尝试把请求加入本次 prefill 批（adder.can_run_list）。
         #       一旦预算耗尽（batch_is_full 且无法抢占）就 break。
         for req in self.waiting_queue:
@@ -2987,9 +3063,12 @@ class Scheduler(
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 # In prefill mode, prealloc queue and transfer queue can also take memory,
                 # so we need to check if the available size for the actual available size.
+                # 中译：PD 分离的 prefill 模式下，prealloc 队列与 transfer 队列也会占用 req_to_token_pool，
+                #       所以还要额外检查该池的可用名额，不能只看名额上限。
                 if len(adder.can_run_list) >= self.req_to_token_pool.available_size():
                     self.running_batch.batch_is_full = True
 
+            # 中译：批已满：若未开抢占、或抢占也无法为该请求腾出空间，则停止遥历等待队列。
             if self.running_batch.batch_is_full:
                 if (
                     not self.enable_priority_preemption
@@ -2997,12 +3076,15 @@ class Scheduler(
                 ):
                     break
 
+            # 中译：启用 HiCache 存储（L3）时，检查该请求从存储预取 KV 的进度。
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    # 中译：预取未完成的请求先跳过，等下轮再调度。
                     continue
                 # Pop the number of tokens loaded from storage (L3 hits)
+                # 中译：取出从存储（L3 命中）加载回来的 token 数，计入该请求的命中长度。
                 req.storage_hit_length = self.tree_cache.pop_prefetch_loaded_tokens(
                     req.rid
                 )
@@ -3019,10 +3101,13 @@ class Scheduler(
             if self.enable_lora:
                 running_loras.add(req.lora_id)
 
+            # 中译：返回值非 CONTINUE 表示本请求未能加入（预算耗尽），需收尾并 break。
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
                     if self.enable_hierarchical_cache:
                         # Set batch_is_full after making sure there are requests that can be served
+                        # 中译：分层缓存下，只有“确实有请求能被服务”时才置 batch_is_full，
+                        #       避免因主机缓存还在加载而误判为满、造成空转。
                         self.running_batch.batch_is_full = len(
                             adder.can_run_list
                         ) > 0 or (not self.running_batch.is_empty())
@@ -3032,6 +3117,9 @@ class Scheduler(
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
                 # lifecycle and freeing them here causes double-free.
+                # 中译：若该请求最终未加入本批，需回收它在本轮新分配的 mamba 槽位以防显存泄漏。
+                #       仅当该槽位是本轮新分配（而非会话 session 预先持有）时才释放——
+                #       session 持有的槽位有自己独立的生命周期，在此释放会造成 double-free。
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if (
                     not added
@@ -3060,11 +3148,14 @@ class Scheduler(
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
 
+        # 中译：本轮攒批过程中产生了新的分块请求（某个 long prompt 被拆成多 chunk），
+        #       记录为当前 chunked_req。断言保证同时只存在一个未完成的分块请求。
         if adder.new_chunked_req is not None:
             # Update chunked prefill
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
+        # 中译：累加“在途中间 chunk”计数（用于 PP 等场景跟踪分块请求的进度）。
         if self.chunked_req is not None:
             self.chunked_req.inflight_middle_chunks += 1
 
@@ -3083,20 +3174,27 @@ class Scheduler(
             chunked_req=self.chunked_req,
         )
 
+        # 中译：标记本批是否包含“最后一个 prefill chunk”。若无分块请求，或本批不是单独的分块
+        #       请求（请求数≠ 1），则视为含最后一块；该标记决定 prefill 后是否生成首 token。
         new_batch.contains_last_prefill_chunk = (
             self.chunked_req is None or len(can_run_list) != 1
         )
 
+        # 中译：记录历史最大 prefill 批大小（用于后续名额估算与调优）。
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+            # 中译：分层缓存下，记录本批需从主机缓存加载 KV 的消费者索引（供后续加载使用）。
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
 
+        # 中译：prepare_for_extend 为 prefill 前向准备所需张量（input_ids、位置、KV 槽位分配等）。
         new_batch.prepare_for_extend()
 
         # Record prefill stats for logging after forward.
+        # 中译：记录本批 prefill 的统计信息（请求数、token 数、抢占与待处理 token 等），
+        #       供前向完成后打日志用。
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder,
             self.running_batch.reqs,
@@ -3118,20 +3216,26 @@ class Scheduler(
             and not self.running_batch.is_empty()
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
+            # 中译：mix_with_running 会拼接 input_ids 但不拼接 input_embeds，若有 input_embeds 则形状会不匹配。
             and new_batch.input_embeds is None
         ):
             # TODO (lianmin): support return_logprob + mixed chunked prefill
+            # 中译：先过滤掉 running_batch 中已完成的请求，准备好 decode 张量后，再把它们拼进本
+            #       prefill 批，实现“一次前向同时处理 prefill + decode”。decoding_reqs 记录被混入的 decode 请求。
             self.running_batch.filter_batch()
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()
                 new_batch.mix_with_running(self.running_batch)
                 new_batch.decoding_reqs = self.running_batch.reqs
+            # 中译：running 请求已被并入 new_batch，清空 running_batch（仅保留 batch_is_full 标记）。
             self.running_batch = ScheduleBatch(
                 reqs=[], batch_is_full=self.running_batch.batch_is_full
             )
         else:
+            # 中译：未启用混合分块，本批不携带 decode 请求。
             new_batch.decoding_reqs = None
 
+        # 中译：返回组装好的新 prefill 批（可能已混入部分 decode 请求）。
         return new_batch
 
     def _can_schedule_lora_req(
@@ -3354,25 +3458,34 @@ class Scheduler(
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
 
+        # 中译：脚本化调度器钩子（测试/复现场景用），在每次 run_batch 前回调。
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)
 
         # Whether to run the profiler
+        # 中译：判定本批是否需要启动/停止 profiler 采集。
         self.profiler_manager._profile_batch_predicate(batch)
+        # 中译：调试钩子——按需在前向前人为 sleep，用于复现调度时序问题。
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
 
         # Place holder handling for pd-disagg decode event loop
+        # 中译：PD 分离 decode 事件循环中的"占位（prebuilt）"批处理：这类批的 KV 已由
+        #       prefill 节点传来，无需再跑正常前向，走专用的 _run_batch_prebuilt 路径。
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
         # Run forward
+        # 中译：按“是否生成模型”分两大类路径：生成模型需采样出 next token，
+        #       嵌入/奖励模型只需前向得到向量。
         if self.is_generation:
             if self.enable_overlap:
                 # 中译：重叠路径（生成模型）。
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
+                # 中译：预先解析本批的 seq_lens_cpu。仅投机 V2 需要（依赖 future_indices），
+                #       非投机 V2 为空操作（ForwardBatch.init_new 会懒计算该和）。
                 self.future_map.resolve_seq_lens_cpu(batch)
 
                 with self.forward_stream_ctx:
@@ -3382,14 +3495,23 @@ class Scheduler(
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring
                     # post-forward must not un-consume staging.
+                    # 中译：resolve_forward_inputs 会“消费” ScheduleBatch 的暂存字段
+                    #       （prefill_input_ids_cpu / mix_running_indices），从 future_map 重建
+                    #       真正的 input_ids。故意放在事务隔离（_forward_isolation）之外，
+                    #       让快照捕获“消费后”状态；否则前向后还原会错误地“反消费”暂存。
                     resolve_forward_inputs(batch, self.future_map)
 
                     with self._forward_isolation(batch, overlap=True):
+                        # 中译：future_indices 是本批请求在 req_to_token_pool 中的槽位索引，
+                        #       同时也用作 future_map 中“未来值”的发布/暂存键。
                         future_indices = batch.req_pool_indices
 
                         # Spec_v2 fires on_publish mid-worker (between verify and
                         # draft_extend) so schedule prep can overlap with draft_extend.
                         # Non-spec has no later work — scheduler publishes after return.
+                        # 中译：投机 V2 会在 worker 内部（verify 与 draft_extend 之间）触发
+                        #       on_publish 回调，让下一轮的调度准备能与 draft_extend 重叠；
+                        #       非投机路径后续无额外工作，由调度器在前向返回后再 publish。
                         fwd_kwargs = (
                             {
                                 "on_publish": partial(
@@ -3412,12 +3534,19 @@ class Scheduler(
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
                         # ring slot as the SB attr snapshot).
+                        # 中译：worker 可能要求某些张量多存活 2 个迭代（跨 stream 生命周期问题），
+                        #       把它们钉进与 SB 快照同一个环形缓冲槽位，避免被缓存分配器提前回收。
                         if batch_result.extra_keep_alive_refs:
                             self.batch_record_buf[self.batch_record_ct].extend(
                                 batch_result.extra_keep_alive_refs
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
+                        # 中译：创建一个 CUDA Event 标记 D2H 拷贝完成点，供后续结果处理同步等待。
                         batch_result.copy_done = self.device_module.Event()
+                        # 中译：delay_sample_func 为 None 表示本批采样已在 worker 内完成，可立即
+                        #       把“未来值”（投机为 draft 输入，非投机为 next_token_ids）暂存到
+                        #       future_map，并启动异步 D2H 拷贝；否则采样被推迟（如结构化输出
+                        #       需等上一批语法状态），仅记录 future_indices，到采样时再处理。
                         if batch_result.delay_sample_func is None:
                             stash_payload = (
                                 batch_result.next_draft_input
@@ -3436,10 +3565,14 @@ class Scheduler(
                 # 中译：下一轮的 input_ids 改由 future_map 中继，这里清空避免读到本轮旧值。
                 batch.input_ids = None
 
+                # 中译：投机解码下，把本次产出的 draft 输入作为下一轮 spec_info 带入，并记下其
+                #       future_indices（下一轮从 future_map 取回真实值）。
                 if not batch.spec_algorithm.is_none():
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
+                # 中译：PD 复用（pdmux）的“拆分 prefill”路径：先解析输入、跑拆分 prefill，
+                #       若产出了 next token 则照样用 future_map 中继，并清空 input_ids。
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
@@ -3450,11 +3583,14 @@ class Scheduler(
             elif not batch.spec_algorithm.is_none():
                 # Non-overlap: drive the V2 worker synchronously (no
                 # future_map relay / on_publish).
+                # 中译：非重叠的投机路径：同步驱动 V2 worker（不经 future_map 中继、无 on_publish）。
                 resolve_forward_inputs(batch, self.future_map)
                 with self._forward_isolation(batch, overlap=False):
                     batch_result = self.model_worker.forward_batch_generation(batch)
                 # The isolation restore reverted the worker's in-forward SB edits;
                 # re-apply what must carry to the next iter.
+                # 中译：事务隔离退出时已回滚 worker 在前向中对 SB 的修改，这里手动重新应用
+                #       那些必须带到下一轮的字段（spec_info、新的 seq_lens 等）。
                 batch.spec_info = batch_result.next_draft_input
                 if batch_result.new_seq_lens is not None:
                     batch.seq_lens = batch_result.new_seq_lens
@@ -3464,6 +3600,7 @@ class Scheduler(
                 batch.input_ids = None  # rebuilt next iter from draft_token
                 self.update_cache_from_scheduler(batch, batch_result)
                 # Sync D2H so the result processor can read CPU tensors.
+                # 中译：同步一次 D2H 拷贝，使结果处理器能读到 CPU 上的张量。
                 batch_result.copy_done = self.device_module.Event()
                 batch_result.copy_to_cpu(
                     return_logprob=batch.return_logprob,
@@ -3482,6 +3619,7 @@ class Scheduler(
                 )
                 if isinstance(batch_result.next_token_ids, torch.Tensor):
                     # Non-spec: relay via future_map, gathered next iter.
+                    # 中译：非投机：把 next_token_ids 暂存到 future_map 中继，下一轮再汇集取回。
                     self.future_map.stash(
                         batch.req_pool_indices, batch_result.next_token_ids
                     )
@@ -3491,6 +3629,8 @@ class Scheduler(
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
             # we can use the correct values in output processing.
+            # 中译：以下两个值（每请求的 extend 输入长度、logprob 起点）处理输出时需要，
+            #       但重叠调度可能在下一轮修改它们，所以这里先拷贝一份，保证输出处理用到正确值。
             if batch.return_logprob:
                 batch_result.extend_input_len_per_req = [
                     req.extend_input_len for req in batch.reqs
@@ -3506,6 +3646,7 @@ class Scheduler(
         else:  # embedding or reward model
             # 中译：非生成模型（embedding / reward）——只做前向得到向量，无需采样。
             if self.enable_overlap:
+                # 中译：重叠模式下同样先钉住本批张量生命周期，再在 forward_stream 上跑前向。
                 self.record_batch_in_overlap(batch)
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)

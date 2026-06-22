@@ -64,12 +64,13 @@ class QueueCount:
 @dataclass
 class SchedulerStats:
     # Basics
-    num_running_reqs: QueueCount = field(default_factory=QueueCount)
-    num_queue_reqs: QueueCount = field(default_factory=QueueCount)
-    num_grammar_queue_reqs: int = 0
-    gen_throughput: float = 0.0
-    cache_hit_rate: float = 0.0
-    decode_sum_seq_lens: int = 0
+    # 中译：基础指标。
+    num_running_reqs: QueueCount = field(default_factory=QueueCount)  # 正在运行（解码中）的请求数
+    num_queue_reqs: QueueCount = field(default_factory=QueueCount)  # 等待队列中的请求数
+    num_grammar_queue_reqs: int = 0  # 等待语法（grammar）编译队列中的请求数
+    gen_throughput: float = 0.0  # 生成吞吐（token/s）
+    cache_hit_rate: float = 0.0  # 前缀缓存命中率
+    decode_sum_seq_lens: int = 0  # 当前 decode 批次所有请求序列长度之和
 
     # Memory pool usage ratios (0.0–1.0).
     # Each pool tracks: used = total - available - evictable, usage = used / total.
@@ -79,6 +80,12 @@ class SchedulerStats:
     # full_token_usage: full-attention KV cache pool usage (always active).
     # swa_token_usage:  sliding-window attention KV cache pool usage (hybrid SWA models only, e.g. Gemma2).
     # mamba_usage:      Mamba SSM state pool usage (hybrid SSM models only, e.g. Jamba).
+    # 中译：内存池使用率（0.0–1.0）。每个池满足：used = total - available - evictable，usage = used / total。
+    #   token_usage：      max(full, swa, mamba)——所有池中的瓶颈值。
+    #                      FIXME：名字 "token_usage" 有误导性；重命名需走 API 弃用流程。
+    #   full_token_usage： 全注意力 KV 缓存池使用率（始终生效）。
+    #   swa_token_usage：  滑动窗口注意力 KV 缓存池使用率（仅混合 SWA 模型，如 Gemma2）。
+    #   mamba_usage：      Mamba SSM 状态池使用率（仅混合 SSM 模型，如 Jamba）。
     token_usage: float = 0.0
     full_token_usage: float = 0.0
     swa_token_usage: float = 0.0
@@ -94,65 +101,85 @@ class SchedulerStats:
     # kv_used_tokens:       actively used slots (locked by running requests). Equals full_num_used.
     # num_used_tokens:      max(full_num_used, swa_num_used) for hybrid-SWA models, else full_num_used.
     #                       Does NOT include the mamba pool.
+    # 中译：全注意力 KV 缓存池的绝对 token 数。
+    #   不变式：kv_available_tokens + kv_evictable_tokens + kv_used_tokens <= max_total_num_tokens
+    #   （差额对应受保护/会话持有、此处未暴露的 token）。max_total_num_tokens 在启动时经 emit_constants 上报一次。
+    #   kv_available_tokens： 池中空闲（未分配）的槽位数。
+    #   kv_evictable_tokens： 持有 radix 缓存 KV 数据、可为新请求腾出而淘汰的槽位数。
+    #   kv_used_tokens：      正在使用（被运行中请求锁定）的槽位数，等于 full_num_used。
+    #   num_used_tokens：     混合 SWA 模型取 max(full_num_used, swa_num_used)，否则取 full_num_used；不含 mamba 池。
     num_used_tokens: int = 0
     kv_available_tokens: int = 0
     kv_evictable_tokens: int = 0
     kv_used_tokens: int = 0
 
+    # 中译：SWA（滑动窗口注意力）KV 缓存池的空闲/可淘汰/已用 token 数（仅混合 SWA 模型）。
     swa_available_tokens: int = 0
     swa_evictable_tokens: int = 0
     swa_used_tokens: int = 0
+    # 中译：Mamba SSM 状态池的空闲/可淘汰/已用 token 数（仅混合 SSM 模型）。
     mamba_available_tokens: int = 0
     mamba_evictable_tokens: int = 0
     mamba_used_tokens: int = 0
 
     # Speculative decoding
-    spec_accept_length: float = 0.0
-    spec_accept_rate: float = 0.0
+    # 中译：投机解码指标。
+    spec_accept_length: float = 0.0  # 平均每步接受的草稿 token 数（接受长度）
+    spec_accept_rate: float = 0.0  # 草稿 token 的接受率
     # Adaptive speculative decoding (currently active tier).
-    spec_num_steps: int = 0
-    spec_num_draft_tokens: int = 0
+    # 中译：自适应投机解码（当前生效的档位）。
+    spec_num_steps: int = 0  # 当前档位每次投机的步数
+    spec_num_draft_tokens: int = 0  # 当前档位每次生成的草稿 token 数
 
     # Retract
-    num_retracted_reqs: int = 0
-    num_paused_reqs: int = 0
+    # 中译：回撤/抢占指标。
+    num_retracted_reqs: int = 0  # 被回撤（因显存不足而退回队列）的请求数
+    num_paused_reqs: int = 0  # 被暂停的请求数
 
     # PD disaggregation
-    num_prefill_bootstrap_queue_reqs: QueueCount = field(default_factory=QueueCount)
-    num_prefill_inflight_queue_reqs: QueueCount = field(default_factory=QueueCount)
-    num_decode_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)
-    num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
-    kv_transfer_speed_gb_s: float = 0.0
-    kv_transfer_latency_ms: float = 0.0
-    pending_prealloc_token_usage: float = 0.0
+    # 中译：PD 分离（prefill/decode 分别部署）指标。
+    num_prefill_bootstrap_queue_reqs: QueueCount = field(default_factory=QueueCount)  # prefill 端 bootstrap（握手）队列请求数
+    num_prefill_inflight_queue_reqs: QueueCount = field(default_factory=QueueCount)  # prefill 端传输中（inflight）队列请求数
+    num_decode_prealloc_queue_reqs: QueueCount = field(default_factory=QueueCount)  # decode 端预分配队列请求数
+    num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)  # decode 端 KV 传输队列请求数
+    kv_transfer_speed_gb_s: float = 0.0  # KV 传输速度（GB/s）
+    kv_transfer_latency_ms: float = 0.0  # KV 传输延迟（ms）
+    pending_prealloc_token_usage: float = 0.0  # 待预分配 token 占用比例
 
     # Utilization
-    utilization: float = 0.0
-    fwd_occupancy: float = float("nan")
+    # 中译：利用率指标。
+    utilization: float = 0.0  # 调度器整体利用率
+    fwd_occupancy: float = float("nan")  # 前向计算占用率
 
     # Scheduler policy
-    new_token_ratio: float = 0.0
+    # 中译：调度策略指标。
+    new_token_ratio: float = 0.0  # 新 token 比例（用于预估保留显存的自适应系数）
 
     # CUDA graph
-    is_cuda_graph: int = 0
+    # 中译：CUDA Graph 指标。
+    is_cuda_graph: int = 0  # 本批次是否走 CUDA Graph 重放（1 是 / 0 否）
 
     # LoRA pool metrics
-    lora_pool_slots_used: int = 0
-    lora_pool_slots_total: int = 0
-    lora_pool_utilization: float = 0.0
+    # 中译：LoRA 池指标。
+    lora_pool_slots_used: int = 0  # 已使用的 LoRA 槽位数
+    lora_pool_slots_total: int = 0  # LoRA 槽位总数
+    lora_pool_utilization: float = 0.0  # LoRA 池利用率
 
     # HiCache metrics
-    hicache_host_used_tokens: int = 0
-    hicache_host_total_tokens: int = 0
+    # 中译：HiCache（分层缓存）指标。
+    hicache_host_used_tokens: int = 0  # host（CPU）缓存已用 token 数
+    hicache_host_total_tokens: int = 0  # host（CPU）缓存总 token 数
 
     # Streaming session metrics
-    num_streaming_sessions: int = 0
-    streaming_session_held_tokens: int = 0
+    # 中译：流式会话指标。
+    num_streaming_sessions: int = 0  # 活跃的流式会话数
+    streaming_session_held_tokens: int = 0  # 流式会话所持有（占用）的 token 数
 
     # Routing key metrics
-    num_unique_running_routing_keys: int = 0
-    routing_key_running_req_counts: List[int] = field(default_factory=list)
-    routing_key_all_req_counts: List[int] = field(default_factory=list)
+    # 中译：路由键（routing key）指标。
+    num_unique_running_routing_keys: int = 0  # 运行中请求的去重路由键数量
+    routing_key_running_req_counts: List[int] = field(default_factory=list)  # 各路由键下运行中的请求数列表
+    routing_key_all_req_counts: List[int] = field(default_factory=list)  # 各路由键下全部（含排队）的请求数列表
 
 
 ROUTING_KEY_REQ_COUNT_BUCKET_BOUNDS = [1, 2, 3, 5, 7, 10, 20, 50, 100, 200]

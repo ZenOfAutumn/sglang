@@ -540,20 +540,36 @@ class PrefillAdder:
 
     def __init__(
         self,
+        # 中译：分页 KV 缓存的页大小（每页 token 数）。token 数需向上对齐到 page_size，
+        #       预算计算与切块边界都以页为粒度。
         page_size: int,
+        # 中译：前缀缓存（radix/前缀树）。提供前缀复用命中、可驱逐空间统计、Mamba 支持判断等能力。
         tree_cache: BasePrefixCache,
+        # 中译：KV 缓存物理分配器。提供「当前可用 token 数」等物理显存口径，用于判断预算是否够用。
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+        # 中译：当前正在运行（decode）的批次。需为其中每个请求预留未来生成 token 的显存，避免被新 prefill 侵占。
         running_batch: ScheduleBatch,
+        # 中译：运行中请求「剩余将生成 token 数」的折扣系数（<1），用于乐观估算需预留显存，避免过度保守。
         new_token_ratio: float,
+        # 中译：本轮可摄入的「输入 token」总预算，对应 max_prefill_tokens。
         rem_input_tokens: int,
+        # 中译：分块 prefill 的单轮 chunk token 预算；为 None 表示未启用分块 prefill。
         rem_chunk_tokens: Optional[int],
+        # 中译：本轮批次中混合进来的 decode token 数（mixed chunk）。会先从各项预算里扣除。
         num_mixed_decode_tokens: int = 0,
+        # 中译：优先级调度的抢占阈值——仅当新请求优先级高出运行请求达到该阈值时才允许抢占。
         priority_scheduling_preemption_threshold: int = 0,
+        # 中译：单轮 prefill 的最大 batch size 上限（请求条数）。
         max_prefill_bs: int = 0,
+        # 中译：系统允许同时运行的最大请求数；用于限制接纳后整体并发不超限。
         max_running_requests: Optional[int] = None,
+        # 中译：单轮 prefill 最多接纳的请求条数上限（与 max_prefill_bs 配合做条数约束）。
         prefill_max_requests: Optional[int] = None,
+        # 中译：prefill 延迟器（单趟执行器）。用于在特定条件下推迟 prefill 以攒批/优化吞吐。
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor] = None,
+        # 中译：扩散式 LLM（dllm）配置；非空时按块大小与并发数初始化 dllm 专属 token 预算。
         dllm_config: Optional[DllmConfig] = None,
+        # 中译：本轮 prefill 开始时调度器等待队列长度的快照，供 PrefillDelayer 的队列长度触发判断使用。
         waiting_queue_len: int = 0,
     ):
         self.page_size = page_size

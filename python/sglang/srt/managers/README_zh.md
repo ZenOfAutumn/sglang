@@ -174,7 +174,198 @@ HTTP 请求
 - **自检**：① 用自己的话解释「为什么 overlap 模式能消除调度开销」，`FutureMap` 在其中扮演什么角色？② prefill 请求与 decode 请求是如何在「同一批」或「不同批」中被调度的？`get_next_batch_to_run` 的优先级是怎样的？
 - **产出物**：`event_loop_normal` 与 `event_loop_overlap` 的对比时序图，标出两者在「采样结果可用时刻」的差异。
 
-#### 配图：`event_loop_overlap` 的 CPU/GPU 重叠原理
+> 📊 `event_loop_overlap` 的 CPU/GPU 重叠原理配图（核心思想、关键代码、时间轴对比、单轮内部步骤、正确性要点）已移至文末 **[附录 A：`event_loop_overlap` 的 CPU/GPU 重叠原理配图](#附录-aevent_loop_overlap-的-cpugpu-重叠原理配图)**，建议读完本小节后跳转查看。
+
+> 📊 overlap 相比非 overlap 的效果提升（定量直觉、收益场景对比、代价与取舍、经验结论）已移至文末 **[附录 B：overlap 相比非 overlap 的效果提升](#附录-boverlap-相比非-overlap-的效果提升)**，建议读完本小节后跳转查看。
+
+---
+
+### 子阶段 D：批次数据流与组批预算（第 8–9 天）
+
+**目标**：吃透 `Req` / `ScheduleBatch` 的状态机，以及 `PrefillAdder` 如何在显存/token 预算内组批。
+
+| 阅读 | 关键类/函数（行号） |
+| --- | --- |
+| `schedule_batch.py` | `Req`(`:644`)、`init_next_round_input`(`:1096`)、`finished`(`:1068`)；`ScheduleBatch`(`:1634`)、`prepare_for_extend`(`:1967`)、`prepare_for_decode`(`:2544`)、`filter_batch`(`:2639`)、`merge_batch`(`:2715`) |
+| `schedule_policy.py` | `SchedulePolicy`(`:149`)、`calc_priority`(`:170`)、`PrefillAdder`(`:425`)、`add_one_req`(`:858`)、`preempt_to_schedule`(`:1025`)；前缀缓存排序 `_sort_by_longest_prefix`(`:296`) |
+
+- **动手打点**：在 `prepare_for_extend`(`:1967`) 与 `prepare_for_decode`(`:2544`) 打印 batch 的 `seqlen`/token 数；发送共享前缀的请求，在 `_compute_prefix_matches`(`:247`) 观察 RadixCache 命中如何改变排队顺序。
+- **自检**：① `Req` 从「等待队列」到「运行批次」再到「完成出队」经历哪些方法？② `PrefillAdder` 的 token 预算（`rem_total_tokens` / `cur_rem_tokens`）如何决定一个请求能否加入本轮 prefill？preempt（抢占）在什么条件下触发？
+- **产出物**：`Req` 生命周期状态机图 + 一份「组批预算」要点笔记。
+- **衔接**：内存池 / RadixCache 的实现细节属于 `mem_cache` 目录，对应总计划阶段 3，此处只需理解调度侧如何「申请/释放」即可。
+
+#### 参考流程图（批次数据流与组批预算 —— 各方法如何串联）
+
+> 本图把子阶段 D 阅读清单里的方法按**一轮调度内的实际调用顺序**串起来：
+> 左侧 **PREFILL 路径**（组新批）由 `get_new_batch_prefill` 驱动 `PrefillAdder` 在 token/显存预算内挑请求；
+> 右侧 **DECODE 路径**（推进运行批）由 `update_running_batch` 驱动；
+> 两者最终都产出 `ScheduleBatch`，再经 `ForwardBatch.init_new` 交给 GPU。
+
+```
+                    get_next_batch_to_run()  ── 每轮调度入口，决定本轮跑 prefill 还是 decode
+                              │
+            ┌─────────────────┴──────────────────┐
+            ▼ (有可组的新请求)                     ▼ (无新批，推进运行批)
+  ┌───────────────────────────┐        ┌───────────────────────────┐
+  │   PREFILL 路径（组新批）    │        │   DECODE 路径（推进运行批）  │
+  │   get_new_batch_prefill    │        │   update_running_batch      │
+  └───────────────────────────┘        └───────────────────────────┘
+            │                                        │
+            ▼ ① 排序等待队列                          ▼ ① 预算不足则抢占
+  SchedulePolicy.calc_priority()           preempt_to_schedule()
+   ├─ CacheAware: _sort_by_longest_prefix   （回撤低优/后来的 req，
+   │   （按 RadixCache 前缀命中长度排序）       release_kv_cache 腾显存）
+   └─ Priority: 按 priority 排序                       │
+            │                                         ▼ ② 为存活 req 续 1 token
+            ▼ ② 逐个尝试加入，受预算约束        ScheduleBatch.prepare_for_decode()
+  PrefillAdder(rem_total_tokens,            （seqlen+1、分配 KV slot、
+              cur_rem_tokens)                  out_cache_loc、位置自增）
+   ├─ add_chunked_req()  续跑上一轮被切块的 req         │
+   ├─ add_one_req()      普通新 req                     │
+   │    └─ Req.init_next_round_input()                  │
+   │         （_refresh_fill_ids + tree_cache           │
+   │          .match_prefix 前缀匹配 → prefix_indices    │
+   │          → set_extend_input_len 算待 prefill 数）   │
+   └─ 预算耗尽 / 命中 chunked → 停止收 req               │
+            │                                           │
+            ▼ ③ 把选中的 req 组成批                      │
+  ScheduleBatch.prepare_for_extend()                    │
+   （拼 input_ids、分配 req_pool/KV、                    │
+     标记 chunked 中间块 inflight_middle_chunks）        │
+            │                                           │
+            └───────────────┬───────────────────────────┘
+                            ▼
+                    ScheduleBatch（本轮批次，含 forward_mode）
+                            │
+                            ▼  run_batch → tp_worker
+                    ForwardBatch.init_new(batch, model_runner) ── 转 GPU 前向输入
+                            │
+                            ▼  GPU 前向 + 采样
+                    process_batch_result（采样后处理）
+                            │
+                            ▼ 维护运行批集合
+            ┌───────────────┴───────────────┐
+            ▼ 剔除已完成 req                  ▼ prefill 批并入运行批
+  ScheduleBatch.filter_batch()      ScheduleBatch.merge_batch()
+   （req.finished() 为真者出队，       （新 prefill 批 ← 合并 → running_batch，
+     释放其 KV / req_pool slot）         拼接各张量字段）
+            │                               │
+            └───────────────┬───────────────┘
+                            ▼
+                    running_batch（下一轮 decode 的输入）
+                            └────────► 回到 get_next_batch_to_run()（继续下一轮）
+```
+
+**配合自检题理解：**
+
+- **① `Req` 的方法链**（等待→运行→完成）：`init_next_round_input`（前缀匹配、算待 prefill 数）→ `prepare_for_extend`（进 prefill 批）→ `prepare_for_decode`（每轮续 1 token）→ `finished()` 为真后被 `filter_batch` 剔除并释放资源。
+- **② 组批预算**：`PrefillAdder` 用 `rem_total_tokens`（含为运行请求预留未来生成空间的全局 KV 余量）与 `cur_rem_tokens`（当前这一步实际可占用的 KV 余量）双重约束，`add_one_req` 每加入一个 req 就扣减对应偏移；任一耗尽即停止收新 req（或把当前 req 切成 chunked 中间块）。详见下方 **PrefillAdder 专项说明**。
+- **③ 抢占（preempt）触发时机**：仅在 **DECODE 路径**显存不足、无法为运行中 req 续 token 时，由 `preempt_to_schedule` 回撤低优先级/较晚的 req，`release_kv_cache` 腾出 KV 后再 `prepare_for_decode`。
+
+#### PrefillAdder 专项说明（组批预算的核心）
+
+> 源码：`schedule_policy.py` 的 `PrefillAdder`（类 `:536`、`add_one_req` `:1021`、`add_chunked_req` `:852`、`preempt_to_schedule` `:1206`）。
+> 它是「**在多重显存/token 预算约束下，决定本轮 prefill 收哪些请求、收多少**」的执行体——`get_new_batch_prefill` 排好序后，逐个 `add_one_req` 喂给它，由它判定接纳 / 切块 / 停止。
+
+**1）四类预算（构造期注入，逐请求扣减）**
+
+| 预算 | 字段 | 含义 | 约束的是 |
+| --- | --- | --- | --- |
+| 总 KV 预算 | `rem_total_tokens`（属性）+ `rem_total_token_offset`（偏移） | 物理可用 + 可驱逐 − 偏移；偏移里**预留了运行中请求未来要生成的 token 空间**（按 `new_token_ratio` 折扣估算） | 全局显存「装不装得下」 |
+| 当前步 KV 预算 | `cur_rem_tokens`（属性）+ `cur_rem_token_offset`（偏移） | 同口径但偏移只算**当前这一步实际占用**，不含未来预留 | 本步实际放得下放不下 |
+| 输入 token 预算 | `rem_input_tokens` | 对应 `--max-prefill-tokens`，本轮 prefill 总输入上限 | 单轮喂进去的输入规模 |
+| 分块 token 预算 | `rem_chunk_tokens` | 对应 `--chunked-prefill-size`；为 `None` 表示未启用分块 | 单个 chunk 的大小（触发切块） |
+| SWA 池预算 | `rem_swa_tokens` | 仅混合 SWA 模型（如 Gemma2）有效，单独核算滑动窗口池 | SWA KV 池余量 |
+
+**2）核心方法链**
+
+```
+add_one_req(req)                            ← 逐个请求入口（普通新请求）
+  ├─ req.init_next_round_input()            前缀匹配，算出 extend_input_len（真正待 prefill 的 token 数）
+  ├─ 计算本 req 占用 → 与四类预算比对
+  │    ├─ 放得下且无需切块  → 计入 can_run_list，扣减各 offset，返回 CONTINUE
+  │    ├─ 超过 rem_chunk_tokens → 切块：只收前 rem_chunk_tokens 个，
+  │    │                          剩余记为 new_chunked_req（下一轮用 add_chunked_req 续跑），返回 OTHER
+  │    └─ rem_total/cur/swa 任一 ≤ 0 → 返回 NO_TOKEN（停止收新 req）
+  └─ budget_state()                          统一裁决返回 AddReqResult
+
+add_chunked_req(req)                        ← 续跑上一轮被切块的中间块（优先于普通新请求）
+add_one_req_ignore_eos(req)                 ← ignore_eos 请求的特殊预算估算（按剩余 token 预留）
+preempt_to_schedule(req)                    ← 优先级调度下，回撤运行中低优 req 腾预算（→ preempt_list）
+```
+
+**3）三种产出（`AddReqResult`）与对应动作**
+
+- `CONTINUE`：预算充足，继续取等待队列下一个请求。
+- `NO_TOKEN`：KV/SWA token 预算耗尽，**本轮停止收新请求**。
+- `OTHER`：因输入/分块/请求数上限等约束停止；常见于**当前请求被切成 chunked 中间块**（`new_chunked_req` 非空，下一轮续跑）。
+
+**4）几个易混点**
+
+- `rem_total_tokens` vs `cur_rem_tokens`：前者**含为运行请求预留的未来生成空间**（防止新 prefill 侵占 decode 的命脉），后者只看**当前步**的实际占用；两者都要 > 0 才可继续。
+- 分块预算来自 `rem_chunk_tokens`（≈ `--chunked-prefill-size`），**不是** `cur_rem_tokens`——切块由前者触发。
+- 抢占（`preempt_to_schedule`）**只在启用优先级调度时**于组批阶段发生，与 DECODE 路径里因显存不足的回撤是两条不同触发线。
+
+---
+
+### 子阶段 E：TpModelWorker 前向 与 Detokenizer 出口（第 10–11 天）
+
+**目标**：打通「调度结果 → GPU 前向 → 采样后处理 → 反分词回包」的下半程。
+
+| 阅读 | 关键函数（行号） |
+| --- | --- |
+| `scheduler.py` | `run_batch`(`:3055`)、`process_batch_result`(`:3277`)（前向触发与后处理） |
+| `tp_worker.py` | `TpModelWorker`(`:218`)、`__init__`(`:221`)、`forward_batch_generation`(`:466`)（注意 `:479` 的 `ForwardBatch.init_new` —— 当前真实的批次转换点） |
+| `utils.py` | `GenerationBatchResult`（前向结果容器；overlap 下的 CPU 拷贝语义） |
+| `detokenizer_manager.py` | `event_loop`(`:159`)、`trim_matched_stop`(`:169`)（增量反分词与停止串裁剪） |
+
+- **动手打点**：在 `run_batch`(`:3055`) 前后与 `process_batch_result`(`:3277`) 打点统计单轮前向耗时；在 `trim_matched_stop`(`:169`) 观察 stop string 命中时如何裁剪输出。
+- **自检**：① `forward_batch_generation` 接收 `ScheduleBatch`，内部为何还要转成 `ForwardBatch`？两者职责边界是什么？② overlap 模式下 `GenerationBatchResult` 为什么需要把结果从 GPU 拷回 CPU 才能交给后处理？
+- **产出物**：补全子阶段 C 的时序图下半段（前向 → 采样 → detokenize → 回包），形成端到端闭环。
+
+---
+
+### 子阶段 F（选学）：高级特性 Mixin（第 12–14 天）
+
+按兴趣/工作需要挑 1–2 个深入，其余了解入口即可。这些能力多以独立文件或 Mixin 形式组合进 Scheduler / TokenizerManager：
+
+| 特性 | 入口文件 |
+| --- | --- |
+| 流水线并行（PP）调度循环 | `scheduler_pp_mixin.py`（`event_loop_pp`、`PPBatchMetadata`） |
+| 数据并行（DP）请求分发 | `data_parallel_controller.py` |
+| 权重热更新需要的全局静止 | `scheduler_input_blocker.py` |
+| 分层缓存（HiCache）异步搬运 | `cache_controller.py`、`hisparse_coordinator.py` |
+| 多模态处理 | `multimodal_processor.py`、`mm_utils.py` |
+| 多 HTTP worker / 多 tokenizer | `multi_tokenizer_mixin.py` |
+| PD 分离辅助服务 | `disagg_service.py` |
+| 会话式多轮生成 | `session_controller.py` |
+| chat/completion 模板 | `template_manager.py`、`template_detection.py` |
+
+- **自检**：能说出所选特性「挂载到 Scheduler/TokenizerManager 的哪个扩展点、解决什么问题」。
+- **产出物**：所选特性的一页式「入口 + 数据流 + 触发条件」速记。
+
+---
+
+### 阶段自检清单（学完本目录应能回答）
+
+1. 一条请求从 HTTP 到 token 输出，依次经过哪三个进程、跨进程传了哪些 `io_struct` 对象？
+2. `event_loop_normal` 与 `event_loop_overlap` 的本质区别是什么，后者靠什么消除调度开销？
+3. `Req` 的完整生命周期与状态流转？`PrefillAdder` 用什么预算约束组批？
+4. 当前真实的批次数据流是什么（注意不再有 `ModelWorkerBatch`）？转换发生在哪一行？
+5. 你正在用的高级特性（如有）通过哪个 Mixin/文件挂载进调度链路？
+
+### 学习方法提示（针对本目录）
+
+- **按数据流读，别按文件读**：始终顺着上方「学习主线」那条链，遇到 Mixin 再按需跳转。
+- **善用 `server_args.py`**：本目录大量分支由启动参数控制（如 `--chunked-prefill-size`、`--enable-overlap-schedule`、`--max-running-requests`），从参数反查处理逻辑能快速定位调度分支。
+- **打点优于猜测**：调度路径状态多、跳转密，在 `event_loop_*` / `get_new_batch_prefill` / `process_batch_result` 三处打点，比纯读代码高效得多。
+- **带注释副本**：`tokenizer_manager_annotated_zh.py` 是 `tokenizer_manager.py` 的逐行中文注释学习副本，读 B 阶段时可对照。
+
+---
+
+## 附录 A：`event_loop_overlap` 的 CPU/GPU 重叠原理配图
+
+> 本附录配合 [子阶段 C：Scheduler 事件循环与连续批处理](#子阶段-cscheduler-事件循环与连续批处理第-57-天--本目录核心) 阅读。
 
 **核心思想**：`event_loop_normal`（非重叠）每轮严格串行——CPU 调度 → 启动 GPU 前向 → **同步等 GPU 算完** → CPU 处理结果，两者互相阻塞。`event_loop_overlap` 则把「处理结果」**延后一轮**：`run_batch` 启动前向后不等结果，只把 `(batch.copy(), batch_result)` 压入 `result_queue`，立刻进入下一轮做 CPU 调度。于是**第 N 轮的 CPU 工作叠在第 N-1 轮的 GPU 前向之上**。
 
@@ -239,71 +430,34 @@ GPU:         │      [前向B1]       │      [前向B2]      │      [前向
 
 ---
 
-### 子阶段 D：批次数据流与组批预算（第 8–9 天）
+## 附录 B：overlap 相比非 overlap 的效果提升
 
-**目标**：吃透 `Req` / `ScheduleBatch` 的状态机，以及 `PrefillAdder` 如何在显存/token 预算内组批。
+> 本附录配合 [子阶段 C：Scheduler 事件循环与连续批处理](#子阶段-cscheduler-事件循环与连续批处理第-57-天--本目录核心) 阅读，是 [附录 A](#附录-aevent_loop_overlap-的-cpugpu-重叠原理配图) 的延伸。
 
-| 阅读 | 关键类/函数（行号） |
-| --- | --- |
-| `schedule_batch.py` | `Req`(`:644`)、`init_next_round_input`(`:1096`)、`finished`(`:1068`)；`ScheduleBatch`(`:1634`)、`prepare_for_extend`(`:1967`)、`prepare_for_decode`(`:2544`)、`filter_batch`(`:2639`)、`merge_batch`(`:2715`) |
-| `schedule_policy.py` | `SchedulePolicy`(`:149`)、`calc_priority`(`:170`)、`PrefillAdder`(`:425`)、`add_one_req`(`:858`)、`preempt_to_schedule`(`:1025`)；前缀缓存排序 `_sort_by_longest_prefix`(`:296`) |
+**收益从哪来（定量直觉）**：设单轮 CPU 调度+后处理耗时为 `T_cpu`，单轮 GPU 前向耗时为 `T_gpu`。
 
-- **动手打点**：在 `prepare_for_extend`(`:1967`) 与 `prepare_for_decode`(`:2544`) 打印 batch 的 `seqlen`/token 数；发送共享前缀的请求，在 `_compute_prefix_matches`(`:247`) 观察 RadixCache 命中如何改变排队顺序。
-- **自检**：① `Req` 从「等待队列」到「运行批次」再到「完成出队」经历哪些方法？② `PrefillAdder` 的 token 预算（`rem_total_tokens` / `cur_rem_tokens`）如何决定一个请求能否加入本轮 prefill？preempt（抢占）在什么条件下触发？
-- **产出物**：`Req` 生命周期状态机图 + 一份「组批预算」要点笔记。
-- **衔接**：内存池 / RadixCache 的实现细节属于 `mem_cache` 目录，对应总计划阶段 3，此处只需理解调度侧如何「申请/释放」即可。
+```
+非 overlap：每轮墙钟 ≈ T_cpu + T_gpu     （串行相加）
+overlap：  每轮墙钟 ≈ max(T_cpu, T_gpu)   （两者重叠，取较大者）
+```
 
----
+- **理想加速比** ≈ `(T_cpu + T_gpu) / max(T_cpu, T_gpu)`。
+- 当 `T_cpu ≈ T_gpu` 时，单轮墙钟最多可省去近一半 → **吞吐接近翻倍**。
+- 当 `T_cpu << T_gpu`（GPU 远大于 CPU）时，`max ≈ T_gpu`，CPU 开销几乎被**完全隐藏**，提升仍可观但比例变小。
 
-### 子阶段 E：TpModelWorker 前向 与 Detokenizer 出口（第 10–11 天）
+**哪种场景提升最明显**：
 
-**目标**：打通「调度结果 → GPU 前向 → 采样后处理 → 反分词回包」的下半程。
+| 场景 | T_cpu 占比 | overlap 收益 |
+| --- | --- | --- |
+| **decode 为主、batch 大、序列多**（高并发解码） | 高（每轮要遍历大量 req 做采样后处理/出队/流式回包） | **最大**——CPU 后处理与 GPU 解码前向充分重叠 |
+| 小模型 / 短序列 | 偏高（GPU 前向快，CPU 占比相对高） | 明显 |
+| 超大模型 / 超长 prefill | 低（GPU 前向极重） | 较小（CPU 本就被淹没在 GPU 时间里） |
+| 单请求、低并发 | 低 | 较小（没有足够批量摊薄调度开销） |
 
-| 阅读 | 关键函数（行号） |
-| --- | --- |
-| `scheduler.py` | `run_batch`(`:3055`)、`process_batch_result`(`:3277`)（前向触发与后处理） |
-| `tp_worker.py` | `TpModelWorker`(`:218`)、`__init__`(`:221`)、`forward_batch_generation`(`:466`)（注意 `:479` 的 `ForwardBatch.init_new` —— 当前真实的批次转换点） |
-| `utils.py` | `GenerationBatchResult`（前向结果容器；overlap 下的 CPU 拷贝语义） |
-| `detokenizer_manager.py` | `event_loop`(`:159`)、`trim_matched_stop`(`:169`)（增量反分词与停止串裁剪） |
+**为什么不是"无脑全开"——overlap 的代价与取舍**：
 
-- **动手打点**：在 `run_batch`(`:3055`) 前后与 `process_batch_result`(`:3277`) 打点统计单轮前向耗时；在 `trim_matched_stop`(`:169`) 观察 stop string 命中时如何裁剪输出。
-- **自检**：① `forward_batch_generation` 接收 `ScheduleBatch`，内部为何还要转成 `ForwardBatch`？两者职责边界是什么？② overlap 模式下 `GenerationBatchResult` 为什么需要把结果从 GPU 拷回 CPU 才能交给后处理？
-- **产出物**：补全子阶段 C 的时序图下半段（前向 → 采样 → detokenize → 回包），形成端到端闭环。
+- **延迟一轮可见**：第 N 轮的结果在第 N+1 轮才处理，单请求**首 token 延迟（TTFT）会多等约一轮**。因此 `is_disable_overlap_for_batch` 会在「连续两个 prefill」时关闭重叠，优先压低首个 prefill 的 TTFT（牺牲少量吞吐换延迟）。
+- **显存/引用开销**：`batch.copy()` 快照 + `batch_record_buf` 钉住张量 2 个迭代，需多保留约一轮的中间张量引用。
+- **复杂度与兼容性**：需要 `FutureMap` 中继未来 token、WAR 屏障防读写竞争；个别组合（如 spec + grammar + decode）暂不支持重叠，必须退化为串行。
 
----
-
-### 子阶段 F（选学）：高级特性 Mixin（第 12–14 天）
-
-按兴趣/工作需要挑 1–2 个深入，其余了解入口即可。这些能力多以独立文件或 Mixin 形式组合进 Scheduler / TokenizerManager：
-
-| 特性 | 入口文件 |
-| --- | --- |
-| 流水线并行（PP）调度循环 | `scheduler_pp_mixin.py`（`event_loop_pp`、`PPBatchMetadata`） |
-| 数据并行（DP）请求分发 | `data_parallel_controller.py` |
-| 权重热更新需要的全局静止 | `scheduler_input_blocker.py` |
-| 分层缓存（HiCache）异步搬运 | `cache_controller.py`、`hisparse_coordinator.py` |
-| 多模态处理 | `multimodal_processor.py`、`mm_utils.py` |
-| 多 HTTP worker / 多 tokenizer | `multi_tokenizer_mixin.py` |
-| PD 分离辅助服务 | `disagg_service.py` |
-| 会话式多轮生成 | `session_controller.py` |
-| chat/completion 模板 | `template_manager.py`、`template_detection.py` |
-
-- **自检**：能说出所选特性「挂载到 Scheduler/TokenizerManager 的哪个扩展点、解决什么问题」。
-- **产出物**：所选特性的一页式「入口 + 数据流 + 触发条件」速记。
-
----
-
-### 阶段自检清单（学完本目录应能回答）
-
-1. 一条请求从 HTTP 到 token 输出，依次经过哪三个进程、跨进程传了哪些 `io_struct` 对象？
-2. `event_loop_normal` 与 `event_loop_overlap` 的本质区别是什么，后者靠什么消除调度开销？
-3. `Req` 的完整生命周期与状态流转？`PrefillAdder` 用什么预算约束组批？
-4. 当前真实的批次数据流是什么（注意不再有 `ModelWorkerBatch`）？转换发生在哪一行？
-5. 你正在用的高级特性（如有）通过哪个 Mixin/文件挂载进调度链路？
-
-### 学习方法提示（针对本目录）
-
-- **按数据流读，别按文件读**：始终顺着上方「学习主线」那条链，遇到 Mixin 再按需跳转。
-- **善用 `server_args.py`**：本目录大量分支由启动参数控制（如 `--chunked-prefill-size`、`--enable-overlap-schedule`、`--max-running-requests`），从参数反查处理逻辑能快速定位调度分支。
-- **打点优于猜测**：调度路径状态多、跳转密，在 `event_loop_*` / `get_new_batch_prefill` / `process_batch_result` 三处打点，比纯读代码高效得多。
-- **带注释副本**：`tokenizer_manager_annotated_zh.py` 是 `tokenizer_manager.py` 的逐行中文注释学习副本，读 B 阶段时可对照。
+**经验结论**：在线服务的**高并发 decode** 工况下，overlap 通常带来**显著的吞吐提升（常见量级为百分之十几到接近翻倍，取决于 `T_cpu/T_gpu` 比值与 batch 规模）**；而对**单请求 TTFT 敏感**或 GPU 前向极重的场景，收益变小甚至需要按批关闭。SGLang 默认开启重叠（`--disable-overlap-schedule` 可关闭），并通过按批动态关闭兼顾延迟与吞吐。

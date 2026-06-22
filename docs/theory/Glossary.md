@@ -181,6 +181,39 @@ $$
 - 暂不支持与 `--enable-http2` 同时使用（`tokenizer_worker_num > 1` 会报错）。
 - 请求需要由 router 正确路由回**发起该请求的那个 worker**，以便把反分词后的字符串结果返回给对应的 HTTP 连接。
 
+## 增量解码（Incremental Detokenization）
+
+指在**流式生成**过程中，每生成一步就把**新产生的 token** 实时还原成文本片段返回给用户，而不是等整条序列全部生成完再一次性解码。它是流式输出（如 SSE 逐字返回）的基础，由 `DetokenizerManager`（见 `python/sglang/srt/managers/detokenizer_manager.py`）实现。
+
+### 为什么不能「每步只解码新 token」
+
+直觉上，每步只把新增的那几个 token 单独 `decode` 一下、拼到已有文本后面即可。但这样会出错，根因是 **「token 序列 → 文本」不是逐 token 拼接**：
+
+- 一个字符（尤其中文、emoji）可能由**多个 token** 编码，单独解码其中一个 token 得到的是不完整字节；
+- tokenizer 在拼接处对**空格、特殊符号**的处理依赖上下文，孤立解码单个 token 会丢失这些信息。
+
+因此必须**带着上下文**解码，并维护每个请求的解码进度状态。
+
+### SGLang 的实现：带上下文的「窗口解码 + 相减」
+
+每个请求在 `decode_status` 字典里（按 `rid` 索引）维护一份增量解码状态，核心是两个游标：
+
+- **`surr_offset`（环绕上下文起点）**：解码时额外多带的一段前文起点，用来让跨 token 的字符 / 空格能正确拼接。
+- **`read_offset`（已读取起点）**：已经提交给用户的文本对应的 token 边界。
+
+每一步的处理（见 `_decode_batch_token_id_output`）：
+
+1. 解码 `[surr_offset, 末尾]` 得到 `read` 文本（含本次新 token）；
+2. 解码 `[surr_offset, read_offset)` 得到 `surr` 上下文文本；
+3. **本次真正新增的文本 = `read` 去掉 `surr` 前缀**——多带上下文只是为了正确拼接，最后减掉避免重复输出；
+4. 推进 `surr_offset = read_offset`、`read_offset = len(decode_ids)`，供下一步接续。
+
+由于 `decode_status` 需为每个在途请求长期保存状态，它用「有界 + 自动淘汰最旧」（`LimitedCapacityDict`）来约束内存上限。
+
+### 与边界问题的关系
+
+增量解码的**正确性难点**集中在 token 交界处——这正是下一条「反向解码的边界问题」要解决的（UTF-8 字符被切断、批量 vs 逐行解码差异等）。简言之：增量解码是**机制**，边界问题是该机制必须处理好的**坑**。
+
 ## 反向解码的边界问题（Detokenization Edge Cases）
 
 「反向解码（detokenization）」指把 token id 还原成文本字符串。它的**边界问题**指：在 **token 与 token 的交界处、文本片段的拼接处**，增量解码结果可能出错（乱码、多/少空格、特殊符号异常等）。这是因为「一个字符 ↔ 一个 token」并非一一对应——一个字符可能跨多个 token，文本也不是简单把每个 token 的解码结果拼接起来。
