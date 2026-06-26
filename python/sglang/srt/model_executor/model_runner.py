@@ -364,11 +364,11 @@ class RankZeroFilter(logging.Filter):
 class ModelRunnerOutput:
     # 中译：ModelRunner 一次前向的输出容器。
     # logits_output：logits 处理器输出，或流水线并行（PP）场景下的代理张量。
+    logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     # can_run_graph：本次前向是否命中了 CUDA Graph（即是否以 graph replay 方式执行）。
+    can_run_graph: bool
     # expert_distribution_metrics / routed_experts_output / indexer_topk_output：
     #   MoE 专家分布指标与状态捕获（state capturer）输出，仅在开启相应功能时非空。
-    logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
-    can_run_graph: bool
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None

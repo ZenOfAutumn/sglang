@@ -13,21 +13,24 @@ SGLang 是一个**高性能大模型推理服务框架**（LLM/多模态/扩散�
 
 ### 1.2 核心能力（决定了学习的重点）
 
+> 「重要性」= 对延迟/吞吐/成本或部署可行性的影响权重（★ 越多越关键）；「复杂性」= 上手与改动的难度（涉及的进程数、并发/同步、底层 kernel、跨节点协调等）。建议按「重要性高 × 复杂性中」优先攻克（如调度、RadixAttention）。
 
-| 能力                     | 一句话说明                             | 对应源码区域                                           |
-| ------------------------ | -------------------------------------- | ------------------------------------------------------ |
-| **RadixAttention**       | 基于基数树的前缀缓存复用 KV cache      | `srt/mem_cache/radix_cache.py`                         |
-| **Zero-overhead 调度**   | CPU 调度与 GPU 计算重叠，消除调度开销  | `srt/managers/scheduler.py` (`event_loop_overlap`)     |
-| **Continuous batching**  | 连续批处理，动态加入/退出请求          | `srt/managers/schedule_batch.py`, `schedule_policy.py` |
-| **Chunked prefill**      | 长 prompt 分块预填充                   | `schedule_policy.py`                                   |
-| **Paged attention**      | 分页 KV 内存管理                       | `srt/mem_cache/memory_pool.py`, `allocator.py`         |
-| **Speculative decoding** | 投机解码（EAGLE 等）                   | `srt/speculative/`                                     |
-| **PD 分离**              | Prefill/Decode 解耦部署                | `srt/disaggregation/`                                  |
-| **并行**                 | TP/PP/EP/DP（张量/流水/专家/数据并行） | `srt/distributed/`, `srt/layers/dp_attention.py`       |
-| **结构化输出**           | JSON/正则约束解码（压缩 FSM）          | `srt/constrained/`                                     |
-| **量化**                 | FP4/FP8/INT4/AWQ/GPTQ                  | `srt/layers/quantization/`                             |
-| **多 LoRA**              | 批量 LoRA                              | `srt/lora/`                                            |
-| **CUDA Graph**           | 捕获静态图降低 kernel launch 开销      | `srt/model_executor/cuda_graph_runner.py`              |
+> 下表已按「重要性降序 → 同重要性再按复杂性降序」排列，越靠前越值得优先理解。
+
+| 能力                     | 一句话说明                             | 对应源码区域                                           | 重要性 | 复杂性 | 为什么重要 / 难在哪 |
+| ------------------------ | -------------------------------------- | ------------------------------------------------------ | ------ | ------ | ------------------- |
+| **并行**                 | TP/PP/EP/DP（张量/流水/专家/数据并行） | `srt/distributed/`, `srt/layers/dp_attention.py`       | ★★★★★ | ★★★★★ | 决定能否跑超大模型与扩展上限；难在多种并行维度组合、集合通信（NCCL）正确性与负载均衡（尤其 EP/EPLB） |
+| **Zero-overhead 调度**   | CPU 调度与 GPU 计算重叠，消除调度开销  | `srt/managers/scheduler.py` (`event_loop_overlap`)     | ★★★★★ | ★★★★☆ | 决定性能上限的核心，把 CPU 组批/采样后处理与 GPU 前向流水线重叠；难在主循环的多阶段状态管理、与 overlap 模式下结果延后一拍的处理 |
+| **Continuous batching**  | 连续批处理，动态加入/退出请求          | `srt/managers/schedule_batch.py`, `schedule_policy.py` | ★★★★★ | ★★★★☆ | 高吞吐的基石，请求可逐步进出同一批而非整批等待；难在 prefill/decode 混合批、`Req`/`ScheduleBatch` 状态机与显存预算的动态裁剪 |
+| **RadixAttention**       | 基于基数树的前缀缓存复用 KV cache      | `srt/mem_cache/radix_cache.py`                         | ★★★★★ | ★★★☆☆ | SGLang 的标志性能力，多请求共享前缀时直接省掉 prefill 计算，对 TTFT/吞吐影响极大；难在基数树的分裂/合并、LRU 驱逐与 KV 物理内存的引用计数一致性 |
+| **Paged attention**      | 分页 KV 内存管理                       | `srt/mem_cache/memory_pool.py`, `mem_cache/allocator/` | ★★★★★ | ★★★☆☆ | 分页化是消除显存碎片、支撑大并发与前缀复用的前提；难在多种分配器（`paged.py`/`token.py`/`swa.py`/`mamba.py`）与上层 cache 的协同 |
+| **PD 分离**              | Prefill/Decode 解耦部署                | `srt/disaggregation/`                                  | ★★★★☆ | ★★★★★ | 大规模部署下分别按 prefill/decode 特性独立扩缩、提高利用率；难在跨节点 KV 传输（Mooncake/NIXL/MORI）、bootstrap 建链与两端调度协调 |
+| **Speculative decoding** | 投机解码（EAGLE 等）                   | `srt/speculative/`                                     | ★★★★☆ | ★★★★★ | 在内存受限的 decode 阶段成倍提速；难在 draft/verify 两阶段、专用 CUDA Graph runner、与连续批和 attention 后端的耦合 |
+| **量化**                 | FP4/FP8/INT4/AWQ/GPTQ                  | `srt/layers/quantization/`                             | ★★★★☆ | ★★★★☆ | 直接降低显存与成本、提升吞吐；难在众多 scheme（AWQ/GPTQ/compressed-tensors/FP8/FP4）与硬件/kernel 适配 |
+| **CUDA Graph**           | 捕获静态图降低 kernel launch 开销      | `srt/model_executor/runner/`（`base/decode/prefill_cuda_graph_runner.py`） | ★★★★☆ | ★★★★☆ | decode 阶段消除大量小 kernel 的 launch 开销，显著降延迟；难在静态形状捕获/重放、padding 策略与各特性（spec/PD/多模态）的专用 runner |
+| **Chunked prefill**      | 长 prompt 分块预填充                   | `srt/managers/schedule_policy.py`                      | ★★★★☆ | ★★★☆☆ | 避免长 prompt 阻塞解码、平滑显存与延迟；难在分块大小与 decode 请求的调度权衡（`--chunked-prefill-size`）及跨 chunk 的状态衔接 |
+| **多 LoRA**              | 批量 LoRA                              | `srt/lora/`                                            | ★★★☆☆ | ★★★★☆ | 一份基座服务多业务微调权重，省显存；难在同批内不同 LoRA 的批处理（SGMV 等 triton kernel）与动态加载 |
+| **结构化输出**           | JSON/正则约束解码（压缩 FSM）          | `srt/constrained/`                                     | ★★★☆☆ | ★★★☆☆ | Agent/工具调用刚需，保证输出可被程序解析；难在多 grammar 后端（xgrammar/outlines/llguidance）与采样、压缩 FSM 的对接 |
 
 ### 1.3 技术栈
 
@@ -190,8 +193,8 @@ Decode 节点各阶段：
 | ---------- | --------------------- | ------------------------------------------------------------------------------------------------ |
 | 服务入口   | `srt/entrypoints/`    | `http_server.py`, `engine.py`, `EngineBase.py`                                                   |
 | 调度管理   | `srt/managers/`       | `scheduler.py`, `tokenizer_manager.py`, `schedule_batch.py`, `schedule_policy.py`                |
-| 内存/缓存  | `srt/mem_cache/`      | `radix_cache.py` (`RadixCache:285`, `TreeNode:121`), `memory_pool.py`, `allocator.py`            |
-| 模型执行   | `srt/model_executor/` | `model_runner.py` (`ModelRunner:285`), `forward_batch_info.py`, `cuda_graph_runner.py`           |
+| 内存/缓存  | `srt/mem_cache/`      | `radix_cache.py` (`RadixCache:285`, `TreeNode:222`), `memory_pool.py`, `allocator/`              |
+| 模型执行   | `srt/model_executor/` | `model_runner.py` (`ModelRunner:387`), `forward_batch_info.py`, `runner/*_cuda_graph_runner.py`  |
 | 模型实现   | `srt/models/`         | 168+ 模型，如`llama.py`, `qwen2.py`, `deepseek_v2.py`                                            |
 | 计算层     | `srt/layers/`         | `radix_attention.py`, `attention/`, `moe/`, `quantization/`, `sampler.py`, `logits_processor.py` |
 | 配置       | `srt/`                | `server_args.py`（6700+ 行，所有启动参数的真相源）                                               |

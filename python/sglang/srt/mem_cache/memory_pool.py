@@ -207,60 +207,92 @@ def _set_kv_buffer_prefix_valid_impl(
 
 
 class ReqToTokenPool:
-    """A memory pool that maps a request to its token locations."""
+    """请求到 token 位置的内存池（两级映射中的第一级）。
 
+    维护一张二维张量 ``req_to_token``，形状为 ``[size+1, max_context_len]``：
+    第 ``req_pool_idx`` 行记录该请求各 token 对应的 KV 槽位下标（即第二级
+    ``TokenToKVPoolAllocator`` 分配出来的 KV slot index）。调度器通过它把
+    「逻辑 token 位置」翻译成「物理 KV 槽位」，再由 KVCache 定位到真正的显存。
+
+    示例：某请求经 ``alloc`` 拿到 ``req_pool_idx = 3``，它的 5 个 token 又从
+    ``TokenToKVPoolAllocator`` 拿到 KV 槽位 ``[100, 101, 102, 103, 104]``，
+    则用 ``write`` 写入后该行内容为::
+
+        req_to_token[3] = [100, 101, 102, 103, 104, <未使用>, ...]
+                            ↑t=0  ↑t=1 ...           ↑列数 = max_context_len
+
+    之后注意力计算想取「该请求第 t 个 token」的 KV 时，先读
+    ``slot = req_to_token[3, t]`` 得到物理槽位，再交给 KVCache 按 ``slot``
+    定位显存。两级映射的好处：请求层（哪一行）与 KV 物理层（行内存什么槽位）
+    解耦，分块预填充时同一请求始终复用第 3 行，token 槽位却可以分批追加。
+    """
+
+    # 延迟初始化 Mamba 额外缓冲区的开关（混合模型相关，默认关闭）。
     enable_mamba_extra_buffer_lazy: bool = False
 
     def __init__(
         self,
-        size: int,
-        max_context_len: int,
+        size: int,  # 可容纳的请求数（即并发运行请求数上限）
+        max_context_len: int,  # 单个请求最大上下文长度，决定每行的列数
         device: str,
-        enable_memory_saver: bool,
+        enable_memory_saver: bool,  # 是否启用显存节省器（用 region 包裹张量分配）
     ):
         memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
 
         self.size = size
-        # +1 padding row at index 0: cuda-graph padded batches default
-        # req_pool_indices to 0, so dummy reads/writes land here harmlessly.
+        # 在下标 0 处多留一行 padding：CUDA Graph 的 padding 批默认把
+        # req_pool_indices 填为 0，于是这些占位读写都落到第 0 行，不会污染真实请求。
         self._alloc_size = size + 1
         self.max_context_len = max_context_len
         self.device = device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            # req_to_token[req_pool_idx, t] = 该请求第 t 个 token 的 KV 槽位下标。
             self.req_to_token = torch.zeros(
                 (self._alloc_size, max_context_len), dtype=torch.int32, device=device
             )
+        # 空闲请求槽位列表；从 1 开始（0 号为上面的 padding 行，不参与分配）。
+        # 示例：size=4 时初始为 [1, 2, 3, 4]。
+        #   alloc 2 个请求 → 取走头部 [1, 2]，free_slots 变为 [3, 4]；
+        #   free 掉 req_pool_idx=1 的请求 → 追加回尾部，free_slots 变为 [3, 4, 1]；
+        #   下次 alloc 又从头部取 3，体现「头部取、尾部还」的复用顺序。
         self.free_slots = list(range(1, self._alloc_size))
 
     def write(self, indices, values):
+        # 写入某请求某段 token 的 KV 槽位映射；indices 可为 (行, 列切片) 等高级索引。
         self.req_to_token[indices] = values
 
     def available_size(self):
+        # 当前还能再容纳多少个新请求。
         return len(self.free_slots)
 
     def alloc(self, reqs: list[Req]) -> Optional[List[int]]:
-        # Indices of reqs that already have a req_pool_idx and will reuse
-        # their existing slot (e.g. chunked prefill continuing across chunks).
+        # 已经持有 req_pool_idx、本次将复用原槽位的请求下标
+        # （例如分块预填充跨 chunk 续跑时，同一请求保持同一行）。
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
-        # NOTE: this check is relaxed temporarily
+        # 注意：此处的校验被临时放宽
         # https://github.com/sgl-project/sglang/pull/20476
         # if not any(r.is_dllm() for r in reqs):
         #     assert (
         #         sum(1 for i in reusing if reqs[i].inflight_middle_chunks > 0) <= 1
         #     ), "only one chunked request may reuse req_pool_idx in a batch"
+        # 复用槽位的请求必须满足：要么是进行中的分块请求，要么已有已提交的 KV。
         assert all(
             reqs[i].inflight_middle_chunks > 0 or reqs[i].kv_committed_len > 0
             for i in reusing
         ), "reusing request must be chunked or have committed KV"
 
+        # 真正需要新分配的槽位数 = 总请求数 − 复用已有槽位的请求数。
         need_size = len(reqs) - len(reusing)
+        # 空闲槽位不足则分配失败，返回 None（由调用方决定排队/抢占）。
         if need_size > len(self.free_slots):
             return None
+        # 从空闲列表头部取 need_size 个槽位，并把它们从空闲列表移除。
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
         offset = 0
+        # 仅为尚未持有槽位的新请求依次赋予 req_pool_idx；复用者保持原值不变。
         for r in reqs:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
@@ -268,11 +300,13 @@ class ReqToTokenPool:
         return [r.req_pool_idx for r in reqs]
 
     def free(self, req: Req):
+        # 请求完成/退出时归还其槽位：放回空闲列表并清空 req 上的索引。
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
 
     def clear(self):
+        # 重置整个池：所有槽位（除 0 号 padding 行外）重新标记为空闲。
         self.free_slots = list(range(1, self._alloc_size))
 
 
@@ -847,49 +881,63 @@ def unwrap_write_loc(loc_info):
 
 
 class KVCache(abc.ABC):
+    """KV 缓存的物理存储抽象基类（两级映射中第二级所管理的真正显存）。
+
+    它持有按层组织的 K/V 显存缓冲区，并定义统一的读写接口；上层（注意力 backend、
+    缓存树）只通过槽位下标 ``loc`` 与之交互，不关心底层张量布局。具体形态由子类实现：
+    ``MHATokenToKVPool``（标准多头注意力）、``MLATokenToKVPool``（DeepSeek MLA 压缩
+    KV）、``SWAKVPool``（滑动窗口）等。``ReqToTokenPool`` 把「请求第 t 个 token」映射成
+    KV 槽位，再由本类按槽位定位到具体显存地址。
+    """
+
     @abc.abstractmethod
     def __init__(
         self,
-        size: int,
-        page_size: int,
-        dtype: torch.dtype,
-        layer_num: int,
+        size: int,  # KV 槽位总数（可缓存的 token 数）
+        page_size: int,  # 分页大小：每页含多少个 token 槽位（paged KV）
+        dtype: torch.dtype,  # KV 的计算 dtype（如 bf16/fp16/fp8）
+        layer_num: int,  # 本池负责的注意力层数
         device: str,
-        enable_memory_saver: bool,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
+        enable_memory_saver: bool,  # 是否启用显存节省器
+        start_layer: Optional[int] = None,  # 本池覆盖的起始层（PP/分层场景）
+        end_layer: Optional[int] = None,  # 本池覆盖的结束层
     ):
         self.size = size
         self.page_size = page_size
         self.dtype = dtype
         self.device = device
         if dtype in (torch.float8_e5m2, torch.float8_e4m3fn, torch.float8_e4m3fnuz):
-            # NOTE: Store as torch.uint8 because Tensor.index_put is not implemented for torch.float8_e5m2
+            # 注意：fp8 一律按 torch.uint8 存储，因为 Tensor.index_put 尚未
+            # 对 torch.float8_e5m2 实现；读写时再按需重解释为 fp8。
             self.store_dtype = torch.uint8
         else:
+            # 非 fp8 时，存储 dtype 与计算 dtype 一致。
             self.store_dtype = dtype
         self.layer_num = layer_num
+        # 缺省时本池覆盖全部层 [0, layer_num-1]；PP 等场景可只覆盖一段。
         self.start_layer = start_layer or 0
         self.end_layer = end_layer or layer_num - 1
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
+        # 本池占用显存（GB），在 _finalize_allocation_log 中统计后写入。
         self.mem_usage = 0
 
-        # used for chunked cpu-offloading
+        # 分块 CPU offload 的块大小（按 token 数）。
         self.cpu_offloading_chunk_size = 8192
 
-        # default state for optional layer-wise transfer control
+        # 可选的逐层传输计数器，默认关闭；启用后用于分层 KV 传输的完成同步。
         self.layer_transfer_counter = None
 
-        # for disagg with nvlink
+        # PD 分离 + NVLink 场景下的自定义内存池（不支持时返回 None）。
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
 
     def _finalize_allocation_log(self, num_tokens: int):
-        """Common logging and mem_usage computation for KV cache allocation.
-        Supports both tuple (K, V) size returns and single KV size returns.
+        """KV 缓存分配后的统一日志与 mem_usage 统计。
+
+        兼容两种返回形态：返回 (K, V) 二元组大小，或返回单一 KV 大小。
         """
         kv_size_bytes = self.get_kv_size_bytes()
         if isinstance(kv_size_bytes, tuple):
@@ -909,58 +957,76 @@ class KVCache(abc.ABC):
 
     @abc.abstractmethod
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
+        # 取指定层的 Key 缓冲张量（注意力读取 K 时用）。
         raise NotImplementedError()
 
     @abc.abstractmethod
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
+        # 取指定层的 Value 缓冲张量。
         raise NotImplementedError()
 
     @abc.abstractmethod
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 一次取回指定层的 (K, V) 两个缓冲张量。
         raise NotImplementedError()
 
     @abc.abstractmethod
     def set_kv_buffer(
         self,
-        layer: RadixAttention,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
+        layer: RadixAttention,  # 当前注意力层（含 layer_id 等元信息）
+        loc: torch.Tensor,  # 待写入的 KV 槽位下标（来自 req_to_token 映射）
+        cache_k: torch.Tensor,  # 本批新算出的 K
+        cache_v: torch.Tensor,  # 本批新算出的 V
     ) -> None:
+        # 把本步新生成的 K/V 写入 loc 指定的槽位（prefill/decode 后回填缓存）。
         raise NotImplementedError()
 
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
+        # 注册逐层传输完成计数器（启用分层 KV 传输时由上层调用）。
         self.layer_transfer_counter = layer_transfer_counter
 
     def get_cpu_copy(self, indices, mamba_indices=None):
+        # 把指定槽位的 KV 拷贝到 CPU（HiCache offload 用）；基类不实现。
         raise NotImplementedError()
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        # 把 CPU 上的 KV 回灌到指定槽位（HiCache 取回用）；基类不实现。
         raise NotImplementedError()
 
     def maybe_get_custom_mem_pool(self):
+        # 返回自定义内存池（PD 分离 + NVLink 场景），未启用时为 None。
         return self.custom_mem_pool
 
 
 class MHATokenToKVPool(KVCache):
+    """标准多头注意力（MHA / GQA）的 KV 物理存储池。
+
+    为每一层维护两组按 token 槽位组织的缓冲：``k_buffer[layer]`` 与
+    ``v_buffer[layer]``，默认 NHD 布局形状为 ``[size+page_size, head_num, head_dim]``
+    （末尾多预留一页 padding，供 padding/dummy token 写入而不污染真实数据）。
+    注意力 backend 通过 ``set_kv_buffer`` 按槽位 ``loc`` 回填 K/V，再通过
+    ``get_kv_buffer`` 读取。子类 ``NoOpMHATokenToKVPool`` / ``MHATokenToKVPoolFP4``
+    在此基础上做特化。
+    """
+
     def __init__(
         self,
-        size: int,
-        page_size: int,
-        dtype: torch.dtype,
-        head_num: int,
-        head_dim: int,
-        layer_num: int,
+        size: int,  # KV 槽位总数（可缓存 token 数）
+        page_size: int,  # 每页 token 数（paged KV）
+        dtype: torch.dtype,  # KV 计算 dtype
+        head_num: int,  # KV 头数（GQA 下为 KV head 数，可小于 query head）
+        head_dim: int,  # 每个 K 头的维度
+        layer_num: int,  # 本池负责的层数
         device: str,
         enable_memory_saver: bool,
-        v_head_dim: Optional[int] = None,
-        swa_head_num: Optional[int] = None,
-        swa_head_dim: Optional[int] = None,
-        swa_v_head_dim: Optional[int] = None,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
-        enable_alt_stream: bool = True,
-        enable_kv_cache_copy: bool = False,
+        v_head_dim: Optional[int] = None,  # V 头维度，缺省时与 head_dim 相同
+        swa_head_num: Optional[int] = None,  # 滑动窗口子池专用头数（SWAKVPool 传入）
+        swa_head_dim: Optional[int] = None,  # 滑动窗口子池专用 K 头维度
+        swa_v_head_dim: Optional[int] = None,  # 滑动窗口子池专用 V 头维度
+        start_layer: Optional[int] = None,  # 本池覆盖的起始层
+        end_layer: Optional[int] = None,  # 本池覆盖的结束层
+        enable_alt_stream: bool = True,  # 是否启用备用 CUDA stream 并行写 K/V
+        enable_kv_cache_copy: bool = False,  # 是否初始化 move_kv_cache 所需的拷贝内核
     ):
         super().__init__(
             size,
@@ -972,6 +1038,8 @@ class MHATokenToKVPool(KVCache):
             start_layer,
             end_layer,
         )
+        # 若传入了 swa_* 参数（来自 SWAKVPool 的滑动窗口子池），优先采用之；
+        # 否则用常规的 head_num/head_dim/v_head_dim。
         self.head_num = swa_head_num if swa_head_num is not None else head_num
         self.head_dim = swa_head_dim if swa_head_dim is not None else head_dim
         self.v_head_dim = (
@@ -980,17 +1048,16 @@ class MHATokenToKVPool(KVCache):
             else v_head_dim if v_head_dim is not None else head_dim
         )
 
-        # Optional SHUFFLE 5D ("vectorized") physical layout for K/V.
-        # Selected by `SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d` on the ROCm
-        # AITER backend (HIP + SGLANG_USE_AITER=1). When active:
-        #   K shape: (num_blocks, H, D_k // X, page, X)
-        #   V shape: (num_blocks, H, page // X, D_v, X)   where X = 16 / dtype_bytes
-        # aiter `mha_batch_prefill_func` consumes these 5D shapes natively and
-        # aiter `pa_decode_gluon` reads SHUFFLE blocks directly during decode.
-        # An explicit `kv_cache_layout=` argument always wins (e.g. SWAKVPool
-        # passes "nhd" to keep its SWA sub-pool on the legacy layout); on
-        # non-AITER platforms the env var is ignored and NHD is forced since
-        # no consumer kernel exists for SHUFFLE 5D outside the AITER backend.
+        # 可选的 SHUFFLE 5D（"vectorized"）K/V 物理布局。
+        # 仅在 ROCm AITER 后端（HIP + SGLANG_USE_AITER=1）下，由
+        # `SGLANG_AITER_KV_CACHE_LAYOUT=vectorized_5d` 选中。启用时：
+        #   K 形状: (num_blocks, H, D_k // X, page, X)
+        #   V 形状: (num_blocks, H, page // X, D_v, X)   其中 X = 16 / dtype_bytes
+        # aiter 的 `mha_batch_prefill_func` 原生消费这些 5D 形状，
+        # `pa_decode_gluon` 在 decode 时直接读取 SHUFFLE 块。
+        # 显式传入的 `kv_cache_layout=` 参数始终优先（例如 SWAKVPool 传 "nhd"
+        # 让其 SWA 子池保持传统布局）；非 AITER 平台忽略该环境变量并强制 NHD，
+        # 因为 AITER 后端之外没有消费 SHUFFLE 5D 的内核。
         self.kv_cache_layout = "nhd"
         if _use_aiter:
             layout = envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower()
@@ -1001,10 +1068,9 @@ class MHATokenToKVPool(KVCache):
                 )
             self.kv_cache_layout = layout
             if layout == "vectorized_5d":
-                # X is the inner vectorization width in the SHUFFLE layout,
-                # determined by the STORAGE dtype (not the compute dtype) since
-                # it controls how many elements fit in 16 bytes of the on-pool
-                # tensor. For fp8 storage X=16, for bf16/fp16 X=8.
+                # X 是 SHUFFLE 布局的内层向量化宽度，由「存储 dtype」（而非计算
+                # dtype）决定，因为它控制池内张量 16 字节里能放几个元素。
+                # fp8 存储时 X=16，bf16/fp16 时 X=8。
                 self._kv_vector_x = 16 // self.store_dtype.itemsize
                 assert (self.size + self.page_size) % self.page_size == 0
                 assert self.page_size % self._kv_vector_x == 0, (
@@ -1014,10 +1080,12 @@ class MHATokenToKVPool(KVCache):
                 assert self.head_dim % self._kv_vector_x == 0
                 assert self.v_head_dim % self._kv_vector_x == 0
 
+        # 按上面确定的布局，为每层分配 K/V 显存缓冲。
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
 
+        # 备用 stream：在 CUDA/类 CUDA 平台上用它与主 stream 并行写 K 和 V。
         _use_alt_stream = _is_cuda or current_platform.is_cuda_alike()
         self.alt_stream = (
             self.device_module.Stream()
@@ -1025,24 +1093,26 @@ class MHATokenToKVPool(KVCache):
             else None
         )
 
+        # 仅在需要 move_kv_cache（如某些缓存搬移场景）时初始化拷贝内核并预热。
         if enable_kv_cache_copy:
             self._init_kv_copy_and_warmup()
         else:
             self._kv_copy_config = None
 
+        # 统计并打印本池显存占用。
         self._finalize_allocation_log(size)
 
-        # for store_cache JIT kernel
+        # 供 store_cache JIT 内核使用：每行元素数与 K/V 维度是否相同。
         self.row_dim = self.head_num * self.head_dim
         self.same_kv_dim = self.head_dim == self.v_head_dim
 
     def _init_kv_copy_and_warmup(self):
-        # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
+        # 零层池（如 all-SWA 模型的 full 子池）没有缓冲，直接跳过。
         if self.layer_num == 0:
             self._kv_copy_config = None
             return
 
-        # Heuristics for KV copy tiling
+        # KV 拷贝分块（tiling）的经验阈值与 tile 大小。
         _KV_COPY_STRIDE_THRESHOLD_LARGE = 8192
         _KV_COPY_STRIDE_THRESHOLD_MEDIUM = 4096
         _KV_COPY_TILE_SIZE_LARGE = 512
@@ -1051,6 +1121,7 @@ class MHATokenToKVPool(KVCache):
         _KV_COPY_NUM_WARPS_LARGE_TILE = 8
         _KV_COPY_NUM_WARPS_SMALL_TILE = 4
 
+        # 按单层每 token 的字节跨度，选择合适的 tile 大小。
         stride_bytes = int(self.data_strides[0].item())
         if stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_LARGE:
             bytes_per_tile = _KV_COPY_TILE_SIZE_LARGE
@@ -1059,7 +1130,7 @@ class MHATokenToKVPool(KVCache):
         else:
             bytes_per_tile = _KV_COPY_TILE_SIZE_SMALL
 
-        # Calculate num_locs_upper to avoid large Triton specialization (e.g. 8192)
+        # 限制 num_locs_upper，避免 Triton 针对超大值（如 8192）做特化编译。
         chunk_upper = 128 if bytes_per_tile >= _KV_COPY_TILE_SIZE_LARGE else 256
 
         self._kv_copy_config = {
@@ -1073,6 +1144,8 @@ class MHATokenToKVPool(KVCache):
             "num_locs_upper": chunk_upper,
         }
 
+        # 用 dummy 输入预跑一次内核，提前触发 JIT 编译（warmup），避免首个真实
+        # move_kv_cache 调用承担编译延迟。
         dummy_loc = torch.zeros(chunk_upper, dtype=torch.int64, device=self.device)
         grid = (self.data_ptrs.numel(), self._kv_copy_config["byte_tiles"])
 
@@ -1089,6 +1162,7 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
+        # 在显存节省器 region（以及可选的自定义内存池）内分配缓冲张量。
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -1096,6 +1170,7 @@ class MHATokenToKVPool(KVCache):
                 else nullcontext()
             ):
                 if self.kv_cache_layout == "vectorized_5d":
+                    # AITER SHUFFLE 5D 布局：按页分块组织。
                     total_slots = self.size + self.page_size
                     num_blocks = total_slots // self.page_size
                     x = self._kv_vector_x
@@ -1130,8 +1205,8 @@ class MHATokenToKVPool(KVCache):
                         for _ in range(self.layer_num)
                     ]
                 else:
-                    # [size, head_num, head_dim] for each layer
-                    # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                    # 默认 NHD 布局：每层一个 [size+page_size, head_num, head_dim] 张量。
+                    # 末尾预留的 padding 槽位用于承接 padding/dummy token 的占位输出。
                     self.k_buffer = [
                         torch.zeros(
                             (self.size + self.page_size, self.head_num, self.head_dim),
@@ -1153,6 +1228,7 @@ class MHATokenToKVPool(KVCache):
                         for _ in range(self.layer_num)
                     ]
 
+        # 把每层 K/V 缓冲的显存首地址收集成张量，供逐层拷贝内核按指针访问。
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
             dtype=torch.uint64,
@@ -1163,7 +1239,9 @@ class MHATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
+        # data_ptrs 把 K 的各层指针与 V 的各层指针拼接在一起。
         self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        # 每个缓冲单 token 的字节跨度（= 除第 0 维外所有维度元素数 × 单元素字节）。
         self.data_strides = torch.tensor(
             [
                 np.prod(x.shape[1:]) * x.dtype.itemsize
@@ -1173,10 +1251,12 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _clear_buffers(self):
+        # 释放 K/V 缓冲（关停或重建池时调用）。
         del self.k_buffer
         del self.v_buffer
 
     def get_kv_size_bytes(self):
+        # 统计本池 K、V 各自占用的总字节数，返回 (k_size_bytes, v_size_bytes)。
         assert hasattr(self, "k_buffer")
         assert hasattr(self, "v_buffer")
         k_size_bytes = 0
@@ -1187,10 +1267,10 @@ class MHATokenToKVPool(KVCache):
             v_size_bytes += get_tensor_size_bytes(v_cache)
         return k_size_bytes, v_size_bytes
 
-    # for disagg
+    # 供 PD 分离（disaggregation）使用：导出各层 K/V 缓冲的连续内存信息，
+    # 以便跨进程/跨节点传输。
     def get_contiguous_buf_infos(self):
-        # layer_num x [seq_len, head_num, head_dim]
-        # layer_num x [page_num, page_size, head_num, head_dim]
+        # 返回三组列表：各缓冲首地址、各缓冲总字节数、单页（page_size 个 token）字节数。
         kv_data_ptrs = [
             self._get_key_buffer(i).data_ptr()
             for i in range(self.start_layer, self.start_layer + self.layer_num)
@@ -1215,11 +1295,14 @@ class MHATokenToKVPool(KVCache):
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def get_cpu_copy(self, indices, mamba_indices=None):
+        # 把指定槽位的 KV 逐层、分块拷到 CPU（HiCache offload）。
+        # 拷贝前后各同步一次，确保异步搬运完成。
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
+            # 按 chunk_size 切分，避免一次性搬运过大。
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 k_cpu = self.k_buffer[layer_id][chunk_indices].to(
@@ -1233,6 +1316,7 @@ class MHATokenToKVPool(KVCache):
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        # get_cpu_copy 的逆操作：把 CPU 上的 KV 分块回灌到指定槽位（HiCache 取回）。
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -1250,51 +1334,55 @@ class MHATokenToKVPool(KVCache):
         current_platform.synchronize()
 
     def _get_key_buffer(self, layer_id: int):
-        # for internal use of referencing
+        # 内部引用用：不带同步地取 K 缓冲。store_dtype 与 dtype 不同时（如 fp8
+        # 实存为 uint8）按计算 dtype 重解释视图返回。layer_id 减 start_layer 得本池行号。
         if self.store_dtype != self.dtype:
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.k_buffer[layer_id - self.start_layer]
 
     def get_key_buffer(self, layer_id: int):
-        # note: get_key_buffer is hooked with synchronization for layer-wise KV cache loading
-        # it is supposed to be used only by attention backend not for information purpose
-        # same applies to get_value_buffer and get_kv_buffer
+        # 注意：get_key_buffer 挂了同步钩子，用于逐层 KV 加载，仅应由注意力 backend
+        # 调用、而非用于查看信息；get_value_buffer / get_kv_buffer 同理。
+        # 若启用了逐层传输计数器，先等待该层 KV 传输完成再返回。
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self._get_key_buffer(layer_id)
 
     def _get_value_buffer(self, layer_id: int):
-        # for internal use of referencing
+        # 内部引用用：不带同步地取 V 缓冲，处理同 _get_key_buffer。
         if self.store_dtype != self.dtype:
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.v_buffer[layer_id - self.start_layer]
 
     def get_value_buffer(self, layer_id: int):
+        # 取 V 缓冲（带逐层传输同步），用法同 get_key_buffer。
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self._get_value_buffer(layer_id)
 
     def get_kv_buffer(self, layer_id: int):
+        # 一次取回该层 (K, V)。
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
     def set_kv_buffer(
         self,
-        layer: RadixAttention,
-        loc_info,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        k_scale: Optional[float] = None,
-        v_scale: Optional[float] = None,
-        layer_id_override: Optional[int] = None,
+        layer: RadixAttention,  # 当前注意力层
+        loc_info,  # 待写槽位信息（可能被包装，需 unwrap）
+        cache_k: torch.Tensor,  # 本步新算出的 K
+        cache_v: torch.Tensor,  # 本步新算出的 V
+        k_scale: Optional[float] = None,  # K 的反量化缩放（fp8 等）
+        v_scale: Optional[float] = None,  # V 的反量化缩放
+        layer_id_override: Optional[int] = None,  # 显式指定层号（覆盖 layer.layer_id）
     ):
         loc, _ = unwrap_write_loc(loc_info)
-        # Catch stale slot ids here instead of as illegal-addr / silent KV
-        # corruption in the store_kvcache write (gated on SGLANG_ENABLE_ASYNC_ASSERT).
+        # 在此处提前拦截越界/过期的槽位号，避免到 store_kvcache 写入时变成非法地址
+        # 或静默的 KV 损坏（受 SGLANG_ENABLE_ASYNC_ASSERT 控制）。
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MHA)")
         if layer_id_override is not None:
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+        # 若输入 dtype 与池 dtype 不一致，先按 scale 反量化再转成池 dtype。
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
@@ -1303,23 +1391,21 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
+        # fp8 等情形：按存储 dtype（uint8）重解释后再写入。
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
 
         if self.kv_cache_layout == "vectorized_5d":
-            # Late-import to keep the NHD path import-clean.
+            # 延迟导入，保持 NHD 主路径的导入干净。
             from sglang.srt.layers.attention.utils import (
                 launch_reshape_and_cache_shuffle_5d,
             )
 
-            # The writer kernel uses key.stride(0) directly as the source
-            # token stride; head/dim are assumed contiguous within each
-            # token (stride(1)=head_size, stride(2)=1). Both hold for K/V
-            # produced by QKV split + RoPE in upstream attention even when
-            # the outer per-token stride is non-canonical, so we skip the
-            # protective .contiguous() copies that would otherwise fire
-            # large per-layer elementwise kernels.
+            # 写入内核直接用 key.stride(0) 作为源 token 跨度；并假设每个 token 内部
+            # head/dim 连续（stride(1)=head_size, stride(2)=1）。上游注意力经 QKV 拆分
+            # + RoPE 产出的 K/V 即便外层 per-token 跨度非规范也满足该假设，故跳过
+            # 保护性的 .contiguous() 拷贝（否则会触发昂贵的逐层逐元素内核）。
             launch_reshape_and_cache_shuffle_5d(
                 cache_k,
                 cache_v,
@@ -1329,6 +1415,7 @@ class MHATokenToKVPool(KVCache):
             )
             return
 
+        # NHD 主路径：调用底层实现把 K/V 写入对应层缓冲的 loc 槽位。
         _set_kv_buffer_impl(
             cache_k,
             cache_v,
@@ -1338,8 +1425,8 @@ class MHATokenToKVPool(KVCache):
             row_dim=self.row_dim,
             store_dtype=self.store_dtype,
             device_module=self.device_module,
-            # size + page_size = real slots + the reserved padding slot (padded /
-            # dummy tokens write there); valid index range is [0, size + page_size).
+            # size + page_size = 真实槽位 + 预留 padding 槽位（padding/dummy token
+            # 写到那里）；合法下标范围是 [0, size + page_size)。
             size_limit=self.size + self.page_size,
             alt_stream=self.alt_stream,
             same_kv_dim=self.same_kv_dim,
@@ -1348,19 +1435,22 @@ class MHATokenToKVPool(KVCache):
     def set_kv_buffer_prefix_valid(
         self,
         layer: RadixAttention,
-        loc_2d: torch.Tensor,
-        commit_lens: torch.Tensor,
+        loc_2d: torch.Tensor,  # 二维槽位表 [批, 每请求最大写入数]
+        commit_lens: torch.Tensor,  # 每个请求实际有效（已提交）的写入长度
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
+        # set_kv_buffer 的变体：仅写每行前 commit_lens[i] 个有效槽位，其余视为无效跳过。
+        # 用于分块/前缀提交场景，loc_2d 各行长度对齐但有效部分不同。
         if layer_id_override is not None:
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
 
+        # 形状校验：loc_2d 必须是二维，commit_lens 必须是一维且批大小一致。
         if loc_2d.ndim != 2:
             raise ValueError(f"loc_2d must be rank-2, got shape={tuple(loc_2d.shape)}.")
         if commit_lens.ndim != 1 or commit_lens.shape[0] != loc_2d.shape[0]:
@@ -1369,6 +1459,7 @@ class MHATokenToKVPool(KVCache):
                 f"{tuple(commit_lens.shape)=} {tuple(loc_2d.shape)=}."
             )
 
+        # 稠密 K/V 的行数必须等于 loc_2d 的元素总数（每个槽位一行）。
         num_rows = int(loc_2d.numel())
         if cache_k.shape[0] != num_rows or cache_v.shape[0] != num_rows:
             raise ValueError(
@@ -1376,6 +1467,7 @@ class MHATokenToKVPool(KVCache):
                 f"{tuple(cache_k.shape)=} {tuple(cache_v.shape)=} {tuple(loc_2d.shape)=}."
             )
 
+        # dtype 对齐：必要时反量化并转成池 dtype（同 set_kv_buffer）。
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
@@ -1384,6 +1476,7 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
+        # 这里底层内核要求输入连续，故统一 .contiguous()（fp8 再按存储 dtype 重解释）。
         if self.store_dtype != self.dtype:
             cache_k = cache_k.contiguous().view(self.store_dtype)
             cache_v = cache_v.contiguous().view(self.store_dtype)
@@ -1391,6 +1484,7 @@ class MHATokenToKVPool(KVCache):
             cache_k = cache_k.contiguous()
             cache_v = cache_v.contiguous()
 
+        # 把索引/长度搬到缓冲所在设备，并对齐到内核期望的 dtype。
         if loc_2d.device != self.k_buffer[0].device:
             loc_2d = loc_2d.to(device=self.k_buffer[0].device, non_blocking=True)
         if commit_lens.device != self.k_buffer[0].device:
@@ -1402,6 +1496,7 @@ class MHATokenToKVPool(KVCache):
         if commit_lens.dtype != torch.int32:
             commit_lens = commit_lens.to(torch.int32)
 
+        # 非 CUDA/HIP 平台没有专用内核：用掩码筛出有效槽位后退化为普通 set_kv_buffer。
         if not (_is_cuda or _is_hip):
             row_offsets = torch.arange(loc_2d.shape[1], device=loc_2d.device)
             valid_mask = row_offsets[None, :] < commit_lens.to(torch.int64)[:, None]
@@ -1419,6 +1514,7 @@ class MHATokenToKVPool(KVCache):
             )
             return
 
+        # CUDA/HIP 平台：调用专用内核，仅写每行前 commit_lens 个有效槽位。
         _set_kv_buffer_prefix_valid_impl(
             cache_k,
             cache_v,
@@ -1431,15 +1527,17 @@ class MHATokenToKVPool(KVCache):
         )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
+        # 把 src_loc 处的 KV 整体搬到 tgt_loc 处（如缓存碎片整理）。
+        # 零层池（如 all-SWA 模型的 full 子池）没有缓冲，直接返回。
         if self.layer_num == 0:
             return
 
-        # Catch stale indices here instead of as illegal-addr or silent KV corruption.
+        # 提前拦截过期/越界索引，避免变成非法地址或静默 KV 损坏。
         size_limit = self.size + self.page_size
         maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
 
+        # 可用环境变量切到原生（torch 实现）搬运路径。
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
             move_kv_cache_native(self.k_buffer, self.v_buffer, tgt_loc, src_loc)
             return
@@ -1453,9 +1551,11 @@ class MHATokenToKVPool(KVCache):
         ), "KV copy not initialized. Set enable_kv_cache_copy=True in __init__"
 
         cfg = self._kv_copy_config
+        # cap 为单次内核处理的槽位数上限（来自 warmup 时的特化配置）。
         cap = int(cfg.get("num_locs_upper", 256))
         grid = (self.data_ptrs.numel(), cfg["byte_tiles"])
 
+        # N 不超过 cap：一次内核搞定，upper 取大于等于 N 的 2 的幂以复用编译特化。
         if N <= cap:
             upper = next_power_of_2(N)
             copy_all_layer_kv_cache_tiled[grid](
@@ -1471,7 +1571,7 @@ class MHATokenToKVPool(KVCache):
             )
             return
 
-        # Huge N: chunk, but each chunk's upper is still pow2(<= cap)
+        # N 很大：按 cap 分块循环，每块的 upper 仍取 2 的幂（≤ cap），避免内核特化爆炸。
         for start in range(0, N, cap):
             end = min(start + cap, N)
             chunk_len = end - start

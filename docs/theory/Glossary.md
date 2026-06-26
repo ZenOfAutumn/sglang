@@ -52,6 +52,46 @@ LongCat 等模型使用的一种嵌入机制：除常规的 token embedding 外�
 - `_init_ngram_embedding_info`：按 decode / extend 模式构建本批次的 ngram embedding 信息。
 - `model_runner.use_ngram_embedding`：是否启用该机制的开关。
 
+## Mamba（状态空间模型 / SSM）
+
+**Mamba** 是一类**状态空间模型（State Space Model, SSM）** 架构，作为 Transformer 自注意力的替代/补充：它用一个**固定大小的循环状态**沿序列逐步演化来「记住历史」，而不是像注意力那样保留全部历史 token 的 Key/Value。其核心是**选择性 SSM（Selective SSM）**——状态转移参数随输入内容动态变化，使模型能选择性地记住或遗忘信息。SGLang 中的实现以 **Mamba2** 为主（`MambaMixer2`，见 `python/sglang/srt/layers/attention/mamba/mamba.py`）。
+
+### 为什么重要：和注意力的本质区别
+
+| | 自注意力（Attention） | Mamba / SSM |
+| --- | --- | --- |
+| 历史的承载 | KV cache，**随序列线性增长**（每个 token 一份 K/V） | 固定大小的**循环状态**，**与序列长度无关** |
+| 单 token 计算 | 与已有序列长度成正比（要看全部历史） | **常数**（只更新状态） |
+| 长序列复杂度 | 训练 $O(N^2)$、显存 $O(N)$ | 训练近 $O(N)$、推理显存 $O(1)$ |
+| 长上下文显存 | KV 占用是主要瓶颈 | 状态恒定，显存压力小 |
+
+这使 Mamba 在**超长上下文**下显存友好；代价是状态容量固定，对需要精确回看任意历史位置的任务（如大海捞针式检索）不如注意力。实践中常用**混合架构**：少数注意力层 + 多数 Mamba 层，兼顾精确回看与长序列效率（SGLang 已支持 Qwen3-Next、Nemotron-H、Falcon-H1、GraniteMoE-Hybrid、LFM2、Zaya、Jet-Nemotron 等混合模型）。
+
+### 两种计算模式：与 prefill / decode 天然对应
+
+Mamba 的循环本质带来与注意力相同的「两段式」推理结构，SGLang 也据此走两条算子路径：
+
+- **Prefill（并行分块扫描）**：一次性吃进整段 prompt，用 **SSD（State Space Duality，状态空间对偶）** 的**分块扫描**把循环展开成可并行的矩阵运算（`mamba_chunk_scan_combined`，见 `ops/ssd_combined.py`、`ssd_chunk_scan.py`、`ssd_state_passing.py`），既算出每个位置的输出，又得到序列末尾的最终状态。
+- **Decode（单步递推更新）**：每步只来一个新 token，直接做**单步状态更新**（`selective_state_update`），把上一状态推进一格——这正是 SSM「常数时间单 token」的来源。
+- 配套的**因果一维卷积**同样分两路：prefill 用 `causal_conv1d_fn`，decode 用 `causal_conv1d_update`。
+
+### 状态缓存：Mamba 版的「KV cache」
+
+每个请求的 Mamba 状态由两部分组成，必须像 KV cache 一样跨步保存：
+
+- **`conv_state`（卷积状态）**：因果 conv1d 的滑动窗口缓冲，保留最近若干 token 以延续卷积。
+- **`ssm_state`（SSM 状态）**：选择性扫描的循环隐状态，承载「到目前为止的历史摘要」。
+
+二者大小**与序列长度无关**（只取决于模型维度），由 `MambaPool`（`python/sglang/srt/mem_cache/memory_pool.py`）分配、`HybridReqToTokenPool` 在混合模型里与注意力 KV 池并存管理。
+
+### 在 SGLang 中的意义与注意点
+
+- **前缀缓存（prefix caching）语义不同**：注意力的 KV 是**逐 token 可寻址**的，能在 RadixCache 里按 token 前缀精确复用；而 Mamba 状态是**整段历史压缩成的一份快照**，无法「截取前缀状态」。因此混合模型的缓存需要专门的 `MambaComponent`（`python/sglang/srt/mem_cache/unified_cache_components/mamba_component.py`）来协调状态的存取与淘汰，而非简单套用 token 级前缀匹配。
+- **相关字段/文件**：
+  - `python/sglang/srt/layers/attention/mamba/`：Mamba2 混合器、因果卷积、SSD 扫描算子（`ops/`）、前向元数据 `Mamba2Metadata`。
+  - `python/sglang/srt/layers/attention/hybrid_linear_attn_backend.py`：混合线性注意力后端，按层在注意力路径与 SSM 路径间分派。
+  - `python/sglang/srt/mem_cache/memory_pool.py` 的 `MambaPool` / `HybridReqToTokenPool`：Mamba 状态的显存池与混合模型的请求-token 映射。
+
 ## 在线 softmax（Online Softmax）
 
 一种**单遍（one-pass）、数值稳定地增量计算 softmax** 的方法。它是 FlashAttention 等高效注意力 kernel 的数学基础：在不把完整的注意力分数矩阵 $S = QK^\top$ 写回显存的前提下，一边遍历 Key/Value 分块，一边累积出最终的注意力输出。

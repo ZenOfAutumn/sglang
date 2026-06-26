@@ -11,7 +11,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Logits processing."""
+"""Logits 处理模块。
+
+本模块负责把模型主干输出的隐藏状态（hidden_states）经过语言模型头（lm_head）
+投影成词表维度的 logits，并进一步在需要时计算各类对数概率（logprob）。核心内容：
+  - LogitsProcessorOutput：前向产出的结果容器（logits / hidden_states / 各类 logprob）。
+  - LogitsMetadata：驱动 logits 处理所需的元数据（前向模式、是否返回 logprob、
+    DP attention 相关信息等），可由 ForwardBatch 转换而来。
+  - LogitsProcessor：实际执行 LM head 计算、张量并行 all-gather、DP attention
+    gather/scatter、softcap、以及（可选的）输入 logprob 计算的 nn.Module。
+
+关键概念：
+  - prefill / extend 阶段一次处理多个 token，需要按序列裁剪出「要采样的最后一个 token」
+    与「需要 input logprob 的 token」两类位置；decode 阶段每个序列只有一个 token。
+  - 当词表很大且开启分块时，输入 logprob 会按行分块计算以降低显存峰值。
+"""
 
 import dataclasses
 import logging
@@ -71,15 +85,22 @@ _is_cpu = is_cpu()
 # attention/MoE/GEMM kernels, so the LM-head all-gather is wasted work --
 # and its [batch * dp_size, vocab] output OOMs under DP attention with a
 # tight mem_fraction_static.
+# 中译：该标志置位时，LogitsProcessor.forward 直接返回空结果，跳过 LM head 与张量并行
+#       all-gather。FlashInfer 自动调优（autotune）只对 attention/MoE/GEMM 等 kernel 做
+#       性能采样，此时 LM head 的 all-gather 是无用功；而且在 DP attention + 紧张的
+#       mem_fraction_static 下，其 [batch * dp_size, vocab] 的输出还会触发 OOM。
 _in_autotune_dummy_run = False
 
 
 def get_in_autotune_dummy_run() -> bool:
+    # 中译：返回当前是否处于「autotune 空跑」模式。
     return _in_autotune_dummy_run
 
 
 @contextmanager
 def autotune_dummy_run_mode():
+    # 中译：上下文管理器——进入时置位「autotune 空跑」标志，退出时恢复，
+    #       用于在 FlashInfer 自动调优期间临时跳过 LM head 计算。
     global _in_autotune_dummy_run
     _in_autotune_dummy_run = True
     try:
@@ -114,7 +135,14 @@ class LogitsProcessorOutput:
     next_token_logits: Optional[torch.Tensor]
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
+    # shape: [#seq, hidden_dim] when capture_hidden_mode is LAST (only last-token
+    #        states are kept), or [#token, hidden_dim] when capture_hidden_mode is FULL.
+    #        When aux_hidden_states are used (multi-layer EAGLE), the last dim becomes
+    #        hidden_dim * num_aux_layers (layers concatenated along dim=-1).
     # 中译：最后一层的隐藏状态，供投机解码（EAGLE）等使用；未启用时为 None。
+    #       形状：capture_hidden_mode 为 LAST 时为 [序列数, hidden_dim]（仅保留每个序列最后一个
+    #       token 的隐藏状态）；为 FULL 时为 [token 数, hidden_dim]。当使用 aux_hidden_states
+    #       （多层 EAGLE）时，最后一维变为 hidden_dim * 辅助层数（各层沿 dim=-1 拼接）。
     hidden_states: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
@@ -167,47 +195,73 @@ class LogitsProcessorOutput:
 
 @dataclasses.dataclass
 class LogitsMetadata:
+    """驱动 logits 处理所需的元数据。
+
+    它通常由 from_forward_batch 从 ForwardBatch 抽取生成，集中携带本次前向
+    「该如何处理 logits / logprob」所需的全部信息，避免把庞大的 ForwardBatch
+    一路透传到 LogitsProcessor 内部。主要包含三类信息：
+      1. 前向模式与隐藏状态捕获模式（forward_mode / capture_hidden_mode）；
+      2. 输入 logprob 相关的开关与各序列的长度/起始位置（extend_* 系列字段）；
+      3. DP attention（数据并行注意力）下做 gather/scatter 所需的 token 分布信息。
+    """
+
+    # 中译：前向模式（prefill/extend、decode、target_verify、draft_extend 等）。
     forward_mode: ForwardMode
+    # 中译：隐藏状态捕获模式——决定是否、以及如何保存 hidden_states（供投机解码使用）。
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
+    # 中译：可复用的 next_token_logits 输出缓冲区（若提供则原地写入，省一次分配）。
     next_token_logits_buffer: Optional[torch.Tensor] = None
 
-    extend_return_logprob: bool = False
-    extend_return_top_logprob: bool = False
-    extend_token_ids_logprob: bool = False
-    extend_seq_lens: Optional[torch.Tensor] = None
-    extend_seq_lens_cpu: Optional[List[int]] = None
-    extend_logprob_start_lens_cpu: Optional[List[int]] = None
-    extend_logprob_pruned_lens_cpu: Optional[List[int]] = None
-    top_logprobs_nums: Optional[List[int]] = None
-    extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
-    token_ids_logprobs: Optional[List[List[int]]] = None
+    # 中译：以下 extend_* 为 prefill/extend 阶段计算输入 logprob 的相关开关与长度信息。
+    extend_return_logprob: bool = False  # 是否返回输入 token 的 logprob
+    extend_return_top_logprob: bool = False  # 是否返回输入位置的 top-k logprob
+    extend_token_ids_logprob: bool = False  # 是否返回输入位置上指定 token id 的 logprob
+    extend_seq_lens: Optional[torch.Tensor] = None  # 各序列 extend 的 token 数（GPU 张量）
+    extend_seq_lens_cpu: Optional[List[int]] = None  # 同上，CPU 侧列表
+    extend_logprob_start_lens_cpu: Optional[List[int]] = None  # 各序列从第几个 token 开始算 logprob
+    extend_logprob_pruned_lens_cpu: Optional[List[int]] = None  # 各序列裁剪后参与 logprob 的 token 数
+    top_logprobs_nums: Optional[List[int]] = None  # 各序列请求的 top-k 数量
+    extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None  # 各位置「目标 token id」（用于取其 logprob）
+    token_ids_logprobs: Optional[List[List[int]]] = None  # 各序列请求 logprob 的指定 token id 列表
 
     # logits and logprobs post processing
-    temperature: torch.Tensor = None
-    top_p: torch.Tensor = None
+    # 中译：logits / logprob 后处理参数。
+    temperature: torch.Tensor = None  # 温度
+    top_p: torch.Tensor = None  # top-p（核采样阈值）
 
     # DP attention metadata. Not needed when DP attention is not used.
+    # 中译：DP attention（数据并行注意力）相关元数据；不启用 DP attention 时无需填写。
     # Number of tokens in the request.
+    # 中译：本次请求（全局）的 token 数。
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     # The start position of local hidden states.
+    # 中译：本 DP rank 局部隐藏状态在全局缓冲区中的起始位置。
     dp_local_start_pos: Optional[torch.Tensor] = None
-    dp_local_num_tokens: Optional[torch.Tensor] = None
-    global_dp_buffer_len: Optional[int] = None
+    dp_local_num_tokens: Optional[torch.Tensor] = None  # 本 DP rank 局部 token 数
+    global_dp_buffer_len: Optional[int] = None  # 全局 DP gather 缓冲区长度
     # Number of tokens to sample per DP rank
+    # 中译：每个 DP rank 需要计算 logprob 的 token 数（CPU / GPU 两份）。
     global_num_tokens_for_logprob_cpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     # The gather mode for DP attention
+    # 中译：DP attention 的 gather 模式（如按 token 数求和对齐）。
     dp_padding_mode: Optional[DpPaddingMode] = None
     # for padding
+    # 中译：用于 padding 的静态长度；<0 表示未启用静态 padding。
     padded_static_len: int = -1
 
     # Whether this batch is prefill-only (no token generation needed)
+    # 中译：本批是否为「仅 prefill」（不需要生成下一个 token，如打分/嵌入类请求）。
     is_prefill_only: bool = False
 
+    # 中译：多模态输入嵌入（透传字段）。
     mm_input_embeds: Optional[torch.Tensor] = None
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
+        # 中译：从 ForwardBatch 抽取构造 LogitsMetadata。
+        #       仅当处于 extend 模式、请求要求返回 logprob、且不是投机解码的 target_verify
+        #       时，才真正解析输入 logprob 相关字段；否则把这些开关全部置为 False/空。
         if (
             forward_batch.forward_mode.is_extend()
             and forward_batch.return_logprob
@@ -221,6 +275,8 @@ class LogitsMetadata:
             )
             extend_return_logprob = False
             extend_logprob_pruned_lens_cpu = []
+            # 中译：逐序列计算「裁剪后参与 input logprob 的 token 数」= extend_len - start_len；
+            #       只要有任一序列该值 > 0，就说明本批确实需要返回输入 logprob。
             for extend_len, start_len in zip(
                 forward_batch.extend_seq_lens_cpu,
                 forward_batch.extend_logprob_start_lens_cpu,
@@ -260,6 +316,8 @@ class LogitsMetadata:
         )
 
     def compute_dp_attention_metadata(self):
+        # 中译：计算 DP attention 下本 rank 的局部起止位置，并预分配用于 all-gather 的全局缓冲区。
+        #       通过对各 rank 的 token 数做前缀和，得到本 rank 在全局张量中的起始偏移与长度。
         cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
         dp_rank = get_attention_dp_rank()
         if dp_rank == 0:
@@ -278,6 +336,7 @@ class LogitsMetadata:
 
         if self.global_num_tokens_for_logprob_cpu is not None:
             # create a smaller buffer to reduce peak memory usage
+            # 中译：用各 rank token 数之和作为缓冲区长度，得到尽量小的缓冲区以降低显存峰值。
             self.global_dp_buffer_len = sum(self.global_num_tokens_for_logprob_cpu)
         else:
             self.global_dp_buffer_len = self.global_dp_buffer_len
@@ -293,6 +352,21 @@ class LogitsMetadata:
 
 
 class LogitsProcessor(nn.Module):
+    """负责「hidden_states → logits → (可选) logprob」的核心模块。
+
+    主要职责：
+      1. 根据前向模式从 hidden_states 中裁剪出「需要采样的位置」与「需要输入 logprob 的位置」；
+      2. 调用 lm_head 计算 logits，并处理张量并行 all-gather、DP attention 的 gather/scatter、
+         logit 缩放与 softcap 等后处理；
+      3. 若请求要求，计算输入 token / top-k / 指定 token id 的 logprob（可分块以省显存）。
+
+    构造参数：
+      - config：模型配置（提供 vocab_size、final_logit_softcapping 等）。
+      - skip_all_gather：是否跳过张量并行 all-gather。
+      - logit_scale：可选的 logit 缩放系数。
+      - return_full_logits：是否返回完整 logits（扩散式 LLM 等场景）。
+    """
+
     def __init__(
         self,
         config,
@@ -304,8 +378,11 @@ class LogitsProcessor(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
+        # 中译：是否在 attention TP 组内做 LM head 并行（enable_dp_lm_head）；
+        #       是否以 fp32 精度计算 LM head（enable_fp32_lm_head）。
         self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
         self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
+        # 中译：根据是否使用 attention TP 组，决定 all-gather 的方式与是否需要叠加 DP attention 路径。
         if self.use_attn_tp_group:
             self.attn_tp_size = get_attention_tp_size()
             self.do_tensor_parallel_all_gather = (
@@ -319,6 +396,7 @@ class LogitsProcessor(nn.Module):
             self.do_tensor_parallel_all_gather_dp_attn = (
                 self.do_tensor_parallel_all_gather and get_attention_dp_size() != 1
             )
+        # 中译：读取模型的 final_logit_softcapping（如 Gemma 系列）；若为负值则视为未启用。
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -329,11 +407,14 @@ class LogitsProcessor(nn.Module):
             self.final_logit_softcapping = None
 
         self.return_full_logits = return_full_logits
+        # 中译：是否启用 multi-item scoring（多项打分）。
         self.enable_mis = get_global_server_args().enable_mis
 
         # enable chunked logprobs processing
+        # 中译：是否启用输入 logprob 的分块计算（词表大/token 多时用以降低显存峰值）。
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
         # chunk size for logprobs processing
+        # 中译：分块计算 logprob 时的每块行数。
         self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
 
     def forward(
@@ -345,7 +426,21 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: Optional[torch.Tensor] = None,
         hidden_states_before_norm: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
+        """前向入口：把 hidden_states 转为 next_token_logits（及可选的输入 logprob）。
+
+        参数：
+          - input_ids：输入 token id（主要供 multi-item scoring 使用）。
+          - hidden_states：模型主干输出的隐藏状态，形状 [#token, hidden_dim]。
+          - lm_head：语言模型头（词表投影）。
+          - logits_metadata：驱动元数据，可是 LogitsMetadata 或直接传 ForwardBatch（会被转换）。
+          - aux_hidden_states：多层 EAGLE 用的辅助隐藏状态（可选）。
+          - hidden_states_before_norm：归一化前的隐藏状态（某些投机解码场景会优先保存它）。
+
+        处理分支概述：依次处理 autotune 空跑 → multi-item scoring → 扩散式 LLM →
+        通用路径（裁剪状态 → 计算 logits → 可选的输入 logprob）。
+        """
         # Extract MIS indices before ForwardBatch → LogitsMetadata conversion
+        # 中译：在把 ForwardBatch 转成 LogitsMetadata 之前，先取出 multi-item scoring 的分隔符位置。
         multi_item_delimiter_indices = None
         if isinstance(logits_metadata, ForwardBatch):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
@@ -354,10 +449,13 @@ class LogitsProcessor(nn.Module):
         # Autotune dummy run discards this output; see _in_autotune_dummy_run.
         # Placed before the MIS / DLLM / common dispatch so all three LM-head
         # paths are skipped.
+        # 中译：autotune 空跑会丢弃本输出（详见 _in_autotune_dummy_run）。置于 MIS / DLLM /
+        #       通用分发之前，以保证三条 LM head 路径都被跳过。
         if _in_autotune_dummy_run:
             return LogitsProcessorOutput(next_token_logits=None)
 
         # Multi-item scoring only for prefill-only requests with pre-computed indices.
+        # 中译：仅对「仅 prefill 且已预计算分隔符位置」的请求走 multi-item scoring 路径。
         if multi_item_delimiter_indices is not None and logits_metadata.is_prefill_only:
             return self.compute_logprobs_for_multi_item_scoring(
                 input_ids,
@@ -368,10 +466,12 @@ class LogitsProcessor(nn.Module):
             )
 
         # Diffusion LLM only.
+        # 中译：仅扩散式 LLM（Diffusion LLM）的 extend 路径，返回完整 logits。
         if logits_metadata.forward_mode.is_dllm_extend():
             return self._get_dllm_logits(hidden_states, lm_head, logits_metadata)
 
         # Get the last hidden states and last logits for the next token prediction
+        # 中译：按前向模式裁剪出用于预测下一个 token 的隐藏状态，以及用于输入 logprob 的位置索引。
         (
             pruned_states,
             pruned_states_before_norm,
@@ -396,16 +496,19 @@ class LogitsProcessor(nn.Module):
             sample_indices,
             logits_metadata,
         )
+        # 中译：hidden_states 后续不再使用，及早释放以节省显存。
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
+            # 中译：不需要返回输入 logprob 的快路——直接算 logits，并按 sample_indices 取出采样位置。
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
 
             # Decode mode or extend mode without return_logprob.
+            # 中译：decode 模式，或不要求返回 logprob 的 extend 模式。
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
@@ -421,6 +524,9 @@ class LogitsProcessor(nn.Module):
         # 1. Chunking is disabled
         # 2. Total count is below chunk size threshold
         # 3. DP attention all-gather is enabled (can use "enable_dp_lm_head" to enable chunking)
+        # 中译：开始处理输入 logprob。决定是否走分块路径；以下任一成立则跳过分块：
+        #       1. 未启用分块；2. 总 token 数不超过分块阈值；
+        #       3. 启用了 DP attention 的 all-gather（可用 enable_dp_lm_head 配合分块）。
         should_skip_chunking = (
             not self.enable_logprobs_chunk
             or pruned_states.shape[0] <= self.logprobs_chunk_size
@@ -429,6 +535,7 @@ class LogitsProcessor(nn.Module):
 
         if should_skip_chunking:
             # Compute logits for both input and sampled tokens.
+            # 中译：不分块路径——一次性算出全部 logits，再分别取出采样位置与输入 logprob 位置。
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
@@ -438,6 +545,7 @@ class LogitsProcessor(nn.Module):
 
             logprobs_result = self.process_input_logprobs(input_logits, logits_metadata)
         else:
+            # 中译：分块路径——按块计算 logits 与输入 logprob，同时填出采样 logits，以降低显存峰值。
             logprobs_result, sampled_logits = self.process_input_logprobs_by_chunk(
                 pruned_states,
                 sample_indices,
@@ -465,10 +573,23 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: Optional[torch.Tensor],
         logits_metadata: LogitsMetadata,
     ):
+        """按前向模式从 hidden_states 裁剪出后续计算所需的子集及索引。
+
+        返回五元组（+token_to_seq_idx）：
+          - pruned_states：需要计算 logits/logprob 的隐藏状态子集；
+          - pruned_states_before_norm / aux_pruned_states：对应的归一化前状态与辅助状态；
+          - sample_indices：在 pruned_states 中「要采样」的位置（decode 等场景为 None）；
+          - input_logprob_indices：「需要输入 logprob」的位置；
+          - token_to_seq_idx：每个 token 到其所属序列索引的映射（供分块计算使用）。
+        三种情形：decode/target_verify/draft_extend_v2 直接用全部；不要 logprob 的 extend 只取
+        每序列最后一个 token；要 logprob 的 extend 需同时算出上述四类索引。
+        """
         pruned_states_before_norm: Optional[torch.Tensor] = None
         aux_pruned_states = None
         token_to_seq_idx = []
 
+        # 中译：decode/idle、target_verify、draft_extend_v2 模式下，每序列只有一个输出位置，
+        #       直接用全部 hidden_states，无需裁剪。
         if (
             logits_metadata.forward_mode.is_decode_or_idle()
             or logits_metadata.forward_mode.is_target_verify()
@@ -486,12 +607,17 @@ class LogitsProcessor(nn.Module):
             and not logits_metadata.extend_return_logprob
         ):
             # Prefill without input logprobs.
+            # 中译：不要求输入 logprob 的 prefill——只需取出每个序列的最后一个 token 用于采样。
             if logits_metadata.padded_static_len < 0:
+                # 中译：无静态 padding：累加各序列长度减 1，即为各序列最后一个 token 的下标。
                 last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
             else:
                 # If padding_static length is 5 and extended_seq_lens is [2, 3],
                 # then our batch looks like [t00, t01, p, p, p, t10, t11, t12, p, p]
                 # and this retrieves t01 and t12, which are the valid last tokens
+                # 中译：有静态 padding 时：若 padded_static_len=5、extend_seq_lens=[2,3]，
+                #       批布局为 [t00, t01, p, p, p, t10, t11, t12, p, p]（p 为填充），
+                #       这里按 idx*padded_static_len + 序列长 - 1 取出 t01、t12 这些有效的最后 token。
                 idx = torch.arange(
                     len(logits_metadata.extend_seq_lens),
                     device=logits_metadata.extend_seq_lens.device,
@@ -515,6 +641,11 @@ class LogitsProcessor(nn.Module):
             # 2. sample_indices: Indices that have sampled tokens.
             # 3. input_logprob_indices: Indices that have input logprob tokens.
             # 4. token_to_seq_idx: map each token to its sequence index
+            # 中译：要求返回输入 logprob 的 prefill。需要算出四类索引：
+            #       1. pruned_states：需要取 logprob 的隐藏状态；
+            #       2. sample_indices：有采样 token 的位置；
+            #       3. input_logprob_indices：有输入 logprob token 的位置；
+            #       4. token_to_seq_idx：每个 token 到其所属序列的映射。
             #
             # Example
             # -------
@@ -531,6 +662,9 @@ class LogitsProcessor(nn.Module):
             #
             # If chunk is enabled and chunk_size = 3, the chunks will be computed in a chunked manner:
             # [t00, t01, t02], [t03, t14, t23], [t24, t25]
+            # 中译：上例中批按序列拼平，三个序列长为 [4,5,6]、logprob 起始为 [0,5,3]，
+            #       据此算出上述四组索引；若启用分块且 chunk_size=3，则按
+            #       [t00,t01,t02]、[t03,t14,t23]、[t24,t25] 逐块计算。
 
             sample_index_pt = -1
             sample_indices = []
@@ -551,6 +685,8 @@ class LogitsProcessor(nn.Module):
             ):
                 # It can happen in chunked prefill. We still need to sample 1 token,
                 # But we don't want to include it in input logprob.
+                # 中译：分块 prefill 下可能出现 extend_len == start_len：仍需采样 1 个 token，
+                #       但不想把它计入输入 logprob，故起始位置回退一个。
                 if extend_len == extend_logprob_start_len:
                     start_len = extend_logprob_start_len - 1
                 else:
@@ -558,6 +694,7 @@ class LogitsProcessor(nn.Module):
 
                 # We always need at least 1 token to sample because that's required
                 # by a caller.
+                # 中译：调用方要求至少采样 1 个 token，故 extend_len 必须严格大于 start_len。
                 assert extend_len > start_len
                 pruned_states_list.append(
                     hidden_states[pt + start_len : pt + extend_len]
@@ -573,6 +710,7 @@ class LogitsProcessor(nn.Module):
                         )
                 # Map each token to its sequence index, for chunked computation
                 # of input logprobs
+                # 中译：把本序列的每个 token 映射到其序列索引 idx，供分块计算输入 logprob 使用。
                 token_to_seq_idx.extend([idx] * (extend_len - start_len))
                 pt += extend_len
                 sample_index_pt += extend_len - start_len
@@ -586,6 +724,7 @@ class LogitsProcessor(nn.Module):
                 input_logprob_indices_pt += extend_len - start_len
 
             # Set the last token of the last sequence
+            # 中译：补上最后一个序列的末 token 对应的序列索引（供后续切片使用）。
             token_to_seq_idx.append(len(logits_metadata.extend_seq_lens_cpu) - 1)
             pruned_states = torch.cat(pruned_states_list)
             if hidden_states_before_norm is not None:
@@ -595,6 +734,7 @@ class LogitsProcessor(nn.Module):
 
             # Build the index tensors via pinned host memory + non-blocking H2D
             # so the small copy doesn't drain the stream.
+            # 中译：用锁页内存 + 非阻塞 H2D 拷贝构造索引张量，避免这次小拷贝阻塞 CUDA 流。
             sample_indices = torch.tensor(
                 sample_indices,
                 dtype=torch.int64,
@@ -626,6 +766,13 @@ class LogitsProcessor(nn.Module):
         sample_indices: Optional[torch.Tensor],
         logits_metadata: LogitsMetadata,
     ) -> Optional[torch.Tensor]:
+        """根据 capture_hidden_mode 决定要保存（回传）哪些隐藏状态，供投机解码（EAGLE）使用。
+
+        - need_capture() 为 False：不保存，返回 None。
+        - is_full()：保存全部 token 的隐藏状态（有辅助状态时沿最后一维拼接）。
+        - is_last()：只保存每个序列最后一个 token 的隐藏状态。
+        若提供了归一化前状态（hidden_states_before_norm），则优先返回它。
+        """
         hidden_states_to_store: Optional[torch.Tensor] = None
         hidden_states_to_store_before_norm: Optional[torch.Tensor] = None
         if logits_metadata.capture_hidden_mode.need_capture():
@@ -639,6 +786,8 @@ class LogitsProcessor(nn.Module):
             elif logits_metadata.capture_hidden_mode.is_last():
                 # Get the last token hidden states. If sample_indices is None,
                 # pruned states only contain the last tokens already.
+                # 中译：取最后一个 token 的隐藏状态。若 sample_indices 为 None，
+                #       说明 pruned_states 本身已只含最后一个 token。
                 if aux_hidden_states is not None:
                     aux_pruned_states = torch.cat(aux_pruned_states, dim=-1)
                     hidden_states_to_store = (
@@ -664,14 +813,22 @@ class LogitsProcessor(nn.Module):
         if hidden_states_to_store_before_norm is not None:
             # NOTE: when hidden_states_before_norm is provided, we always
             # prefer to return it.
+            # 中译：注意——一旦提供了归一化前状态，就总是优先返回它。
             hidden_states_to_store = hidden_states_to_store_before_norm
 
         return hidden_states_to_store
 
     def process_input_logprobs(self, input_logits, logits_metadata: LogitsMetadata):
+        """从输入位置的 logits 计算各类输入 logprob（不分块路径）。
+
+        先对词表维做 log_softmax 得到对数概率分布，再按需取：
+        top-k logprob、指定 token id 的 logprob，以及「目标 token id」位置的 logprob。
+        """
+        # 中译：log_softmax 即数值稳定版的 log(softmax(x))，沿词表维 dim=-1 计算。
         input_logprobs = torch.nn.functional.log_softmax(input_logits, dim=-1)
 
         # Get the logprob of top-k tokens
+        # 中译：取 top-k token 的 logprob（若请求要求）。
         if logits_metadata.extend_return_top_logprob:
             (
                 input_top_logprobs_val,
@@ -681,6 +838,7 @@ class LogitsProcessor(nn.Module):
             input_top_logprobs_val = input_top_logprobs_idx = None
 
         # Get the logprob of given token id
+        # 中译：取调用方指定的那批 token id 的 logprob（若请求要求）。
         if logits_metadata.extend_token_ids_logprob:
             (
                 input_token_ids_logprobs_val,
@@ -689,6 +847,7 @@ class LogitsProcessor(nn.Module):
         else:
             input_token_ids_logprobs_val = input_token_ids_logprobs_idx = None
 
+        # 中译：按「每个位置的目标 token id」逐行 gather，取出输入 token 自身的 logprob。
         input_token_logprobs = input_logprobs[
             torch.arange(input_logprobs.shape[0], device=input_logprobs.device),
             logits_metadata.extend_input_logprob_token_ids_gpu,
@@ -711,17 +870,18 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
     ) -> Tuple[InputLogprobsResult, torch.Tensor]:
-        """
-        compute logprobs for the output token from the hidden states.
-        To avoid using too much memory, we split pruned_states into chunks of
-        rows to compute input_logprobs separately, then concatenate the results.
+        """以分块方式从隐藏状态计算输入 logprob，以控制显存峰值。
 
-        Returns:
-            InputLogprobsResult: logprobs result
-            torch.Tensor: sampled logits
+        思路：把 pruned_states 按行切成若干块，逐块计算 input_logprobs，最后拼接。
+        同时在逐块过程中填出采样位置的 logits（sampled_logits）。显存峰值与块大小成正比。
+
+        返回：
+            InputLogprobsResult：输入 logprob 结果；
+            torch.Tensor：采样位置的 logits。
         """
 
         # The peak memory usage is proportional to the chunk size.
+        # 中译：显存峰值与块大小成正比；总行数除以块大小向上取整得到块数。
         chunk_size = self.logprobs_chunk_size
         total_size = pruned_states.shape[0]
         num_chunks = (total_size + chunk_size - 1) // chunk_size
@@ -742,6 +902,7 @@ class LogitsProcessor(nn.Module):
 
         # If a single sequence is split into multiple chunks, we need to keep track
         # of the pruned length of the sequences in the previous chunks.
+        # 中译：若同一序列被拆到多个块，需记录它在之前各块中已裁剪的长度（以便跨块拼接）。
         split_len_topk = 0
         split_len_token_ids = 0
 
@@ -752,10 +913,13 @@ class LogitsProcessor(nn.Module):
             # Notify lm_head LoRA about the current chunk so it can swap
             # to the precomputed per-chunk batch_info.  This is a no-op
             # for non-LoRA lm_head modules.
+            # 中译：告知 lm_head 的 LoRA 当前处于哪一块，使其切换到预计算的逐块 batch_info；
+            #       对非 LoRA 的 lm_head 模块而言是空操作。
             if hasattr(lm_head, "set_lm_head_pass"):
                 lm_head.set_lm_head_pass(i)
 
             # Get indices for this chunk
+            # 中译：取出落在本块 [start_idx, end_idx) 范围内的输入 logprob 位置，并转为块内局部下标。
             chunk_mask = (input_logprob_indices >= start_idx) & (
                 input_logprob_indices < end_idx
             )
@@ -763,13 +927,16 @@ class LogitsProcessor(nn.Module):
             chunk_indices = global_indices - start_idx
             # Get the positions in the original array where chunk_mask is True
             # This is needed to correctly index into extend_input_logprob_token_ids_gpu
+            # 中译：取出 chunk_mask 为 True 的原数组位置，用于正确索引 extend_input_logprob_token_ids_gpu。
             mask_indices = torch.nonzero(chunk_mask, as_tuple=True)[0]
 
             # Get the logits for this chunk
+            # 中译：取本块的隐藏状态并计算 logits。
             chunk_states = pruned_states[start_idx:end_idx]
             chunk_logits = self._get_logits(chunk_states, lm_head, logits_metadata)
 
             # Initialize sampled_logits on first chunk
+            # 中译：在第一块时初始化 sampled_logits（按采样位置数 x 词表大小）。
             if i == 0:
                 sampled_logits = torch.empty(
                     (sample_indices.shape[0], chunk_logits.shape[1]),
@@ -779,6 +946,7 @@ class LogitsProcessor(nn.Module):
 
             # Handle sampled logits for the chunk if needed
             # This must be done before the continue statement to ensure all sampled_logits are filled
+            # 中译：处理本块内的采样位置。必须放在下面 continue 之前，以保证 sampled_logits 被填满。
             chunk_sample_mask = (sample_indices >= start_idx) & (
                 sample_indices < end_idx
             )
@@ -787,21 +955,25 @@ class LogitsProcessor(nn.Module):
                 sampled_logits[chunk_sample_mask] = chunk_logits[chunk_sample_indices]
 
             # If there are no input logprobs in this chunk, skip the rest
+            # 中译：若本块没有需要计算输入 logprob 的位置，跳过后续处理。
             if chunk_indices.numel() == 0:
                 continue
 
             # Compute the logprobs of the chunk
+            # 中译：对本块做 log_softmax 得到输入 logprob。
             chunk_input_logprobs = chunk_logits[chunk_indices]
             chunk_input_logprobs = torch.nn.functional.log_softmax(
                 chunk_input_logprobs, dim=-1
             )
 
             # For each chunk, we need to get the slice of the token_to_seq_idx
+            # 中译：取出本块对应的「序列索引」区间，用于按序列取 top-k / token_ids 等参数。
             chunk_slice = slice(
                 token_to_seq_idx[start_idx], token_to_seq_idx[end_idx] + 1
             )
 
             # Get the logprob of top-k tokens
+            # 中译：取本块 top-k token 的 logprob（若请求要求）。
             if logits_metadata.extend_return_top_logprob:
                 top_k_nums = logits_metadata.top_logprobs_nums[chunk_slice]
                 pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[
@@ -818,6 +990,7 @@ class LogitsProcessor(nn.Module):
                 )
 
             # Get the logprob of given token id
+            # 中译：取本块中指定 token id 的 logprob（若请求要求）。
             if logits_metadata.extend_token_ids_logprob:
                 token_ids_logprobs = logits_metadata.token_ids_logprobs[chunk_slice]
                 pruned_lens = logits_metadata.extend_logprob_pruned_lens_cpu[
@@ -833,6 +1006,7 @@ class LogitsProcessor(nn.Module):
                 )
 
             # Get the logprob of the requested token ids
+            # 中译：按「每个位置的目标 token id」逐行 gather，取出本块输入 token 自身的 logprob。
             chunk_input_token_logprobs = chunk_input_logprobs[
                 torch.arange(
                     chunk_input_logprobs.shape[0], device=chunk_input_logprobs.device
@@ -842,6 +1016,7 @@ class LogitsProcessor(nn.Module):
             input_token_logprobs.append(chunk_input_token_logprobs)
 
         # Restore the full-pruned lm_head batch_info after chunk iteration.
+        # 中译：分块迭代结束后，恢复 lm_head 的完整（未分块）batch_info。
         if hasattr(lm_head, "reset_lm_head_pass"):
             assert hasattr(
                 lm_head, "set_lm_head_pass"
@@ -849,6 +1024,7 @@ class LogitsProcessor(nn.Module):
             lm_head.reset_lm_head_pass()
 
         # Concatenate the results
+        # 中译：拼接各块结果。
         input_token_logprobs = torch.cat(input_token_logprobs, dim=0)
 
         return (
@@ -869,21 +1045,27 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Get logits from hidden_states.
+        """从 hidden_states 计算 logits。
 
-        If sampled_logits_only is True, it means hidden_states only contain the
-        last position (e.g., extend without input logprobs). The caller should
-        guarantee the given hidden_states follow this constraint.
+        流程：DP attention gather 隐藏状态 → 计算 LM head → （可选）logit 缩放 →
+        张量并行 all-gather → DP attention scatter 回局部 → 拷入输出缓冲区 → （可选）softcap。
+
+        说明：若调用方保证传入的 hidden_states 只包含最后一个位置（如不要 logprob 的 extend），
+        则输出也只对应这些位置。
         """
+        # 中译：DP attention 下先把各 rank 的局部隐藏状态 all-gather 成全局缓冲区。
         hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
             hidden_states, logits_metadata
         )
 
+        # 中译：核心一步——用 lm_head 把隐藏状态投影为词表维的 logits。
         logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
 
+        # 中译：若配置了 logit 缩放系数，则原地乘上。
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
+        # 中译：张量并行下把各 rank 的部分词表 logits 聚合成完整词表。
         if self.do_tensor_parallel_all_gather:
             if self.use_attn_tp_group:
                 logits = self._gather_attn_tp_logits(logits)
@@ -894,8 +1076,10 @@ class LogitsProcessor(nn.Module):
             logits, local_hidden_states, logits_metadata
         )
 
+        # 中译：截取有效词表范围并（可选）拷入复用缓冲区，统一转为 float。
         logits = self._copy_logits_to_buffer(logits, logits_metadata)
 
+        # 中译：若模型定义了 final_logit_softcapping，对 logits 做 softcap（tanh 压缩）。
         if self.final_logit_softcapping:
             if not _is_npu:
                 fused_softcap(logits, self.final_logit_softcapping)
@@ -912,11 +1096,18 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """调用 lm_head 把 hidden_states 投影为 logits，兼容多种 lm_head 实现。
+
+        依次处理：LoRA 包装的模块 → 普通线性层（带 weight，可选 fp32 / Intel AMX /
+        RL on-policy / 默认 matmul） → GGUF 等量化模型（走 quant_method.apply）。
+        """
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
+            # 中译：LoRA 包装的 lm_head，直接调用其 forward。
             logits = lm_head(hidden_states)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
+            # 中译：普通线性层。
             if self.use_fp32_lm_head:
                 logits = torch.matmul(
                     hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
@@ -930,6 +1121,8 @@ class LogitsProcessor(nn.Module):
                 )
             elif get_global_server_args().rl_on_policy_target is not None:
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype
+                # 中译：RL on-policy 场景：因权重绑定（tie-weight）可能无法改变 lm_head 权重的 dtype，
+                #       故这里统一转为 bfloat16 再做 matmul。
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
@@ -940,6 +1133,7 @@ class LogitsProcessor(nn.Module):
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models
+            # 中译：GGUF 等量化模型，走 quant_method.apply；TODO：后续可改用 weight_packed_linear。
             if self.use_fp32_lm_head:
                 with torch.cuda.amp.autocast(enabled=False):
                     logits = lm_head.quant_method.apply(
@@ -954,6 +1148,10 @@ class LogitsProcessor(nn.Module):
     def _gather_dp_attn_hidden_states(
         self, hidden_states: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """DP attention 下把各 rank 的局部隐藏状态 gather 成全局缓冲区。
+
+        返回 (全局隐藏状态, 本 rank 局部隐藏状态)；未启用时两者均为原输入。
+        """
         if self.do_tensor_parallel_all_gather_dp_attn:
             logits_metadata.compute_dp_attention_metadata()
             local_hidden_states = hidden_states
@@ -963,6 +1161,11 @@ class LogitsProcessor(nn.Module):
         return hidden_states, hidden_states
 
     def _gather_attn_tp_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """在 attention TP 组内把各 rank 的部分词表 logits all-gather 成完整词表。
+
+        词表能被 attn_tp_size 整除时走高效的 into_tensor 路径并 reshape；
+        否则退化到按最后一维 split 的通用 all-gather 路径。
+        """
         if self.vocab_size % self.attn_tp_size == 0:
             global_logits = torch.empty(
                 (
@@ -996,6 +1199,7 @@ class LogitsProcessor(nn.Module):
         local_hidden_states: torch.Tensor,
         logits_metadata: LogitsMetadata,
     ) -> torch.Tensor:
+        """DP attention 下把全局 logits scatter 回本 rank 局部对应的那部分。"""
         if self.do_tensor_parallel_all_gather_dp_attn:
             global_logits = logits
             logits = torch.empty(
@@ -1009,6 +1213,7 @@ class LogitsProcessor(nn.Module):
     def _copy_logits_to_buffer(
         self, logits: torch.Tensor, logits_metadata: LogitsMetadata
     ) -> torch.Tensor:
+        """截取有效词表范围的 logits；若提供了复用缓冲区则原地拷入，否则转为 float 返回。"""
         if logits_metadata.next_token_logits_buffer is not None:
             logits_buffer = logits_metadata.next_token_logits_buffer
             assert logits_buffer.dtype == torch.float
@@ -1024,6 +1229,7 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
     ) -> LogitsProcessorOutput:
+        """扩散式 LLM（Diffusion LLM）专用：返回完整 logits（而非只取下一个 token）。"""
         assert self.return_full_logits
         full_logits = self._get_logits(hidden_states, lm_head, logits_metadata)
         return LogitsProcessorOutput(
@@ -1040,20 +1246,22 @@ class LogitsProcessor(nn.Module):
         multi_item_delimiter_indices: List[torch.Tensor],
     ):
         """
-        Compute logprobs for multi-item scoring using pre-computed delimiter indices.
+        基于预计算的分隔符位置，为 multi-item scoring（多项打分）计算 logprob。
 
-        Sequence format: Query<delimiter>Item1<delimiter>Item2<delimiter>...
-        Scoring positions: Extracts logprobs at positions before each <delimiter>
+        序列格式：Query<分隔符>Item1<分隔符>Item2<分隔符>...
+        打分位置：在每个 <分隔符> 之前的位置提取 logprob。
 
         Args:
-            input_ids: Input token IDs. Shape: [total_sequence_length].
-            hidden_states: Hidden states from the model. Shape: [sequence_length, hidden_dim].
-            lm_head: Language model head for computing logits.
-            logits_metadata: Metadata containing batch info and logprob specs.
-            multi_item_delimiter_indices: Pre-computed delimiter positions per request (CPU tensors).
+            input_ids: 输入 token id，形状 [总序列长度]。
+            hidden_states: 模型输出的隐藏状态，形状 [序列长度, hidden_dim]。
+            lm_head: 用于计算 logits 的语言模型头。
+            logits_metadata: 包含批信息与 logprob 规格的元数据。
+            multi_item_delimiter_indices: 各请求预计算好的分隔符位置（CPU 张量）。
         """
         # Compute positions just before each delimiter.
         # Build offset-adjusted indices on CPU, then do a single CPU→GPU transfer.
+        # 中译：计算每个分隔符「之前一位」的位置；先在 CPU 上构造加上偏移的索引，
+        #       再一次性拷到 GPU（减少 CPU→GPU 传输次数）。
         device = input_ids.device
         all_tensors = []
         if logits_metadata.extend_seq_lens_cpu is not None:
@@ -1066,6 +1274,8 @@ class LogitsProcessor(nn.Module):
                     # indices - 1 wraps to -1. This is harmless — the first
                     # delimiter entry is always discarded by
                     # _process_multi_item_scoring_results.
+                    # 中译：注意——若第一个分隔符在位置 0（空 Query），indices-1 会绕到 -1；
+                    #       这是无害的，因为第一个分隔符项总会被 _process_multi_item_scoring_results 丢弃。
                     all_tensors.append(indices_tensor + (offset - 1))
                 offset += req_seq_len
         else:
@@ -1073,18 +1283,22 @@ class LogitsProcessor(nn.Module):
         multi_item_indices = torch.cat(all_tensors).to(device, non_blocking=True)
 
         # Extract hidden states at delimiter positions for multi-item scoring
+        # 中译：取出各分隔符位置处的隐藏状态，用于多项打分。
         sliced_hidden = hidden_states[multi_item_indices]
 
+        # 中译：算出这些位置的 logits 并做 log_softmax 得到对数概率。
         sliced_logits = self._get_logits(sliced_hidden, lm_head, logits_metadata)
         sliced_logprobs = torch.nn.functional.log_softmax(sliced_logits, dim=-1)
 
         # Initialize return values
+        # 中译：初始化返回值。
         input_token_ids_logprobs_val = []
         input_token_ids_logprobs_idx = []
         input_top_logprobs_val = None
         input_top_logprobs_idx = None
 
         # Recalculate extend_logprob_pruned_lens_cpu to match delimiter counts per request
+        # 中译：重算 extend_logprob_pruned_lens_cpu，使其与每个请求的分隔符个数对齐。
         if (
             logits_metadata.token_ids_logprobs
             or logits_metadata.extend_return_top_logprob
@@ -1094,6 +1308,7 @@ class LogitsProcessor(nn.Module):
             ]
 
         # Get the logprobs of specified token ids
+        # 中译：取指定 token id 的 logprob（若请求要求）。
         if logits_metadata.extend_token_ids_logprob:
             (
                 input_token_ids_logprobs_val,
@@ -1103,6 +1318,7 @@ class LogitsProcessor(nn.Module):
             )
 
         # Get the logprob of top-k tokens
+        # 中译：取 top-k token 的 logprob（若请求要求）。
         if logits_metadata.extend_return_top_logprob:
             (
                 input_top_logprobs_val,

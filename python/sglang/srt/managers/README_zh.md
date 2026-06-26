@@ -2,7 +2,35 @@
 
 ## 目录用途
 
-`managers` 是 SGLang 推理引擎的核心运行时管理与调度层，承担请求从入口（`entrypoints`）到模型执行（`model_executor`）之间的中枢角色。它将系统拆分为多个可独立运行的进程——前端的 `TokenizerManager`（分词与请求分发）、独立进程的 `Scheduler`（连续批处理调度、KV 缓存与显存池管理、驱动前向计算）、以及 `DetokenizerManager`（反分词、增量文本拼接）——进程间全部通过 ZMQ（PUSH/PULL）消息队列解耦通信。该目录还定义了跨进程传输的全部数据结构（`io_struct.py`）、批次的逐层数据流转（`ScheduleBatch` → `ModelWorkerBatch` → `ForwardBatch`）、调度策略、张量并行 worker 封装，并通过大量 Mixin 把投机解码、PD 分离、流水线并行、DP attention、分层缓存（HiCache）、权重热更新、多模态、会话管理等高级特性组合进来。
+`managers` 是 SGLang 推理引擎的核心运行时管理与调度层，承担请求从入口（`entrypoints`）到模型执行（`model_executor`）之间的中枢角色。它将系统拆分为多个可独立运行的进程——前端的 `TokenizerManager`（分词与请求分发）、独立进程的 `Scheduler`（连续批处理调度、KV 缓存与显存池管理、驱动前向计算）、以及 `DetokenizerManager`（反分词、增量文本拼接）——进程间全部通过 ZMQ（PUSH/PULL）消息队列解耦通信。该目录还定义了跨进程传输的全部数据结构（`io_struct.py`）、批次的逐层数据流转（`ScheduleBatch` → `ForwardBatch`）、调度策略、张量并行 worker 封装，并通过组件化（`scheduler_components/`）与 Mixin 把投机解码、PD 分离、流水线并行、DP attention、分层缓存（HiCache）、权重热更新、多模态、会话管理等高级特性组合进来。
+
+## 核心能力总览
+
+> 本节是对本目录「该层到底要做成哪几件事」的纲领性审计，按能力归类（而非按文件），并标注每项的**重要性**（对正确性/性能的影响）与**复杂性**（实现与维护难度）。重要性/复杂性均分为 高 / 中 / 低 三档。具体实现文件见后续「文件清单」。
+
+| # | 核心能力 | 主要承载 | 重要性 | 复杂性 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | **三进程解耦与跨进程协议** | `tokenizer_manager.py`、`detokenizer_manager.py`、`io_struct.py`、`scheduler_components/ipc_channels.py` | 高 | 中 | 前端/调度/反分词三进程经 ZMQ 解耦，靠 GIL 隔离让 CPU 预处理与 GPU 计算互不阻塞；`io_struct` 是跨进程协议的唯一契约，改动需三端同步。 |
+| 2 | **连续批处理调度（事件循环）** | `scheduler.py`（`event_loop_normal` / `event_loop_overlap`）、`overlap_utils.py` | 高 | 高 | SGLang 性能基石。overlap 把「启动前向即返回 + 结果延后一轮」做成 CPU/GPU 流水线，是 zero-overhead 调度的核心，也是最易出并发/正确性问题之处（见附录 A/B）。 |
+| 3 | **组批决策与预算控制** | `schedule_policy.py`（`SchedulePolicy` / `PrefillAdder`）、`schedule_batch.py`、`prefill_delayer.py` | 高 | 高 | 在多重显存/token/条数预算下决定每轮收哪些请求、收多少、是否切块/抢占；直接决定吞吐与公平性（见子阶段 D 与附录 D）。 |
+| 4 | **批次数据结构与状态机** | `schedule_batch.py`（`Req` / `ScheduleBatch`）、`utils.py`（`GenerationBatchResult`） | 高 | 中 | `Req` 的等待→运行→完成状态流转，以及 `ScheduleBatch → ForwardBatch` 的数据流，是调度层（CPU）到执行层（GPU）的承载体。 |
+| 5 | **GPU 前向与采样后处理** | `tp_worker.py`、`scheduler_components/batch_result_processor.py`、`logprob_result_processor.py` | 高 | 中 | 把 `ScheduleBatch` 转 `ForwardBatch` 驱动 `ModelRunner`，并把前向结果整理为输出、计算 logprob、组织流式/非流式回包。 |
+| 6 | **请求生命周期的资源安全** | `scheduler.py`（abort/timeout/retract 路径）、`session_controller.py` | 高 | 高 | 中止/超时/显存回撤等异常路径的资源安全收尾（`to_finish` 延迟标记等），是健壮性的关键，约定「等待中可直接丢、运行中须延迟收尾」（见附录 C）。 |
+| 7 | **反分词与增量文本输出** | `detokenizer_manager.py`、`scheduler_components/output_streamer.py`、`output_sender.py` | 中 | 中 | 把 token id 流增量拼接为可打印文本并裁剪 stop 串，流式增量正确性依赖跨轮状态维护。 |
+| 8 | **运行时可观测性与一致性核查** | `scheduler_components/`（`metrics_reporter.py`、`pool_stats_observer.py`、`invariant_checker.py`、`kv_events_publisher.py`、`profiler_manager.py`） | 中 | 中 | 指标上报、KV/池统计、watchdog 与不变量核查、profiler；对线上排障与防御性正确性至关重要，但不在请求主链路上。 |
+| 9 | **权重热更新与全局静止** | `scheduler_components/weight_updater.py`、`scheduler_input_blocker.py`、`communicator.py`、`load_snapshot.py` | 中 | 高 | 从磁盘/分布式/IPC/tensor 更新权重，需全局屏障让系统静止、刷新缓存，复杂在于与在途请求和多进程的并发协调。 |
+| 10 | **多模态处理** | `multimodal_processor.py`、`mm_utils.py`、`embed_types.py` | 中 | 中 | 多模态 processor 注册/查找、跨进程张量代理与 padding；难点在多模型差异与大张量跨进程传输。 |
+| 11 | **分布式扩展：PP / DP / DP-attention** | `scheduler_pp_mixin.py`、`data_parallel_controller.py`、`scheduler_components/dp_attn.py` | 中 | 高 | PP 的有序收发与计算/通信重叠、DP 的请求分发、DP-attention 的跨 rank MLP 同步；都涉及多 rank 协商，调试成本高。 |
+| 12 | **分层/稀疏缓存协调（HiCache / HiSparse）** | `cache_controller.py`、`hisparse_coordinator.py` | 中 | 高 | device/host/storage 间的异步搬运、预取与按 top-k 换入；与调度、KV 池强耦合，异步事件管理复杂。 |
+| 13 | **PD 分离（Prefill/Decode 拆分）** | `disagg_service.py` 及 `scheduler.py` 内 PD 队列处理 | 中 | 高 | bootstrap/KV-store 辅助服务与各阶段队列管理；跨实例 KV 传输与握手是难点（见 abort 在 PD 各队列的处理）。 |
+| 14 | **多 HTTP worker / 多 tokenizer** | `multi_tokenizer_mixin.py` | 中 | 中 | 多 TokenizerWorker 的路由与 socket 映射，提升前端分词吞吐。 |
+| 15 | **会话与模板管理** | `session_controller.py`、`template_manager.py`、`template_detection.py` | 中 | 中 | 有状态多轮会话的请求树与缓存关联，以及 chat/completion 模板的检测与加载。 |
+| 16 | **分词吞吐优化与收包节流** | `async_dynamic_batch_tokenizer.py`、`scheduler_recv_skipper.py`、`scheduler_components/idle_sleeper.py` | 低 | 低 | 动态批分词聚合、按 forward mode 降低收包频率、空闲休眠，属于边际性能优化。 |
+
+**审计结论**：
+
+- **完整性**：能力 1–7 构成请求主链路（必备核心），8–16 为高级/横切能力，整体覆盖完整；本目录的能力清单与实际代码基本对应。
+- **准确性修正**：原「文件清单」存在与当前代码的偏差——① 大量原 `scheduler_*_mixin.py` 已重构进 `scheduler_components/` 子目录（如 `dp_attn.py`、`batch_result_processor.py`、`profiler_manager.py`、`invariant_checker.py`、`weight_updater.py`）；② 新增了 `communicator.py`、`embed_types.py`、`load_snapshot.py`、`template_detection.py` 等文件；③ score 能力实为 `tokenizer_manager_score_mixin.py`。下方文件清单中以 Mixin 文件名描述的若干项，应理解为「该能力现多由 `scheduler_components/` 承载」。
 
 ## 文件清单
 
@@ -306,6 +334,10 @@ preempt_to_schedule(req)                    ← 优先级调度下，回撤运�
 - 分块预算来自 `rem_chunk_tokens`（≈ `--chunked-prefill-size`），**不是** `cur_rem_tokens`——切块由前者触发。
 - 抢占（`preempt_to_schedule`）**只在启用优先级调度时**于组批阶段发生，与 DECODE 路径里因显存不足的回撤是两条不同触发线。
 
+> 📊 `prefill_max_requests`（配置硬上限）与 `max_prefill_bs`（运行时观测峰值）这对易混概念的辨析，以及「为什么要限制 prefill 请求条数」，见文末 **[附录 D：prefill 批的两个"上限"](#附录-dprefill-批的两个上限prefill_max_requests-vs-max_prefill_bs)**。
+>
+> 📊 正常路径之外的**异常路径**（请求中止 / 排队超时 / 运行超时 / 显存不足回撤）及其背后的资源安全约定，见文末 **[附录 C：请求的异常路径与资源安全](#附录-c请求的异常路径与资源安全中止--超时--抢占)**。
+
 ---
 
 ### 子阶段 E：TpModelWorker 前向 与 Detokenizer 出口（第 10–11 天）
@@ -353,6 +385,7 @@ preempt_to_schedule(req)                    ← 优先级调度下，回撤运�
 3. `Req` 的完整生命周期与状态流转？`PrefillAdder` 用什么预算约束组批？
 4. 当前真实的批次数据流是什么（注意不再有 `ModelWorkerBatch`）？转换发生在哪一行？
 5. 你正在用的高级特性（如有）通过哪个 Mixin/文件挂载进调度链路？
+6. 等待中与运行中的请求被中止时，为何处理方式相反？`to_finish` 这个延迟标记解决了什么资源安全问题？（见附录 C）
 
 ### 学习方法提示（针对本目录）
 
@@ -461,3 +494,80 @@ overlap：  每轮墙钟 ≈ max(T_cpu, T_gpu)   （两者重叠，取较大者�
 - **复杂度与兼容性**：需要 `FutureMap` 中继未来 token、WAR 屏障防读写竞争；个别组合（如 spec + grammar + decode）暂不支持重叠，必须退化为串行。
 
 **经验结论**：在线服务的**高并发 decode** 工况下，overlap 通常带来**显著的吞吐提升（常见量级为百分之十几到接近翻倍，取决于 `T_cpu/T_gpu` 比值与 batch 规模）**；而对**单请求 TTFT 敏感**或 GPU 前向极重的场景，收益变小甚至需要按批关闭。SGLang 默认开启重叠（`--disable-overlap-schedule` 可关闭），并通过按批动态关闭兼顾延迟与吞吐。
+
+---
+
+## 附录 C：请求的异常路径与资源安全（中止 / 超时 / 抢占）
+
+> 本附录配合 [子阶段 C](#子阶段-cscheduler-事件循环与连续批处理第-57-天--本目录核心) 与 [子阶段 D](#子阶段-d批次数据流与组批预算第-89-天) 阅读。
+> 正文的学习主线只画了**正常路径**（happy path）；但调度器一大半的健壮性代码在处理**异常路径**——客户端主动断开、请求排队/运行超时、显存不足被迫回撤。这些路径的共同主题是**资源安全**：一个请求可能正持有 KV 缓存、可能正处在 GPU 前向中途，绝不能「说删就删」。
+
+### C.1 两种超时中止：为什么等待中和运行中处理方式相反
+
+两个方法都在每轮调度入口 `get_next_batch_to_run` 末尾被调用（`scheduler.py:2721-2722`），但动作截然不同：
+
+| 方法 | 行号 | 针对的请求 | 是否持有 KV | 动作 |
+| --- | --- | --- | --- | --- |
+| `_abort_on_waiting_timeout` | `:2549` | **等待队列**中超时的 req | 否（还没组批） | **直接**发 `AbortReq` 给 tokenizer + 从 `waiting_queue` 出队 |
+| `_abort_on_running_timeout` | `:1512` | **运行批次**中超时的 req | 是 | **延迟**：仅置 `req.to_finish = FINISH_ABORT(...)`（`:1536`），不直接删 |
+
+**为什么相反？** 关键在于**有没有分配 KV、会不会正在 GPU 前向中途**：
+
+- 等待中的请求**尚未占用任何 KV / req_pool slot**，也不可能正在前向里，所以可以原地丢弃——立即出队、立即回包，最省事。
+- 运行中的请求**正持有 KV 缓存，且可能此刻正被 GPU 计算**（尤其 overlap 模式下结果还在 `result_queue` 里）。若在这里直接删它、释放它的 KV，正在跑的前向就会读到已释放的显存 → 崩溃或数据错乱。因此只能**打一个延迟标记** `to_finish`，把真正的「回包 + 释放 KV」交给正常的完成路径去做。
+
+### C.2 `to_finish` 这个延迟标记在哪被消费
+
+`to_finish` 不是立刻生效的中止，而是「**下一次该请求走到结果处理时，按中止收尾**」的约定：
+
+```
+_abort_on_running_timeout (:1512)
+  └─ req.to_finish = FINISH_ABORT(...)      # 只打标记，不动 KV
+              │
+              ▼  （该 req 照常再跑/收尾一次）
+process_batch_result (:3277) 内的中止收尾 (:3332-3340)
+  └─ for req in reqs_to_abort:
+       abort_reason = req.to_finish          # 读出标记
+       send_to_tokenizer(AbortReq(...))      # 此刻才回包
+     （随后走正常 filter_batch → 释放 KV / req_pool slot）
+```
+
+同样的「置 `to_finish` 而非直接删」手法也用在**客户端主动中止**里——`AbortReq` 处理逻辑对「已在 running batch 里 decode 的请求」采用 abort method 3（`:4252-4256`：`req.to_finish = FINISH_ABORT()`，让它再跑一步 decode 再收尾），而对还在等待队列的请求才直接移除。**判据始终一致：是否已占用 KV / 是否可能在前向中途。**
+
+### C.3 第三条异常路径：decode 显存不足时的抢占回撤（retract）
+
+除超时/主动中止外，还有一条由**显存压力**触发的异常路径，已在子阶段 D 正文提及，这里归并对照：
+
+- 触发点：**DECODE 路径**为运行中 req 续 token 时 KV 池告罄（`update_running_batch` 内）。
+- 动作：回撤（retract）部分运行中 req，`release_kv_cache` 腾出显存，被回撤的 req 重新入等待队列（其已生成的 token 不丢，靠前缀缓存复用）。
+- 收尾：`process_batch_result` 里同样会统计 `retracted_reqs`（`:3325-3329`）并调整 `new_token_ratio`，让后续 prefill 预留更保守，减少再次回撤。
+
+> 三条异常路径的统一心智：**等待中 → 可直接丢；运行中 → 必须延迟/经正常收尾路径释放资源**。读代码时凡看到 `to_finish`、`reqs_to_abort`、`retracted_reqs`，都属于「异常路径的资源安全收尾」这一族。
+
+- **动手打点**：构造一个会超时的慢请求（或客户端中途断开），在 `_abort_on_running_timeout`(`:1512`)、`to_finish` 消费处(`:3332`) 打点，观察「打标记」与「真正回包+释放」之间隔了几轮。
+- **自检**：① 为什么运行中的请求不能像等待中的那样被立即删除？② `to_finish` 从被设置到被消费，中间这个请求还会发生什么？
+
+---
+
+## 附录 D：prefill 批的两个"上限"——`prefill_max_requests` vs `max_prefill_bs`
+
+> 本附录配合 [子阶段 D 的 PrefillAdder 专项说明](#prefilladder-专项说明组批预算的核心) 阅读。
+> 这两个名字相近、都和「一批 prefill 收多少请求」有关，极易混淆，但**性质完全不同**：一个是**配置的硬上限**，一个是**运行时观测到的峰值统计**。
+
+| | `prefill_max_requests` | `max_prefill_bs` |
+| --- | --- | --- |
+| 性质 | **配置项**（硬上限） | **运行时统计**（历史观测峰值） |
+| 来源 | `server_args`，CLI `--prefill-max-requests`，默认 `None`（不限） | `Scheduler` 内部变量，初始 `0`（`scheduler.py:1100`） |
+| 如何变化 | 启动后固定 | 每组完一批就 `max(self.max_prefill_bs, len(can_run_list))` 累积刷新（`:3184`） |
+| 作用点 | `PrefillAdder.add_one_req`：`len(can_run_list) >= x` 时**停止收请求**（`schedule_policy.py:1064`，返回 `OTHER`） | 喂给 `prefill_delayer_single_pass.negotiate_should_allow_prefill`（`schedule_policy.py:1050`），参与**跨 DP rank 的 prefill 负载协商**与统计，**本身不卡准入** |
+| 一句话 | 「这一批最多收几个，到了就不收了」 | 「历史上我最多一次收过几个」——一个被观测出来、再反过来指导延迟器的数字 |
+
+**易错点**：看到 `max_prefill_bs=self.max_prefill_bs` 被传进 `PrefillAdder`（`scheduler.py:3013`）会以为它是准入上限——其实它只流向 prefill **延迟器**做负载协商；真正「数到几就停」的硬上限是 `prefill_max_requests`（`:1064`）那一行。
+
+**为什么需要限制 prefill 的请求条数（而不是一路加到显存上限）？** 显存（token 预算）只约束「装不装得下」，但**请求条数**本身会带来与 token 数无关的开销与公平性问题：
+
+1. **逐序列 / ragged-varlen 的固定开销**：prefill 的 attention 是变长拼接，请求条数越多，per-sequence 的元数据、kernel launch、边界处理开销越大——即使总 token 数不变。
+2. **固定条数资源**：`max_running_requests`、各类按「最大请求数」预分配的元数据缓冲、CUDA graph 的 max batch size，都是按**条数**而非 token 数封顶的。
+3. **队头公平性**：一批里塞进上千个极短请求，会让后到但更重要的请求等待整批 prefill 完成，恶化队头阻塞。
+
+> ⚠️ 一个**常见误解**（本仓库讨论中曾出现并被纠正）：「放进上千个极短输入会让 decode 的 TPOT 炸裂」。**这是不准确的**——极短输入的 KV 很小、attention 很便宜，不会让 decode「雪崩」。真实机制是：**TPOT 随 batch 增大、越过 GEMM ridge point 后大致线性上升**，这是吞吐/延迟的权衡，不是崩溃。所以限制条数的真正理由在**上面三点（prefill 侧开销 + 固定条数资源 + 公平性）**，而非「decode 扛不住」。
