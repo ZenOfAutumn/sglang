@@ -30,6 +30,52 @@
 - **presence vs frequency**：二者都是「加法型」，区别只在累计算子。presence 用赋值（`scatter_`），出现过就是那个固定惩罚；frequency 用累加（`scatter_add_`），出现 N 次惩罚就是 N 倍。
 - **repetition vs presence**：二者都「只看是否出现过」，区别在作用方式。repetition 是乘法型（对 logit 乘或除惩罚系数），presence 是加法型（直接减一个常数）。
 
+### 一·补一、惩罚系数的取值范围与校验
+
+下表取值范围以 `sampling/sampling_params.py` 的 `SamplingParams.verify()` 实际校验为准（越界会抛 `ValueError`）：
+
+| 参数 | 类型 | 默认值 | 合法范围 | 不惩罚（中性值） | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| `repetition_penalty` | float | 1.0 | `(0, 2]` | 1.0 | `>1` 抑制已出现 token，`<1` 鼓励；`=1` 无影响。注意是乘法型，**不能为 0**（会把 logit 全部归零） |
+| `presence_penalty` | float | 0.0 | `[-2, 2]` | 0.0 | `>0` 抑制已出现 token，`<0` 鼓励复现；与出现次数无关 |
+| `frequency_penalty` | float | 0.0 | `[-2, 2]` | 0.0 | `>0` 出现越频繁抑制越强，`<0` 越频繁越鼓励；惩罚 = 次数 × 系数 |
+| `min_new_tokens` | int | 0 | `[0, max_new_tokens]` | 0 | 在生成长度达到该值前，把 EOS 等结束 token 压到 -inf，强制至少生成这么多 token |
+
+要点：
+- **repetition 与其它三个范围不同**：它是乘法系数，合法区间为 `(0, 2]`，中性值是 `1.0`；其余两个加法惩罚区间是 `[-2, 2]`，中性值是 `0.0`。
+- **负值含义**：presence/frequency 取负数表示「鼓励」而非「抑制」——会增大对应 token 的 logit，使其更可能被采样。
+- **min_new_tokens 还受 `max_new_tokens` 约束**：必须满足 `min_new_tokens <= max_new_tokens`，否则校验失败。
+
+### 一·补二、各惩罚的计算示例（同一输入对比）
+
+为了直观看出四种惩罚的差异，统一假设单请求、`vocab_size=5`，并已生成
+**`output_ids = [2, 2, 0]`**（token 2 出现 2 次、token 0 出现 1 次）。
+当前 logits 为 `[0.5, -0.5, 2.0, 1.0, -1.0]`。
+
+约定每种惩罚的系数：repetition=1.2，presence=0.3，frequency=0.3，min_new_tokens=5（EOS 的 id=4）。
+
+1) **repetition（乘法型，赋值，不随次数加重）**
+   累积缩放矩阵：`[1.0, 1.0, 1.2, 1.0, 1.0]`（token 2 出现 2 次但仍是 1.2，不叠加）。
+   施加：正 logit 除、负 logit 乘 —— 仅 token 2：`2.0 / 1.2 ≈ 1.667`。
+   结果：`[0.5, -0.5, 1.667, 1.0, -1.0]`。
+
+2) **presence（加法型，赋值，不随次数加重）**
+   累积惩罚矩阵：`[0.3, 0.0, 0.3, 0.0, 0.0]`（token 0、token 2 各被赋值 0.3）。
+   施加：`logits - 累积`。
+   结果：`[0.2, -0.5, 1.7, 1.0, -1.0]`。
+
+3) **frequency（加法型，累加，随次数加重）**
+   累积惩罚矩阵：`[0.3, 0.0, 0.6, 0.0, 0.0]`（token 2 出现 2 次 → 0.3×2=0.6；token 0 出现 1 次 → 0.3）。
+   施加：`logits - 累积`。
+   结果：`[0.2, -0.5, 1.4, 1.0, -1.0]`（token 2 比 presence 压得更狠，因为出现更频繁）。
+
+4) **min_new_tokens（按步判断，把结束 token 压到 -inf）**
+   已生成长度 `len_output_tokens=3 < min_new_tokens=5`，故 mask 生效，把 EOS（id=4）的 logit 设为 -inf。
+   结果：`[0.5, -0.5, 2.0, 1.0, -inf]`（与是否出现过无关，只看长度是否达标）。
+
+对比小结：presence 与 frequency 输入相同，唯一差别是 token 2 的惩罚（0.3 vs 0.6），
+正是「赋值 vs 累加」的体现；repetition 与 presence 都不随次数加重，但一个乘除、一个减常数。
+
 ### 二、乘法型 vs 加法型（为什么要分两类）
 
 惩罚器用 `is_multiplicative` 标志区分两类，orchestrator 据此分别处理：

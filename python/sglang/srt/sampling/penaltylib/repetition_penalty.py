@@ -43,6 +43,32 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
 
     惩罚以乘法形式作用于 logits（见 apply_scaling_penalties），故
     is_multiplicative = True，由 orchestrator 与其他乘法型惩罚累乘后统一施加。
+
+    张量示例（bs=2, vocab_size=5）：
+        假设两个请求的 repetition_penalty 分别为 1.2 和 1.0（第二个请求不惩罚）。
+
+        1) _prepare() 后：
+           repetition_penalties = [[1.2],      # [bs, 1]
+                                   [1.0]]
+           cumulated_repetition_penalties =    # [bs, vocab_size]，初始全 1.0
+               [[1.0, 1.0, 1.0, 1.0, 1.0],
+                [1.0, 1.0, 1.0, 1.0, 1.0]]
+
+        2) 某 decode step，两请求分别生成 token id = 2 和 0：
+           output_ids = [2, 0]  ->  unsqueeze(1) -> [[2], [0]]
+           scatter_ 把每行 output_ids 指向的列赋值为该行的惩罚系数：
+           cumulated_repetition_penalties =
+               [[1.0, 1.0, 1.2, 1.0, 1.0],     # 第 0 行第 2 列被写成 1.2
+                [1.0, 1.0, 1.0, 1.0, 1.0]]     # 第 1 行第 0 列写成 1.0（无变化）
+
+        3) 若下一步请求 0 再次生成 token id = 2，仍是「赋值」1.2 而非累乘，
+           系数保持 1.2 不变（这正是 HF repetition_penalty「只看是否出现过」的语义）。
+
+        4) _apply() 对 logits 施加（以请求 0 为例，logits[0] = [0.5, -0.5, 2.0, 1.0, -1.0]）：
+           - 列 2 logit=2.0 >= 0 -> 2.0 / 1.2 ≈ 1.667（被抑制）
+           - 其余列系数为 1.0，logit 不变
+           结果 logits[0] ≈ [0.5, -0.5, 1.667, 1.0, -1.0]
+           （若被惩罚位置的 logit 为负，则改用乘法，例如 -1.0 * 1.2 = -1.2，同样更不可能被采样）
     """
 
     # 标记为乘法型惩罚。orchestrator 据此把它与其他乘法型惩罚的系数矩阵相乘，
