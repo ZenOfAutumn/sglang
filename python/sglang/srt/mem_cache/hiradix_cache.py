@@ -661,6 +661,37 @@ class HiRadixCache(RadixCache):
 
         Returns:
             tuple: (extra_config_dict, prefetch_threshold, prefetch_timeout_config, hicache_storage_pass_prefix_keys)
+
+        Example:
+            配置里既有 HiCache 通用的预取参数（会被弹出、单独解析），也有透传给
+            具体 storage 后端的自定义键（弹出预取参数后原样保留在 extra_config 里）。
+
+            1) 直接传 JSON 字符串（命令行示例）::
+
+                --hicache-storage-backend mooncake \\
+                --hicache-storage-backend-extra-config '{
+                    "prefetch_threshold": 512,
+                    "prefetch_timeout_base": 1.0,
+                    "prefetch_timeout_per_ki_token": 0.25,
+                    "prefetch_timeout_max": 30.0,
+                    "hicache_storage_pass_prefix_keys": true,
+                    "master_server_address": "10.0.0.1:50051",
+                    "local_buffer_size": 1073741824
+                }'
+
+               解析后：prefetch_* 与 hicache_storage_pass_prefix_keys 被抽取为独立返回值；
+               剩余的 {"master_server_address": ..., "local_buffer_size": ...} 作为
+               extra_config_dict 透传给 mooncake 后端。
+
+            2) 以 "@" 前缀从文件读取（支持 .json / .toml / .yaml/.yml）::
+
+                --hicache-storage-backend-extra-config @/etc/sglang/hicache.yaml
+
+               对应 hicache.yaml::
+
+                   prefetch_threshold: 512
+                   prefetch_timeout_max: 30.0
+                   master_server_address: "10.0.0.1:50051"
         """
         # 若提供了 extra config 则解析。它可以是 JSON 字符串，
         # 也可以是以 "@" 为前缀的 json/toml/yaml 文件路径。
