@@ -368,11 +368,13 @@ class HiCacheController:
         enable_storage_metrics: bool = False,
     ):
         # 中译：保存各分布式进程组（张量并行、注意力 cp/tp、流水线并行），供后续做集合通信。
-        self.tp_group = tp_group
-        self.attn_cp_group = attn_cp_group
-        self.attn_tp_group = attn_tp_group
-        self.pp_group = pp_group
+        self.tp_group = tp_group  # 张量并行进程组
+        self.attn_cp_group = attn_cp_group  # 注意力上下文并行（context parallel）进程组
+        self.attn_tp_group = attn_tp_group  # 注意力张量并行进程组
+        self.pp_group = pp_group  # 流水线并行进程组
+        # 预取命中数跨 rank 同步用的进程组列表（gloo），由 _create_prefetch_sync_groups 建立。
         self.prefetch_sync_groups: List[torch.distributed.ProcessGroup] = []
+        # L1 设备侧 KV 池的分配器（负责 device 页的分配/释放）。
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -380,28 +382,28 @@ class HiCacheController:
         # 中译：混合线性 KV 池只对其中的 full KV 子池做分层缓存搬运。
         if isinstance(mem_pool_device, HybridLinearKVPool):
             mem_pool_device = mem_pool_device.full_kv_pool
-        self.mem_pool_device = mem_pool_device
-        self.mem_pool_host = mem_pool_host
-        self.write_policy = write_policy
-        self.page_size = page_size
-        self.io_backend = io_backend
-        self.enable_storage = False
-        self.storage_backend = None
-        self.storage_backend_type = None
-        self.enable_storage_metrics = enable_storage_metrics
+        self.mem_pool_device = mem_pool_device  # L1 设备侧（GPU）KV 池
+        self.mem_pool_host = mem_pool_host  # L2 主机侧（CPU 内存）KV 池
+        self.write_policy = write_policy  # 写回策略：write_through / write_through_selective / write_back
+        self.page_size = page_size  # 每页 token 数（分配与搬运的最小粒度）
+        self.io_backend = io_backend  # device<->host 拷贝所用的 IO 后端标识
+        self.enable_storage = False  # 是否已启用 L3 存储后端（attach 成功后置 True）
+        self.storage_backend = None  # L3 存储后端实例（未 attach 时为 None）
+        self.storage_backend_type = None  # L3 存储后端类型名（如 file / mooncake 等）
+        self.enable_storage_metrics = enable_storage_metrics  # 是否采集存储命中/耗时等指标
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         # 中译：草稿（draft）KV 池支持（投机解码用）——尽力而为地搭车在目标 KV 的 L2/L3 操作上一起搬运。
-        self.has_draft = False
-        self.mem_pool_device_draft = None
-        self.mem_pool_host_draft = None
-        self.draft_page_get_func = None
-        self.draft_page_set_func = None
+        self.has_draft = False  # 是否存在草稿 KV 池（投机解码启用时为 True）
+        self.mem_pool_device_draft = None  # 草稿 KV 的 L1 设备侧池
+        self.mem_pool_host_draft = None  # 草稿 KV 的 L2 主机侧池
+        self.draft_page_get_func = None  # 草稿 KV 的 storage 读页函数（attach 时设置）
+        self.draft_page_set_func = None  # 草稿 KV 的 storage 写页函数（attach 时设置）
 
         # Default storage page IO functions (may be overridden by attach).
         # 中译：默认的存储页读/写函数（attach 后端时可能被替换为零拷贝版本）。
-        self.page_get_func = self._generic_page_get
-        self.page_set_func = self._generic_page_set
+        self.page_get_func = self._generic_page_get  # storage 读页函数（attach 后可替换为零拷贝版）
+        self.page_set_func = self._generic_page_set  # storage 写页函数（attach 后可替换为零拷贝版）
 
         # Dedicated stop event for storage background threads (prefetch/backup).
         # NOTE: Do NOT reuse `self.stop_event` here since it also guards core HiCache
@@ -410,10 +412,11 @@ class HiCacheController:
         # 中译：存储后台线程（预取/备份）专用的停止事件。
         #       注意：不要复用 self.stop_event——后者还守护核心的 CPU<->GPU 传输缓冲；
         #       单独一个事件才能在运行时 attach/detach 存储后端而不必停掉整个控制器。
-        self.storage_stop_event = threading.Event()
+        self.storage_stop_event = threading.Event()  # 存储后台线程（预取/备份）专用停止信号
 
-        self.device = self.mem_pool_device.device
-        self.layer_num = self.mem_pool_device.layer_num
+        self.device = self.mem_pool_device.device  # 执行设备（如 cuda:0）
+        self.layer_num = self.mem_pool_device.layer_num  # 模型层数（逐层搬运时使用）
+        # 逐层完成计数器：搬运每层完成时打点，供计算与拷贝流水线重叠。
         self.layer_done_counter = LayerDoneCounter(self.layer_num)
         # 中译：把逐层完成计数器注册给设备 KV 池，使其在逐层搬运时回调标记每层完成事件。
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
@@ -428,18 +431,18 @@ class HiCacheController:
         # self.write_queue = PriorityQueue[CacheOperation]()
         # 中译：L1<->L2 的待处理队列与完成回执队列。load/write 各一对：
         #       *_queue 暂存待发起的操作，ack_*_queue 暂存已发起、等待事件完成的回执。
-        self.load_queue: List[CacheOperation] = []
-        self.write_queue: List[CacheOperation] = []
-        self.ack_load_queue: List[HiCacheAck] = []
-        self.ack_write_queue: List[HiCacheAck] = []
+        self.load_queue: List[CacheOperation] = []  # 待发起的 L2->L1 加载操作队列
+        self.write_queue: List[CacheOperation] = []  # 待发起的 L1->L2 写回操作队列
+        self.ack_load_queue: List[HiCacheAck] = []  # 已发起加载、等待事件完成的回执队列
+        self.ack_write_queue: List[HiCacheAck] = []  # 已发起写回、等待事件完成的回执队列
 
-        self.stop_event = threading.Event()
-        self.write_buffer = TransferBuffer(self.stop_event)
-        self.load_buffer = TransferBuffer(self.stop_event, buffer_count=10)
+        self.stop_event = threading.Event()  # 控制器核心（CPU<->GPU 传输缓冲）的停止信号
+        self.write_buffer = TransferBuffer(self.stop_event)  # 写回用的中转缓冲
+        self.load_buffer = TransferBuffer(self.stop_event, buffer_count=10)  # 加载用的中转缓冲
 
         # 中译：写回与加载各用独立 CUDA stream，与主计算 stream 并发以隐藏拷贝延迟。
-        self.write_stream = device_module.Stream()
-        self.load_stream = device_module.Stream()
+        self.write_stream = device_module.Stream()  # 专用写回流（L1->L2）
+        self.load_stream = device_module.Stream()  # 专用加载流（L2->L1）
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -524,18 +527,20 @@ class HiCacheController:
         assert self.enable_storage
         assert not self.storage_stop_event.is_set()
 
+        # 预取线程：从 L3 storage 异步拉取到 host（L2）。
         self.prefetch_thread = threading.Thread(
             target=self.prefetch_thread_func, daemon=True
         )
+        # 备份线程：把 host（L2）异步写回 L3 storage。
         self.backup_thread = threading.Thread(
             target=self.backup_thread_func, daemon=True
         )
-        self.prefetch_queue = Queue()
-        self.backup_queue = Queue()
+        self.prefetch_queue = Queue()  # 待处理的预取操作队列
+        self.backup_queue = Queue()  # 待处理的备份操作队列
 
-        self.prefetch_revoke_queue: Queue[str] = Queue()
-        self.ack_backup_queue: Queue[StorageOperation] = Queue()
-        self.host_mem_release_queue: Queue[torch.Tensor] = Queue()
+        self.prefetch_revoke_queue: Queue[str] = Queue()  # 被撤销的预取请求 id 队列
+        self.ack_backup_queue: Queue[StorageOperation] = Queue()  # 备份完成回执队列
+        self.host_mem_release_queue: Queue[torch.Tensor] = Queue()  # 待释放的 host 页索引队列
 
         self.prefetch_thread.start()
         self.backup_thread.start()

@@ -481,7 +481,137 @@ KV cache 与内存/前缀缓存管理的核心模块。包含两级内存池（�
 
 - **动手打点**：开启 HiCache（`--enable-hierarchical-cache`），灌入超过显存的前缀，在 `write_backup`/`load_back` 打点，观察 KV 被卸载到 host 再被命中拉回的过程。
 - **自检**：① 三级（device/host/storage）各自的容量与带宽特征，决定了什么数据放哪一级？② 写回（write_through/write_back）与预取（prefetch/load_back）为什么必须异步，它们如何与调度事件循环配合（呼应 managers 的 `hicache_consumer_index`）？
-- **产出物**：device/host/storage 三级搬运的数据流图，标注同步点与异步事件。
+- **产出物**：device/host/storage 三级搬运的数据流图，标注同步点与异步事件（见下图）。
+
+#### 数据流图：device / host / storage 三级搬运
+
+下图串起三级之间的双向搬运，并标注**同步点**（🔒，主调度线程与搬运线程/流之间必须等待或加锁的地方）与**异步事件**（⚡，跨 CUDA stream 或跨线程的非阻塞事件/队列）。所有行号对应当前 `cache_controller.py` / `hiradix_cache.py`。
+
+```
+                        主调度线程（Scheduler event loop）
+                                    │
+        ┌───────────────────────────┼────────────────────────────┐
+        │ 写方向（backup / 卸载）     │  读方向（prefetch / 拉回）    │
+        ▼                           │                             ▼
+┌───────────────────┐               │                 ┌───────────────────────┐
+│ write_backup       │               │                 │ init_load_back        │
+│ (hiradix:759)      │               │                 │ (hiradix:1213)        │
+│  🔒 inc_lock_ref   │               │                 │  🔒 inc_lock_ref 保护 │
+│     锁住节点直到写完│               │                 │     祖先链直到拉回完成 │
+└─────────┬─────────┘               │                 └───────────┬───────────┘
+          │ controller.write 入 write_queue             load_back(hiradix:1141)
+          │ （非阻塞，仅登记）                            │ controller.load 入 load_queue
+          ▼                                              ▼
+┌──────────────────────────────┐            ┌──────────────────────────────┐
+│ start_writing (cc:895)       │            │ start_loading (cc:984)       │
+│  merge_ops 合并整批           │            │  ⚡ update_producer 取逐层事件│
+│  ⚡ write_stream（专用流）    │            │  ⚡ load_stream（专用流）     │
+│  start_event.record()(cc:910)│            │  start_event.record()(cc:998)│
+│  🔒 start_event.wait(stream) │            │  🔒 start_event.wait(stream) │
+│      让写流等起点对齐         │            │      让载流等起点对齐         │
+└─────────┬────────────────────┘            └───────────┬──────────────────┘
+          │ D2H：backup_from_device_all_layer            │ H2D：load_to_device_per_layer
+          │ （kernel/JIT，见 transfer.cu）               │ （逐层，边搬边可用）
+          ▼                                              ▼
+   ┌────────────┐   D2H 搬运    ┌────────────┐  H2D 搬运   ┌────────────┐
+   │  DEVICE    │ ────────────▶ │   HOST     │ ──────────▶ │  DEVICE    │
+   │ (GPU KV池) │               │ (CPU KV池) │  ◀───┐      │ (GPU KV池) │
+   └────────────┘               └─────┬──────┘      │      └────────────┘
+                                      │ prefetch    │ 逐层完成即通知：
+                                      │ (host←L3)   │ ⚡ producer_event.complete(i)
+                                      ▼             │    (cc:1018) → LayerDoneCounter
+                          ┌───────────────────────┐ │    消费方按层 index 边到边算
+                          │ backup_thread /        │ │
+                          │ prefetch_thread(后台)  │ │
+                          │  ⚡ prefetch_queue      │ │
+                          │  ⚡ backup_queue        │ │
+                          │  🔒 storage_hit_query   │ │
+                          │     跨 rank all_reduce  │ │
+                          │     取 MIN 对齐命中页数 │ │
+                          └───────────┬───────────┘ │
+                                      │ host↔storage │
+                                      ▼             │
+                                ┌────────────┐      │
+                                │  STORAGE   │──────┘
+                                │ (L3 外部)  │
+                                │ file/mooncake/nixl/...
+                                └────────────┘
+
+  完成回收（两个方向对称）：
+    ⚡ finish_event.record()          写/载流上登记完成事件（cc:923 / 1031）
+    ⚡ ack_write_queue / ack_load_queue  回执入队，主线程轮询
+    🔒 writing_check (hiradix:907)    query() 事件完成 → dec_lock_ref 解锁节点
+    🔒 loading_check (hiradix:942)    同上，载入完成后解锁并回填 node.value
+```
+
+**关键点速记**：
+
+- **🔒 同步点**：① `inc_lock_ref` / `dec_lock_ref`：搬运期间锁住节点，防止被 `evict` 误删（与子阶段 C 一脉相承）；② `start_event.wait(stream)`：让专用搬运流与控制器流对齐起点；③ `writing_check` / `loading_check`：主线程用 `event.query()`（非阻塞查询）确认完成后才解锁，是「异步搬运」与「同步调度」的交界；④ storage 命中查询后跨 rank `all_reduce` 取 MIN，保证各 rank 预取页数一致。
+- **⚡ 异步事件**：① 写/载各有**专用 CUDA stream**（`write_stream` / `load_stream`），与主计算流并发以隐藏拷贝延迟；② `start_event` / `finish_event` 标记一批搬运的起止，配合 `ack_*_queue` 让主线程「发起后不等待、稍后再收割」；③ `LayerDoneCounter` + `producer_event.complete(i)`：H2D **逐层**完成即通知消费方，使「回载」与「计算」按层流水线重叠；④ `prefetch_thread` / `backup_thread` 两个后台线程经 `prefetch_queue` / `backup_queue` 与主线程解耦，独立推进 host↔storage IO。
+- **三级容量/带宽**：DEVICE（小、最快、直接算）→ HOST（大、较慢、L2 缓冲）→ STORAGE（最大、最慢、跨机持久化）。数据「热」则上移、「冷」则下沉，异步搬运把慢速 IO 藏在计算之后。
+
+#### 放大：host ↔ storage（L2 ↔ L3）子流程
+
+上图把 L2↔L3 折叠成一个「后台线程」框。这里展开它的两条方向。**与 L1↔L2 的本质区别**：L1↔L2 是 **GPU kernel** 在 CUDA stream 上做离散 gather/scatter；而 L2↔L3 是 **CPU 后台线程**调用存储后端 IO（文件 / mooncake / nixl / eic / …），**不涉及 GPU**，按页哈希键（key）读写。
+
+```
+                    主调度线程（Scheduler / HiRadixCache）
+        ┌─────────────────────────────┴──────────────────────────────┐
+        │ 备份方向（backup: L2 → L3）        预取方向（prefetch: L3 → L2）│
+        ▼                                                              ▼
+┌──────────────────────────┐                      ┌──────────────────────────────┐
+│ write_backup_storage      │                      │ query_storage_hit_length      │
+│ (hiradix:923)             │                      │ (hiradix:1359)                │
+│  · 若节点被分裂→沿链拼接   │                      │  · 构造「只查询」探测 operation│
+│    还原入队时刻数据        │                      │  🔒 _all_reduce_attn_groups   │
+│  · prefix_keys 锚定链顶    │                      │     跨 rank 取 MIN 命中长度    │
+│  · node.protect_host()🔒  │                      │  · 命中<阈值 → 不预取          │
+└────────────┬─────────────┘                      └───────────────┬──────────────┘
+             │ controller.write_storage(hiradix→cc:1343)          │ prefetch_from_storage(hiradix:1620)
+             │  ⚡ 入 backup_queue（非阻塞）                        │  · protect_host()🔒 + host 池 alloc
+             ▼                                                    │  · host 满→evict_host→尽力而为缩短
+┌──────────────────────────┐                      │  ⚡ 入 prefetch_queue（非阻塞）
+│ backup_thread_func(cc:1483)│                     ▼
+│  后台 CPU 线程             │      ┌──────────────────────────────────────┐
+│  循环取 backup_queue       │      │ prefetch_thread_func (cc:1290)         │
+│  🔒 backup_skip:           │      │  后台 CPU 线程，循环取 prefetch_queue  │
+│     MLA 仅 rank0 实写      │      │  ① _storage_hit_query (cc:1257)        │
+└────────────┬─────────────┘      │     逐页链式哈希 + batch_exists 探测   │
+             │ _page_backup(cc:1455)│    （命中必须连续，断则止）            │
+             ▼                     │  🔒 all_reduce 取 MIN 对齐命中页数     │
+┌──────────────────────────┐      │  ② 命中<阈值 → revoke + 归还 host 内存 │
+│ _page_backup 分批写出      │      │  ③ 命中≥阈值 → 裁剪到命中范围          │
+│  每批 STORAGE_BATCH_SIZE   │      │     ⚡ 投入 prefetch_buffer            │
+│  page_set_func:            │      └───────────────┬──────────────────────┘
+│   · zero_copy: 后端直接从   │                     │ prefetch_io_aux_func（IO 辅助线程）
+│     host 槽位读(batch_set_v1)│                    ▼
+│   · generic: 取页再batch_set│      ┌──────────────────────────────────────┐
+│  · draft 页尽力随写         │      │ _page_transfer (cc:1190)               │
+│  · completed_tokens 累加    │      │  分批 L3→L2：batch_get 到 host 槽位    │
+└────────────┬─────────────┘      │  · draft 页尽力随读                     │
+             │                    │  · increment(完成 token，可提前终止)   │
+             ▼ host↔storage IO    └───────────────┬──────────────────────┘
+        ┌────────────┐   写 (set)                 │ 读 (get)
+        │  STORAGE   │ ◀──────────────────────────┘
+        │ (L3 外部)  │ ──────────────────────────▶  写回 HOST(L2) 命中页
+        │ file/mooncake/nixl/eic/simm/...          （按 host_indices 落位）
+        └────────────┘
+
+  完成回收：
+    备份：⚡ ack_backup_queue(cc:1498) → 主线程收割 → node.release_host()🔒 解除保护
+    预取：⚡ check_prefetch_progress → _insert_helper_host 把「仅 L2 存在」的前缀登记进树
+          （新建 value=None、host_value=命中数据 的节点，发 store(CPU) 事件）
+```
+
+**L2↔L3 关键点**：
+
+- **谁在搬**：`backup_thread` / `prefetch_thread` 两个**守护 CPU 线程**（`_start_storage_threads` 启动），另有 `prefetch_io_aux_thread` 专做预取 IO，与主调度线程用 `backup_queue` / `prefetch_queue` / `prefetch_buffer` 解耦。**全程不碰 GPU**。
+- **按 key 而非 index**：L3 用**逐页链式哈希 key**（`_storage_hit_query`，每页哈希依赖上一页）作为存储键；命中必须是**连续前缀**，一旦某批未全命中即停止。
+- **🔒 同步点**：① `protect_host()` / `release_host()`：备份/预取期间保护 host 节点不被 `evict_host` 回收；② 命中长度跨 rank `all_reduce` 取 MIN（备份查询与预取查询各一次），保证各 rank 一致；③ MLA 模型 `backup_skip` 只让 rank0 实际写出（KV 按 rank 复制，避免重复写）。
+- **⚡ 异步事件**：`backup_queue` / `prefetch_queue`（主线程→后台线程，非阻塞入队）、`prefetch_buffer`（预取主线程→IO 辅助线程）、`ack_backup_queue`（后台→主线程回执）。
+- **零拷贝 vs 通用**：`page_set_func` / `page_get_func` 在 attach 后端时按能力选择——零拷贝版（`batch_set_v1` / `batch_get` 直接读写 host 池槽位）或通用版（先 `get_data_page` 取出再 `batch_set`）。
+- **尽力而为**：预取 host 内存不足时会 `evict_host` 后按可用空间**缩短预取长度**；命中不足阈值则 `revoke` 并归还预分配内存；draft（投机解码）KV 页随目标页尽力而为地一起读写，失败静默跳过、不影响主流程。
+- **落树**：预取到 host 的数据经 `_insert_helper_host`（`hiradix:1692`）登记为**「仅 L2 存在」的节点**（`value=None`、`host_value` 有数据），并发 `store(CPU)` 事件；之后若被命中，再经前述 L1↔L2 的 H2D 回载路径拉回 device。
 
 ---
 

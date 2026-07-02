@@ -105,6 +105,15 @@ class PoolTransfer:
     device <-> host 路径：使用 host_indices + device_indices（显存与主机内存间拷贝）
     host <-> storage 路径：使用 host_indices + keys（主机内存与后端存储间读写）
     nodes_to_load   ：本次传输涉及的、已被淘汰（需重新加载）的节点
+
+    数值示例（Mamba 混合模型，page_size=4，备份 12 个 token = 3 页）：
+      KV 主池（每页都搬，ALL_PAGES）：
+        device_indices=[0,1,2], host_indices=[100,101,102], keys=["h0","h1","h2"]
+      Mamba 状态池（只保留末页，TRAILING_PAGES）：
+        device_indices=[7], host_indices=[50], keys=["h2"]
+      其中 keys 为逐页链式哈希（h1 依赖 h0，h2 依赖 h1）。
+      若 storage 实际只命中 2 页（kv_hit_pages=2），_sync_trailing_keys 会把
+      Mamba 的 keys 从 ["h2"] 重对齐为实际命中范围的末页 ["h1"]（SWA 取 N 页则为 ["h0","h1"]）。
     """
 
     name: PoolName  # 本传输针对的缓存池名
