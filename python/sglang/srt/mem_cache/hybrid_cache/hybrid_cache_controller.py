@@ -700,6 +700,7 @@ class HybridCacheController(BaseHiCacheController):
     def move_hybrid_indices(
         self, operation: CacheOperation
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
+        # 把 KV 主池与各额外池的 host/device 索引都搬到执行设备上，并返回归一化后的搬运描述。
         host_indices, device_indices = self.move_indices(
             operation.host_indices, operation.device_indices
         )
@@ -751,10 +752,13 @@ class HybridCacheController(BaseHiCacheController):
         super()._page_backup(operation)
 
     def _resolve_sidecar_derived_pool_transfers(self, operation):
+        # 解析「派生型」额外池：它们不拥有自己的索引/键，而是从另一个源池（KV 或另一个
+        # 额外池）借用 host_indices 与 keys。在真正读写 storage 前，把这些字段从源池填好。
         for transfer in operation.pool_transfers:
             if transfer.indices_from_pool is None:
                 continue
             if transfer.indices_from_pool != PoolName.KV:
+                # 源是另一个额外池：在本次搬运列表里找到那个「拥有自己索引」的源 transfer。
                 source = next(
                     (
                         t
@@ -773,6 +777,7 @@ class HybridCacheController(BaseHiCacheController):
                 if transfer.keys is None:
                     transfer.keys = source.keys
             else:
+                # 源是 KV 主池：直接用本次操作的 KV host 索引与页哈希作为索引/键。
                 transfer.host_indices = operation.host_indices
                 if transfer.keys is None:
                     transfer.keys = operation.hash_value

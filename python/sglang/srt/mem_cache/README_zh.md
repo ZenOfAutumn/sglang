@@ -613,6 +613,37 @@ KV cache 与内存/前缀缓存管理的核心模块。包含两级内存池（�
 - **尽力而为**：预取 host 内存不足时会 `evict_host` 后按可用空间**缩短预取长度**；命中不足阈值则 `revoke` 并归还预分配内存；draft（投机解码）KV 页随目标页尽力而为地一起读写，失败静默跳过、不影响主流程。
 - **落树**：预取到 host 的数据经 `_insert_helper_host`（`hiradix:1692`）登记为**「仅 L2 存在」的节点**（`value=None`、`host_value` 有数据），并发 `store(CPU)` 事件；之后若被命中，再经前述 L1↔L2 的 H2D 回载路径拉回 device。
 
+#### L2 ↔ L3 触发条件（backup 与 prefetch 分别在什么时候发生）
+
+上面讲了「怎么搬」，这里补齐「什么时候搬」——两个方向各由不同的时机触发。
+
+**备份方向（backup：L2 → L3，把 host 上的前缀写到外部存储）**
+
+| 触发点 | 时机 | 关键约束 |
+| ------ | ---- | -------- |
+| 节点在 host 完成写回后 | L1→L2 的 `write_backup` 让节点获得 `host_value`（host 上有了备份），HiRadixCache 进一步把它排队写往 L3 | 只有 host 上已存在的页才可能被写到 L3（backup 是「host→storage」，前置是 D2H 已完成） |
+| 连续前缀不变式 | 只有当**父节点也已备份**时，本节点才允许写出 | 保证 L3 上的前缀链从链顶到当前页连续（`prefix_keys` 锚定链顶） |
+| `write_storage` 入队 | 满足条件的节点 KV 经 `controller.write_storage` 非阻塞入 `backup_queue`，由 `backup_thread` 后台实际写盘 | `node.protect_host()` 锁住 host 节点直到写完，防止被 `evict_host` 中途回收 |
+
+触发的**本质动机**：把「host 上有、但可能很快被 host 淘汰」的前缀持久化到 L3，从而在 host 淘汰后仍可跨请求复用（扩大有效缓存容量、防丢）。
+
+跳过 backup 的情况：① 父节点未备份（破坏连续前缀）→ 直接返回 0；② MLA 模型的 `backup_skip`——KV 在各 rank 完全相同，只让 rank0 实际写出，其余 rank 跳过重复写。
+
+**预取方向（prefetch：L3 → L2，把外部存储的前缀拉回 host）**
+
+| 触发点 | 时机 | 关键约束 |
+| ------ | ---- | -------- |
+| 新请求前缀匹配后 | radix 树在 device/host 都没能把前缀匹配到底，但 `query_storage_hit_length`（`hiradix:1359`）发现 L3 上还有更长的连续前缀 | 命中必须是**从头连续前缀**，用逐页链式哈希 key 探测（`_storage_hit_query`），断则止 |
+| 命中长度达阈值 | 只有 L3 命中长度 ≥ 阈值才真正发起预取；跨 rank `all_reduce` 取 **MIN** 对齐命中页数后再决策 | 命中 < 阈值 → 不预取（`revoke` 并归还预分配的 host 内存），避免小碎片搬运不划算 |
+| `prefetch_from_storage` 入队 | 达标后 `protect_host()` + host 池 `alloc`，经 `prefetch_queue` 交给 `prefetch_thread` 后台拉取 | host 内存不足时先 `evict_host`，再按可用空间**缩短**预取长度（尽力而为） |
+
+触发的**本质动机**：新请求命中了历史请求留在 L3 的前缀，但 host（L2）上已经没有了 → 从 L3 拉回 host，供后续 H2D 回载到 device 复用，避免重新 prefill 重算。
+
+**一句话对照**：
+- **backup（L2→L3）** 由「host 上出现了新的、满足连续前缀的备份节点」触发 → 目的是**防丢/扩容**；
+- **prefetch（L3→L2）** 由「新请求的前缀在 L3 命中、但 host 上缺失」触发 → 目的是**跨请求复用/避免重算**。
+- 两者都：按页链式哈希 key 组织、要求前缀连续、用 `protect_host` 保护搬运期间的 host 节点、跨 rank 取 MIN 对齐。
+
 ---
 
 ### 子阶段 E（选学）：变体缓存（第 10–11 天）

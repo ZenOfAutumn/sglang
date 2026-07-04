@@ -150,11 +150,21 @@ class PoolTransferResult:
         return cls(0, {})
 
     def update_kv_hit_pages(self, kv_hit_pages: int) -> None:
-        """跨多个批次累计 kv_hit_pages（取最大值 = 最后一个成功批次的结果）。"""
+        """跨多个批次累计 kv_hit_pages（取最大值 = 最后一个成功批次的结果）。
+
+        数值示例：
+          初始 self.kv_hit_pages=3；本批次 kv_hit_pages=5 → 更新为 max(3,5)=5。
+          再来一批 kv_hit_pages=4 → 仍为 max(5,4)=5（不回退）。
+        """
         self.kv_hit_pages = max(self.kv_hit_pages, kv_hit_pages)
 
     def update_extra_pool_hit_pages(self, results: dict[str, List[bool]]) -> None:
-        """记录每个附加池实际加载/写入成功的页数（布尔列表中 True 的个数）。"""
+        """记录每个附加池实际加载/写入成功的页数（布尔列表中 True 的个数）。
+
+        数值示例：
+          results = {"mamba": [True, True, False], "swa": [True, True, True]}
+          → extra_pool_hit_pages = {"mamba": 2, "swa": 3}
+        """
         self.extra_pool_hit_pages.update(
             {name: sum(rs) for name, rs in results.items()}
         )
@@ -173,6 +183,8 @@ class HiCacheStorage(ABC):
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         # 注册主机侧缓存池（v2 接口，按名称区分多个池）。
+        # 数值示例：依次注册 KV / MAMBA / SWA 三个池后，
+        #   registered_pools = {"kv": <pool>, "mamba": <pool>, "swa": <pool>}。
         if not hasattr(self, "registered_pools"):
             self.registered_pools = {}
         self.registered_pools[host_pool_name] = host_pool
@@ -204,6 +216,15 @@ class HiCacheStorage(ABC):
         PoolTransferResult
             ``kv_hit_pages`` = 可用 KV 前缀的页长度。
             ``extra_pool_hit_pages`` 将每个池名映射到实际找到的页数。
+
+        数值示例（keys 共 6 页 [h0..h5]）：
+          KV 主池：storage 中存在 h0..h3、缺 h4 → kv_pages=4。
+          Mamba 池（trailing_pages，keys=["h3"]）：末页 h3 存在 → boundary=4。
+          SWA 池（all_pages）：h0..h3 逐页都在 → boundary=4。
+          final_pages = min(4, 4, 4) = 4
+          返回 PoolTransferResult(kv_hit_pages=4,
+                                 extra_pool_hit_pages={"mamba":4, "swa":4})。
+          若 SWA 缺 h2 → SWA boundary=2 → final_pages=min(4,4,2)=2。
         """
         raise NotImplementedError()
 
@@ -215,6 +236,11 @@ class HiCacheStorage(ABC):
         """为每个 PoolTransfer 从后端存储读取数据到主机内存。
 
         返回一个字典：池名 -> 逐页成功与否的布尔列表。
+
+        数值示例：
+          transfers=[PoolTransfer(name="kv", keys=["h0","h1","h2"], host_indices=...)]
+          若 h0/h1 读成功、h2 读失败
+          → 返回 {"kv": [True, True, False]}。
         """
         raise NotImplementedError()
 
@@ -226,6 +252,11 @@ class HiCacheStorage(ABC):
         """为每个 PoolTransfer 将主机内存中的数据写入后端存储。
 
         返回一个字典：池名 -> 逐页成功与否的布尔列表。
+
+        数值示例：
+          transfers=[PoolTransfer(name="kv", keys=["h0","h1","h2"], host_indices=...)]
+          三页都写成功 → 返回 {"kv": [True, True, True]}。
+          若 h1 已存在（跳过重写但视为成功）→ 仍返回 {"kv": [True, True, True]}。
         """
         raise NotImplementedError()
 
@@ -238,6 +269,11 @@ class HiCacheStorage(ABC):
         """
         批量读取多个键对应的值。
         返回一个布尔列表，表示每个键是否读取成功。
+
+        数值示例（KV 主池，page_size=4）：
+          keys=["h0","h1","h2"]，host_indices=tensor([100..111])（3 页 * 4 = 12）
+          若 h0/h1 命中、h2 未命中 → 返回 [True, True, False]，
+          且 host 索引 100~107 处被填入读回的数据。
         """
         pass
 
@@ -250,6 +286,11 @@ class HiCacheStorage(ABC):
         """
         批量存储多个键值对。
         返回一个布尔列表，表示每个键是否写入成功。
+
+        数值示例（KV 主池，page_size=4）：
+          keys=["h0","h1","h2"]，host_indices=tensor([100..111])
+          h0/h1 写入成功、h2 因空间不足失败 → 返回 [True, True, False]。
+          （keys 为链式前缀哈希：h1 依赖 h0、h2 依赖 h1）
         """
         pass
 
@@ -263,6 +304,10 @@ class HiCacheStorage(ABC):
         """
         读取给定键所关联的值。
         若键不存在则返回 None。
+
+        数值示例：
+          get("h0", target_location=<预分配的空张量>)
+          命中 → 数据读入 target_location 并返回该张量；未命中 → 返回 None。
         """
         pass
 
@@ -277,6 +322,10 @@ class HiCacheStorage(ABC):
         """
         批量读取多个键对应的值。
         返回一个列表，每个元素为对应的张量或 None。
+
+        数值示例：
+          keys=["h0","h1","h2"]，h1 未命中
+          → 返回 [tensor_h0, None, tensor_h2]。
         """
         pass
 
@@ -291,6 +340,10 @@ class HiCacheStorage(ABC):
         """
         存储给定键所关联的值。
         操作成功返回 True，否则返回 False。
+
+        数值示例：
+          set("h0", value=<一页 KV 张量>) → 写盘成功返回 True；
+          若 "h0" 已存在，则跳过重写、刷新访问时间并返回 True。
         """
         pass
 
@@ -306,6 +359,10 @@ class HiCacheStorage(ABC):
         """
         批量存储多个键值对。
         全部成功返回 True，否则返回 False。
+
+        数值示例：
+          keys=["h0","h1","h2"]，三页均写入成功 → 返回 True；
+          若 h1 写失败 → 立即返回 False（不保证前面已写的回滚）。
         """
         pass
 
@@ -314,6 +371,9 @@ class HiCacheStorage(ABC):
         """
         检查该键是否存在于存储中。
         存在返回 True，否则返回 False。
+
+        数值示例：
+          exists("h0") → 对应条目在存储中则 True，否则 False。
         """
         pass
 
@@ -325,6 +385,10 @@ class HiCacheStorage(ABC):
         检查这些键是否存在于存储中。
         返回从开头起连续存在的键的个数（即最长连续前缀长度）。
         子类可覆写以提供更高效的实现。
+
+        数值示例：
+          keys=["h0","h1","h2","h3"]，存在 h0/h1、缺 h2
+          → 扫到 i=2 时 h2 不存在，返回 2（即使 h3 存在也不计，前缀必须连续）。
         """
         # 逐个检查，遇到第一个不存在的键就返回当前下标（即连续命中的个数）。
         for i in range(len(keys)):
@@ -364,6 +428,9 @@ class HiCacheFile(HiCacheStorage):
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
         # 根据模型名 + 并行配置拼出存储键后缀，使不同模型/不同并行切分的缓存互不混淆。
+        # 数值示例（model_name="meta/llama", tp_rank=0, tp_size=2, pp_size=1，非 MLA）：
+        #   模型名先把 "/" 换为 "-" → "meta-llama"；
+        #   最终 config_suffix = "_meta-llama_0_2"（若 MLA 则不拼 tp 信息："_meta-llama"）。
         self.config_suffix = f"_{model_name}"
         # 非 MLA 模型：每个 TP rank 持有不同的 KV 分片，故键需区分 tp_rank/tp_size；
         # MLA 模型：KV 在 TP 间共享，不加 tp 信息，以便跨 rank 复用同一份缓存。
@@ -396,10 +463,14 @@ class HiCacheFile(HiCacheStorage):
 
     def _get_suffixed_key(self, key: str) -> str:
         # 给原始键拼上配置后缀（含模型名、TP/PP/CP rank 等），以隔离不同配置的缓存。
+        # 数值示例（config_suffix="_llama_0_2"）：_get_suffixed_key("h0") -> "h0_llama_0_2"。
         return key + self.config_suffix
 
     def _get_component_key(self, key: str, component_name: Optional[str] = None) -> str:
         # 生成“组件级”存储键：KV 主组件不加组件后缀，其它池（如 mamba/swa）追加 ".组件名"。
+        # 数值示例（设 config_suffix="_llama_0_2"）：
+        #   _get_component_key("h0")          -> "h0_llama_0_2"        （KV 主组件）
+        #   _get_component_key("h0", "mamba") -> "h0.mamba_llama_0_2"  （mamba 池）
         if component_name is None or component_name in ("__default__", PoolName.KV):
             return self._get_suffixed_key(key)
         return self._get_suffixed_key(f"{key}.{component_name}")
@@ -408,6 +479,8 @@ class HiCacheFile(HiCacheStorage):
         self, key: str, component_name: Optional[str] = None
     ) -> str:
         # 由组件键拼出完整的 .bin 文件路径。
+        # 数值示例（file_path="/tmp/hicache", config_suffix="_llama_0_2"）：
+        #   _get_component_path("h0", "mamba") -> "/tmp/hicache/h0.mamba_llama_0_2.bin"。
         return os.path.join(
             self.file_path, f"{self._get_component_key(key, component_name)}.bin"
         )
@@ -419,6 +492,8 @@ class HiCacheFile(HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
         # 从磁盘读取单个键的原始字节到 target_location；命中返回该张量，未命中返回 None。
+        # 数值示例：target_location 为 4096 个 fp16 元素的张量 → expected=4096*2=8192 字节；
+        #   若文件只读到 8000 字节（不足 8192）则报 IOError（视为文件损坏）。
         suffixed = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
         try:
@@ -460,6 +535,9 @@ class HiCacheFile(HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> bool:
         # 将单个键的张量以原始字节写入磁盘（经“临时文件 + 原子重命名”保证原子性）。
+        # 数值示例：set("h0", value=<4096 个 fp16>) → value_bytes=8192；
+        #   先写 "h0_....bin.tmp.<pid>.<tid>.<uuid>"，再 os.replace 为 "h0_....bin"；
+        #   若 "h0" 已存在则直接返回 True（跳过重写）。
         suffixed = self._get_suffixed_key(key)
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
 
@@ -527,6 +605,9 @@ class HiCacheFile(HiCacheStorage):
         pool_transfers: Optional[List[PoolTransfer]] = None,
     ) -> Set[str]:
         # 一次性收集本次关心的所有组件文件名（KV 主组件 + 各附加池组件），
+        # 数值示例（keys=["h0","h1"]，mamba 池，config_suffix="_m"）：
+        #   target_files = {"h0_m.bin","h1_m.bin","h0.mamba_m.bin","h1.mamba_m.bin"}；
+        #   scandir 后若目录仅有前三个 → 返回该三个文件名的集合。
         # 然后用一次 scandir 扫目录取交集，避免逐个 os.path.exists 的高频 syscall。
         target_files = {f"{self._get_component_key(key)}.bin" for key in keys}
         for transfer in pool_transfers or []:
@@ -546,6 +627,11 @@ class HiCacheFile(HiCacheStorage):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
+        # 数值示例（keys=["h0","h1","h2","h3"]）：
+        #   磁盘上存在 h0/h1/h2 的 KV 文件、缺 h3 → kv_pages=3；
+        #   mamba 池（trailing_pages, keys=["h2"]）：末页 h2 存在 → boundary=3；
+        #   若 mamba 缺 h2 但有 h1 → 回退到 boundary=2；
+        #   final_pages = min(kv_pages, 各池 boundary)。
         existing_files = self._collect_existing_component_keys(keys, pool_transfers)
 
         def has_component(page_idx: int, name: str) -> bool:
@@ -597,10 +683,16 @@ class HiCacheFile(HiCacheStorage):
 
     def _log_key(self, pool_name: str, key: str) -> str:
         # 根据池名构造实际使用的存储键：KV 池用原键，其它池追加 ".池名"。
+        # 数值示例：_log_key("kv", "h0") -> "h0"；_log_key("mamba", "h0") -> "h0.mamba"。
         return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
 
     def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
-        """从存储读取一页，写入 host_pool 的 page_offset 位置。成功返回 True。"""
+        """从存储读取一页，写入 host_pool 的 page_offset 位置。成功返回 True。
+
+        数值示例：_read_page("mamba", "h0", host_pool, page_offset=100)
+          → 读 storage 键 "h0.mamba"，命中则写入 host_pool 第 100 号位置并返回 True，
+            未命中返回 False。
+        """
         storage_key = self._log_key(pool_name, key)
         data_page = self.get(storage_key, host_pool.get_dummy_flat_data_page())
         if data_page is None:
@@ -611,13 +703,21 @@ class HiCacheFile(HiCacheStorage):
     def _write_page(
         self, pool_name: str, key: str, host_pool, page_offset: int
     ) -> bool:
-        """将 host_pool 中 page_offset 位置的一页以原始字节写入存储。成功返回 True。"""
+        """将 host_pool 中 page_offset 位置的一页以原始字节写入存储。成功返回 True。
+
+        数值示例：_write_page("kv", "h0", host_pool, page_offset=100)
+          → 取 host_pool 第 100 号页的 flat 数据，写入 storage 键 "h0"（KV 池不加后缀）。
+        """
         storage_key = self._log_key(pool_name, key)
         data_page = host_pool.get_data_page(page_offset, flat=True)
         return self.set(storage_key, data_page)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], op_fn):
         # batch_get_v2 / batch_set_v2 的公共骨架：逐个池、逐页调用 op_fn（读页或写页）。
+        # 数值示例（page_size=4）：
+        #   transfer.keys=["h0","h1","h2"] → expected = 3*4 = 12；
+        #   host_indices 长度必须为 12，否则本池全部记为 [False,False,False]；
+        #   逐页取 host_indices[i*4] 作为页起始索引传给 op_fn。
         results: dict[str, List[bool]] = {}
         for transfer in transfers:
             host_pool = self.registered_pools[transfer.name]
@@ -661,6 +761,7 @@ class HiCacheFile(HiCacheStorage):
 
     def clear(self) -> bool:
         # 清空整个存储目录：删除所有文件并重置 evictor 的计账。
+        # 数值示例：目录下有 h0.bin/h1.bin/h2.bin → 全部删除，evictor 占用归零，返回 True。
         try:
             for filename in os.listdir(self.file_path):
                 file_path = os.path.join(self.file_path, filename)
