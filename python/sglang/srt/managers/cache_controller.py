@@ -1192,6 +1192,7 @@ class HiCacheController:
         #       每批：先尽力读草稿 L3（须在发布目标完成前，避免竞态把目标 KV 先加载回来），
         #       再读目标页；若本批未达预期完成数则终止操作。
         # Transfer batch by batch
+        # 中译：逐批传输。
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
             batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
@@ -1202,20 +1203,26 @@ class HiCacheController:
             # Best-effort draft L3 read before publishing target completion.
             # Otherwise wait_complete can race and load back target KV before
             # draft KV reaches host memory.
+            # 中译：在发布目标完成状态之前，尽力（best-effort）先读取草稿（draft）L3。
+            #       否则 wait_complete 可能发生竞态，在草稿 KV 到达 host 内存之前
+            #       就把目标 KV 先加载回来。
             if self.has_draft:
                 self._draft_page_get(batch_hashes, batch_host_indices)
 
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
+            # 中译：读取一批 token，成功则更新 completed_tokens。
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
             # Check termination
+            # 中译：检查是否需要终止。
             if (
                 operation.completed_tokens
                 != prev_completed_tokens + len(batch_hashes) * self.page_size
             ):
                 operation.mark_terminate()
                 break  # Some operations fail or operation terminated by controller
+                # 中译：部分操作失败，或操作被控制器终止。
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes

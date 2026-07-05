@@ -1,0 +1,147 @@
+<mxfile host="app.diagrams.net" agent="SGLang-HiCache-Doc" version="24.0.0">
+  <diagram id="hicache-transfer" name="HiCache三级传输全图">
+    <mxGraphModel dx="1600" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1650" pageHeight="1180" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="SGLang HiCache 三级 KV 缓存传输全图（L1 GPU ↔ L2 Host ↔ L3 Storage）" style="text;html=1;fontSize=20;fontStyle=1;align=center;verticalAlign=middle;fillColor=none;" vertex="1" parent="1">
+          <mxGeometry x="360" y="16" width="920" height="36" as="geometry" />
+        </mxCell>
+        <mxCell id="subtitle" value="核心执行者：HiCacheController（cache_controller.py）；调用方：HiRadixCache（hiradix_cache.py）。蓝=同步搬运 / 橙=异步后台线程搬运" style="text;html=1;fontSize=12;align=center;verticalAlign=middle;fillColor=none;fontColor=#555555;" vertex="1" parent="1">
+          <mxGeometry x="360" y="50" width="920" height="22" as="geometry" />
+        </mxCell>
+
+        <mxCell id="l1lane" value="L1&#10;GPU 设备显存&#10;(mem_pool_device)&#10;最快 · 最稀缺" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;verticalAlign=top;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="60" y="100" width="220" height="980" as="geometry" />
+        </mxCell>
+        <mxCell id="l2lane" value="L2&#10;主机内存 (CPU)&#10;(mem_pool_host / HostKVCache)&#10;容量更大 · 稍慢" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;verticalAlign=top;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="620" y="100" width="240" height="980" as="geometry" />
+        </mxCell>
+        <mxCell id="l3lane" value="L3&#10;外部存储后端&#10;(storage_backend)&#10;hf3fs / mooncake / eic / nixl / file&#10;容量最大 · 最慢 · 可跨进程/跨节点复用" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;verticalAlign=top;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="100" width="260" height="980" as="geometry" />
+        </mxCell>
+
+        <mxCell id="ctrlband" value="HiCacheController（独立 CUDA stream + 后台线程，与前向计算 overlap）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;verticalAlign=top;fontStyle=2;fontSize=12;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="300" y="120" width="1140" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="l1pool" value="KVCache 物理张量&#10;[size+page, ...] 每层&#10;device_indices 定位" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="80" y="200" width="180" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="l1alloc" value="token_to_kv_pool_allocator&#10;alloc / free（device 槽位）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="80" y="300" width="180" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="l2pool" value="Host KV 池 (HostKVCache)&#10;layout: layer_first / page_first_direct&#10;host_indices 定位&#10;alloc / free" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="640" y="200" width="200" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="l2draft" value="草稿(draft) Host 池&#10;（投机解码，搭车搬运）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#82b366;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="640" y="300" width="200" height="50" as="geometry" />
+        </mxCell>
+
+        <mxCell id="l3store" value="storage_backend&#10;batch_get / batch_set&#10;batch_get_v1/v2（零拷贝）&#10;batch_exists（命中探测）&#10;key = 逐页哈希链" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="1220" y="200" width="220" height="100" as="geometry" />
+        </mxCell>
+
+        <mxCell id="wbox" value="① write / write-through（L1 → L2）&#10;write_backup() → controller.write()&#10;→ start_writing()：write_stream 上&#10;backup_from_device_all_layer（整批逐层）&#10;→ HiCacheAck(start,finish) 入 ack_write_queue&#10;writing_check() 轮询完成→标记节点 backuped" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;fontSize=11;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="300" y="200" width="300" height="110" as="geometry" />
+        </mxCell>
+        <mxCell id="warrow" style="endArrow=block;html=1;strokeColor=#6c8ebf;strokeWidth=2.5;" edge="1" parent="1" source="l1pool" target="l2pool">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="450" y="175" /></Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="wlabel" value="① write (GPU→Host) write_stream" style="text;html=1;fontSize=11;fontColor=#2d4a7a;fontStyle=1;labelBackgroundColor=#ffffff;" vertex="1" parent="1">
+          <mxGeometry x="345" y="152" width="210" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="lbox" value="② load-back（L2 → L1）&#10;load_back() → controller.load()（alloc device 槽位）&#10;→ start_loading()：load_stream 上&#10;load_to_device_per_layer（逐层）&#10;→ LayerLoadingEvent 每层 record，消费者按层等待&#10;→ ack_load_queue；loading_check() 轮询完成" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;align=left;fontSize=11;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="300" y="380" width="300" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="larrow" style="endArrow=block;html=1;strokeColor=#82b366;strokeWidth=2.5;" edge="1" parent="1" source="l2pool" target="l1pool">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="450" y="330" /></Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="llabel" value="② load-back (Host→GPU) load_stream·逐层事件" style="text;html=1;fontSize=11;fontColor=#3a6b2e;fontStyle=1;labelBackgroundColor=#ffffff;" vertex="1" parent="1">
+          <mxGeometry x="330" y="333" width="240" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="pbox" value="③ prefetch（L3 → L2，异步后台线程）&#10;prefetch() → prefetch_queue&#10;prefetch_thread_func：&#10; · _storage_hit_query() → batch_exists 探测前缀命中&#10; · 跨 rank all_reduce(MIN) 对齐命中页数&#10; · 命中&lt;阈值→revoke 并释放 host 内存&#10; · 否则投入 prefetch_buffer&#10;prefetch_io_aux_func → _page_transfer()&#10; · 分批 STORAGE_BATCH_SIZE，先读 draft 再读 target&#10; · page_get_func：_generic_page_get / _page_get_zero_copy" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;align=left;fontSize=11;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="880" y="360" width="300" height="180" as="geometry" />
+        </mxCell>
+        <mxCell id="parrow" style="endArrow=block;html=1;strokeColor=#d79b00;strokeWidth=2.5;dashed=1;" edge="1" parent="1" source="l3store" target="l2pool">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="1030" y="325" /></Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="plabel" value="③ prefetch (Storage→Host) prefetch_thread / io_aux_thread" style="text;html=1;fontSize=11;fontColor=#a35c00;fontStyle=1;labelBackgroundColor=#ffffff;" vertex="1" parent="1">
+          <mxGeometry x="895" y="305" width="270" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="bbox" value="④ backup / write_storage（L2 → L3，异步后台线程）&#10;write_backup_storage() → controller.write_storage()&#10;→ backup_queue&#10;backup_thread_func → _page_backup()&#10; · 分批写 target 页（page_set_func）&#10; · 尽力附带写 draft 页（_draft_page_set）&#10; · MLA 模型非 rank0 跳过（backup_skip）&#10;→ ack_backup_queue；drain 后释放 host 锁" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;align=left;fontSize=11;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="880" y="600" width="300" height="150" as="geometry" />
+        </mxCell>
+        <mxCell id="barrow" style="endArrow=block;html=1;strokeColor=#d79b00;strokeWidth=2.5;dashed=1;" edge="1" parent="1" source="l2pool" target="l3store">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="1030" y="660" /></Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="blabel" value="④ backup (Host→Storage) backup_thread" style="text;html=1;fontSize=11;fontColor=#a35c00;fontStyle=1;labelBackgroundColor=#ffffff;" vertex="1" parent="1">
+          <mxGeometry x="905" y="558" width="250" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="evbox" value="⑤ 驱逐（腾容量）&#10;evict_device()：allocator.free 释放 L1 槽位&#10;evict_host()：mem_pool_host.free 释放 L2 槽位&#10;（write_back 策略下驱逐 L1 前先回写 host）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;fontSize=11;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="300" y="560" width="300" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="evarrowl1" style="endArrow=open;html=1;strokeColor=#b85450;strokeWidth=1.5;dashed=1;" edge="1" parent="1" source="evbox" target="l1alloc">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="evarrowl2" style="endArrow=open;html=1;strokeColor=#b85450;strokeWidth=1.5;dashed=1;" edge="1" parent="1" source="evbox" target="l2pool">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <mxCell id="hrc" value="HiRadixCache（调用方 / 调度侧，hiradix_cache.py）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;verticalAlign=top;fontStyle=1;fontSize=13;align=center;" vertex="1" parent="1">
+          <mxGeometry x="300" y="790" width="880" height="270" as="geometry" />
+        </mxCell>
+        <mxCell id="hrc1" value="match_prefix()&#10;device 命中 + host 命中长度&#10;→ 决定是否 load-back / prefetch" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffffff;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="320" y="830" width="200" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="hrc2" value="_inc_hit_count() 命中计数&#10;≥ write_through_threshold&#10;→ write_backup()（① 写穿透）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="540" y="830" width="200" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="hrc3" value="init_load_back()/load_back()&#10;→ ②：host 命中前缀回载 device" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="760" y="830" width="200" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="hrc4" value="check_prefetch_progress()&#10;→ ③ 预取完成后插入 host 树" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="980" y="830" width="180" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="hrc5" value="check_hicache_events()（每步调度循环调用）&#10;writing_check()｜loading_check()｜drain_storage_control_queues()（revoke/backup-ack/host释放，跨 rank MIN 对齐）" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="320" y="930" width="840" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="hrc6" value="write_policy：write_through / write_through_selective / write_back　｜　prefetch_stop_policy：best_effort / wait_complete / timeout" style="text;html=1;fontSize=11;fontColor=#5b3f73;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="320" y="990" width="840" height="24" as="geometry" />
+        </mxCell>
+        <mxCell id="hrc7" value="io_backend：kernel / direct / kernel_ascend（move_indices 按后端调整索引布局与所在设备）" style="text;html=1;fontSize=11;fontColor=#5b3f73;align=left;spacingLeft=8;" vertex="1" parent="1">
+          <mxGeometry x="320" y="1014" width="840" height="24" as="geometry" />
+        </mxCell>
+
+        <mxCell id="legend" value="图例 &amp; 典型链路" style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#666666;verticalAlign=top;fontStyle=1;align=left;spacingLeft=6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1200" y="790" width="260" height="270" as="geometry" />
+        </mxCell>
+        <mxCell id="lg1" value="实线箭头 = 同步搬运（CUDA stream，与前向 overlap）" style="text;html=1;fontSize=11;align=left;" vertex="1" parent="1">
+          <mxGeometry x="1212" y="820" width="240" height="28" as="geometry" />
+        </mxCell>
+        <mxCell id="lg2" value="虚线箭头 = 异步后台线程搬运（prefetch/backup）" style="text;html=1;fontSize=11;align=left;" vertex="1" parent="1">
+          <mxGeometry x="1212" y="850" width="240" height="28" as="geometry" />
+        </mxCell>
+        <mxCell id="lg8" value="典型链路：&#10;首见前缀→计算→① 写穿透到 Host→④ 备份到 Storage；&#10;再次命中→match_prefix 命中 Host/Storage→③ 预取到 Host&#10;→② 回载到 GPU 复用。容量不足→⑤ 驱逐 L1/L2。" style="text;html=1;fontSize=11;align=left;spacingLeft=4;" vertex="1" parent="1">
+          <mxGeometry x="1212" y="884" width="240" height="120" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
+
