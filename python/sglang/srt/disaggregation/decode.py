@@ -16,6 +16,28 @@ Life cycle of a request in the decode server
 
 4. RunningBatch:
     a. Merge the resolved PrebuiltExtendBatch into running batch to run decoding
+
+中译：decode（解码）服务器中一个请求的生命周期。
+
+在 PD（Prefill-Decode，预填充-解码）分离架构下，decode 节点不做 prefill 前向计算，
+而是从 prefill 节点接收已算好的 KV Cache，然后只做逐 token 的解码生成。请求依次流经
+以下四个阶段（对应四个队列/批次）：
+
+1. PreallocQueue（预分配队列）：
+    a. 为每个请求初始化一个 KV 接收器（kv_receiver）；
+    b. 请求先与 prefill 节点握手（handshake），一旦本地有空闲 KV 空间就预分配 KV；
+    c. 预分配成功后把请求移入 TransferQueue（传输队列）。
+
+2. TransferQueue（传输队列）：
+    a. 轮询（poll）接收器以检查 KV 传输状态；
+    b. 若传输完成，则把请求移入 WaitingQueue（等待队列）。
+
+3. WaitingQueue（等待队列）：
+    a. 用队列中的请求构造 PrebuiltExtendBatch（预构建的 extend 批次）；
+    b. 跳过 prefill 前向计算，只填充所需的元数据（因为 KV 已由 prefill 节点算好并传来）。
+
+4. RunningBatch（运行批次）：
+    a. 把已就绪的 PrebuiltExtendBatch 合并进运行批次，开始执行解码。
 """
 
 from __future__ import annotations
@@ -99,6 +121,8 @@ CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
+    # 中译：把请求的 bootstrap 主机与端口拼成 "host:port" 字符串，作为标识 prefill 节点的地址。
+    #       FIXME（原注）：这本应做成 Req 的一个属性（property）。
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
 
 
@@ -112,6 +136,17 @@ class DecodeReqToTokenPool:
 
     In DecodeReqToTokenPool, if `--max-running-requests` is 8,
     #running <= 8, #pre-allocated + #transfer <= pre_alloc_size, so we can use the free memory to pre-allocate requests to unblock prefill.
+
+    中译：DecodeReqToTokenPool 与普通 ReqToTokenPool 的区别在于，前者额外为「预分配请求」
+          预留（subscribe）一块内存。
+
+          在 ReqToTokenPool 中，若 `--max-running-requests`（最大并发运行请求数）为 8，则约束为：
+              预分配数 + 传输中数 + 运行中数 <= 8；
+          但实际上还有更多内存可以承载预分配请求，这块能力被浪费了。
+
+          在 DecodeReqToTokenPool 中，同样 `--max-running-requests` 为 8 时，约束变为：
+              运行中数 <= 8，且 预分配数 + 传输中数 <= pre_alloc_size；
+          这样就能用空闲内存去提前预分配请求，从而不阻塞（unblock）上游 prefill 节点的推进。
     """
 
     def __init__(
@@ -128,6 +163,8 @@ class DecodeReqToTokenPool:
 
         self.size = size
         # +1 padding row at index 0; see ReqToTokenPool for rationale.
+        # 中译：额外 +1 是在索引 0 处放一行 padding（占位），原因参见 ReqToTokenPool。
+        #       因此实际分配大小 = 运行槽位 size + 预分配槽位 pre_alloc_size + 1 行占位。
         self._alloc_size = size + pre_alloc_size + 1
         self.max_context_len = max_context_len
         self.device = device
@@ -150,6 +187,8 @@ class DecodeReqToTokenPool:
     def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
         # Indices of reqs that already have a req_pool_idx and will reuse
         # their existing slot (e.g. chunked prefill continuing across chunks).
+        # 中译：reusing 收集那些「已经拥有 req_pool_idx、会复用现有槽位」的请求下标
+        #       （例如分块 prefill 跨 chunk 继续时，同一请求需沿用同一个槽位）。
         reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
         assert (
             len(reusing) <= 1
@@ -210,6 +249,8 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.enable_memory_saver = enable_memory_saver
         # Each request needs 1 main mamba slot + ping-pong slots when extra_buffer is enabled.
         # Cap the pool at max concurrent requests * slots_per_req to avoid allocating failed.
+        # 中译：每个请求需要 1 个主 mamba 槽位；当启用 extra_buffer 时还需额外的 ping-pong 槽位。
+        #       池大小上限设为「最大并发请求数 * 每请求槽位数」，以避免运行期分配失败。
         slots_per_req = 1 + (
             self.mamba_ping_pong_track_buffer_size if enable_mamba_extra_buffer else 0
         )
@@ -253,6 +294,7 @@ class DecodeRequest:
     metadata_buffer_index: int = -1
 
     # HiCache Status
+    # 中译：以下为 HiCache（分层缓存）相关状态字段，用于记录 decode 侧命中/回载的前缀 KV 情况。
     prefix_match: Optional[DecodePrefixMatch] = None
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
     hicache_restored_node: Any = None
@@ -271,6 +313,9 @@ class DecodeRequest:
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
     Store the requests that are preallocating.
+
+    中译：预分配队列。存放正处于「预分配 KV」阶段的请求——即已发起握手、正在等待或
+          已获得本地 KV 空间的请求。这是 decode 请求生命周期的第一个队列。
     """
 
     def __init__(
@@ -315,13 +360,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
+        # 中译：queue——已创建接收器、等待预分配 KV 的请求主队列。
         self.queue: List[DecodeRequest] = []
+        # 中译：retracted_queue——被回退（retract，因显存不足被换出）的请求，待后续重新分配。
         self.retracted_queue: List[Req] = []
+        # 中译：pending_reqs——尚未解析出 prefill 侧 dp rank、需走慢路径查询的请求。
         self.pending_reqs: List[DecodeRequest] = []
+        # 中译：以下四个字段用于控制「解析 prefill 信息（_ensure_prefill_info）」的重试节奏：
+        #       _ensure_retry_count：每个 bootstrap 地址已重试的次数（以调度周期计）。
         self._ensure_retry_count: Dict[str, int] = {}
-        self._max_ensure_retries: int = 15  # scheduling cycles
+        self._max_ensure_retries: int = 15  # scheduling cycles  # 中译：最大重试周期数
+        # 中译：_ensure_last_attempt_time：每个地址上次尝试解析的时间戳，用于控制重试间隔。
         self._ensure_last_attempt_time: Dict[str, float] = {}
-        self._ensure_retry_interval: float = 1.0  # seconds
+        self._ensure_retry_interval: float = 1.0  # seconds  # 中译：重试间隔（秒）
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         if self.enable_staging and self.is_mla_backend:
             raise RuntimeError(
@@ -338,6 +389,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         ):
             # Fallback for SWA allocators that still allocate the SWA pool at
             # full prompt length.
+            # 中译：对于仍按「完整 prompt 长度」分配 SWA 池的分配器，这里做一个降级处理：
+            #       把 max_total_num_tokens 限制为模型的 swa_max_total_num_tokens，避免预估过高。
             self.max_total_num_tokens = min(
                 self.max_total_num_tokens,
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
@@ -411,6 +464,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
+            # 中译：（推测解码时）需一并传输 draft 草稿模型的 KV Cache；其索引总是与 target
+            #       目标模型共享（因此无需单独的一套索引）。
             draft_kv_data_ptrs, draft_kv_data_lens, draft_kv_item_lens = (
                 self.draft_token_to_kv_pool.get_contiguous_buf_infos()
             )
@@ -445,6 +500,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.is_mla_backend,
         )
         # Staging buffer setup (only when heterogeneous TP staging is enabled)
+        # 中译：配置 staging（暂存）缓冲区，仅在开启异构 TP staging 时生效（MLA 不支持）。
+        #       用于 prefill 与 decode 两侧 TP 大小不一致时，先落到中转缓冲区再重排到目标布局。
         if self.enable_staging and not self.is_mla_backend:
             kv_pool_for_heads = self.token_to_kv_pool
             if hasattr(kv_pool_for_heads, "full_kv_pool"):
@@ -462,34 +519,50 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return kv_manager
 
     def add(self, req: Req, is_retracted: bool = False) -> None:
-        """Add a request to the pending queue."""
+        """Add a request to the pending queue.
+
+        中译：把一个请求加入预分配（pending）队列。
+              若是被回退的请求，直接放回 retracted_queue；否则创建 KV 接收器，
+              并尝试走快路径（本地缓存）解析 prefill 侧 dp rank 后直接 init；
+              若无法解析则放入 pending_reqs，后续走慢路径查询。
+        """
+        # 中译：若请求长度超过 KV 容量上限，直接在内部报错/中止并返回，不入队。
         if self._check_if_req_exceed_kv_capacity(req):
             return
 
         if is_retracted:
+            # 中译：被回退的请求清空 retraction_mb_id，直接放入回退队列等待重新调度。
             req.retraction_mb_id = None
             self.retracted_queue.append(req)
         else:
+            # 中译：为新请求创建 KV 接收器并封装为 DecodeRequest。
             decode_req = self._create_receiver_and_enqueue(req)
 
             # NOTE: fake transfer does not need to resolve prefill dp rank in the pending queue
+            # 中译：fake transfer（伪传输，仅测试用）无需在 pending 队列中解析 prefill dp rank，
+            #       直接用 rank 0 初始化接收器即可。
             if _is_fake_transfer(req, self.scheduler.server_args):
                 decode_req.kv_receiver.init(0)
                 return
 
             # Fast path: cache-only lookup, no network calls
+            # 中译：快路径——仅查本地缓存，不发网络请求；若能直接解析出 dp rank 则立即 init。
             prefill_dp_rank = self._resolve_prefill_dp_rank(req)
             logger.debug(f"prefill_dp_rank: {prefill_dp_rank}")
             if prefill_dp_rank is not None:
                 decode_req.kv_receiver.init(prefill_dp_rank)
                 return
 
+            # 中译：快路径未命中（本地无缓存），放入 pending_reqs 等待慢路径解析。
             self.pending_reqs.append(decode_req)
 
     def _match_prefix_and_lock(self, req: Req) -> DecodePrefixMatch:
         """
         Match a request against the decode-side radix cache, lock the matched
         node to prevent eviction, and return the matched prefix information.
+
+        中译：在 decode 侧的 radix cache（前缀树）中对请求做前缀匹配，锁住命中节点
+              以防止被驱逐（eviction），并返回匹配到的前缀信息。
         """
         result = match_prefix_for_req(
             self.tree_cache,
@@ -499,12 +572,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             include_req=True,
         )
         # Always lock to match aggregated scheduling behavior
+        # 中译：总是加锁，以与聚合式（非分离）调度的行为保持一致。
         self.tree_cache.inc_lock_ref(result.last_device_node)
         return self._build_decode_prefix_match(req, result)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
         # If None, it will go to the slow path and resolve prefill_info by _ensure_prefill_info then cache it
+        # 中译：若本地缓存中无 prefill_info（返回 None），会走慢路径通过 _ensure_prefill_info
+        #       去解析，并将结果缓存下来。
         if prefill_info is None:
             return None
 
@@ -562,7 +638,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return False
 
     def extend(self, reqs: List[Req], is_retracted: bool = False) -> None:
-        """Add a request to the pending queue."""
+        """Add a request to the pending queue.
+
+        中译：批量版的 add——把一组请求逐个加入预分配（pending）队列。
+        """
         for req in reqs:
             self.add(req, is_retracted=is_retracted)
 
@@ -580,8 +659,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self, rids_to_check: Optional[List[str]] = None
     ) -> List[Req]:
         # TODO refactor the scheduling part, reuse with the unified engine logic as much as possible
+        # 中译：恢复被回退（retracted）的请求——在显存回升后，尽量把回退队列中的请求
+        #       重新预分配并回载其 KV。
+        #       TODO（原注）：重构调度部分，尽可能复用统一引擎（unified engine）的逻辑。
 
         # allocate memory
+        # 中译：先估算可分配的 token 预算（区分是否使用 SWA 尾部预分配）。
         resumed_reqs = []
         indices_to_remove = set()
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
@@ -616,6 +699,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 swa_allocatable_tokens -= swa_required
 
             # load from cpu, release the cpu copy
+            # 中译：从 CPU 回载 KV Cache 到显存，并释放 CPU 上的副本。
             req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
 
         self.retracted_queue = [
@@ -633,6 +717,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             return
 
         # Still poll if any receiver was aborted, otherwise it stays stuck.
+        # 中译：即使所有请求都已「等待输入」，只要有接收器被 abort（Failed）也仍需轮询，
+        #       否则那个失败请求会一直卡住无法推进。
         if all(decode_req.waiting_for_input for decode_req in self.queue) and not any(
             decode_req.kv_receiver.conclude_state == KVPoll.Failed
             for decode_req in self.queue
@@ -661,6 +747,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     error_message += f" with exception {e}"
                     is_propagated = getattr(e, "is_from_another_rank", False)
                 # Mute error message for propagated exceptions to avoid duplicate logging
+                # 中译：对于从其他 rank 传播而来的异常，静默错误信息（降为 debug）以避免重复日志。
                 if is_propagated:
                     logger.debug(error_message)
                 else:
@@ -679,7 +766,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self, addr_to_reqs: Dict[str, List[DecodeRequest]]
     ) -> Tuple[Dict[str, List[DecodeRequest]], List[DecodeRequest]]:
         """Non-blocking ensure parallel info for each addr.
-        Returns (ready_addrs, remaining_reqs)."""
+        Returns (ready_addrs, remaining_reqs).
+
+        中译：非阻塞地为每个（bootstrap）地址确保已获取 prefill 侧的并行信息。
+              受重试间隔与最大重试次数控制；达到上限仍失败则 abort 对应请求。
+              返回（已就绪的地址 -> 请求列表，尚需等待重试的剩余请求）。
+        """
         ready: Dict[str, List[DecodeRequest]] = {}
         remaining: List[DecodeRequest] = []
 
@@ -718,17 +810,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return ready, remaining
 
     def _resolve_pending_reqs(self) -> None:
-        """Batch-resolve prefill_dp_ranks for pending requests and initialize receivers."""
+        """Batch-resolve prefill_dp_ranks for pending requests and initialize receivers.
+
+        中译：批量为 pending 请求解析 prefill 侧 dp rank，并初始化其 KV 接收器。
+              处理流程分两趟：先确保拿到并行信息（Pass 1），再对已就绪地址解析 dp rank（Pass 2）。
+        """
         if not self.pending_reqs:
             return
 
         # Group pending requests by bootstrap_addr
+        # 中译：按 bootstrap 地址对 pending 请求分组（同一 prefill 节点的请求归为一组）。
         addr_to_reqs: Dict[str, List[DecodeRequest]] = {}
         for decode_req in self.pending_reqs:
             addr = _bootstrap_addr(decode_req.req)
             addr_to_reqs.setdefault(addr, []).append(decode_req)
 
         # Pass 1: ensure parallel info for each addr
+        # 中译：第一趟——为每个地址确保已拿到 prefill 侧并行信息。
         ready_addrs, remaining = self._ensure_prefill_info(addr_to_reqs)
 
         resolved: List[Tuple[DecodeRequest, int]] = []
@@ -742,6 +840,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     need_query.append(decode_req)
 
             # Pass 2: resolve dp rank for addrs whose info is available
+            # 中译：第二趟——对那些已拿到信息但本地仍无法直接推导的请求，
+            #       向 prefill 侧批量查询 dp rank（按 bootstrap_room）。
             if need_query:
                 rooms = [decode_req.req.bootstrap_room for decode_req in need_query]
                 room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
@@ -764,7 +864,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def pop_preallocated(
         self, rids_to_check: Optional[List[str]] = None
     ) -> Tuple[List[DecodeRequest], List[DecodeRequest]]:
-        """Pop the preallocated requests from the pending queue (FIFO)."""
+        """Pop the preallocated requests from the pending queue (FIFO).
+
+        中译：从预分配队列中按 FIFO（先入先出）弹出已完成预分配的请求。
+              流程：先解析 pending 请求、更新握手状态；将失败请求出队；然后在显存/
+              元数据 buffer 等预算允许的前提下，尽量为已握手完成的请求预分配 KV。
+              返回（已预分配请求列表，失败请求列表）。
+        """
+        # 中译：先解析 pending 请求（拿 dp rank、init 接收器），再更新握手等待者状态。
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check)
 
@@ -774,6 +881,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # We need to make sure that the sum of inflight tokens and allocatable tokens is greater than maximum input+output length of each inflight request
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
+        # 中译：必须保证「在途 token 数 + 可分配 token 数」大于每个在途请求的最大输入+输出长度；
+        #       否则可能出现：某个正在 decode 的请求显存耗尽（OOM），而其他请求都卡在无法
+        #       回退（retract）的传输队列里，造成死锁。这里先算出可回退的 token 总量。
         retractable_tokens = sum(
             len(r.origin_input_ids) + len(r.output_ids)
             for r in self.scheduler.running_batch.reqs
@@ -801,6 +911,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         full_allocatable_tokens -= reserved_restore_tokens
         # Sort by priority before any index-based bookkeeping so that both the
         # abort-scan loop and the preallocation loop operate on the same order.
+        # 中译：在任何基于下标的记账之前先按优先级排序，确保「扫描 abort 循环」与
+        #       「预分配循环」作用于同一个顺序（否则下标会错位）。
         if self.scheduler.enable_priority_scheduling:
             priority_sign = (
                 1 if self.scheduler.schedule_low_priority_values_first else -1
@@ -808,6 +920,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.queue.sort(key=lambda r: r.req.priority * priority_sign)
 
         # First, remove all failed requests from the queue
+        # 中译：第一步：先把队列中所有已失败（FINISH_ABORT）的请求清理出队，
+        #       回流给客户端并释放其接收器。
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -825,6 +939,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Each admitted req needs padded_buffer_size from hisparse device pool.
         # waiting_queue reqs already have device buffers (allocated in admit_request_direct),
         # only transfer_queue reqs are pending device buffer allocation.
+        # 中译：HiSparse 物理约束：可接纳请求数受设备 buffer 容量限制。
+        #       每个被接纳请求需从 hisparse 设备池占用 padded_buffer_size；
+        #       waiting_queue 中的请求已拥有设备 buffer（在 admit_request_direct 中分配），
+        #       只有 transfer_queue 中的请求尚待分配设备 buffer。
         hisparse_req_budget = float("inf")
         if self.scheduler.enable_hisparse:
             hisparse_avail = (
@@ -837,6 +955,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
 
         # Then, preallocate the remaining requests if possible
+        # 中译：第二步：在各项预算（req_pool、元数据 buffer、HiSparse、显存 token）允许的情况下，
+        #       为剩余已握手请求逐个预分配 KV（任一预算不够就 break，保证 FIFO）。
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
                 continue
@@ -858,10 +978,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             # Memory estimation: don't add if the projected memory cannot be met
             # TODO: add new_token ratio
+            # 中译：显存估算：若预估显存无法满足则不接纳该请求。TODO（原注）：加入 new_token 比率。
             origin_input_len = len(decode_req.req.origin_input_ids)
             prefix_match: Optional[DecodePrefixMatch] = None
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
                 # Match prefix against decode's radix cache.
+                # 中译：在 decode 侧 radix cache 中做前缀匹配（并锁住命中节点）。
                 prefix_match = self._match_prefix_and_lock(decode_req.req)
                 prefix_indices = prefix_match.prefix_indices
                 # prefix_len: tokens already on device (L1 hit).
@@ -869,6 +991,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # (L1 + L2 host hit + L3 storage hit), sent as PD
                 # protocol's `decode_prefix_len`. The [prefix_len, total)
                 # gap is filled by HiCache loadback later.
+                # 中译：prefix_len：已在设备（显存）上的 token 数（L1 命中）。
+                #       total_prefix_len：承诺给 prefill 的完整前缀长度
+                #       （L1 + L2 主机命中 + L3 存储命中），作为 PD 协议的 `decode_prefix_len` 发送。
+                #       [prefix_len, total) 之间的缺口稍后由 HiCache 回载（loadback）填补。
                 prefix_len = prefix_match.l1_prefix_len
                 total_prefix_len = prefix_match.decode_prefix_len
 
@@ -879,6 +1005,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # Matching may lock previously-evictable radix pages, so refresh
                 # the admission budget against the post-lock pool state before we
                 # decide whether this request still fits.
+                # 中译：前缀匹配可能会锁住之前可驱逐的 radix 页，因此在判断该请求是否仍能装下
+                #       之前，先基于「加锁后的池状态」重新刷新接纳预算。
                 full_allocatable_tokens = self._allocatable_token_budgets(
                     retractable_tokens=retractable_tokens,
                     count_retracted=True,
@@ -946,6 +1074,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
             # This accounts for page rounding and newly locked evictable cache.
+            # 中译：为下一个队列项重新从实际池状态计算预算，以计入页对齐开销及新锁住的可驱逐缓存。
             if prefix_match is not None:
                 reserved_restore_tokens += prefix_match.restore_token_count
             full_allocatable_tokens = self._allocatable_token_budgets(
@@ -957,6 +1086,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if uses_swa_tail_prealloc:
                 # SWA budget uses simple decrement (no radix cache eviction in
                 # the SWA pool, so page-rounding drift is negligible).
+                # 中译：SWA 预算直接递减即可（SWA 池不做 radix 缓存驱逐，页对齐误差可忽略）。
                 swa_allocatable_tokens -= swa_required
             decode_req.req.cache_protected_len = total_prefix_len
 
@@ -965,12 +1095,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if self.scheduler.enable_hisparse:
                 # Direct-to-host sends host/C4 rows; keep allocator.page_size
                 # logical and use the compressed page size only for these indices.
+                # 中译：直达主机（Direct-to-host）方式发送的是 host/C4 行；保持 allocator.page_size
+                #       为逻辑页大小，仅对这些索引使用压缩后的页大小。
                 kv_transfer_page_size = getattr(
                     self.token_to_kv_pool_allocator,
                     "hisparse_page_size",
                     page_size,
                 )
                 # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
+                # 中译：必须转为 int32 以便 ZMQ 序列化（from_zmq 按 np.int32 读取）。
                 kv_indices = (
                     dst_kv_indices[: origin_input_len - prefix_len]
                     .cpu()
@@ -979,6 +1112,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             else:
                 # Only send delta indices (beyond prefix) to prefill.
+                # 中译：仅向 prefill 发送「前缀之外的增量（delta）索引」（前缀部分已命中，无需重传）。
                 kv_indices = (
                     self.req_to_token_pool.req_to_token[decode_req.req.req_pool_idx][
                         total_prefix_len:origin_input_len
@@ -1019,6 +1153,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     decode_req.req.req_pool_idx, :seq_len
                 ]
                 # Indexer lives on device pool; always use device page_size
+                # 中译：indexer 位于设备池上，因此总是使用设备端的 page_size。
                 device_page_size = self.token_to_kv_pool.page_size
                 return kv_to_page_indices(
                     kv_indices_full.cpu().numpy(), device_page_size
@@ -1027,6 +1162,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             def _swa_ring_payload():
                 # Mirror of prefill _swa_ring_payload using this side's req_pool_idx.
                 # Same window positions and order -> positional match with prefill.
+                # 中译：与 prefill 侧 _swa_ring_payload 镜像对应，但使用本侧自己的 req_pool_idx。
+                #       采用相同的窗口位置与顺序，从而在位置上与 prefill 对应得上。
                 ring_stride = self.token_to_kv_pool.unified_swa_ring_size
                 window_size = self.token_to_kv_pool.unified_swa_window
                 window_start = max(0, seq_len - window_size)
@@ -1155,6 +1292,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.scheduler.enable_hisparse:
             # HiSparse pre-alloc only allocates logical indices (alloc_logical_only),
             # so the logical pool is the binding constraint for admission control.
+            # 中译：HiSparse 预分配仅分配逻辑索引（alloc_logical_only），因此逻辑池
+            #       才是接纳控制（admission control）的真正约束。
             available_size = (
                 self.token_to_kv_pool_allocator.logical_attn_allocator.available_size()
             )
@@ -1166,6 +1305,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             available_size = self.token_to_kv_pool_allocator.available_size()
             # Include evictable decode-radix cache entries in the budget -- they
             # can be freed on demand before allocation.
+            # 中译：把可驱逐的 decode-radix 缓存项也计入预算——它们可在分配前按需释放。
             if self.scheduler.server_args.disaggregation_decode_enable_radix_cache:
                 available_size += self.tree_cache.evictable_size()
         allocatable_tokens = available_size - max(
@@ -1174,6 +1314,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
         #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
+        # 中译：注意——若上一个预构建（prebuilt）extend 批刚刚完成，而下一轮立即进入
+        #       `pop_preallocated`，此时该 extend 批不在任何队列中，因此需要在这里显式扣除
+        #       其预留的 token 槽位。
         if (
             self.scheduler.last_batch
             and self.scheduler.last_batch.forward_mode.is_prebuilt()
@@ -1223,6 +1366,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # `num_reserved_decode_tokens * n_active` (correct for the full
         # pool) over-reserves SWA in steady state. Cap by the actual
         # remaining headroom up to per-req window cap.
+        # 中译：SWA 的增长受滑动窗口限制：一旦某请求的 SWA 占用达到 `sliding_window_size`，
+        #       后续解码 token 会驱逐旧 token，净增长为零。线性预留
+        #       `num_reserved_decode_tokens * n_active`（对完整池而言是正确的）在稳态下会
+        #       对 SWA 过度预留。因此按「实际剩余余量」且不超过「每请求窗口上限」来封顶。
         window_size = self.scheduler.sliding_window_size or 0
         swa_total = self.token_to_kv_pool_allocator.size_swa
         swa_used = swa_total - self.token_to_kv_pool_allocator.swa_available_size()
@@ -1235,6 +1382,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
         #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
+        # 中译：同上——若上一个 prebuilt extend 批刚完成且本轮立即进入 pop_preallocated，
+        #       它不在任何队列中，故需在此显式扣除其 SWA 预留 token。
         if (
             self.scheduler.last_batch
             and self.scheduler.last_batch.forward_mode.is_prebuilt()
@@ -1279,6 +1428,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         prefix committed to prefill as ``decode_prefix_len`` (L1 + L2 + L3);
         the ``[prefix_len, total_prefix_len)`` gap is filled later by HiCache
         loadback.
+
+        中译：为 req_to_token 与 token_kv_pool 预分配内存。
+              ``prefix_len``：L1 层已驻留于设备（显存）的前缀长度（已由 ``prefix_indices`` 支撑）。
+              ``total_prefix_len``：承诺给 prefill 的完整前缀长度（即 ``decode_prefix_len``，
+              含 L1 + L2 + L3）；区间 ``[prefix_len, total_prefix_len)`` 的缺口稍后由 HiCache 回载填补。
         """
         if prefix_len is None:
             prefix_len = 0
@@ -1303,12 +1457,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # TODO(retraction): when retraction is implemented with radix cache
         # awareness, a retracted request should re-match the tree here
         # instead of re-allocating from scratch. See resume_retracted_reqs.
+        # 中译：TODO（回退）：当回退机制实现为感知 radix cache 后，被回退的请求应在此处
+        #       重新匹配前缀树，而非从头重新分配。参见 resume_retracted_reqs。
         delta_len = fill_len - total_prefix_len
         required_alloc_tokens = self._required_alloc_tokens(
             fill_len=fill_len, prefix_len=prefix_len
         )
 
         # Evict cached entries if the pool doesn't have enough free pages.
+        # 中译：若池中空闲页不够，先驱逐（evict）一些可驱逐的缓存项以腾出空间。
         if (
             self.scheduler.server_args.disaggregation_decode_enable_radix_cache
             and self.token_to_kv_pool_allocator.available_size() < required_alloc_tokens
@@ -1333,10 +1490,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if self.scheduler.enable_hisparse:
             # HiSparse is incompatible with decode-side L1 radix cache. Keep
             # this path on the upstream full-allocation semantics.
+            # 中译：HiSparse 与 decode 侧 L1 radix cache 不兼容，故此路径保持上游的「全量分配」语义。
             assert prefix_len == 0
 
             # Direct-to-host path: only allocate logical indices (no hisparse
             # device indices) and allocate host indices for RDMA destination.
+            # 中译：直达主机路径：仅分配逻辑索引（不分配 hisparse 设备索引），
+            #       并为 RDMA 目的地分配主机端索引。
             coordinator = self.scheduler.hisparse_coordinator
             device = self.token_to_kv_pool_allocator.device
             kv_loc = self.token_to_kv_pool_allocator.alloc_logical_only(
@@ -1370,6 +1530,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # When prefix_len > 0 (radix cache hit), we fall back to
                 # alloc_extend which allocates SWA at full page count; the
                 # SWA budget in that case may slightly under-estimate.
+                # 中译：仅分配 SWA 尾部：仅当 prefix_len == 0 时有效。
+                #       当 prefix_len > 0（radix 缓存命中）时回退到 alloc_extend，它按完整页数分配 SWA；
+                #       那种情况下 SWA 预算可能会略微低估。
                 kv_loc = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
                     prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
                     prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
@@ -1413,18 +1576,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Truncate fill_len to kv_committed_len so cache_unfinished_req only
         # inserts committed KV into the radix tree. The last output token
         # hasn't had KV committed yet (output_ids is 1 ahead).
+        # 中译：把 fill_len 截断到 kv_committed_len，以保证 cache_unfinished_req 只把已提交的 KV
+        #       插入 radix 树。最后一个输出 token 的 KV 尚未提交（output_ids 比 KV 领先 1 个）。
         req.full_untruncated_fill_ids = req.origin_input_ids + req.output_ids
         req.fill_len = req.kv_committed_len
         # Set prefix_indices so downstream consumers (init_next_round_input,
         # prepare_for_extend) see the correct prefix length. In the agg path
         # this is done inside init_next_round_input, but decode-disagg needs
         # allocation info before batch assembly so we set it here.
+        # 中译：设置 prefix_indices，以便下游消费者（init_next_round_input、prepare_for_extend）
+        #       能看到正确的前缀长度。在聚合（agg）路径中这是在 init_next_round_input 内完成的，
+        #       但 decode-disagg 在组批前就需要分配信息，故在此处设置。
         req.prefix_indices = (
             prefix_indices if prefix_len > 0 else torch.empty((0,), dtype=torch.int64)
         )
         req.set_extend_input_len(req.fill_len - total_prefix_len)
 
         # Return the transfer destination indices:
+        # 中译：返回传输目的地索引（供 prefill 向此处写入 KV）：
+        #       HiSparse 返回主机端索引，否则返回显存 KV 位置 kv_loc。
         if self.scheduler.enable_hisparse:
             return host_indices
         return kv_loc
@@ -1433,6 +1603,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     """
     Store the requests that is polling kv
+
+    中译：传输队列。存放「正在轮询 KV 传输状态」的请求——即已预分配好目标显存、
+          等待 prefill 节点把 KV 传过来的请求。传输完成后会移入等待队列。
     """
 
     def __init__(
@@ -1484,6 +1657,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         ) = self.metadata_buffers.get_buf(idx)
 
         # Validate bootstrap_room to detect context corruption
+        # 中译：校验 bootstrap_room，以检测上下文错乱（元数据 buffer 索引碰撞）。
         actual_room = output_bootstrap_room[0].item()
         expected_room = (
             decode_req.req.bootstrap_room
@@ -1497,6 +1671,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             # Should never happen: _poll_with_metadata_gate already confirmed
             # readiness on all TP ranks. Abort deterministically to avoid
             # cross-rank queue divergence.
+            # 中译：理论上不应发生：_poll_with_metadata_gate 已在所有 TP rank 上确认就绪。
+            #       这里确定性地 abort，以避免跨 rank 的队列状态发生分歧。
             logger.error(
                 f"Metadata unexpectedly not ready after readiness gate: "
                 f"request {decode_req.req.rid}, bootstrap_room={expected_room}, "
@@ -1514,6 +1690,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         elif actual_room != expected_room:
             # Real corruption detected (mismatch)
             # Abort the request and remove from the queue
+            # 中译：检测到真实的上下文错乱（room 不匹配）：abort 该请求并从队列中移除。
             error_msg = (
                 f"Context corruption detected: Request {decode_req.req.rid} "
                 f"(bootstrap_room={expected_room}) received metadata from "
@@ -1534,6 +1711,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         self._commit_hicache_local_restore_to_req(decode_req)
 
         # Case 3: Success - commit the transfer
+        # 中译：情况 3：传输成功——提交本次传输结果。
         decode_req.req.output_ids.append(output_id[0].item())
         decode_req.req.cached_tokens = cached_tokens[0].item()
         # The prefill node already reported its prefix-cache hit in
@@ -1542,6 +1720,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # only adds decode-side reuse *beyond* what prefill counted, instead of
         # double-counting the shared prompt prefix (which would make
         # cached_tokens exceed prompt_tokens when decode radix cache is on).
+        # 中译：prefill 节点已将其前缀缓存命中数写入 cached_tokens[0]。
+        #       用它初始化 already_computed，这样 prepare_for_prebuilt 中的
+        #       `cached_tokens += pre_len - already_computed` 只累加 decode 侧
+        #       超出 prefill 已计入部分的复用量，而非重复计算共享的 prompt 前缀
+        #       （否则在开启 decode radix cache 时 cached_tokens 会超过 prompt_tokens）。
         decode_req.req.already_computed = decode_req.req.cached_tokens
         decode_req.req.cached_tokens_device = cached_tokens[1].item()
         decode_req.req.cached_tokens_host = cached_tokens[2].item()
@@ -1598,7 +1781,10 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         )
 
     def _init_staging_handler(self, kv_manager):
-        """Create staging handler from kv_manager. Must be called exactly once."""
+        """Create staging handler from kv_manager. Must be called exactly once.
+
+        中译：从 kv_manager 创建 staging（暂存）处理器。必须且只能调用一次。
+        """
         from sglang.srt.disaggregation.common.staging_handler import (
             DecodeStagingHandler,
         )
@@ -1650,6 +1836,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         is_propagated = getattr(e, "is_from_another_rank", False)
                 self._clean_hicache_prefetch_resources(decode_req)
                 # Mute error message for propagated exceptions to avoid duplicate logging
+                # 中译：对于从其他 rank 传播而来的异常，静默错误信息以避免重复日志。
                 if is_propagated:
                     logger.debug(error_message)
                 else:
@@ -1666,6 +1853,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 if self.scheduler.enable_hisparse:
                     self.scheduler.hisparse_coordinator.request_finished(decode_req.req)
                 # release pre-allocated kv cache, but don't insert into the tree since it's failed
+                # 中译：释放已预分配的 KV Cache，但不插入前缀树（因为请求失败了，KV 无效）。
                 release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                 decode_req.kv_receiver.clear()
                 decode_req.kv_receiver = None
@@ -1682,6 +1870,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._commit_transfer_to_req(decode_req)
                 indices_to_remove.add(i)
                 # Check if request was aborted due to corruption
+                # 中译：检查请求是否因上下文错乱而被 abort。
                 if isinstance(decode_req.req.finished_reason, FINISH_ABORT):
                     self.scheduler.output_streamer.stream_output(
                         [decode_req.req],
@@ -1717,6 +1906,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             assert idx != -1
             # Reset so the next owner sees actual_room == 0 ("not yet written")
             # instead of the stale value, avoiding a false-positive mismatch.
+            # 中译：重置 bootstrap_room 为 0，使下一个拥有者读到 "尚未写入" 的状态，
+            #       而非旧的残留值，以避免假阳性不匹配。
             self.metadata_buffers.bootstrap_room[idx] = 0
             self.req_to_metadata_buffer_idx_allocator.free(idx)
 
@@ -1727,18 +1918,30 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         return transferred_reqs
 
     def release_memory_occupation(self):
-        """Clean up in-flight transfers before releasing GPU memory."""
+        """Clean up in-flight transfers before releasing GPU memory.
+
+        中译：在释放 GPU 显存前清理在途传输。
+        """
         self.queue.clear()
 
     def resume_memory_occupation(self):
-        """Queues are already cleared on release; new transfers can be accepted."""
+        """Queues are already cleared on release; new transfers can be accepted.
+
+        中译：队列在 release 时已清空；可接收新的传输。
+        """
         pass
 
 
 class SchedulerDisaggregationDecodeMixin:
+    # 中译：Decode 侧调度器的分离架构混入（Mixin），提供事件循环与批次管理逻辑。
+
     @torch.no_grad()
     def event_loop_normal_disagg_decode(self: Scheduler):
-        """A normal scheduler loop for decode worker in disaggregation mode."""
+        """A normal scheduler loop for decode worker in disaggregation mode.
+
+        中译：分离架构下 decode 工作线程的普通（非重叠）调度循环。
+              每轮循环：接收请求 → 处理 decode 队列 → 取下一批次 → 运行 → 处理结果。
+        """
 
         while True:
             # Receive requests
@@ -1758,6 +1961,7 @@ class SchedulerDisaggregationDecodeMixin:
                 self.process_batch_result(batch, result)
             else:
                 # When the server is idle, do self-check and re-init some states
+                # 中译：服务器空闲时执行自检并重新初始化一些状态。
                 self.on_idle()
 
             # Update last_batch
@@ -1765,10 +1969,13 @@ class SchedulerDisaggregationDecodeMixin:
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
+        # 中译：分离架构下 decode 工作线程的重叠（overlap）调度循环。
+        #       与普通循环不同，调度与前向计算重叠：当前轮调度的批次在下一轮才处理结果。
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
         def pop_and_process():
+            # 中译：从结果队列中弹出一对（batch, result）并处理。
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
@@ -1781,6 +1988,8 @@ class SchedulerDisaggregationDecodeMixin:
                 continue
 
             # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
+            # 中译：WAR（Write-After-Read）屏障：本轮调度要写共享 GPU buffer，
+            #       需等待上一轮前向计算的读完成。
             if self._war_barrier_enabled:
                 self.schedule_stream.wait_stream(self.forward_stream)
 
@@ -1788,6 +1997,7 @@ class SchedulerDisaggregationDecodeMixin:
             batch = self.get_next_disagg_decode_batch_to_run()
             self.cur_batch = batch
             # overlap + spec + grammar is unsupported (would desync DP ranks).
+            # 中译：overlap + spec（推测解码） + grammar 不受支持（会导致 DP rank 间失步）。
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(batch)
 
             if disable_overlap_for_batch and self.last_batch:
@@ -1809,6 +2019,8 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
+            # 中译：运行当前批次的采样。它依赖上一批次的结果（如 grammar），
+            #       所以放在上一批次处理完毕之后执行。
             self.launch_batch_sample_if_needed(batch_result)
 
             # Update last_batch
@@ -1820,6 +2032,7 @@ class SchedulerDisaggregationDecodeMixin:
         if batch.inner_idle_batch is not None:
             idle_batch = batch.inner_idle_batch
             # Reset the inner idle batch to avoid reusing it.
+            # 中译：重置内部 idle 批次引用，避免后续误用。
             batch.inner_idle_batch = None
             return self.run_batch(idle_batch)
 
@@ -1829,8 +2042,12 @@ class SchedulerDisaggregationDecodeMixin:
     def get_next_disagg_decode_batch_to_run(
         self: Scheduler,
     ) -> Optional[ScheduleBatch]:
-        """Process prebuilt batch and schedule the next decode batch."""
+        """Process prebuilt batch and schedule the next decode batch.
+
+        中译：处理预构建（prebuilt）批次并调度下一个解码批次。
+        """
         # Process pending prebuilt batch: output processing + filter + merge
+        # 中译：处理待处理的预构建批次：输出处理 + 过滤 + 合并。
         new_prebuilt_batch = self.get_new_prebuilt_batch()
         if new_prebuilt_batch:
             assert self.chunked_req is None
@@ -1849,6 +2066,7 @@ class SchedulerDisaggregationDecodeMixin:
                     self.running_batch.merge_batch(new_prebuilt_batch)
 
         # Schedule decode batch
+        # 中译：调度解码批次。
         if self.running_batch.is_empty():
             ret = None
         else:
@@ -1861,7 +2079,11 @@ class SchedulerDisaggregationDecodeMixin:
         return ret
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
-        """Create a schedulebatch for fake completed prefill"""
+        """Create a schedulebatch for fake completed prefill
+
+        中译：为「伪完成 prefill」创建 ScheduleBatch——即从等待队列中取出请求，
+              构造一个跳过 prefill 前向计算、仅填充元数据的 extend 批次。
+        """
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
@@ -1880,6 +2102,7 @@ class SchedulerDisaggregationDecodeMixin:
         num_not_used_batch = batch_size - curr_batch_size
 
         # pop req from waiting queue
+        # 中译：从等待队列中取出可运行的请求。
         can_run_list: List[Req] = []
         waiting_queue: List[Req] = []
 
@@ -1891,6 +2114,8 @@ class SchedulerDisaggregationDecodeMixin:
                 # Decode-radix path: new requests already matched in
                 # `pop_preallocated`. Retracted requests reset `last_node`,
                 # so re-match only when that state is missing.
+                # 中译：Decode-radix 路径：新请求已在 `pop_preallocated` 中匹配过前缀。
+                #       被回退的请求重置了 `last_node`，因此仅在该状态缺失时才重新匹配。
                 if self.server_args.disaggregation_decode_enable_radix_cache:
                     tree_cache = self.tree_cache if req.last_node is None else None
                 else:
@@ -1899,6 +2124,8 @@ class SchedulerDisaggregationDecodeMixin:
                 # Truncate fill_len to kv_committed_len so cache_unfinished_req
                 # only sees committed KV (full array includes one uncommitted
                 # token because init_next_round_input rebuilt it as full).
+                # 中译：将 fill_len 截断为 kv_committed_len，使 cache_unfinished_req
+                #       只看到已提交的 KV（完整数组因 init_next_round_input 重建包含一个未提交 token）。
                 if req.kv_committed_len is not None:
                     req.fill_len = req.kv_committed_len
                     req.set_extend_input_len(req.fill_len - len(req.prefix_indices))
@@ -1912,6 +2139,7 @@ class SchedulerDisaggregationDecodeMixin:
         set_time_batch(can_run_list, "set_forward_entry_time")
 
         # construct a schedule batch with those requests and mark as decode
+        # 中译：用这些请求构造一个 ScheduleBatch 并标记为解码模式。
         new_batch = ScheduleBatch.init_new(
             can_run_list,
             self.req_to_token_pool,
@@ -1923,12 +2151,14 @@ class SchedulerDisaggregationDecodeMixin:
         )
 
         # construct fake completed prefill
+        # 中译：构造「伪完成 prefill」——跳过真实前向计算，仅填充元数据。
         new_batch.prepare_for_prebuilt()
         new_batch.process_prebuilt(self.server_args, self.future_map)
 
         return new_batch
 
     def process_decode_queue(self: Scheduler):
+        # 中译：处理 decode 队列——恢复被回退的请求、预分配 KV、传输 KV、移入等待队列。
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 
@@ -1936,10 +2166,12 @@ class SchedulerDisaggregationDecodeMixin:
             self.decode_offload_manager.check_offload_progress()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
+        # 中译：如果有足够空间支持 `num_reserved_decode_tokens` 步解码，尝试恢复被回退的请求。
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
+            # 中译：若仍有被回退的请求，则不分配新请求（优先恢复回退请求）。
             return
 
         if not hasattr(self, "polling_count"):

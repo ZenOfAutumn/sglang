@@ -158,30 +158,49 @@ class CommonKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         # 中译：缓存 KV 参数与预算每条/每组数据项的字节长度总和（供传输量统计用）。
+        # 中译：KVArgs——包含 KV pool 显存地址/长度、每项字节数、head 数、page size、
+        #       state 元数据等底层传输所需的全部参数。
         self.kv_args = args
+        # 中译：单个 token 的 KV cache 总字节数（各层/各分量 item_len 之和），用于把
+        #       “已传索引数”换算成传输总字节数。
         self.kv_item_lens_sum = sum(args.kv_item_lens)
+        # 中译：单个 token 的特殊 state（Mamba/SWA/DSA 等）总字节数，同样用于字节数统计。
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
+        # 中译：是否为 MLA 后端（DeepSeek 类模型）。MLA 的 KV 组织方式不同，影响传输布局。
         self.is_mla_backend = is_mla_backend
+        # 中译：本实例角色——PREFILL 或 DECODE，决定 __init__ 走哪条初始化分支。
         self.disaggregation_mode = disaggregation_mode
+        # 中译：服务端启动参数（并行规模、超时、负载均衡策略等），后续多处从中读取配置。
         self.server_args = server_args
         # for p/d multi node infer
+        # 中译：bootstrap server 的 host（PD 双侧建立关联的控制面服务地址）。
         self.bootstrap_host = server_args.host
+        # 中译：bootstrap server 的端口（多机 prefill 下会在后面跨节点同步为 leader 端口）。
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
+        # 中译：分布式初始化地址（rank 0 地址），多机注册时以它为目标。
         self.dist_init_addr = server_args.dist_init_addr
+        # 中译：以下为当前 rank 在各并行维度下的坐标（size=该维度总规模，rank=本进程序号）。
+        # 中译：attention 张量并行（TP）规模与本 rank 序号。
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
+        # 中译：attention 上下文并行（CP）规模与本 rank 序号。
         self.attn_cp_size = get_attention_cp_size()
         self.attn_cp_rank = get_attention_cp_rank()
+        # 中译：attention 数据并行（DP）规模与本 rank 序号（用于按 room 路由到正确 dp 组）。
         self.attn_dp_size = get_attention_dp_size()
         self.attn_dp_rank = get_attention_dp_rank()
+        # 中译：系统级 DP 规模——启用 dp attention 时视为 1，否则等于 server_args.dp_size。
         self.system_dp_size = (
             1 if server_args.enable_dp_attention else server_args.dp_size
         )
+        # 中译：系统级 DP rank，来自 KVArgs（未提供则默认为 0）。
         self.system_dp_rank = (
             self.kv_args.system_dp_rank if self.kv_args.system_dp_rank else 0
         )
+        # 中译：流水线并行（PP）规模与本 rank 序号。
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
+        # 中译：本机自动探测到的本地 IP，作为本 rank KV 传输控制通道对外暴露的地址。
         self.local_ip = get_local_ip_auto()
         # 中译：为 True 时所有 CP rank 都参与 KV 传输；否则仅 CP rank 0 发送（其余为 dummy）。
         self.enable_all_cp_ranks_for_transfer = (
@@ -191,69 +210,90 @@ class CommonKVManager(BaseKVManager):
         # bind zmq socket
         # 中译：绑定本 rank 的 ZMQ PULL 套接字，自动选取空闲端口；该 (ip, port)
         #       会随后注册到 bootstrap server，作为本 rank 的 KV 传输控制通道地址。
+        # 中译：ZMQ 上下文对象，管理本 rank 所有 ZMQ 套接字的生命周期。
         self._zmq_ctx = zmq.Context()
+        # 中译：rank_port——自动分配到的 PULL 监听端口；server_socket——接收对端
+        #       控制信令（传输信息、KV 参数注册、chunk 就绪通知等）的 PULL 套接字。
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
             self._zmq_ctx, zmq.PULL, host=self.local_ip
         )
         logger.debug(f"kv manager bind to {self.local_ip}:{self.rank_port}")
 
+        # 中译：请求状态表——bootstrap_room -> KVPoll 状态（本 rank 上所有在管请求的状态机）。
         self.request_status: Dict[int, KVPoll] = {}
+        # 中译：出站 PUSH 套接字缓存——按目标地址复用 ZMQ 连接，避免重复建连。
         self._socket_cache: Dict[str, zmq.Socket] = {}
+        # 中译：套接字监控（socket monitor）缓存——按地址复用，用于观察连接事件/断连检测。
         self._monitor_cache: Dict[str, zmq.Socket] = {}
+        # 中译：保护上述套接字缓存的并发访问锁（多线程收发时避免竞态）。
         self._socket_lock = threading.Lock()
+        # 中译：失败记录表——bootstrap_room -> 失败原因字符串，供 failure_exception() 回溯。
         self.failure_records: Dict[int, str] = {}
+        # 中译：保护失败记录表的并发访问锁。
         self.failure_lock = threading.Lock()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             # 中译：PREFILL 角色：同步 leader 端口 -> 向 bootstrap server 注册本 rank
             #       -> 初始化传输信息表与超时阈值。
-            # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
-            # participate in KV transfer; Otherwise only CP rank 0 sends.
+            # 当 SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER 为 True 时，所有 CP rank
+            # 都参与 KV 传输；否则仅 CP rank 0 发送（其余为 dummy）。
             self.is_dummy_cp_rank = (
                 not self.enable_all_cp_ranks_for_transfer
                 and self.attn_cp_size > 1
                 and self.attn_cp_rank != 0
             )
-            # Sync the leader's bootstrap port to every rank before
-            # registering: in multi-node prefill, registration targets
-            # `dist_init_addr` (rank 0) but each rank's local port may
-            # differ when the launcher auto-reserves a free port per host.
+            # 在注册前把 leader 的 bootstrap 端口同步给每个 rank：多节点 prefill 下，
+            # 注册目标是 `dist_init_addr`（rank 0），但当启动器为每台主机自动预留
+            # 空闲端口时，各 rank 的本地端口可能不同，需先同步统一。
             self.bootstrap_port = self._sync_bootstrap_port_across_nodes(
                 self.bootstrap_port
             )
             self.register_to_bootstrap()
+            # 中译：传输信息表——bootstrap_room -> 该请求从 Decode 侧收到的传输目标信息
+            #       （目标地址、目标 KV 索引、aux 目标位置等），是发送 KV 的依据。
             self.transfer_infos = {}
+            # 中译：room -> decode 端已缓存的前缀长度，Prefill 据此跳过前缀、只发送剩余 KV。
             self.req_to_decode_prefix_len: Dict[int, int] = {}
+            # 中译：decode 端 KV 参数注册表——缓存各 Decode 对端注册来的 KVArgs 信息。
             self.decode_kv_args_table = {}
+            # 中译：流水线并行进程组（PP group），用于跨 PP rank 的通信/同步。
             self.pp_group = get_pp_group()
-            # If a timeout happens on the prefill side, it means prefill instances
-            # fail to receive the KV indices from the decode instance of this request.
-            # These timeout requests should be aborted to release the tree cache.
+            # 若 prefill 侧发生超时，说明 prefill 实例未能从该请求对应的 decode 实例
+            # 收到 KV 索引。这些超时请求应被中止以释放 tree cache。
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             # 中译：DECODE 角色：维护连接池/拓扑缓存/心跳失败计数/HTTP 会话池，
             #       并记录 bootstrap_addr <-> 请求 room 的反向映射，用于节点故障时定位受影响请求。
+            # 中译：是否启用 staging（中转缓冲）传输模式，默认关闭，由后续协商开启。
             self.enable_staging: bool = False
+            # 中译：连接池——缓存到各 Prefill rank 端点的连接信息（地址/端口），供复用。
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
+            # 中译：保护连接池的并发访问锁。
             self.connection_lock = threading.Lock()
+            # 中译：room -> 该请求需要收齐的 Prefill 响应数（多 rank 取 KV 时的应答计数目标）。
             self.required_prefill_response_num_table: Dict[int, int] = {}
+            # 中译：Prefill 拓扑缓存——bootstrap_addr -> PrefillServerInfo（并行拓扑 + rank 映射）。
             self.prefill_info_table: Dict[str, PrefillServerInfo] = {}
+            # 中译：心跳失败计数——bootstrap_addr -> 连续失败次数，达到 max_failures 判定对端故障。
             self.heartbeat_failures: Dict[str, int] = {}
+            # 中译：HTTP 会话池——按地址复用 requests.Session（连接保活，降低握手开销）。
             self.session_pool: Dict = defaultdict(requests.Session)
+            # 中译：保护会话池的并发访问锁。
             self.session_pool_lock = threading.Lock()
+            # 中译：地址 -> 该地址上活跃请求 room 集合的反向映射，用于对端故障时快速定位受影响请求。
             self.addr_to_rooms_tracker: Dict[str, Set[int]] = defaultdict(set)
+            # 中译：room -> 已收到响应的 Prefill 端点集合，用于判断某请求的 KV 是否已全部取齐。
             self.prefill_response_tracker: Dict[int, Set[int]] = defaultdict(set)
-            # Heartbeat interval should be at least 2 seconds
+            # 心跳间隔至少为 2 秒。
             self.heartbeat_interval = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
             )
-            # Heartbeat failure should be at least 1
+            # 心跳失败阈值至少为 1。
             self.max_failures = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE.get(), 1
             )
-            # If a timeout happens on the decode side, it means decode instances
-            # fail to receive the KV Cache transfer done signal after bootstrapping.
-            # These timeout requests should be aborted to release the tree cache.
+            # 若 decode 侧发生超时，说明 decode 实例在 bootstrap 之后未能收到
+            # KV Cache 传输完成信号。这些超时请求应被中止以释放 tree cache。
             self.waiting_timeout = envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
         else:
             raise ValueError(
@@ -269,10 +309,10 @@ class CommonKVManager(BaseKVManager):
         #       但已被 clear() 清除的 room 不得被迟到的 Failed “复活”，否则会
         #       污染复用同一 bootstrap_room 的未来请求。
         if bootstrap_room not in self.request_status:
-            # Do not resurrect a cleared entry with Failed: once clear() has
-            # popped the room from request_status, any late update_status(Failed)
-            # (e.g. from abort()) must be a no-op. Otherwise a Failed entry could
-            # pollute a future request that reuses the same bootstrap_room.
+            # 不要用 Failed 复活一个已被清除的条目：一旦 clear() 已把该 room 从
+            # request_status 中弹出，任何迟到的 update_status(Failed)（如来自 abort()）
+            # 都必须是空操作。否则一个 Failed 条目可能污染复用同一 bootstrap_room 的
+            # 未来请求。
             if status == KVPoll.Failed:
                 return
             self.request_status[bootstrap_room] = status
@@ -318,7 +358,7 @@ class CommonKVManager(BaseKVManager):
             logger.error(f"Error fetching prefill server info from bootstrap: {e}")
             return False
 
-        # Sanity checks
+        # 合理性校验（Prefill 与 Decode 两侧的 page_size / kv_cache_dtype 必须一致）。
         if info.page_size is not None and info.page_size != self.kv_args.page_size:
             raise RuntimeError(
                 f"Page size mismatch: prefill server has page_size={info.page_size}, "
@@ -352,7 +392,7 @@ class CommonKVManager(BaseKVManager):
           - decode_tp >  prefill_tp：多个 decode rank 共享一个 prefill rank；
           - decode_tp <  prefill_tp：一个 decode rank 需从多个 prefill rank 取（非MLA）。
         """
-        # TP rank mapping
+        # TP rank 映射
         if self.attn_tp_size == info.attn_tp_size:
             target_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
             required_dst_info_num = 1
@@ -374,7 +414,7 @@ class CommonKVManager(BaseKVManager):
                 logger.warning_once(
                     "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
                 )
-            # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks
+            # 对于非 MLA 模型，一个 decode rank 需从多个 prefill rank 拉取 KVCache。
             target_tp_ranks = list(
                 range(
                     (self.kv_args.engine_rank % self.attn_tp_size)
@@ -383,9 +423,9 @@ class CommonKVManager(BaseKVManager):
                     * (info.attn_tp_size // self.attn_tp_size),
                 )
             )
-            # For MLA models, we can retrieve KVCache from only one prefill rank, but we still need to maintain
-            # multiple connections in the connection pool and have to send dummy requests to other prefill ranks,
-            # or the KVPoll will never be set correctly
+            # 对于 MLA 模型，只需从一个 prefill rank 拉取 KVCache，但仍需在连接池中维持
+            # 多个连接，并向其它 prefill rank 发送 dummy 请求，否则 KVPoll 永远无法被
+            # 正确置位。
             target_tp_rank = target_tp_ranks[0]
             required_dst_info_num = 1
             if self.is_mla_backend:
@@ -393,7 +433,7 @@ class CommonKVManager(BaseKVManager):
             else:
                 required_prefill_response_num = info.attn_tp_size // self.attn_tp_size
 
-        # CP rank mapping — decode cp size should be equal to 1
+        # CP rank 映射 —— decode 的 cp size 应等于 1。
         assert self.attn_cp_size == 1, (
             f"Decode cp size ({self.attn_cp_size}) should be equal to 1",
         )
@@ -405,13 +445,13 @@ class CommonKVManager(BaseKVManager):
         else:
             target_cp_ranks = list(range(info.attn_cp_size))
             if not self.enable_all_cp_ranks_for_transfer:
-                # Only retrieve from prefill CP rank 0 when not using all ranks
+                # 未启用“全部 CP rank 参与”时，仅从 prefill 的 CP rank 0 拉取。
                 target_cp_ranks = target_cp_ranks[:1]
                 required_prefill_response_num *= 1
             else:
                 required_prefill_response_num *= info.attn_cp_size // self.attn_cp_size
 
-        # PP rank mapping — decode pp size should be equal to prefill pp size or 1
+        # PP rank 映射 —— decode 的 pp size 应等于 prefill 的 pp size 或为 1。
         assert self.pp_size == info.pp_size or self.pp_size == 1, (
             f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1",
         )
@@ -437,6 +477,12 @@ class CommonKVManager(BaseKVManager):
         ranks register to `<leader_ip>:<their_local_port>`, hit
         `Connection refused`, and the leader's `prefill_port_table` ends
         up missing rows.
+
+        中译：把 world-rank-0（leader）的 bootstrap 端口广播给所有 prefill rank。
+        多节点 prefill 且启动器为每台主机自动预留空闲端口（如 Dynamo 的
+        `_reserve_disaggregation_bootstrap_port`）时必需：若不同步，非 leader
+        rank 会注册到 `<leader_ip>:<自己的本地端口>`，导致 `Connection refused`，
+        使 leader 的 `prefill_port_table` 缺失部分行。
         """
         if not self.dist_init_addr or self.server_args.nnodes == 1:
             return local_port
@@ -467,14 +513,14 @@ class CommonKVManager(BaseKVManager):
         因为 aiohttp>=3.9 会拒绝 Host 为 0.0.0.0 的请求）。带指数退避重试。
         """
         if self.dist_init_addr:
-            # Multi-node case: bootstrap server's host is dist_init_addr
+            # 多节点情形：bootstrap server 的 host 为 dist_init_addr。
             host = NetworkAddress.parse(self.dist_init_addr).resolved().host
         else:
-            # Single-node case: bootstrap server's host is the same as http server's host
+            # 单节点情形：bootstrap server 的 host 与 http server 的 host 相同。
             host = self.bootstrap_host
-            # If the server was bound to the wildcard address (0.0.0.0 / ::), use the
-            # actual local IP instead — a PUT to http://0.0.0.0:<port>/route is rejected
-            # with 403 by aiohttp ≥3.9 because 0.0.0.0 is not a valid HTTP Host value.
+            # 若服务器绑定到通配地址（0.0.0.0 / ::），则改用真实的本地 IP——
+            # 因为 aiohttp ≥3.9 会以 403 拒绝 Host 为 0.0.0.0 的 PUT 请求
+            # （http://0.0.0.0:<port>/route），0.0.0.0 不是合法的 HTTP Host 值。
             if host in ("0.0.0.0", "::"):
                 host = self.local_ip
 
@@ -509,7 +555,7 @@ class CommonKVManager(BaseKVManager):
                     f"Prefill register attempt {attempt + 1}/{max_retries} failed: status {response.status_code}"
                 )
             except Exception as e:
-                # Walk to root cause to skip misleading urllib3 wrapper messages
+                # 递归到根因，跳过 urllib3 包装层产生的误导性错误信息。
                 cause = e
                 while cause.__cause__ is not None:
                     cause = cause.__cause__
@@ -583,8 +629,8 @@ class CommonKVManager(BaseKVManager):
             num_kv_layers < dst_num_total_layers
             and dst_num_total_layers % num_kv_layers != 0
         ):
-            # Case: Decode has draft model KV while Prefill is deployed without speculative decoding
-            # dst_kv_ptrs layout: [K_main..., V_main..., draft_K..., draft_V...]
+            # 情形：Decode 带有 draft 模型的 KV，而 Prefill 部署时未开启投机解码。
+            # dst_kv_ptrs 布局：[K_main..., V_main..., draft_K..., draft_V...]。
             multiplier_ratio = dst_num_total_layers // num_kv_layers
             dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
             v_ptr_offset = num_kv_layers * multiplier_ratio
@@ -592,7 +638,7 @@ class CommonKVManager(BaseKVManager):
                 v_ptr_offset + start_layer : v_ptr_offset + end_layer
             ]
         else:
-            # Decode pp size should be equal to prefill pp size or 1
+            # decode 的 pp size 应等于 prefill 的 pp size 或为 1。
             dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
             dst_v_ptrs = dst_kv_ptrs[
                 dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
@@ -603,16 +649,14 @@ class CommonKVManager(BaseKVManager):
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
     ) -> Tuple[List[int], List[int], int]:
-        # Fast path: both sides use exactly the same PP layout
+        # 快路径：两侧使用完全相同的 PP 布局。
         if len(src_kv_ptrs) == len(dst_kv_ptrs):
             return src_kv_ptrs, dst_kv_ptrs, len(src_kv_ptrs)
 
         mla_ratios = getattr(self.kv_args, "mla_compression_ratios", None)
         if mla_ratios:
-            # Compressed-MLA (e.g. DeepSeek V4): the flat list is organized
-            # by buffer type (compression-ratio bucket) rather than by
-            # layer, so we locate the sub-range for this PP stage inside each
-            # section of the dst flat list.
+            # 压缩型 MLA（如 DeepSeek V4）：扁平列表按 buffer 类型（压缩率桶）而非
+            # 按层组织，因此需在 dst 扁平列表的每个分段内定位本 PP stage 对应的子区间。
             sliced_src_kv_ptrs, sliced_dst_kv_ptrs = self._mla_slice_ptrs_for_pp(
                 src_kv_ptrs, dst_kv_ptrs, mla_ratios
             )
@@ -622,10 +666,10 @@ class CommonKVManager(BaseKVManager):
                 len(sliced_src_kv_ptrs),
             )
 
-        # Regular MLA PP slicing
+        # 常规 MLA 的 PP 切片。
         start_layer = self.kv_args.prefill_start_layer
         end_layer = start_layer + len(src_kv_ptrs)
-        # Decode pp size should be equal to prefill pp size or 1
+        # decode 的 pp size 应等于 prefill 的 pp size 或为 1。
         sliced_dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
         return src_kv_ptrs, sliced_dst_kv_ptrs, len(src_kv_ptrs)
 
@@ -662,6 +706,27 @@ class CommonKVManager(BaseKVManager):
         decode-side full-model list (when decode is PP=1). We slice dst to
         match src's PP stage. If src itself is also full-model, it is
         returned unchanged.
+
+        中译：在 PP 下为压缩型 MLA pool（如 DeepSeek V4）生成对齐的（src, dst）指针列表。
+
+        该 pool 可能产生两种扁平列表布局（根据 dst 长度区分）：
+
+        - kv_data 布局，长度 = 2 * c4_L + c128_L：
+            [c4_layer_{0..c4_L-1},
+             c4_indexer_layer_{0..c4_L-1},
+             c128_layer_{0..c128_L-1}]
+          每个分段内部按该压缩桶内的“压缩层 id”索引。
+
+        - state_data 布局，长度 = swa_L + 2 * c4_L + c128_L：
+            [swa_layer_{0..swa_L-1},
+             compress_state_{非 None, c4_L + c128_L},
+             indexer_compress_state_{非 None, c4_L}]
+          ``swa_L`` 是 SWA pool 的实际 buffer 数（``num_effective_layers``），
+          当 HF 配置的 ``compress_ratios`` 包含未落入 SWA pool 的层（如尾部的
+          MTP/nextn 槽位）时，它可能小于 ``len(mla_ratios)``。
+
+        src 已在 prefill 侧经 PP 过滤；dst 是 decode 侧的全模型列表（当 decode 为 PP=1）。
+        我们对 dst 切片以匹配 src 的 PP stage；若 src 本身也是全模型，则原样返回。
         """
         start_layer = self.kv_args.prefill_start_layer
         end_layer = getattr(self.kv_args, "prefill_end_layer", None)
@@ -687,9 +752,8 @@ class CommonKVManager(BaseKVManager):
             )
             return src_kv_ptrs, sliced_dst
 
-        # State-data layout. ``swa_L`` is derived from the actual dst
-        # length so we tolerate cases where the SWA pool has fewer
-        # buffers than ``len(mla_ratios)`` (e.g. nextn padding).
+        # state_data 布局。``swa_L`` 由实际 dst 长度推导而来，以容忍 SWA pool
+        # 的 buffer 数少于 ``len(mla_ratios)`` 的情形（如 nextn 填充）。
         swa_L = len(dst_kv_ptrs) - 2 * c4_full - c128_full
         if swa_L < 0 or swa_L > len(mla_ratios):
             raise ValueError(
@@ -700,15 +764,14 @@ class CommonKVManager(BaseKVManager):
                 f"(c4={c4_full}, c128={c128_full}, "
                 f"total={len(mla_ratios)})."
             )
-        # Guard against asking the prefill side to read past the SWA
-        # pool boundary.
+        # 防止让 prefill 侧读取超出 SWA pool 边界。
         assert end_layer <= swa_L, (
             f"prefill_end_layer ({end_layer}) exceeds dst SWA pool "
             f"buffer count ({swa_L}); compression_ratios may include "
             f"layers (e.g. nextn) that the SWA pool does not cover."
         )
 
-        # compress_state non-None count up to L = count(r != 0).
+        # 截至第 L 层的 compress_state 非 None 数 = count(r != 0)。
         c_non_zero_s = sum(1 for r in mla_ratios[:start_layer] if r != 0)
         c_non_zero_e = sum(1 for r in mla_ratios[:end_layer] if r != 0)
         compress_section_start = swa_L
@@ -786,7 +849,10 @@ class CommonKVManager(BaseKVManager):
         threading.Thread(target=heartbeat_checker, daemon=True).start()
 
     def _on_heartbeat_success(self, bootstrap_addr: str):
-        """Hook called on successful heartbeat. Override for backend-specific cleanup."""
+        """Hook called on successful heartbeat. Override for backend-specific cleanup.
+
+        中译：心跳成功时调用的钩子。子类可重写以做后端特定的清理。
+        """
         pass
 
     def _handle_node_failure(self, failed_bootstrap_addr: str):
@@ -799,7 +865,7 @@ class CommonKVManager(BaseKVManager):
             keys_to_remove = [
                 k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
             ]
-            # Collect TCP endpoints from cached bootstrap_infos before deletion
+            # 在删除前从缓存的 bootstrap_infos 中收集 TCP 端点。
             stale_endpoints = set()
             for k in keys_to_remove:
                 for info in self.connection_pool[k]:
@@ -857,16 +923,31 @@ class CommonKVSender(BaseKVSender):
         dest_tp_ranks: List[int],
         pp_rank: int,
     ):
+        # 中译：后端无关的 KV 传输管理器（CommonKVManager）。所有跨请求共享的资源
+        #       （状态表、路由信息、KV/state 元数据、传输引擎句柄等）都挂在它上面，
+        #       本 Sender 通过它读写状态、发送数据、记录失败。
         self.kv_mgr = mgr
+        # 中译：本次传输请求的唯一标识（一次 PD 传输的“房间号”）。Prefill 与 Decode
+        #       通过同一 bootstrap_room 配对，也是本 Sender 在状态表中的键。
         self.bootstrap_room = bootstrap_room
+        # 中译：辅助数据（aux）在 metadata buffer 中的槽位索引，如首 token / hidden states 等。
+        #       初始为 None，稍后由 init() 填入。
         self.aux_index = None
+        # 中译：bootstrap server 的地址（host:port），用于向其注册 dp_rank、查询路由等控制面交互。
         self.bootstrap_server_url = bootstrap_addr
+        # 中译：本次传输的“最终态”缓存（Success/Failed 等）。一旦得出终态就记在这里，
+        #       后续 poll() 直接返回它，避免重复计算或状态回退。None 表示尚未有终态。
         self.conclude_state: Optional[KVPoll] = None
+        # 中译：本请求的传输性能指标（时延、总字节数、速度等），由 get_transfer_metric() 汇总输出。
         self._transfer_metric = KVTransferMetric()
+        # 中译：累计已发送的 KV 索引数量（token 粒度），用于计算传输总字节数。
         self._transfer_num_kv_indices = 0
+        # 中译：累计已发送的 state 索引数量（Mamba/SWA/DSA 等特殊状态），用于计算传输总字节数。
         self._transfer_num_state_indices = 0
         # inner state
+        # 中译：当前发送进度游标——已发送到的 KV 索引位置，配合 num_kv_indices 支持分块续发。
         self.curr_idx = 0
+        # 中译：本次传输的起始时间戳（首次真正发送时记录），用于 bootstrap 超时判定与时延统计。None 表示尚未开始。
         self.init_time: Optional[float] = None
         if self.kv_mgr.is_dummy_cp_rank:
             # Non-authoritative CP ranks are dummy participants.
