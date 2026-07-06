@@ -211,6 +211,17 @@ Decode 节点各阶段：
 
 > 节奏建议：每天 1.5–2 小时，全程约 6 周。每个阶段包含**阅读 → 动手 → 自检**三步。先跑起来再读源码，永远比纯读代码高效。
 
+### 3.0 如何使用本计划（学习方法论）
+
+每个阶段都遵循同一套「四件套」，建议严格照做，避免陷入「只读不练」：
+
+1. **阅读（Read）**：按给定顺序读源码，先读类/函数签名与 docstring，再读主流程，最后才抠细节。大文件（>1K 行）用编辑器的符号大纲或 `grep` 定位关键符号，不要逐行通读。
+2. **动手（Do）**：跑给定实验，改一个参数、看一个指标变化。**先复现现象，再回头读实现**。
+3. **自检（Check）**：合上代码，尝试口头/画图回答「自测题」。答不上来说明还没真懂，回到阅读。
+4. **产出（Output）**：每阶段留一个可检索的产出物（一张图 / 一段笔记 / 一次 profiling trace），沉淀到 `docs/` 或个人笔记，形成可复习的知识资产。
+
+> **验收标准（Definition of Done）**：每阶段末尾给出「✅ 通关标准」，全部达成才进入下一阶段。宁可慢，不要跳。
+
 ### 阶段 0：跑起来（第 0.5 周）
 
 **目标**：在本地/容器里启动一个 SGLang server 并发请求成功。
@@ -220,7 +231,13 @@ Decode 节点各阶段：
   - 安装并启动：`python -m sglang.launch_server --model-path <小模型如 Qwen2.5-0.5B>`。
   - 用 OpenAI 客户端发一次 `/v1/chat/completions`。
   - 跑 `examples/runtime/` 下任意离线 Engine 示例。
+  - 打开 `http://localhost:30000/health`、`/get_server_info`、`/metrics`（Prometheus）三个端点，看看服务暴露了什么。
+- **常见坑**：
+  - 显存不足：用小模型 + `--mem-fraction-static 0.7` 降低 KV 预留；或加 `--max-total-tokens` 限制。
+  - 端口占用：`--port` 换端口；多卡时注意 `--tp-size` 与可见 GPU 数一致。
+  - 首次启动慢：权重下载 + CUDA Graph 捕获耗时正常，看日志 `Capture cuda graph` 进度。
 - 自检：能说清 launch_server 启动后起了哪几个进程（结合 2.1）。
+- ✅ **通关标准**：能独立启动 server、发请求拿到回复；能用 `ps`/日志指认出 TokenizerManager / Scheduler / Detokenizer 三类进程；能读懂 `/get_server_info` 里的关键字段（模型、并行度、KV 容量）。
 
 ### 阶段 1：建立架构心智模型（第 1 周）
 
@@ -233,6 +250,9 @@ Decode 节点各阶段：
   4. `srt/managers/io_struct.py`：进程间传递的数据结构（先看请求/响应 dataclass）。
 - 动手：在 `tokenizer_manager.py` 和 `scheduler.py:recv_requests` 加日志，打印一次请求经过的关键节点，串起链路。
 - 自检：画一张时序图，标出每一步发生在哪个进程、走的什么通信。
+- **自测题**：（1）为什么要拆成三类进程而不是一个？对延迟/吞吐有什么好处？（2）进程间为什么用 ZMQ 而不是直接函数调用？（3）一个 `rid`（请求 id）在哪里生成、如何贯穿全链路？
+- **常见坑**：不要把 `sglang.lang`（前端 DSL）与 `sglang.srt`（运行时）混淆，两者同名但职责完全不同。
+- ✅ **通关标准**：能脱稿画出「请求 → token → 输出」全链时序图（含进程边界与通信方式）；能在源码里指出请求从 HTTP 到 Scheduler 的每一道转发入口。
 
 ### 阶段 2：调度器与连续批处理（第 2 周）★ 重点
 
@@ -244,7 +264,10 @@ Decode 节点各阶段：
   3. `srt/managers/schedule_batch.py`：`ScheduleBatch` / `Req` 的生命周期与状态机。
   4. `process_batch_result` (`scheduler.py:2808`)：一次前向后的后处理与请求出队。
 - 动手：用一个长 prompt + 多个短请求并发，观察日志中 batch 的组成变化；尝试调 `--chunked-prefill-size` 看吞吐变化。
+- **自测题**：（1）`waiting_queue` / `running_batch` / `chunked_req` 三者各自的职责？请求如何在它们之间流转？（2）`get_new_batch_prefill` 与 `PrefillAdder` 如何判定「还能不能再加一个请求」（token 预算/批大小/KV 显存）？（3）什么是 retract（回退）？什么情况会触发？（4）overlap 模式下为什么结果会「延后一拍」，如何处理？
+- **常见坑**：`scheduler.py` 已拆分为大量 `*_mixin`/`scheduler_components`，读主类时遇到未定义方法要去对应 mixin 里找；不要对着一个 4000+ 行的文件硬读。
 - 自检：解释"为什么 overlap 模式能消除调度开销"，以及 prefill 与 decode 请求如何在同一批/不同批中被调度。
+- ✅ **通关标准**：能口述一次 `event_loop_overlap` 迭代里发生了什么（收请求 → 组批 → 前向 → 后处理）；能说清 chunked prefill 与 continuous batching 的关系；能用自己的话说清 CPU/GPU 重叠的原理。
 
 ### 阶段 3：内存管理与 RadixAttention（第 2.5 周）★ 重点
 
@@ -255,7 +278,10 @@ Decode 节点各阶段：
   2. `srt/mem_cache/memory_pool.py` + `allocator.py`：KV cache 物理内存如何分页分配。
   3. `srt/mem_cache/base_prefix_cache.py`：抽象接口（理解可替换的 cache 策略，如 `chunk_cache.py`、`hiradix_cache.py`）。
 - 动手：连续发送共享前缀的请求，对比开/关 radix cache（相关 server_args）时的 TTFT；阅读 `examples/monitoring/` 观察缓存命中。
+- **自测题**：（1）`match_prefix` 如何在基数树上做最长前缀匹配？节点何时发生分裂（split）？（2）LRU 淘汰与引用计数（lock_ref）如何保证「正在使用的 KV 不被释放」？（3）page （页）粒度与 token 粒度分配的区别？（4）radix tree 的逻辑节点与 `memory_pool` 的物理 KV 如何建立映射？
+- **实验建议**：先发请求 A（长 prompt），再发与 A 共享前缀的请求 B，对比两次 TTFT；然后 `curl /flush_cache` 后重发 B，看 TTFT 回升。
 - 自检：画出基数树在多请求共享前缀时的结构变化；说明 cache 命中如何减少 prefill 计算。
+- ✅ **通关标准**：能手画 radix tree 的 insert/split/match 三种操作；能解释 lock_ref 引用计数与 LRU 淘汰的一致性；能用实验数据说明前缀命中对 TTFT 的影响。
 
 ### 阶段 4：模型执行与 CUDA Graph（第 3 周）
 
@@ -267,7 +293,10 @@ Decode 节点各阶段：
   3. `srt/model_executor/cuda_graph_runner.py`：捕获与重放，padding 策略。
   4. 选一个模型 `srt/models/llama.py`：看 `forward` 如何串起 attention + MLP + sampler。
 - 动手：开关 CUDA Graph（`--disable-cuda-graph`）对比 decode 延迟；在 `forward` 打点统计耗时。
+- **自测题**：（1）为什么 CUDA Graph 主要用于 decode 而不是 prefill（形状是否静态）？（2）捕获时的 padding 策略解决了什么问题？（3）`ForwardBatch` 在 prefill/decode/idle 不同模式下张量形状有何不同？
+- **常见坑**：`model_runner.py` 中行号引用可能随版本漂移，以类/方法名为准、用符号搜索定位。
 - 自检：说清 prefill 与 decode 两种 ForwardMode 在内存访问与 CUDA Graph 适用性上的差异。
+- ✅ **通关标准**：能说清 `load_model → forward → sample` 主链；能解释 CUDA Graph 捕获/重放机制与适用场景；能用实验数据说明开关 CUDA Graph 对 decode 延迟的影响。
 
 ### 阶段 5：计算层与注意力后端（第 3.5 周）
 
@@ -280,7 +309,9 @@ Decode 节点各阶段：
   4. 概览 `srt/layers/quantization/`（先看 `base_config.py` 与 `awq.py`/`fp8`）。
   5. 概览 `srt/layers/moe/`（如涉及 DeepSeek/Mixtral）。
 - 参考文档：`docs/advanced_features/attention_backend.md`、`quantization.md`。
+- **自测题**：（1）attention backend 是如何可插拔的（基类接口 + 启动参数选择）？（2）采样（temperature/top-p/top-k）在 `sampler.py` 里如何实现？（3）量化 scheme（FP8/AWQ/GPTQ）对 GEMM 与显存各有什么影响？
 - 自检：能说出切换 attention backend 的入口与各后端适用场景。
+- ✅ **通关标准**：能指出算子层到 attention backend 的调用入口；能说清一次采样的数据流（logits → 处理 → 采样 → token）；能列举至少两种量化 scheme 的适用场景。
 
 ### 阶段 6：进阶特性（第 4–5 周，按需选学）
 
@@ -296,7 +327,17 @@ Decode 节点各阶段：
 | 多 LoRA        | `srt/lora/`                                                   | `lora.ipynb`                                        |
 | 分层 KV 缓存   | `mem_cache/hiradix_cache.py`                                  | `hicache.rst`                                       |
 | 可观测性       | `srt/observability/`                                          | `observability.md`                                  |
-| RL 集成        | `srt/weight_sync/`, `checkpoint_engine/`                      | `sglang_for_rl.md`                                  |
+| RL 集成       | `srt/weight_sync/`, `checkpoint_engine/`                      | `sglang_for_rl.md`                                  |
+
+> **阶段 6 通关标准**：选定的 2–3 个特性，能各自说清「它解决什么问题 + 核心数据流 + 入口代码 + 开启参数」，并能在本地跑通一个最小示例。
+
+#### 深化专题推荐（结合本仓库已有中文文档）
+
+以下三个专题在本仓库已有较深入的中文资料，适合作为阶段 6 的深挖入口：
+
+- **分层 KV 缓存 HiCache（L1/L2/L3）**：先读 `docs/theory/cache/hicache_transfer_zh.md`（五条传输路径 write/load-back/prefetch/backup/evict 与配套 drawio 图），再读 `mem_cache/hiradix_cache.py` 与 `managers/cache_controller.py`；关注「独立 CUDA stream + 后台线程异步搬运」与前向计算的 overlap。自测：能说清一条请求从 L3 预取到回载入 L1 的完整时序与异步重叠点。
+- **PD 分离**：先读 `srt/disaggregation/README_zh.md` 与本文 2.2.1 的 PD 时间轴，再读 `disaggregation/prefill.py` / `decode.py`；关注 bootstrap 建链、prealloc 预分配、跨节点 KV 传输（Mooncake/NIXL/MORI）。自测：prefill 节点与 decode 节点各多出哪些阶段？
+- **KV 容量与预算**：读 `docs/theory/cache/kv_cache_capacity_zh.md`，理解 `max_total_num_tokens` 如何推算、`PrefillAdder` 的准入预算与 `init_req_max_new_tokens` 的一致性约束。
 
 ### 阶段 7：贡献与扩展（第 6 周）
 
@@ -308,6 +349,25 @@ Decode 节点各阶段：
   - 用 `python/sglang/jit_kernel/` 加一个 JIT kernel（参考 `development_jit_kernel_guide.md`）。
   - 跑通 `test/` 套件：`python test/run_suite.py`（先读 `test/README.md`）。
 - 自检：能本地复现一条 CI 测试并提交一个小 PR（修文档/加测试均可）。
+- ✅ **通关标准**：能本地跑通至少一条 `test/` 用例；理解 CI 的分层与触发机制（参考 `test/README.md`）；能独立提一个小 PR 并通过本地自检。
+
+---
+
+## 三半、调试与性能分析工具链（贯穿全程）
+
+> 工具不是独立阶段，而是从阶段 2 开始就该随手用起来。「打点优于猜测」是贯穿全程的原则。
+
+| 场景 | 工具 / 入口 | 说明 |
+| --- | --- | --- |
+| 看实时指标 | `/metrics`（Prometheus）+ `examples/monitoring/`（Grafana 面板） | TTFT/TPOT/吞吐/队列长度/缓存命中率等 |
+| 单请求链路 | 开启 tracing（见 `srt/observability/`）看 trace span | 定位单请求在哪个阶段慢（结合 2.2.1 时间轴） |
+| 服务内部状态 | `curl /get_server_info`、`/get_internal_state` | 看 KV 容量、当前批、new_token_ratio 等运行时状态 |
+| GPU 层 profiling | `docs/developer_guide/benchmark_and_profiling.md` + torch profiler / `examples/profiler/` | 抓 Chrome trace 分析 kernel 耗时与重叠机会 |
+| 基准测试 | `python -m sglang.bench_serving` / `bench_one_batch` | 公平对比不同参数/版本的吞吐与延迟 |
+| 进程卡死/hang | `py-spy dump`、watchdog 日志、CUDA coredump | 分布式 hang 时定位各 rank 的状态发散点 |
+| 源码打点 | 在 `scheduler.py` / `model_runner.py` 关键路径加 `logger.debug` | 最直接的链路串联手段 |
+
+**建议的性能分析四步法**：（1）用 `bench_serving` 定量现状 →（2）看 `/metrics` 定位瓶颈阶段（prefill? decode? 队列?）→（3）抓 profiler trace 看具体 kernel/重叠 →（4）改参数或代码后重新 `bench_serving` 验证。
 
 ---
 
@@ -330,6 +390,26 @@ Decode 节点各阶段：
 3. **打点优于猜测**：在 scheduler / model_runner 关键路径加日志或用 `examples/profiler/` 抓 trace（profiling 见 `docs/developer_guide/benchmark_and_profiling.md`）。
 4. **按数据流读代码**：始终顺着"请求 → batch → forward → sample → output"这条线，不要陷入单个文件。
 5. **关注 Mixin 模式**：scheduler/tokenizer_manager 用大量 `*_mixin.py` 拆分职责，读主类时按需跳转对应 mixin。
+6. **善用 skill 与文档**：本仓库 `.claude/skills/` 下有大量专题 skill（CI、性能、调试 hang、profiling 等），遇到对应场景先查有没有现成 skill；`docs/theory/` 下有中文原理文档可交叉参考。
+
+---
+
+## 五半、学习进度追踪表
+
+> 建议把下表复制到个人笔记，按周打勾。全部「✅ 通关标准」达成才推进；「产出物」是每阶段留下的可复习资产。
+
+| 阶段 | 主题 | 建议周次 | 状态 | 产出物 |
+| --- | --- | --- | --- | --- |
+| 0 | 跑起来 | 0.5 | ☐ | 启动命令 + `/get_server_info` 关键字段笔记 |
+| 1 | 架构心智模型 | 1 | ☐ | 请求全链时序图 |
+| 2 | 调度器与连续批处理 ★ | 2 | ☐ | `event_loop_overlap` 一次迭代的流程笔记 |
+| 3 | 内存管理与 RadixAttention ★ | 2.5 | ☐ | radix tree insert/split/match 手绘图 + TTFT 对比数据 |
+| 4 | 模型执行与 CUDA Graph | 3 | ☐ | CUDA Graph 开关的 decode 延迟对比 |
+| 5 | 计算层与注意力后端 | 3.5 | ☐ | 采样数据流 + backend 切换入口笔记 |
+| 6 | 进阶特性（选 2–3） | 4–5 | ☐ | 各特性「问题+数据流+入口」小结 + 一个最小示例 |
+| 7 | 贡献与扩展 | 6 | ☐ | 跑通一条 CI 用例 + 一个小 PR |
+
+> 里程碑检查点：第 2.5 周末（完成阶段 0–3）应能独立看懂「调度 + 缓存」核心链路；第 5 周末（完成阶段 0–6）应能就任一进阶特性讲清原理与入口；第 6 周末能提交并通过一个 PR。
 
 ---
 

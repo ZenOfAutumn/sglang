@@ -2424,25 +2424,48 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req):
+        # 中译：请求入队时触发的 HiCache「L3 存储预取」。目标是在请求真正被调度进 prefill 之前，
+        #       就异步地把它能从外部存储（L3，磁盘/远端）命中的 KV 前缀提前搬回 host 内存（L2），
+        #       从而在调度到该请求时省掉这部分前缀的重算，缩短首 token 延迟。整个过程是异步、
+        #       尽力而为的——发起后请求照常排队，后续在调度循环里通过 check_prefetch_progress 查进度。
+        # 中译：仅在启用了 HiCache 存储后端（L3）时才有预取的意义；否则直接跳过。
         if self.enable_hicache_storage:
+            # 中译：先做一次前缀匹配，计算本请求在现有 radix tree 中的命中情况。这会填充
+            #       req.prefix_indices（device/L1 命中的槽位）、req.host_hit_length（仅 host/L2
+            #       命中的长度）与 req.last_host_node（沿父链最近一个仍有 host 备份的节点）。
+            #       cow_mamba=False：此处只为算命中、发预取，不需要为 Mamba 状态做写时复制。
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
+            # 中译：last_host_node 是「已匹配前缀」在 host 侧的落点，也是本次预取拼接的锚点。
             last_host_node = req.last_host_node
+            # 中译：只有当该锚点在 host 上确有备份（backuped），或它就是树根（root，表示没有任何
+            #       前缀命中、从头预取）时，才继续。否则说明锚点状态不完整，无法安全拼接哈希链，跳过。
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
+                # 中译：取锚点对应的最后一个页哈希值，作为存储后端定位「接下来这段前缀」的起始 key。
                 last_hash = last_host_node.get_last_hash_value()
+                # 中译：已命中的总前缀长度 = device/L1 命中(prefix_indices) + 仅 host/L2 命中(host_hit_length)。
+                #       这段前缀已在本地（GPU 或 host）有 KV，无需再向 L3 预取。
                 matched_len = len(req.prefix_indices) + req.host_hit_length
+                # 中译：从完整（未截断）的输入 token 序列中，切掉已命中的前缀，剩下的就是「本地缺失、
+                #       需要尝试从 L3 预取」的候选 token。它们将在后端被按页哈希、逐页查存储。
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:]
 
+                # 中译：可选地为存储后端准备「前缀哈希链」。某些后端（如 mooncake）在按页 key 查询时
+                #       需要携带上游各页的哈希以校验/定位；仅当 hicache_storage_pass_prefix_keys 开启时
+                #       才收集，从 last_host_node 一路上溯到其 parent 得到有序哈希列表，否则传 None。
                 prefix_keys = (
                     last_host_node.get_prefix_hash_values(last_host_node.parent)
                     if self.tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
+                # 中译：发起异步预取：在 host 池中为缺失前缀分配落地空间并交给 cache_controller 后台搬运。
+                #       该调用受预取阈值、限流与 host 可用内存约束，可能只做部分预取甚至不预取；
+                #       进行中的预取会登记到 tree_cache.ongoing_prefetch，供调度时轮询完成进度。
                 self.tree_cache.prefetch_from_storage(
-                    req.rid,
-                    last_host_node,
-                    new_input_tokens,
-                    last_hash,
-                    prefix_keys,
+                    req.rid,  # 请求 id，用于登记/查询/释放该请求的预取事件
+                    last_host_node,  # host 侧拼接锚点（预取内容将挂接其后）
+                    new_input_tokens,  # 待从 L3 预取的缺失 token 序列
+                    last_hash,  # 起始页哈希（存储后端定位用）
+                    prefix_keys,  # 可选的上游前缀哈希链
                 )
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):

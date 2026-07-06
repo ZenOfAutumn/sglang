@@ -110,6 +110,255 @@ KV cache 与内存/前缀缓存管理的核心模块。包含两级内存池（�
 
 **一句话理解三者关系**：第 3 层决定「这段 token 要不要复用、复用多少」，第 2 层把「逻辑 token 位置」翻译成「物理槽位下标」，第 1 层是槽位真正对应的显存。Scheduler 持有的三个成员——`tree_cache`（第 3 层）、`req_to_token_pool` + `token_to_kv_pool_allocator`（第 2 层）——正是这三层的入口。
 
+### 模块核心类图（分层，覆盖全部类）
+
+> 下面用 5 张分层类图刻画本模块的核心类及其关系（继承 `<|--`、组合/持有 `*--`、依赖 `..>`）。只保留核心功能与关键方法，省略参数细节。**按上文三层 + HiCache 分层 + 存储后端**组织，逐层看即可。
+
+**① 第 3 层：前缀缓存（`BasePrefixCache` 家族）**
+
+```mermaid
+classDiagram
+    class BasePrefixCache {
+        <<abstract>>
+        +match_prefix(MatchPrefixParams) MatchResult
+        +insert(InsertParams) InsertResult
+        +cache_finished_req(req)
+        +cache_unfinished_req(req)
+        +evict(EvictParams) EvictResult
+        +inc_lock_ref(node)
+        +dec_lock_ref(node)
+    }
+    class KVCacheEventMixin {
+        +_record_store_event()
+        +_record_remove_event()
+    }
+    class RadixCache {
+        +root_node: TreeNode
+        +match_prefix()
+        +insert()
+        +evict()
+        +_match_prefix_helper()
+        +_split_node()
+        +_insert_helper()
+    }
+    class ChunkCache {
+        +关闭 radix 时的简化实现
+    }
+    class SWARadixCache {
+        +滑动窗口前缀树
+    }
+    class MambaRadixCache {
+        +全量+Mamba 混合前缀树
+    }
+    class RadixCacheCpp {
+        +C++ 基数树封装
+    }
+    class HiRadixCache {
+        +write_backup()
+        +load_back()
+        +init_load_back()
+        +evict_host()
+        +writing_check()
+        +loading_check()
+    }
+    class HiMambaRadixCache {
+        +分层 Mamba 前缀树
+    }
+    class TreeNode {
+        +key: RadixKey
+        +value: Tensor(device 槽位)
+        +host_value: Tensor(host 槽位)
+        +lock_ref: int
+        +children
+    }
+    class RadixKey {
+        +token_ids
+        +extra_key(LoRA/salt 隔离)
+        +match(other)
+    }
+    class EvictionStrategy {
+        +get_priority(node) LRU/LFU/FIFO/...
+    }
+
+    BasePrefixCache <|-- RadixCache
+    BasePrefixCache <|-- ChunkCache
+    BasePrefixCache <|-- SWARadixCache
+    BasePrefixCache <|-- MambaRadixCache
+    BasePrefixCache <|-- RadixCacheCpp
+    KVCacheEventMixin <|-- RadixCache
+    KVCacheEventMixin <|-- SWARadixCache
+    KVCacheEventMixin <|-- MambaRadixCache
+    RadixCache <|-- HiRadixCache
+    MambaRadixCache <|-- HiMambaRadixCache
+    RadixCache *-- TreeNode
+    TreeNode *-- RadixKey
+    RadixCache ..> EvictionStrategy : evict 时用
+```
+
+**② 第 2 层：KV 索引分配器（`BaseTokenToKVPoolAllocator` 家族）**
+
+```mermaid
+classDiagram
+    class BaseTokenToKVPoolAllocator {
+        <<abstract>>
+        +alloc(need_size) Tensor
+        +free(indices)
+        +available_size() int
+        +get_kvcache() KVCache
+    }
+    class TokenToKVPoolAllocator {
+        +page_size=1 最简实现
+    }
+    class PagedTokenToKVPoolAllocator {
+        +分页分配(paged attention)
+    }
+    class SWATokenToKVPoolAllocator {
+        +滑动窗口分配
+    }
+    class HiSparseTokenToKVPoolAllocator {
+        +稀疏注意力分配(NSA)
+    }
+    class MambaSlotAllocator {
+        +Mamba 状态槽位分配
+    }
+
+    BaseTokenToKVPoolAllocator <|-- TokenToKVPoolAllocator
+    BaseTokenToKVPoolAllocator <|-- PagedTokenToKVPoolAllocator
+    BaseTokenToKVPoolAllocator <|-- SWATokenToKVPoolAllocator
+    BaseTokenToKVPoolAllocator <|-- HiSparseTokenToKVPoolAllocator
+    BaseTokenToKVPoolAllocator ..> KVCache : 持有并定位物理池
+```
+
+**③ 第 1 层：物理 KV 存储（device / L1，`KVCache` 家族 + 两级映射池）**
+
+```mermaid
+classDiagram
+    class ReqToTokenPool {
+        +req_to_token: Tensor[max_reqs, max_ctx]
+        +alloc(reqs)
+        +free(req)
+        +write(indices, values)
+    }
+    class HybridReqToTokenPool {
+        +全量+Mamba 双表
+    }
+    class KVCache {
+        <<abstract>>
+        +get_kv_buffer(layer_id) (K,V)
+        +set_kv_buffer(...)
+    }
+    class MHATokenToKVPool {
+        +标准多头注意力 KV
+    }
+    class NoOpMHATokenToKVPool
+    class MHATokenToKVPoolFP4
+    class MLATokenToKVPool {
+        +压缩 latent KV(DeepSeek)
+    }
+    class MLATokenToKVPoolFP4
+    class DSATokenToKVPool {
+        +MLA + DSA indexer
+    }
+    class HybridLinearKVPool {
+        +full_kv_pool + 线性层
+    }
+    class MambaPool {
+        +conv_state + ssm_state
+    }
+
+    ReqToTokenPool <|-- HybridReqToTokenPool
+    KVCache <|-- MHATokenToKVPool
+    KVCache <|-- MLATokenToKVPool
+    KVCache <|-- HybridLinearKVPool
+    MHATokenToKVPool <|-- NoOpMHATokenToKVPool
+    MHATokenToKVPool <|-- MHATokenToKVPoolFP4
+    MLATokenToKVPool <|-- MLATokenToKVPoolFP4
+    MLATokenToKVPool <|-- DSATokenToKVPool
+    HybridReqToTokenPool *-- MambaPool
+    HybridLinearKVPool *-- MambaPool
+```
+
+**④ HiCache 分层搬运（控制器 + host 池 L2 + 操作/事件类）**
+
+```mermaid
+classDiagram
+    class HiRadixCache {
+        +write_backup() / load_back()
+    }
+    class HiCacheController {
+        +write() / start_writing()
+        +load() / start_loading()
+        +prefetch() / write_storage()
+        +evict_device() / evict_host()
+    }
+    class HybridCacheController
+    class HostKVCache {
+        <<abstract>>
+        +alloc() / free()
+        +backup_from_device_all_layer()
+        +load_to_device_per_layer()
+    }
+    class MHATokenToKVPoolHost
+    class MLATokenToKVPoolHost
+    class MambaPoolHost
+    class DeepSeekV4PagedHostPool
+    class CacheOperation {
+        +host_indices / device_indices
+        +merge_ops()
+    }
+    class StorageOperation {
+        +host_indices / hash_value
+    }
+    class PrefetchOperation {
+        +mark_terminate() / increment()
+    }
+    class LayerDoneCounter {
+        +update_producer() / wait_until()
+    }
+    class LayerLoadingEvent {
+        +complete(layer) / wait(layer)
+    }
+
+    HostKVCache <|-- MHATokenToKVPoolHost
+    HostKVCache <|-- MLATokenToKVPoolHost
+    HostKVCache <|-- MambaPoolHost
+    HostKVCache <|-- DeepSeekV4PagedHostPool
+    HiCacheController <|-- HybridCacheController
+    StorageOperation <|-- PrefetchOperation
+    LayerDoneCounter *-- LayerLoadingEvent
+    HiRadixCache *-- HiCacheController
+    HiCacheController *-- HostKVCache : L2 池
+    HiCacheController ..> KVCache : L1 池
+    HiCacheController ..> CacheOperation : L1<->L2
+    HiCacheController ..> StorageOperation : L2<->L3
+    HiCacheController *-- LayerDoneCounter
+    HiCacheController ..> HiCacheStorage : L3 后端
+```
+
+**⑤ 第 L3 层：外部存储后端（`HiCacheStorage` 家族）**
+
+```mermaid
+classDiagram
+    class HiCacheStorage {
+        <<abstract>>
+        +batch_get() / batch_set()
+        +batch_get_v1() / batch_set_v1()  零拷贝
+        +batch_exists()  命中探测
+    }
+    class HiCacheFile {
+        +本地文件后端
+    }
+    class HiCacheStorageConfig {
+        +tp/pp/cp rank 生成键前缀
+    }
+
+    HiCacheStorage <|-- HiCacheFile
+    HiCacheStorage ..> HiCacheStorageConfig
+    note for HiCacheStorage "其它后端在 storage/ 子目录：\nmooncake / hf3fs / nixl / lmcache / eic / aibrix / simm"
+```
+
+> **读图提示**：①→②→③ 是自顶向下的三层主链（前缀缓存 → 分配器 → 物理池）；④ 是 `HiRadixCache` 在其上叠加的分层搬运（持有 `HiCacheController`，后者连接 L2 `HostKVCache` 与 L3 `HiCacheStorage`）；⑤ 是可插拔的外部存储后端。变体（SWA/Mamba/NSA/FP4）都以「继承基类」的方式接入，不改变主链结构。
+
 ---
 
 ### 子阶段 A：两级内存池与分配器（第 1–2 天）
@@ -643,6 +892,90 @@ KV cache 与内存/前缀缓存管理的核心模块。包含两级内存池（�
 - **backup（L2→L3）** 由「host 上出现了新的、满足连续前缀的备份节点」触发 → 目的是**防丢/扩容**；
 - **prefetch（L3→L2）** 由「新请求的前缀在 L3 命中、但 host 上缺失」触发 → 目的是**跨请求复用/避免重算**。
 - 两者都：按页链式哈希 key 组织、要求前缀连续、用 `protect_host` 保护搬运期间的 host 节点、跨 rank 取 MIN 对齐。
+
+#### 时序图：一条请求在 HiCache 下的方法调用与多级缓存读写时机
+
+> 从**单条请求被调度**的视角，串起它触发的全部缓存方法调用，标注**三级缓存的读（R）/写（W）时机**与**哪些步骤和调度/前向重叠**。行号对应 `scheduler.py` / `schedule_policy.py` / `hiradix_cache.py` / `cache_controller.py`。图中 `[异步]` 表示发起后不阻塞、由后台线程/专用 stream 推进，主调度循环继续跑别的请求。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SL as Scheduler 事件循环
+    participant HRC as HiRadixCache
+    participant CC as HiCacheController
+    participant L1 as L1 GPU 池
+    participant L2 as L2 Host 池
+    participant L3 as L3 Storage
+    participant BG as 后台线程/流
+
+    Note over SL,L3: ① 请求到达 —— 发起预取（L3→L2，异步）
+    SL->>HRC: _prefetch_kvcache → init_next_round_input
+    HRC->>HRC: match_prefix()  R: 查 L1/L2 命中
+    SL->>HRC: prefetch_from_storage(rid, ...)
+    HRC->>CC: prefetch() 入 prefetch_queue
+    CC-->>BG: [异步] prefetch_thread：batch_exists 探测 + _page_transfer
+    BG->>L3: R: batch_get 命中页
+    BG->>L2: W: 写入 host 槽位（L3→L2 落库）
+
+    Note over SL,L3: ② 每步调度循环开头 —— 收割上一轮完成事件
+    loop 每个调度 step（与前向/搬运重叠）
+        SL->>HRC: check_hicache_events()
+        HRC->>CC: writing_check() 收割 ① write 完成→标记 backuped
+        HRC->>CC: loading_check() 收割 ② load 完成→解锁节点
+        HRC->>CC: drain_storage_control_queues() 收割 prefetch revoke / backup ack
+    end
+
+    Note over SL,L1: ③ 组批 —— 等预取完成后回载（L2→L1）
+    SL->>HRC: check_prefetch_progress(rid)
+    alt 预取未完成
+        HRC-->>SL: False → 本轮跳过该请求（继续调度别的）
+    else 预取完成
+        HRC->>HRC: pop_prefetch_loaded_tokens → req.storage_hit_length
+        SL->>HRC: init_next_round_input → match_prefix() R: L2 命中变长
+        SL->>HRC: add_one_req → init_load_back()
+        HRC->>CC: load()  分配 L1 槽位 + 入 load_queue
+        CC->>CC: start_loading() 逐层 load_to_device_per_layer
+        CC-->>BG: [异步] load_stream 上逐层搬运
+        BG->>L1: W: L2→L1 逐层写入（LayerDoneCounter 逐层通知）
+    end
+
+    Note over SL,L1: ④ 前向计算（与逐层回载重叠）
+    SL->>L1: run_batch 前向：R 复用前缀 KV + 计算新 token KV
+    SL->>L1: W: set_kv_buffer 写入本轮新 KV
+
+    Note over SL,L3: ⑤ 前向后 —— 写回 L2、备份 L3（均异步）
+    SL->>HRC: maybe_cache_unfinished_req / cache_finished_req
+    HRC->>HRC: insert() 写回 radix 树
+    HRC->>CC: write_backup → write()
+    CC->>CC: start_writing() backup_from_device_all_layer
+    CC-->>BG: [异步] write_stream 上 L1→L2
+    BG->>L2: W: L1→L2 写回（write-through）
+    HRC->>CC: write_backup_storage → write_storage() 入 backup_queue
+    CC-->>BG: [异步] backup_thread：_page_backup 分批
+    BG->>L3: W: L2→L3 备份（跨请求持久化）
+
+    Note over SL,L1: ⑥ 容量不足 —— 驱逐（腾位）
+    SL->>HRC: evict / evict_host
+    HRC->>L1: 释放 L1 槽位（write_back 策略先回写 L2）
+    HRC->>L2: 释放 L2 槽位
+```
+
+**读写时机与重叠速记**：
+
+| 阶段 | 缓存动作 | 方向 | 同步性 | 与什么重叠 |
+| --- | --- | --- | --- | --- |
+| ① 请求到达 | `match_prefix` 查命中 + `prefetch` | 读 L1/L2；L3→L2 写 | 预取**异步**（后台线程） | 与其它请求的调度/前向重叠 |
+| ② 每步开头 | `check_hicache_events` 收割 | —— | 非阻塞 `event.query()` | 是「异步搬运」与「同步调度」的交界 |
+| ③ 组批 | `check_prefetch_progress` + `init_load_back`→`load` | L2→L1 写 | 回载**异步**（`load_stream` 逐层） | H2D 逐层与**前向逐层计算**流水线重叠 |
+| ④ 前向 | `get/set_kv_buffer` | 读复用 + 写新 KV | 同步（主计算流） | 与 ③ 的逐层回载、④ 的搬运重叠 |
+| ⑤ 前向后 | `write_backup`→`write`（L1→L2）+ `write_storage`（L2→L3） | 写 L2、写 L3 | 均**异步**（`write_stream` / `backup_thread`） | 与下一步的前向/调度重叠 |
+| ⑥ 容量不足 | `evict` / `evict_host` | 释放 L1/L2 | 同步 | 组批前按需触发 |
+
+**三个关键「异步重叠」点**（HiCache 隐藏延迟的核心）：
+
+1. **预取 vs 调度**（①→③）：请求刚到就异步发起 L3→L2 预取，主循环继续调度别的请求；等真正要组批时才用 `check_prefetch_progress` 检查是否就绪，就绪前该请求被跳过——**存储 IO 延迟被其它请求的处理时间掩盖**。
+2. **回载 vs 前向**（③↔④）：`load` 在 `load_stream` 上**逐层**搬运，`LayerDoneCounter` 每层完成即通知，前向按层 `wait_until` 边到边算——**H2D 拷贝与计算流水线重叠**。
+3. **写回/备份 vs 后续步**（⑤）：前向一算完就把 KV 异步写回 L2、备份到 L3（`write_stream` / `backup_thread`），主循环立刻进入下一步；完成事件在**后续某步**的 `check_hicache_events` 里被 `query()` 收割——**写延迟被后续计算掩盖**。
 
 ---
 

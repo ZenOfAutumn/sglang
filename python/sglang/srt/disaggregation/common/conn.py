@@ -1,3 +1,15 @@
+# 中译：PD 分离（Prefill/Decode 分离部署）下 KV cache 跨实例传输的
+#       「后端无关」通用实现。本文件抽出 Mooncake / NIXL / Mori / Ascend
+#       等传输后端共享的连接管理与元数据交换逻辑，四个核心类分工如下：
+#         - CommonKVManager        每个 rank 一个，管理连接、状态、并行拓扑映射；
+#                                  Prefill 侧向 bootstrap server 注册自身地址，
+#                                  Decode 侧从 bootstrap server 拉取拓扑并做心跳。
+#         - CommonKVSender         Prefill 侧「每请求」对象，负责发送 KV cache。
+#         - CommonKVReceiver       Decode 侧「每请求」对象，负责拉取/接收 KV cache。
+#         - CommonKVBootstrapServer 仅 Prefill 实例启动的轻量 aiohttp HTTP 服务，
+#                                  充当 rendezvous / 服务发现的元数据交换点。
+#       注意：真正的 KV 数据面是 Prefill<->Decode 点对点直连（各后端子类实现），
+#             bootstrap server 只负责「牵线」，不搬运 KV 数据。
 from __future__ import annotations
 
 import asyncio
@@ -49,6 +61,13 @@ logger = logging.getLogger(__name__)
 
 
 class KVTransferError(Exception):
+    """KV 传输失败异常。
+
+    携带 bootstrap_room（请求在 PD 两侧的唯一关联 id）与失败原因；
+    is_from_another_rank 标记该失败是否由同实例其它 rank 上报（用于区分
+    本 rank 自身失败还是被其它 rank 传染，便于日志与状态处理）。
+    """
+
     def __init__(
         self,
         bootstrap_room: int,
@@ -66,7 +85,16 @@ class KVTransferError(Exception):
 
 @dataclasses.dataclass
 class PrefillServerInfo:
+    """Decode 侧缓存的某个 Prefill 实例的并行拓扑与派生的 rank 映射。
+
+    前半部分（拓扑字段）由 Decode 端通过 `GET /route`（哨兵查询）从 bootstrap
+    server 拉取；后半部分（target_* / required_*）由 `_resolve_rank_mapping`
+    在 Decode 端本地计算并回填，描述「本 Decode rank 应向哪些 Prefill rank
+    取 KV、需要多少路响应」。同一 (bootstrap_addr, decode 引擎) 组合下结果确定。
+    """
+
     # Topology fields (fetched from bootstrap server)
+    # 中译：以下为从 bootstrap server 拉取的 Prefill 端并行拓扑信息。
     attn_tp_size: int
     attn_cp_size: int
     dp_size: int
@@ -97,6 +125,12 @@ class PrefillServerInfo:
 
 @dataclasses.dataclass
 class PrefillRankInfo:
+    """单个 Prefill rank 的 KV 传输端点（IP+端口）。
+
+    由该 rank 在启动时 PUT 注册到 bootstrap server 的 prefill_port_table 中，
+    供 Decode 端按 (dp, cp, tp, pp) 索引查询后建立点对点连接。
+    """
+
     rank_ip: str
     rank_port: int
 
@@ -106,6 +140,16 @@ class PrefillRankInfo:
 
 
 class CommonKVManager(BaseKVManager):
+    """KV 传输管理器（后端无关基类），每个 rank（TP/CP/DP/PP）一个实例。
+
+    职责：
+      - 统一读取当前 rank 的并行坐标（attn tp/cp/dp、system dp、pp）；
+      - 绑定用于 KV 传输元数据/控制信令的 ZMQ PULL socket；
+      - PREFILL 角色：向 bootstrap server 注册本 rank 的 (ip, port) 与拓扑；
+      - DECODE 角色：维护连接池、心跳检测、拓扑缓存与失败处理。
+    子类（Mooncake/NIXL/Mori/Ascend）在此基础上实现具体的数据面传输。
+    """
+
     def __init__(
         self,
         args: KVArgs,
@@ -113,6 +157,7 @@ class CommonKVManager(BaseKVManager):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ):
+        # 中译：缓存 KV 参数与预算每条/每组数据项的字节长度总和（供传输量统计用）。
         self.kv_args = args
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
@@ -138,11 +183,14 @@ class CommonKVManager(BaseKVManager):
         self.pp_size = server_args.pp_size
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
+        # 中译：为 True 时所有 CP rank 都参与 KV 传输；否则仅 CP rank 0 发送（其余为 dummy）。
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
         )
 
         # bind zmq socket
+        # 中译：绑定本 rank 的 ZMQ PULL 套接字，自动选取空闲端口；该 (ip, port)
+        #       会随后注册到 bootstrap server，作为本 rank 的 KV 传输控制通道地址。
         self._zmq_ctx = zmq.Context()
         self.rank_port, self.server_socket = get_zmq_socket_on_host(
             self._zmq_ctx, zmq.PULL, host=self.local_ip
@@ -157,6 +205,8 @@ class CommonKVManager(BaseKVManager):
         self.failure_lock = threading.Lock()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # 中译：PREFILL 角色：同步 leader 端口 -> 向 bootstrap server 注册本 rank
+            #       -> 初始化传输信息表与超时阈值。
             # When SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER is True, all CP ranks
             # participate in KV transfer; Otherwise only CP rank 0 sends.
             self.is_dummy_cp_rank = (
@@ -181,6 +231,8 @@ class CommonKVManager(BaseKVManager):
             # These timeout requests should be aborted to release the tree cache.
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            # 中译：DECODE 角色：维护连接池/拓扑缓存/心跳失败计数/HTTP 会话池，
+            #       并记录 bootstrap_addr <-> 请求 room 的反向映射，用于节点故障时定位受影响请求。
             self.enable_staging: bool = False
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
             self.connection_lock = threading.Lock()
@@ -209,9 +261,13 @@ class CommonKVManager(BaseKVManager):
             )
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
+        # 中译：返回指定请求（bootstrap_room）当前的 KV 传输轮询状态。
         return self.request_status[bootstrap_room]
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
+        # 中译：更新请求状态。状态只能单调推进（取 max），Failed 为终态；
+        #       但已被 clear() 清除的 room 不得被迟到的 Failed “复活”，否则会
+        #       污染复用同一 bootstrap_room 的未来请求。
         if bootstrap_room not in self.request_status:
             # Do not resurrect a cleared entry with Failed: once clear() has
             # popped the room from request_status, any late update_status(Failed)
@@ -229,17 +285,25 @@ class CommonKVManager(BaseKVManager):
                 )
 
     def record_failure(self, bootstrap_room: int, failure_reason: str):
+        # 中译：线程安全地记录某请求的失败原因，供后续构造 KVTransferError / 日志使用。
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
 
     def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
         """Single non-blocking attempt to fetch and cache prefill parallel info.
-        Returns True if info is available (cached or freshly fetched)."""
+        Returns True if info is available (cached or freshly fetched).
+
+        中译：（Decode 侧）尝试一次拉取并缓存指定 Prefill 实例的并行拓扑信息，
+        非阻塞（单次尝试，失败返回 False）。命中缓存直接返回，不再访问
+        bootstrap server。拉取后会校验 page_size / kv_cache_dtype 是否与 Decode 端一致，
+        并计算好 rank 映射后写入 prefill_info_table。
+        """
         if bootstrap_addr in self.prefill_info_table:
             return True
 
         info: PrefillServerInfo = None
         try:
+            # 中译：四个 rank 参数均为 -1 是“哨兵查询”，表示只要拓扑元信息而非具体 rank 地址。
             url = f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}&prefill_cp_rank={-1}&target_tp_rank={-1}&target_pp_rank={-1}"
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
@@ -279,7 +343,15 @@ class CommonKVManager(BaseKVManager):
 
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
-        Deterministic for a given (bootstrap_addr, decode engine) pair."""
+        Deterministic for a given (bootstrap_addr, decode engine) pair.
+
+        中译：根据 Prefill 与 Decode 两侧的 TP/CP/PP size 差异，计算本 Decode rank
+        应向哪些 Prefill rank 拉取 KV（target_*_ranks）以及需要多少路响应
+        （required_*_num），并回填到 info 对象上。TP 不对齐时：
+          - decode_tp == prefill_tp：一对一；
+          - decode_tp >  prefill_tp：多个 decode rank 共享一个 prefill rank；
+          - decode_tp <  prefill_tp：一个 decode rank 需从多个 prefill rank 取（非MLA）。
+        """
         # TP rank mapping
         if self.attn_tp_size == info.attn_tp_size:
             target_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
@@ -387,7 +459,13 @@ class CommonKVManager(BaseKVManager):
         return synced_port
 
     def register_to_bootstrap(self):
-        """Register prefill server info to bootstrap server via HTTP PUT."""
+        """Register prefill server info to bootstrap server via HTTP PUT.
+
+        中译：（Prefill 侧）通过 HTTP PUT /route 将本 rank 的 (ip, port) 与并行拓扑
+        注册到 bootstrap server。多节点时 server 位于 dist_init_addr（rank 0），
+        单节点时即本机（若绑定到通配地址 0.0.0.0/:: 则改用真实本地 IP，
+        因为 aiohttp>=3.9 会拒绝 Host 为 0.0.0.0 的请求）。带指数退避重试。
+        """
         if self.dist_init_addr:
             # Multi-node case: bootstrap server's host is dist_init_addr
             host = NetworkAddress.parse(self.dist_init_addr).resolved().host
@@ -449,6 +527,8 @@ class CommonKVManager(BaseKVManager):
         )
 
     def _connect(self, endpoint: str, is_ipv6: bool = False):
+        # 中译：获取（或创建）到指定端点的 ZMQ PUSH 套接字，带连接缓存与断连监控：
+        #       若缓存套接字已断开则关闭重建；并设置 TCP keepalive/无限重连等选项。
         with self._socket_lock:
             sock = self._socket_cache.get(endpoint)
             if sock is not None:
@@ -652,7 +732,12 @@ class CommonKVManager(BaseKVManager):
         return src_kv_ptrs, sliced_dst
 
     def _start_heartbeat_checker_thread(self):
-        """Start the heartbeat checker thread for Decode worker."""
+        """Start the heartbeat checker thread for Decode worker.
+
+        中译：（Decode 侧）启动后台心跳线程，周期性向已知的各 Prefill bootstrap
+        server 发 GET /health；连续失败达到 max_failures 则视为节点故障，
+        调用 _handle_node_failure 清理连接并将受影响请求置 Failed。
+        """
 
         def heartbeat_checker():
             while True:
@@ -705,7 +790,11 @@ class CommonKVManager(BaseKVManager):
         pass
 
     def _handle_node_failure(self, failed_bootstrap_addr: str):
-        """Handle failure of a prefill node."""
+        """Handle failure of a prefill node.
+
+        中译：处理某 Prefill 节点故障：从连接池/拓扑缓存中剔除该地址，断开
+        残留的 ZMQ 端点，并将所有尚未成功且关联该节点的请求标记为 Failed。
+        """
         with self.connection_lock:
             keys_to_remove = [
                 k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
@@ -751,6 +840,15 @@ class CommonKVManager(BaseKVManager):
 
 
 class CommonKVSender(BaseKVSender):
+    """Prefill 侧的「每请求」KV 发送器（后端无关基类）。
+
+    每个待传输的请求（以 bootstrap_room 标识）对应一个 Sender，负责：
+      - 维护该请求的发送进度（curr_idx / num_kv_indices）与状态机；
+      - 处理 CP dummy rank、dp_rank 路由校验与注册；
+      - 统计传输量、处理 bootstrap 超时与中止。
+    具体的 send()/poll() 由各后端子类实现。
+    """
+
     def __init__(
         self,
         mgr: CommonKVManager,
@@ -772,10 +870,14 @@ class CommonKVSender(BaseKVSender):
         self.init_time: Optional[float] = None
         if self.kv_mgr.is_dummy_cp_rank:
             # Non-authoritative CP ranks are dummy participants.
+            # 中译：非权威 CP rank 为 dummy 参与者，不实际发送，直接置为等待输入。
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
             return
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
+        # 中译：多 DP 时需确定该请求归属哪个 prefill dp_rank：
+        #       非 follow_bootstrap_room 策略直接注册；若为 follow_bootstrap_room
+        #       但实际路由与 room%dp_size 不一致，则根据开关决定强制注册或直接失败。
         if self.kv_mgr.server_args.dp_size > 1:
             if self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room":
                 self._register_prefill_dp_rank()
@@ -800,7 +902,11 @@ class CommonKVSender(BaseKVSender):
                     return
 
     def _register_prefill_dp_rank(self):
-        """Register this request's prefill dp_rank to the bootstrap server."""
+        """Register this request's prefill dp_rank to the bootstrap server.
+
+        中译：将本请求（bootstrap_room）实际落到的 prefill dp_rank 注册到
+        bootstrap server，供 Decode 端后续通过 /query_dp_ranks 查到正确的 dp 组。
+        """
         url = f"http://{self.bootstrap_server_url}/register_dp_rank"
         payload = {
             "bootstrap_room": self.bootstrap_room,
@@ -816,6 +922,8 @@ class CommonKVSender(BaseKVSender):
             logger.error(f"Failed to register prefill dp_rank: {e}")
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
+        # 中译：记录本请求待发送的 KV 索引总数与辅助数据索引（如 aux 缓冲区位置），
+        #       作为后续分块发送与“是否最后一块”判断的依据。
         self.num_kv_indices = num_kv_indices
         self.aux_index = aux_index
         logger.debug(
@@ -854,6 +962,10 @@ class CommonKVSender(BaseKVSender):
     ) -> Tuple[npt.NDArray[np.int32], slice, bool, bool]:
         """Common pre-processing for send(): index tracking and CP-rank handling.
 
+        中译：send() 的通用前置处理：推进发送游标 curr_idx、判定是否最后一块，
+        并根据 CP 配置过滤/跳过本 rank 不负责的索引（dummy CP rank 仅在最后
+        一块时置成功）。若返回 should_skip=True，调用方应立即返回。
+
         Returns:
             (kv_indices, index_slice, is_last_chunk, should_skip)
             If should_skip is True, the caller should return immediately.
@@ -882,9 +994,14 @@ class CommonKVSender(BaseKVSender):
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
     ):
+        # 中译：发送一批 KV 索引对应的 KV cache（数据面）。基类为空实现，
+        #       由各后端子类（Mooncake/NIXL/…）结合具体传输机制实现。
         pass
 
     def _check_bootstrap_timeout(self) -> Optional[KVPoll]:
+        # 中译：（Prefill 侧）检查是否在 Bootstrapping 阶段超时（未收到 Decode 侧的
+        #       KV 索引）。超时则记录失败并置 Failed，以释放 tree cache；
+        #       可通过 SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT 放宽阈值。
         if self.init_time is None:
             return None
         elapsed = time.time() - self.init_time
@@ -910,6 +1027,8 @@ class CommonKVSender(BaseKVSender):
         raise Exception("Fake KVReceiver Exception")
 
     def clear(self) -> None:
+        # 中译：清理本请求在管理器上的残留状态（状态、前缀长度、传输信息），
+        #       供 bootstrap_room 安全复用。
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         if hasattr(self.kv_mgr, "req_to_decode_prefix_len"):
             self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
@@ -917,6 +1036,7 @@ class CommonKVSender(BaseKVSender):
             self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
 
     def abort(self):
+        # 中译：响应 AbortReq 中止本请求的发送，记录失败原因并置 Failed 终态。
         self.kv_mgr.record_failure(
             self.bootstrap_room,
             "Aborted by AbortReq.",
@@ -926,6 +1046,16 @@ class CommonKVSender(BaseKVSender):
 
 
 class CommonKVReceiver(BaseKVReceiver):
+    """Decode 侧的「每请求」KV 接收器（后端无关基类）。
+
+    每个需从 Prefill 取 KV 的请求对应一个 Receiver，负责：
+      - 根据预先计算好的 rank 映射，从 bootstrap server 拉取各目标 Prefill
+        rank 的 (ip, port)（_setup_bootstrap_infos）；
+      - 向 Prefill 侧发送本请求的 KV 索引元数据（由子类实现）；
+      - 处理连接池复用、等待超时与中止通知。
+    类级共享一套 ZMQ PUSH 套接字缓存（多个请求复用到同一 Prefill 端点的连接）。
+    """
+
     _ctx = zmq.Context()
     _socket_cache = {}
     _socket_locks = {}
@@ -948,6 +1078,9 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
 
     def init(self, prefill_dp_rank: int):
+        # 中译：初始化本请求的接收：校验目标 Prefill 拓扑已缓存（否则视为节点已下线），
+        #       读取预先计算好的 target_tp/cp/pp rank 映射，建立各目标 rank 的连接信息，
+        #       成功后置为 WaitingForInput。
         if self.bootstrap_addr not in self.kv_mgr.prefill_info_table:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
@@ -985,6 +1118,9 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
     def _setup_bootstrap_infos(self):
+        # 中译：为本请求需要连接的每个 (cp, tp, pp) 目标 Prefill rank 从 bootstrap server
+        #       拉取其 (ip, port)，并缓存到连接池（按 bootstrap_key 去重）；
+        #       MLA 下仅 target_tp_rank 为真实 rank，其余为 dummy（仅维持连接以正确推进 KVPoll）。
         all_bootstrap_infos = []
         # NOTE: key distinguished by bootstrap_addr, prefill_dp_rank, prefill_cp_rank, and target_tp_rank
         for target_cp_rank in self.target_cp_ranks:
@@ -1043,7 +1179,11 @@ class CommonKVReceiver(BaseKVReceiver):
     def _get_bootstrap_info_from_server(
         self, prefill_dp_rank, prefill_cp_rank, target_tp_rank, target_pp_rank
     ):
-        """Fetch the bootstrap info from the bootstrap server."""
+        """Fetch the bootstrap info from the bootstrap server.
+
+        中译：通过 GET /route 按 (dp, cp, tp, pp) 四元组向 bootstrap server 查询
+        具体目标 Prefill rank 的 (rank_ip, rank_port)；失败返回 None。
+        """
         try:
             url = f"http://{self.bootstrap_addr}/route?prefill_dp_rank={prefill_dp_rank}&prefill_cp_rank={prefill_cp_rank}&target_tp_rank={target_tp_rank}&target_pp_rank={target_pp_rank}"
             response = requests.get(url, timeout=5)
@@ -1063,7 +1203,11 @@ class CommonKVReceiver(BaseKVReceiver):
     def query_prefill_dp_ranks(
         bootstrap_addr: str, bootstrap_rooms: List[int]
     ) -> Dict[str, int]:
-        """Batch query prefill dp_ranks for given bootstrap_rooms."""
+        """Batch query prefill dp_ranks for given bootstrap_rooms.
+
+        中译：通过 POST /query_dp_ranks 批量查询一组 bootstrap_room 各自实际落到的
+        prefill dp_rank（与 Sender 侧 _register_prefill_dp_rank 配对使用）。
+        """
         try:
             url = f"http://{bootstrap_addr}/query_dp_ranks"
             response = requests.post(
@@ -1084,6 +1228,7 @@ class CommonKVReceiver(BaseKVReceiver):
 
     @classmethod
     def _connect(cls, endpoint: str, is_ipv6: bool = False):
+        # 中译：类级共享的 ZMQ PUSH 套接字缓存：同一端点只建一次连接，多请求复用。
         with cls._global_lock:
             if endpoint not in cls._socket_cache:
                 sock = cls._ctx.socket(zmq.PUSH)
@@ -1096,6 +1241,7 @@ class CommonKVReceiver(BaseKVReceiver):
 
     @classmethod
     def disconnect_endpoint(cls, endpoint: str):
+        # 中译：从类级缓存中移除并关闭指定端点的套接字（节点故障时清理残留连接）。
         with cls._global_lock:
             sock = cls._socket_cache.pop(endpoint, None)
             lock = cls._socket_locks.pop(endpoint, None)
@@ -1127,6 +1273,9 @@ class CommonKVReceiver(BaseKVReceiver):
         raise NotImplementedError
 
     def _check_waiting_timeout(self) -> Optional[KVPoll]:
+        # 中译：（Decode 侧）检查 WaitingForInput 阶段是否超时（bootstrap 后未收到
+        #       KV 传输完成信号）。超时则置 Failed 并向 Prefill 侧发送中止通知；
+        #       可通过 SGLANG_DISAGGREGATION_WAITING_TIMEOUT 放宽阈值。
         if self.init_time is None:
             return None
         elapsed = time.time() - self.init_time
@@ -1175,6 +1324,8 @@ class CommonKVReceiver(BaseKVReceiver):
             self.abort_notified = True
 
     def _send_abort_notification(self):
+        # 中译：向所有目标 Prefill rank 发送 ABORT 控制消息（best-effort），
+        #       告知其本请求已中止，便于 Prefill 侧释放对应资源。
         for bootstrap_info in self.bootstrap_infos:
             # Best-effort notification to prefill side that this request was aborted.
             try:
@@ -1199,6 +1350,18 @@ class CommonKVReceiver(BaseKVReceiver):
 
 
 class CommonKVBootstrapServer(BaseKVBootstrapServer):
+    """轻量的 aiohttp HTTP 服务，仅由 Prefill 实例启动（跑在 TokenizerManager 后台线程）。
+
+    本质上是一个「注册中心 / 元数据交换点」，全部状态保存在进程内存，
+    不是独立分布式集群，也不参与 KV 数据面传输。提供的路由：
+      - PUT  /route            Prefill 各 rank 注册自身 (ip, port) 与并行拓扑；
+      - GET  /route            Decode 端查拓扑元信息（哨兵）或具体 rank 地址；
+      - POST /register_dp_rank  登记某 bootstrap_room 实际落到的 dp_rank；
+      - POST /query_dp_ranks    批量查询上述 dp_rank 映射；
+      - GET  /health            健康检查（供 Decode 侧心跳）。
+    因为状态在内存，进程重启即丢失；靠多 Prefill 实例部署与上层路由分散单点风险。
+    """
+
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
@@ -1223,6 +1386,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         )
 
         # Start bootstrap server
+        # 中译：在后台 daemon 线程中启动 aiohttp 事件循环（与主进程同生命周期）。
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.run()
 
@@ -1230,6 +1394,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.thread.start()
 
     def _is_ready(self) -> bool:
+        # 中译：判断是否所有预期的 Prefill worker 均已注册（期望数 = dp*cp*tp*pp）。
+        #       未就绪时 GET /route 会返回 503，避免 Decode 端拿到不完整拓扑。
         if (
             self.attn_tp_size is None
             or self.attn_cp_size is None
@@ -1244,6 +1410,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         return self._registered_count >= expected
 
     def _setup_routes(self):
+        # 中译：注册 HTTP 路由（/route 同时处理 PUT 注册与 GET 查询）。
         self.app.router.add_route("*", "/route", self._handle_route)
         self.app.router.add_post("/register_dp_rank", self._handle_register_dp_rank)
         self.app.router.add_post("/query_dp_ranks", self._handle_query_dp_ranks)
@@ -1264,6 +1431,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
 
     async def _handle_route_put(self, request: web.Request):
+        # 中译：处理 Prefill rank 的注册：首次注册时记录全局拓扑（tp/cp/dp/pp size、
+        #       page_size、kv_cache_dtype、负载均衡策略），并把本 rank 的 (ip, port)
+        #       按 (dp, cp, tp, pp) 层级存入 prefill_port_table（加锁保证线程安全）。
         data = await request.json()
         attn_tp_size = data["attn_tp_size"]
         attn_tp_rank = data["attn_tp_rank"]
@@ -1331,6 +1501,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         return web.Response(text="OK", status=200)
 
     async def _handle_route_get(self, request: web.Request):
+        # 中译：处理 Decode 端查询。若四个 rank 参数均为 -1（哨兵），返回整体拓扑
+        #       元信息（PrefillServerInfo）；否则按 (dp, cp, tp, pp) 返回具体 rank 的
+        #       (ip, port)。未完成注册时返 503，找不到对应项时返 404。
         prefill_dp_rank = request.query.get("prefill_dp_rank")
         prefill_cp_rank = request.query.get("prefill_cp_rank")
         target_tp_rank = request.query.get("target_tp_rank")
@@ -1416,7 +1589,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         return web.json_response(result, status=200)
 
     async def _cleanup_expired_entries(self):
-        """Remove entries older than cleanup interval from room_to_dp_rank."""
+        """Remove entries older than cleanup interval from room_to_dp_rank.
+
+        中译：后台协程，周期性清理 room_to_dp_rank 中过期的条目，
+        避免已完成的请求映射无限堆积占用内存。
+        """
         while True:
             await asyncio.sleep(self.entry_cleanup_interval)
             current_time = time.time()
@@ -1434,6 +1611,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 )
 
     def _run_server(self):
+        # 中译：在后台线程内创建独立事件循环，启动 aiohttp 服务并常驻；
+        #       同时拉起过期条目清理协程。
         try:
             # Event Loop
             self._loop = asyncio.new_event_loop()
@@ -1462,7 +1641,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             self._loop.close()
 
     def close(self):
-        """Shutdown"""
+        """Shutdown
+
+        中译：优雅关闭：线程安全地停止事件循环并等待后台线程退出。
+        """
         if self._loop is not None and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
             logger.info("Stopping server loop...")
