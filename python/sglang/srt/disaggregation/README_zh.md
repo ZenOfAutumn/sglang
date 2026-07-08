@@ -184,6 +184,37 @@ PD 模式下 `--policy` 同时作用于 prefill 与 decode，可用 `--prefill-p
 - **阅读顺序**：本 README → `utils.py`（`DisaggregationMode` / `TransferBackend` / `KVClassType` 枚举、`get_kv_class` 工厂、页索引换算）。
 - **自测**：一个请求从进入 prefill 到在 decode 产出首 token，KV cache 在何时、经由谁、搬到哪里？bootstrap server 在其中起什么作用？
 
+<details>
+<summary><b>参考答案</b>（KV cache 端到端流转 & bootstrap server 作用）</summary>
+
+**前提：一个请求被「一分为二」**
+Router 为请求生成共享的 `bootstrap_room`（63-bit 随机数），把**同一请求**同时 POST 给 prefill 与 decode 两个实例；两端凭相同的 `bootstrap_room` 配对。
+
+**时间线（谁搬、何时、搬到哪）**
+
+1. **Decode 端先「备好落点」**（注意：不是 prefill 先动）
+   - `DecodePreallocQueue.add()` 创建 `KVReceiver`，`receiver.init()` 去 **bootstrap server** 查询 prefill 的连接元数据。
+   - `_pre_alloc()` 在 **decode 本地显存**预分配 KV 槽位，得到本地 kv 索引。
+   - `pop_preallocated()` 调用 `receiver.send_metadata(kv_indices, ...)`，把「KV 该写到 decode 的哪个显存地址」告知 prefill。
+2. **Prefill 端算 KV**
+   - `event_loop_*_disagg_prefill` 组 batch 跑一次 prefill 前向，产出整段 prompt 的 KV cache（存于 prefill 本地显存）。
+3. **搬运：prefill → decode**
+   - `process_batch_result_disagg_prefill` 之后，`sender.send(page_indices, state_indices)` 发起传输。
+   - **实际搬运由 KV 传输后端完成**（Mooncake / NIXL / MORI），走 **RDMA 零拷贝**，直接从 prefill 显存写入第 1 步中 decode 预留的显存地址。
+   - prefill 端 `process_disagg_prefill_inflight_queue()` 轮询 `sender.poll()`，`Success` 后退出在途队列，prefill 只回元数据（正文来自 decode）。
+4. **Decode 端接收并解码出首 token**
+   - `DecodeTransferQueue.pop_transferred()` 轮询 `receiver.poll()`，`Success` → 请求进 `waiting_queue`。
+   - `decode_schedule_batch_mixin` **预构建 extend 批**：KV 已在本地显存，**跳过 prefill 前向、只填元数据**，直接进运行批解码产出首 token。
+
+**bootstrap server 的作用**：它是「连接元数据交换所」，**不搬运任何 KV 数据**。
+- 启动期：prefill 端 `KVManager.register_to_bootstrap()` 注册自己的连接元数据（地址/端口/并行拓扑）。
+- 请求期：decode 端凭 `bootstrap_room` 查询对应 prefill 的元数据，建立点对点 RDMA 通道。
+- 一句话：**bootstrap server 负责握手/牵线（控制面），真正的 KV 搬运走 RDMA 后端（数据面），二者分离**。
+
+**核心记忆点**：落点由 **decode 先备并主动告知**；搬运由 **prefill 发起、RDMA 后端执行**；bootstrap server 只管**握手牵线**不碰数据。
+
+</details>
+
 ### 阶段二：KV 传输抽象层（约 0.5 天）
 - **目标**：掌握所有后端都要实现的统一接口契约。
 - **阅读顺序**：`base/conn.py`（`KVArgs` 参数含义、`KVPoll` 状态机、`BaseKVManager/Sender/Receiver/BootstrapServer`）→ `base/README_zh.md`。

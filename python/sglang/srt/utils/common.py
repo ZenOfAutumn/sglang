@@ -3952,15 +3952,32 @@ def get_num_new_pages(
     """
     Get the number of new pages for the given prefix and sequence lengths.
     We use cpu tensors to avoid blocking kernel launch.
+
+    中译：给定一批序列的前缀长度与目标长度，计算这批序列合计需要**新分配**的页数。
+          刻意使用 CPU 张量参与计算，避免占用 GPU 而阻塞（block）kernel 的启动（launch）。
+
+          参数：
+          - ``seq_lens``：每条序列的目标总长度（一维张量，批量）。
+          - ``page_size``：每页容纳的 token 数（KV 池的分配粒度）。
+          - ``prefix_lens``：每条序列已分配 / 已复用的前缀长度；prefill 路径传入。
+          - ``decode``：是否为 decode 步；decode 每步只新增 1 个 token，
+            其前缀长度隐式为 ``seq_lens - 1``，故无需显式传 ``prefix_lens``。
     """
     cpu_device = torch.device("cpu")
     assert seq_lens.device == cpu_device
 
     if prefix_lens is None or decode:
         # NOTE: Special case for handling decode, which prefix lens is `seq_lens - 1`.
+        # 中译：decode 特例——每步仅追加 1 个 token，前缀长度即 ``seq_lens - 1``。
+        #       只有当新增的这个 token 恰好落到某页的第一个槽位时才需要新开一页，
+        #       即 ``seq_len % page_size == 1`` 的序列各自贡献 1 个新页；对整批求和
+        #       即为总的新增页数。
         assert decode
         return (seq_lens % page_size == 1).int().sum().item()
 
+    # 通用（prefill）路径：分别把前缀长度与目标长度向上取整为页数（ceil division，
+    # 用 ``(x + page_size - 1) // page_size`` 实现），两者之差即该序列的新增页数；
+    # 再对整批求和。
     assert prefix_lens.device == cpu_device
     num_pages_after = (seq_lens + page_size - 1) // page_size
     num_pages_before = (prefix_lens + page_size - 1) // page_size

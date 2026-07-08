@@ -455,9 +455,19 @@ class Scheduler(
         self.init_idle_sleeper()
 
         self.mm_receiver = None
+        # 中译：以下四个 PD 分离队列在此先占位为 None，稍后由 init_disaggregation() 根据本节点
+        #       角色（prefill / decode）按需实例化；非分离模式（NULL）则保持 None。
+        # 中译：【Prefill 侧-队列1】bootstrap 队列——存放刚进入 prefill 节点、正在与 decode 节点
+        #       握手（交换连接元数据）的请求；握手完成后移入 waiting_queue 参与 prefill 前向。
         self.disagg_prefill_bootstrap_queue = None
+        # 中译：【Prefill 侧-队列2】inflight（在途）队列——存放已算完 KV、正在把 KV 通过 RDMA/
+        #       Mooncake 等后端传向 decode 节点的请求；传输完成（poll==Success）后退出并回客户端。
         self.disagg_prefill_inflight_queue = None
+        # 中译：【Decode 侧-队列1】prealloc（预分配）队列——decode 请求生命周期的第一个队列：
+        #       创建 KV 接收器、与 prefill 握手，并在本地显存预分配 KV 落点；完成后移入 transfer 队列。
         self.disagg_decode_prealloc_queue = None
+        # 中译：【Decode 侧-队列2】transfer（传输）队列——存放已预分配好落点、正在轮询等待 prefill
+        #       把 KV 传输过来的请求；KV 到达（poll==Success）后移入 waiting_queue 进入解码。
         self.disagg_decode_transfer_queue = None
 
         # Init ZBAL, switch allocator should before any torch alloc action

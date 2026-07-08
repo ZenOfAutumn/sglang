@@ -288,25 +288,53 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 
 @dataclass
 class DecodeRequest:
+    """decode 侧对一个请求的包装，贯穿「预分配 → 传输」两个队列的生命周期。
+
+    中译：DecodeRequest 在原始 Req 之外，额外挂载了 PD 分离 decode 侧所需的运行时状态——
+          KV 接收器、握手进度、元数据 buffer 落点，以及 HiCache（分层缓存）相关的命中/回载状态。
+          它随请求在 DecodePreallocQueue 与 DecodeTransferQueue 之间流转；一旦 KV 传输完成、
+          请求进入等待队列开始解码，kv_receiver 会被清理（置 None），本包装的使命即结束。
+    """
+
+    # 中译：被包装的原始请求对象（含 input_ids、采样参数、bootstrap_room、logprob 状态等）。
     req: Req
+    # 中译：本请求专属的 KV 接收器，负责与 prefill 节点握手、告知 KV 落点并接收 KV 传输；
+    #       其 poll() 返回的状态（Bootstrapping/WaitingForInput/Transferring/Success/Failed）
+    #       驱动请求在各队列间的推进。传输完成后会被 clear() 并置为 None。
     kv_receiver: CommonKVReceiver
+    # 中译：握手是否已完成、进入「等待输入（KV）」状态。由 _update_handshake_waiters 在轮询到
+    #       KVPoll.WaitingForInput 时置 True；只有该标志为 True 的请求才会被预分配 KV。
     waiting_for_input: bool = False
+    # 中译：本请求在 MetadataBuffers 中占用的槽位下标（-1 表示尚未分配）。prefill 侧会把首 token、
+    #       logprob、hidden_states、bootstrap_room 等元数据写入该槽位，decode 侧据此提交传输结果。
     metadata_buffer_index: int = -1
 
     # HiCache Status
     # 中译：以下为 HiCache（分层缓存）相关状态字段，用于记录 decode 侧命中/回载的前缀 KV 情况。
+    # 中译：前缀匹配结果——记录本请求在 decode radix cache 中命中的前缀（L1 设备命中长度、
+    #       L1+L2+L3 的总前缀长度、命中节点、需回载 token 数等），用于跳过重复传输并计入复用。
     prefix_match: Optional[DecodePrefixMatch] = None
+    # 中译：从 L2/L3 回载（loadback）到设备（L1）的 KV 索引张量——即 [prefix_len, total) 缺口
+    #       被 HiCache 填补后所占用的显存 KV 位置。
     hicache_restored_kv_indices: Optional[torch.Tensor] = None
+    # 中译：回载完成后在 radix 树中对应的缓存节点，用于后续引用计数与缓存挂接。
     hicache_restored_node: Any = None
+    # 中译：HiCache 异步回载操作的消费者索引（consumer index），用于向 cache controller
+    #       轮询/领取该请求回载操作的完成结果（-1 表示尚未发起或不适用）。
     hicache_load_consumer_index: int = -1
+    # 中译：本请求的 HiCache 本地恢复状态机：PENDING（回载进行中）/ READY（回载完成、可提交）/
+    #       FAILED（回载失败）。TransferQueue 会用它对 KVPoll.Success 做门控——只有回载也就绪
+    #       才真正提交传输、放行进入解码。
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
 
     @property
     def seqlen(self) -> int:
+        # 中译：代理到底层 Req 的序列长度（origin_input_ids + output_ids 的当前总长）。
         return self.req.seqlen
 
     @property
     def priority(self) -> Optional[int]:
+        # 中译：代理到底层 Req 的调度优先级（启用优先级调度时用于队列排序）。
         return self.req.priority
 
 
@@ -1403,6 +1431,25 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return swa_allocatable_tokens
 
     def _required_alloc_tokens(self, *, fill_len: int, prefix_len: int) -> int:
+        """Compute the number of KV-pool tokens that must be *newly* allocated
+        to grow a sequence from ``prefix_len`` to ``fill_len``, accounting for
+        page-size alignment.
+
+        中译：计算把一条序列从 ``prefix_len`` 增长到 ``fill_len`` 时，KV 池需要
+              **新分配**的 token 数量，并考虑分页（page）对齐。
+
+              - ``fill_len``：目标总长度（该请求最终要占用的 token 数）。
+              - ``prefix_len``：已分配 / 已复用的前缀长度（无需再分配的部分）。
+
+              分两种情况：
+              1) ``page_size == 1``：逐 token 分页，直接返回新增 token 数
+                 ``fill_len - prefix_len``。
+              2) ``page_size > 1``：KV 池以“页”为最小分配粒度，需先算出从
+                 ``prefix_len`` 增长到 ``fill_len`` 会跨越几个尚未分配的新页
+                 （``get_num_new_pages``），再乘以 ``page_size`` 得到按页对齐后
+                 实际要占用的 token 数。由于页可能未填满，返回值通常 ≥ 新增
+                 token 数（即存在页内空洞）。
+        """
         page_size = self.token_to_kv_pool_allocator.page_size
         if page_size == 1:
             return fill_len - prefix_len
@@ -2158,38 +2205,66 @@ class SchedulerDisaggregationDecodeMixin:
         return new_batch
 
     def process_decode_queue(self: Scheduler):
-        # 中译：处理 decode 队列——恢复被回退的请求、预分配 KV、传输 KV、移入等待队列。
+        """推进 decode 端 PD 分离请求在各生命周期队列间的流转。
+
+        中译：这是 decode 端每轮事件循环都会调用的核心驱动函数，负责把请求沿着
+              「预分配队列 → 传输队列 → 等待队列」逐级推进。它并不做真实的解码前向，
+              只负责队列间的状态搬运与准入控制。整体分为四步：
+
+              1. 处理 HiCache 异步事件与 KV 卸载进度（若启用）；
+              2. 优先恢复被回退（retracted）的请求——只有回退队列清空后才接纳新请求，
+                 避免新请求与待恢复请求争抢显存导致的饥饿/死锁；
+              3. 按轮询间隔（polling_interval）节流，避免每轮都做昂贵的跨 rank 轮询；
+              4. 在轮询周期到达时，把已预分配好的请求送入传输队列，并把「KV 已到达」
+                 的请求移入等待队列，交给后续 get_next_disagg_decode_batch_to_run 构批解码。
+        """
+        # 中译：若启用 decode 端 HiCache，先检查并处理分层缓存的异步事件
+        #       （如 L2/L3 → L1 的回载完成通知），推进本地恢复状态机。
         if self.enable_decode_hicache:
             self.tree_cache.check_hicache_events()
 
+        # 中译：若启用 KV Cache 卸载（offload），检查卸载操作的进度，回收已完成卸载的资源。
         if self.server_args.disaggregation_decode_enable_offload_kvcache:
             self.decode_offload_manager.check_offload_progress()
 
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
-        # 中译：如果有足够空间支持 `num_reserved_decode_tokens` 步解码，尝试恢复被回退的请求。
+        # 中译：尝试恢复被回退的请求——仅当显存足以再支撑 `num_reserved_decode_tokens` 步解码时才恢复。
+        #       被回退请求是此前因显存不足被换出（KV 存到 CPU）的请求，此处在显存回升后
+        #       重新为它们预分配 KV 并回载，恢复成功的请求直接进入等待队列。
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
             # if there are still retracted requests, we do not allocate new requests
-            # 中译：若仍有被回退的请求，则不分配新请求（优先恢复回退请求）。
+            # 中译：若回退队列仍未清空，则本轮不接纳新请求——优先保证已被回退的请求恢复，
+            #       避免新请求继续抢占显存，导致回退请求长期无法恢复。
             return
 
+        # 中译：惰性初始化轮询计数器与轮询间隔。polling_interval 控制多少轮事件循环
+        #       才真正做一次预分配/传输轮询（跨 rank 的 poll 开销较大，需节流）。
         if not hasattr(self, "polling_count"):
             self.polling_count = 0
             self.polling_interval = (
                 self.server_args.disaggregation_decode_polling_interval
             )
 
+        # 中译：计数器在 [0, polling_interval) 间循环递增。
         self.polling_count = (self.polling_count + 1) % self.polling_interval
 
+        # 中译：仅在计数归零（即每隔 polling_interval 轮）时执行一次实际的队列推进。
         if self.polling_count % self.polling_interval == 0:
+            # 中译：从预分配队列弹出已完成 KV 预分配的请求（req_conns），送入传输队列，
+            #       此时会向 prefill 端告知 KV 落点、开始等待 KV 到达。
             req_conns, _ = self.disagg_decode_prealloc_queue.pop_preallocated()
             self.disagg_decode_transfer_queue.extend(req_conns)
             transferred_reqs = (
                 self.disagg_decode_transfer_queue.pop_transferred()
-            )  # the requests which kv has arrived
+            )  # the requests which kv has arrived  # 中译：KV 已传输到达的请求
+            # 中译：HiSparse 直达主机（direct-to-host）路径——KV 数据已在主机池中，
+            #       无需再经暂存（staging），直接接纳这些请求。
             if self.enable_hisparse:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
+                    # 中译：直达主机：KV 数据已在主机池中，跳过暂存步骤。
                     self.hisparse_coordinator.admit_request_direct(req)
+            # 中译：把 KV 已到达的请求加入等待队列，后续由构批逻辑取出、预构建 extend 批并解码。
             self.waiting_queue.extend(transferred_reqs)

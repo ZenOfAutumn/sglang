@@ -80,7 +80,7 @@ class DecodeHiCachePreallocMixin:
     供准入时做容量核算。
     """
 
-    def _build_decode_prxefix_match(self, req: Req, result: Any) -> DecodePrefixMatch:
+    def _build_decode_prefix_match(self, req: Req, result: Any) -> DecodePrefixMatch:
         """把一次 ``match_prefix_for_req`` 的结果转换为 ``DecodePrefixMatch``。
 
         当 decode 侧 HiCache 已启用、且最后一个 host 节点已完成 backup 时，会额外查询
