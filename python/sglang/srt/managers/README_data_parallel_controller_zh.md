@@ -92,7 +92,89 @@ DPC 有两条 worker 启动路径，由 `enable_dp_attention` 决定：
 4. 通过 `mp.Pipe` 阻塞等待每个 scheduler 回传"模型加载完成"信息；
 5. 取首个进程上报的 `max_total_num_tokens`、`max_req_input_len` 作为全局上限。
 
-### 1.5 多机端口广播（DP attention）
+### 1.5 `gpu_id` 的详细计算过程
+
+每个 scheduler 进程绑定哪张卡，由 `gpu_id` 决定。它分**两步**合成。
+
+#### 第一步：跨 DP rank 的起始偏移 `base_gpu_id`（`launch_dp_schedulers`）
+
+```python
+base_gpu_id = 0
+for dp_rank in range(server_args.dp_size):
+    ...
+    # 传给 launch_tensor_parallel_group 作为该 rank 的起始偏移
+    base_gpu_id += server_args.tp_size * server_args.pp_size * server_args.gpu_id_step
+```
+
+第 `k` 个 DP rank 的起始偏移 = `k * (tp_size * pp_size * gpu_id_step)`，即每个副本占 `tp_size * pp_size` 张卡的连续区间。
+
+> 仅**普通 DP 模式**逐 rank 递增；DP attention 模式所有 rank 复用同一 TP group，以 `base_gpu_id=0` 只调用一次。
+
+#### 第二步：合成每个进程的 `gpu_id`（`launch_tensor_parallel_group`）
+
+先按节点拓扑算出本节点负责的 rank 区间：
+
+```python
+pp_size_per_node   = max(pp_size // nnodes, 1)      # 每节点承载几个 PP 阶段
+nnodes_per_pp_rank = max(nnodes // pp_size, 1)
+tp_size_per_node   = tp_size // nnodes_per_pp_rank  # 每节点内 TP 卡数
+```
+
+再对本节点每个 `(pp_rank, tp_rank)` 组合合成：
+
+```python
+gpu_id = (
+    server_args.base_gpu_id                                   # ① CLI --base-gpu-id 全局基准
+    + base_gpu_id                                             # ② 本 DP rank 起始偏移（第一步）
+    + (pp_rank % pp_size_per_node) * tp_size_per_node         # ③ 节点内 PP 阶段偏移
+    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step  # ④ 节点内 TP rank 偏移
+)
+```
+
+| 项 | 含义 |
+| --- | --- |
+| ① `server_args.base_gpu_id` | `--base-gpu-id` 指定的整机起始（默认 0） |
+| ② `base_gpu_id`（参数） | 本 DP 副本的起始偏移 |
+| ③ 节点内 PP 阶段偏移 | 本节点内第几个 PP 阶段 × 每阶段卡数 |
+| ④ 节点内 TP rank 偏移 | 本节点内 TP rank × 步长 |
+
+> `gpu_id` 是索引到进程 `CUDA_VISIBLE_DEVICES` 列表的**逻辑下标**（见 `maybe_reindex_device_id`）。开启 `SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS` 时，会用 `gpu_id` 从可见设备列表中取出对应物理卡并把进程内可见设备重置为单卡（返回 0）。因此各节点最终落到哪张物理卡，取决于该节点自身的 `CUDA_VISIBLE_DEVICES`。
+
+#### 示例：`tp_size=4, pp_size=2, dp_size=2, gpu_id_step=1, --base-gpu-id=0, nnodes=2`
+
+单副本需 `tp*pp=8` 卡，2 副本共 16 卡；PP 跨 2 节点，每节点承载 1 个 PP 阶段。
+
+**节点内切分量**（两节点相同）：
+
+- `pp_size_per_node = max(2//2,1) = 1`（每节点 1 个 PP 阶段）
+- `nnodes_per_pp_rank = max(2//2,1) = 1`
+- `tp_size_per_node = 4 // 1 = 4`（每节点 4 卡做 TP）
+- `pp_rank_range`：node0 → `{0}`，node1 → `{1}`
+- `tp_rank_range`：两节点都是 `{0,1,2,3}`
+
+**第一步**（两节点一致，取决于 dp_rank）：
+
+- DP rank 0 → `base_gpu_id = 0`
+- DP rank 1 → `base_gpu_id = 1 * (4*2*1) = 8`
+
+**第二步**合成（因 `pp_rank % pp_size_per_node = pp_rank % 1 = 0`，③ 项恒为 0，故 `gpu_id = base_gpu_id + tp_rank`）：
+
+| DP rank | 节点 | pp_rank | tp_rank | base_gpu_id | 计算 | gpu_id（逻辑） |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0 | node0 | 0 | 0/1/2/3 | 0 | 0 + tp_rank | 0,1,2,3 |
+| 0 | node1 | 1 | 0/1/2/3 | 0 | 0 + tp_rank | 0,1,2,3 |
+| 1 | node0 | 0 | 0/1/2/3 | 8 | 8 + tp_rank | 8,9,10,11 |
+| 1 | node1 | 1 | 0/1/2/3 | 8 | 8 + tp_rank | 8,9,10,11 |
+
+解读：
+
+- **DP rank 0** 的 8 个进程占逻辑 gpu_id `{0,1,2,3}`（node0 的 PP 阶段0）+ `{0,1,2,3}`（node1 的 PP 阶段1）；**DP rank 1** 占 `{8,9,10,11}`（每节点各 4 个）。
+- 每个节点上，两个 DP 副本分别落在逻辑 gpu_id `0~3` 与 `8~11`。这些是**逻辑下标**，经 `CUDA_VISIBLE_DEVICES` 映射到各节点实际物理卡（例如每节点若只可见 8 卡 `0~7`，则通常由部署侧的 `CUDA_VISIBLE_DEVICES`/设备重映射保证不越界）。
+- 同一 DP 副本的两个 PP 阶段分处 node0 / node1，通过 PP 的层间通信串联；副本内 4 个 tp_rank 在各自节点内做 TP。
+
+> 对照单节点场景（`nnodes=1, pp_size=2`）：此时 `pp_size_per_node=2`，③ 项 `(pp_rank%2)*tp_size_per_node` 生效，DP rank 0 会占 gpu_id `0~7`（pp0:0~3, pp1:4~7），DP rank 1 占 `8~15`，正好铺满单机 16 卡。
+
+### 1.6 多机端口广播（DP attention）
 
 `_broadcast_worker_ports` / `_broadcast_ports_as_server` / `_receive_ports_as_client`：
 

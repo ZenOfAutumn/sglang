@@ -696,8 +696,9 @@ class DataParallelController:
                 # Parallelism hierarchy (outermost to innermost):
                 # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
                 # - MoE: Global(TP) -> MOE_DP -> EP -> MOE_TP (innermost)
-                # 中译：并行层级（从外到内）。注意力侧：全局 TP → DP → ATTN_CP → ATTN_TP；
-                #       MoE 侧：全局 TP → MOE_DP → EP → MOE_TP。
+                # 中译：并行层级（从外到内）。
+                # - 注意力侧：全局 TP → DP → ATTN_CP → ATTN_TP；
+                # - MoE 侧：全局 TP → MOE_DP → EP → MOE_TP。
                 #       下面据此从 tp_rank 反推该进程在各并行维度上的 rank。
                 attn_tp_size = (
                     server_args.tp_size // attn_dp_size // server_args.attn_cp_size

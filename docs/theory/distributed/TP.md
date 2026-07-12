@@ -52,16 +52,23 @@ Transformer 里绝大部分计算量是线性层 $Y = XA$（这里省略 bias，
 张量并行的全部技巧，就是利用**分块矩阵乘**的两个恒等式，把 $A$ 切成 $p$ 块分到 $p$ 张卡：
 
 > **沿列切（输出维）**：$A = [A_1 \mid A_2 \mid \dots \mid A_p]$，则
-> $$XA = [XA_1 \mid XA_2 \mid \dots \mid XA_p]$$
+>
+> $$
+> XA = [XA_1 \mid XA_2 \mid \dots \mid XA_p]
+> $$
+>
 > 每张卡用完整的 $X$ 乘自己那块 $A_i$，得到输出的一个**列分片**，**无需通信即可各算各的**。
 
 > **沿行切（输入维）**：$A = \begin{bmatrix} A_1 \\ A_2 \\ \vdots \\ A_p \end{bmatrix}$，
 > 同时把 $X$ 沿列切 $X = [X_1 \mid \dots \mid X_p]$，则
-> $$XA = \sum_{i=1}^{p} X_i A_i$$
+>
+> $$
+> XA = \sum_{i=1}^{p} X_i A_i
+> $$
+>
 > 每张卡算一个**部分和**，最后必须做一次 **all-reduce 求和**才能得到完整结果。
 
-整个 TP 的设计，就是把这两种切法巧妙地**串起来**：让前一层用列切（输出是分片的），
-正好作为后一层行切所需的分片输入，这样**两层之间不需要通信**，只在行并行层的末尾做**一次** all-reduce。
+**整个 TP 的设计，就是把这两种切法巧妙地串起来：让前一层用列切（输出是分片的），正好作为后一层行切所需的分片输入，这样两层之间不需要通信，只在行并行层的末尾做一次all-reduce。**
 
 ---
 
@@ -75,12 +82,36 @@ Transformer 里绝大部分计算量是线性层 $Y = XA$（这里省略 bias，
 - **前向**：默认不通信，直接把分片输出 $Y_i$ 交给下一层；
   若设置 `gather_output=True`，才做一次 all-gather 拼成完整 $Y$。
 
+**X 及输出的维度变化**（$s$ 为 batch 内 token 数）：
+
+
+| 张量                     | 每张卡上的形状                        | 说明                                         |
+| ------------------------ | ------------------------------------- | -------------------------------------------- |
+| 输入$X$                  | $s \times d_\text{in}$                | **完整**，每卡一份相同副本（未切分）         |
+| 权重$A_i$                | $d_\text{in} \times (d_\text{out}/p)$ | 按输出维切分                                 |
+| 输出$Y_i$                | $s \times (d_\text{out}/p)$           | **列分片**，$s$ 维不变，最后一维缩小到 $1/p$ |
+| （若`gather_output`）$Y$ | $s \times d_\text{out}$               | all-gather 拼回完整输出维                    |
+
+即列并行**不改变 $X$**（保持完整），只把输出的**特征维** $d_\text{out}$ 切成 $1/p$；$s$（token 维）自始至终不变。
+
 ### 3.2 行并行 RowParallelLinear
 
 - 权重 $A$ 按**输入维** $d_\text{in}$ 切：每张卡持有 $A_i \in \mathbb{R}^{(d_\text{in}/p) \times d_\text{out}}$。
 - 输入 $X_i$ 必须是**列分片**的（`input_is_parallel=True`，正好接列并行层的输出）。
 - 每张卡算部分和 $X_i A_i \in \mathbb{R}^{s \times d_\text{out}}$。
 - **前向**：必须做一次 **all-reduce 求和** $Y = \sum_i X_i A_i$（`reduce_results=True`）。
+
+**X 及输出的维度变化**：
+
+
+| 张量             | 每张卡上的形状                        | 说明                                                         |
+| ---------------- | ------------------------------------- | ------------------------------------------------------------ |
+| 输入$X_i$        | $s \times (d_\text{in}/p)$            | **列分片**（承接列并行的输出，$d_\text{in}$ 已被切成 $1/p$） |
+| 权重$A_i$        | $(d_\text{in}/p) \times d_\text{out}$ | 按输入维切分                                                 |
+| 部分和$X_i A_i$  | $s \times d_\text{out}$               | 各卡都是**完整输出维**，但只是**部分和**（数值不完整）       |
+| all-reduce 后$Y$ | $s \times d_\text{out}$               | 求和得到数值完整的结果                                       |
+
+关键对比：行并行的输入 $X_i$ 是**切分**的（$d_\text{in}/p$），输出 $X_i A_i$ 的**形状已是完整** $d_\text{out}$，但**数值是部分和**——所以差的不是形状而是一次 all-reduce 求和。这与列并行正好互补：列并行"形状分片、数值完整"，行并行"形状完整、数值待求和"，两者串联时前者的分片输出恰好作为后者的分片输入（见 §3.3）。
 
 ### 3.3 黄金组合：列并行 → 行并行
 
@@ -103,6 +134,7 @@ Transformer 里绝大部分计算量是线性层 $Y = XA$（这里省略 bias，
 **单卡基准**。输入 $x = [1,\ 2]$（一个 token）。
 
 第一层权重（$2 \times 4$，列并行）：
+
 $$
 A = \begin{bmatrix} 1 & 0 & 1 & 0 \\ 0 & 1 & 0 & 1 \end{bmatrix},
 \qquad
@@ -110,6 +142,7 @@ Y = xA = [\,1,\ 2,\ 1,\ 2\,]
 $$
 
 第二层权重（$4 \times 2$，行并行）：
+
 $$
 B = \begin{bmatrix} 1 & 1 \\ 1 & 0 \\ 0 & 1 \\ 1 & 1 \end{bmatrix},
 \qquad
@@ -121,6 +154,7 @@ $$
 ### 4.1 列并行切第一层
 
 $A$ 沿列切成两块，每卡一半输出维：
+
 $$
 A_0 = \begin{bmatrix} 1 & 0 \\ 0 & 1 \end{bmatrix}\ (\text{rank 0}),
 \qquad
@@ -128,6 +162,7 @@ A_1 = \begin{bmatrix} 1 & 0 \\ 0 & 1 \end{bmatrix}\ (\text{rank 1})
 $$
 
 两张卡都拿到**完整的** $x=[1,2]$，各算各的（**无通信**）：
+
 $$
 Y_0 = x A_0 = [1,\ 2]\ (\text{rank 0}),
 \qquad
@@ -139,6 +174,7 @@ $$
 ### 4.2 行并行切第二层
 
 $B$ 沿行切成两块（输入维），正好吃上一步的分片输出：
+
 $$
 B_0 = \begin{bmatrix} 1 & 1 \\ 1 & 0 \end{bmatrix}\ (\text{rank 0}),
 \qquad
@@ -146,6 +182,7 @@ B_1 = \begin{bmatrix} 0 & 1 \\ 1 & 1 \end{bmatrix}\ (\text{rank 1})
 $$
 
 各卡用自己的分片输入算**部分和**：
+
 $$
 Y_0 B_0 = [1,2]\begin{bmatrix} 1 & 1 \\ 1 & 0 \end{bmatrix} = [\,3,\ 1\,],
 \qquad
@@ -153,6 +190,7 @@ Y_1 B_1 = [1,2]\begin{bmatrix} 0 & 1 \\ 1 & 1 \end{bmatrix} = [\,2,\ 3\,]
 $$
 
 最后 **all-reduce 求和**：
+
 $$
 Z = [3,1] + [2,3] = [\,5,\ 4\,]
 $$
@@ -170,26 +208,26 @@ $$
 
 以 LLaMA 的 `SwiGLU` MLP 为例（`gate_up_proj` → `act` → `down_proj`）：
 
-| 层 | 并行方式 | 切分维度 | 通信 |
-|----|---------|---------|------|
-| `gate_up_proj`（`MergedColumnParallelLinear`） | 列并行 | 中间维 $d_\text{ff}$ | 无 |
-| `SiluAndMul` 激活 | 逐元素 | — | 无（分片上逐元素计算天然可并行） |
-| `down_proj`（`RowParallelLinear`） | 行并行 | 中间维 $d_\text{ff}$ | **1 次 all-reduce** |
+
+| 层                                             | 并行方式 | 切分维度            | 通信                             |
+| ---------------------------------------------- | -------- | ------------------- | -------------------------------- |
+| `gate_up_proj`（`MergedColumnParallelLinear`） | 列并行   | 中间维$d_\text{ff}$ | 无                               |
+| `SiluAndMul` 激活                              | 逐元素   | —                  | 无（分片上逐元素计算天然可并行） |
+| `down_proj`（`RowParallelLinear`）             | 行并行   | 中间维$d_\text{ff}$ | **1 次 all-reduce**              |
 
 `gate` 与 `up` 被合并成一个 `MergedColumnParallelLinear`（一次 GEMM 出两份），列并行后每卡持有
 $d_\text{ff}/p$ 个中间通道；激活在分片上逐元素算；`down_proj` 行并行把分片收束回 hidden 维并 all-reduce。
 
 ### 5.2 Attention 子层
 
-| 层 | 并行方式 | 切分维度 | 通信 |
-|----|---------|---------|------|
-| `qkv_proj`（`QKVParallelLinear`） | 列并行 | 注意力 **head** | 无 |
-| 各 head 的注意力计算（`RadixAttention`） | head 独立 | — | 无（每 head 自洽） |
-| `o_proj`（`RowParallelLinear`） | 行并行 | head | **1 次 all-reduce** |
 
-关键点：注意力是**按 head 天然可分**的——每个 head 的 $QK^\top$、softmax、$\cdot V$ 都只在该 head 内部进行，
-head 之间互不依赖。所以把 head 分到不同卡上，每卡独立算自己负责的那几个 head，
-最后 `o_proj` 行并行 all-reduce 合并（详见 [§6](#6-attention-的-head-切分与数值示例)）。
+| 层                                       | 并行方式  | 切分维度       | 通信                |
+| ---------------------------------------- | --------- | -------------- | ------------------- |
+| `qkv_proj`（`QKVParallelLinear`）        | 列并行    | 注意力**head** | 无                  |
+| 各 head 的注意力计算（`RadixAttention`） | head 独立 | —             | 无（每 head 自洽）  |
+| `o_proj`（`RowParallelLinear`）          | 行并行    | head           | **1 次 all-reduce** |
+
+关键点：注意力是**按 head 天然可分**的——每个 head 的 $QK^\top$、softmax、$\cdot V$ 都只在该 head 内部进行，head 之间互不依赖。所以把 head 分到不同卡上，每卡独立算自己负责的那几个 head，最后 `o_proj` 行并行 all-reduce 合并（详见 [§6](#6-attention-的-head-切分与数值示例)）。
 
 ### 5.3 一个 block 的通信开销
 
@@ -199,7 +237,18 @@ hidden(完整) ─► [Attention: QKV列并行→o_proj行并行] ─► all-red
 ```
 
 **每个 Transformer block 前向恰好 2 次 all-reduce**（Attention 一次、MLP 一次）。
-LayerNorm/RMSNorm 在 all-reduce 之后的**完整 hidden** 上做，因此**权重在每张卡上复制**、不参与切分。
+
+### 5.4 LayerNorm / RMSNorm 的处理
+
+Norm 沿 **hidden 维（最后一维）** 归一化，需要每个 token 的完整 $d_\text{model}$ 向量；而 all-reduce 之后每张卡恰好都持有**完整 hidden**（$s \times d_\text{model}$，数值完整）。因此 SGLang 对 Norm 的处理是：
+
+- **权重不切分**：norm 权重只有 $d_\text{model}$ 个参数，在**每张卡上各存一份完整副本**；
+- **各卡本地独立计算**：每张卡在自己的完整 hidden 上各算各的，**无需任何跨卡通信**；
+- **结果一致**：各卡输入相同、算法相同，算出的 norm 结果也相同。
+
+这属于**冗余计算**（$p$ 张卡算同样的东西），但 norm 相对矩阵乘计算量极小，用这点冗余换来"零额外通信 + 实现简单"是划算的。
+
+> 注意"单卡计算"的确切含义是**每张卡都在本地完整 hidden 上独立（且冗余）计算**，而非"只在某一张卡上算、其他卡不算"。
 
 ---
 
@@ -236,7 +285,7 @@ else:
     num_kv_head_replicas = 1
 ```
 
-即：Q head 始终均分，KV head 不够分时就在若干卡上各放一份相同的拷贝。
+即：**Q head 始终均分，KV head 不够分时就在若干卡上各放一份相同的拷贝。**
 这会让 KV cache 在这些卡上冗余，但保证每卡都能独立完成自己 Q head 的注意力。
 
 ---
@@ -277,12 +326,13 @@ LM Head 把 hidden 映射到 $V$ 维 logits，按词表维**列并行**：每卡
 
 ### 8.2 显存
 
-| 部分 | 是否随 TP 切分 | 单卡占用 |
-|------|--------------|---------|
-| Attention QKV/O、MLP gate_up/down 权重 | 是 | $\approx 1/p$ |
-| Embedding / LM Head 权重 | 是（按词表切） | $\approx 1/p$ |
-| LayerNorm / RMSNorm 权重 | 否（复制） | $\times 1$（极小，可忽略） |
-| KV cache | 按 KV head 切；GQA 不够分时部分复制 | $\approx 1/p$（复制时偏大） |
+
+| 部分                                   | 是否随 TP 切分                      | 单卡占用                    |
+| -------------------------------------- | ----------------------------------- | --------------------------- |
+| Attention QKV/O、MLP gate_up/down 权重 | 是                                  | $\approx 1/p$               |
+| Embedding / LM Head 权重               | 是（按词表切）                      | $\approx 1/p$               |
+| LayerNorm / RMSNorm 权重               | 否（复制）                          | $\times 1$（极小，可忽略）  |
+| KV cache                               | 按 KV head 切；GQA 不够分时部分复制 | $\approx 1/p$（复制时偏大） |
 
 主体权重和 KV cache 都约降到 $1/p$，这正是 TP「让单卡装得下」的来源。
 
@@ -343,12 +393,13 @@ MoE 场景另有 `--moe-dense-tp-size` 等专用旋钮。
 
 实际部署常把多种并行组合成 **N 维并行网格**：
 
-| 并行 | 切什么 | 通信粒度 | 适用范围 |
-|------|-------|---------|---------|
-| **TP（张量并行）** | 层内矩阵的张量维 | 每层 all-reduce（频繁、小） | 单机内、高带宽 NVLink |
-| **PP（流水线并行）** | 不同 layer 分到不同卡 | 层间激活传递（稀疏） | 跨机，配合 micro-batch |
-| **DP（数据并行）** | batch 数据 | 反向梯度 all-reduce（训练） | 任意，提吞吐 |
-| **EP（专家并行）** | MoE 的 expert | all-to-all | MoE 模型 |
+
+| 并行                 | 切什么                | 通信粒度                    | 适用范围               |
+| -------------------- | --------------------- | --------------------------- | ---------------------- |
+| **TP（张量并行）**   | 层内矩阵的张量维      | 每层 all-reduce（频繁、小） | 单机内、高带宽 NVLink  |
+| **PP（流水线并行）** | 不同 layer 分到不同卡 | 层间激活传递（稀疏）        | 跨机，配合 micro-batch |
+| **DP（数据并行）**   | batch 数据            | 反向梯度 all-reduce（训练） | 任意，提吞吐           |
+| **EP（专家并行）**   | MoE 的 expert         | all-to-all                  | MoE 模型               |
 
 典型组合：`world_size = TP × PP × DP`。例如 8 机 × 8 卡共 64 卡跑超大模型，
 可设 TP=8（机内切层）、PP=8（跨机切层），DP 再叠在外层提吞吐。

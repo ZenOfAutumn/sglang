@@ -8771,31 +8771,36 @@ DP_ATTENTION_HANDSHAKE_PORT_DELTA = 13
 
 @dataclasses.dataclass
 class PortArgs:
-    # The ipc filename for tokenizer to receive inputs from detokenizer (zmq)
+    # 各进程（TokenizerManager、Scheduler、DetokenizerManager 等）之间通过 ZMQ 通信，
+    # 这里集中保存所有通信端点（endpoint）。单机场景使用 IPC（unix domain socket）文件名，
+    # 开启 DP attention 的多机场景则改用 TCP 地址（见 init_new）。
+
+    # tokenizer 用于接收 detokenizer 输出的 IPC 端点（zmq）
     tokenizer_ipc_name: str
-    # The ipc filename for scheduler (rank 0) to receive inputs from tokenizer (zmq)
+    # scheduler（rank 0）用于接收 tokenizer 输入的 IPC 端点（zmq）
     scheduler_input_ipc_name: str
-    # The ipc filename for detokenizer to receive inputs from scheduler (zmq)
+    # detokenizer 用于接收 scheduler 输出的 IPC 端点（zmq）
     detokenizer_ipc_name: str
 
-    # The port for nccl initialization (torch.dist)
+    # 用于 nccl 初始化的端口（torch.dist）
     nccl_port: int
 
-    # The ipc filename for rpc call between Engine and Scheduler
+    # Engine 与 Scheduler 之间进行 RPC 调用的 IPC 端点
     rpc_ipc_name: str
 
-    # The ipc filename for Scheduler to send metrics
+    # Scheduler 用于上报 metrics（监控指标）的 IPC 端点
     metrics_ipc_name: str
 
-    # The ipc filename for Tokenizer and worker tokenizer
+    # Tokenizer 主进程与各 worker tokenizer 之间通信的 IPC 端点；
+    # 仅在 tokenizer_worker_num > 1（多 tokenizer worker）时才需要，否则为 None
     tokenizer_worker_ipc_name: Optional[str]
 
-    # zmq address for load snapshot PUSH/PULL (dp-attention TCP mode only;
-    # empty when IPC mode derives the address from instance_id).
+    # 负载快照（load snapshot）PUSH/PULL 使用的 zmq 地址；
+    # 仅在 dp-attention 的 TCP 模式下使用，IPC 模式下地址由 instance_id 推导得出，此处留空。
     load_collector_ipc_name: str = ""
 
-    # Stable token shared by all processes in one server instance, used to
-    # derive the /dev/shm path for load snapshots.
+    # 同一个 server 实例内所有进程共享的稳定标识符，
+    # 用于推导负载快照所在的 /dev/shm 路径。
     instance_id: str = ""
 
     @staticmethod
@@ -8804,22 +8809,30 @@ class PortArgs:
         dp_rank: Optional[int] = None,
         worker_ports: Optional[List[int]] = None,
     ) -> PortArgs:
+        # 根据 server_args 构造一套完整的 PortArgs。
+        # dp_rank / worker_ports 仅在开启 DP attention 时使用：
+        #   - dp_rank=None 表示为 TokenizerManager -> DataParallelController 这一路分配端口；
+        #   - dp_rank 非空表示为具体某个 DP worker 分配 scheduler 输入端口。
         if server_args.nccl_port is None:
+            # 未显式指定 nccl_port 时，自动挑选一个空闲端口
             nccl_port = get_free_port()
         else:
             nccl_port = server_args.nccl_port
 
         if server_args.tokenizer_worker_num == 1:
+            # 只有单个 tokenizer worker 时，无需额外的 worker 通信端点
             tokenizer_worker_ipc_name = None
         else:
+            # 多 tokenizer worker 时，创建一个临时 IPC 文件用于主进程与 worker 通信
             tokenizer_worker_ipc_name = (
                 f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
             )
 
+        # 为当前 server 实例生成一个 12 位的稳定标识符（见 instance_id 字段说明）
         instance_id = uuid.uuid4().hex[:12]
 
         if not server_args.enable_dp_attention:
-            # Normal case, use IPC within a single node
+            # 常规场景：单机内部直接使用 IPC（unix domain socket）通信
             return PortArgs(
                 tokenizer_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 scheduler_input_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
@@ -8831,43 +8844,48 @@ class PortArgs:
                 instance_id=instance_id,
             )
         else:
-            # DP attention. Use TCP + port to handle both single-node and multi-node.
+            # DP attention 场景：改用 TCP + 端口，以同时兼容单机与多机部署。
             if server_args.nnodes == 1 and server_args.dist_init_addr is None:
+                # 单机且未指定 dist_init_addr：在服务端口基础上偏移 ZMQ_TCP_PORT_DELTA 得到派生端口，
+                # 若偏移后越界（>65535）则改为向下偏移，并绑定到本地回环地址。
                 derived_port = server_args.port + ZMQ_TCP_PORT_DELTA
                 if derived_port > 65535:
                     derived_port = server_args.port - ZMQ_TCP_PORT_DELTA
                 na = NetworkAddress("127.0.0.1", derived_port)
             else:
+                # 多机或显式指定了 dist_init_addr：直接解析该地址
                 na = NetworkAddress.parse(server_args.dist_init_addr)
 
             dist_init_host = na.host
             dist_init_port = na.port
 
-            # We need 5 consecutive ports from port_base for:
-            # port_base, detokenizer, rpc, metrics, scheduler.
-            # In multi-node, all nodes derive ports independently from
-            # dist_init_port, so the derivation must be deterministic
-            # (no availability-based search). If incrementing would
-            # overflow the valid TCP range, decrement instead.
+            # 需要从 port_base 起连续的 5 个端口，分别用于：
+            # port_base（tokenizer）、detokenizer、rpc、metrics、scheduler。
+            # 多机场景下每个节点都各自独立地从 dist_init_port 推导端口，
+            # 因此推导过程必须是确定性的（不能基于端口可用性做搜索）。
+            # 若递增会超出合法 TCP 端口范围，则改为递减。
             NUM_DERIVED_PORTS = 5
             if dist_init_port + NUM_DERIVED_PORTS > 65535:
                 port_base = dist_init_port - NUM_DERIVED_PORTS - 1
             else:
                 port_base = dist_init_port + 1
 
+            # 基于 port_base 依次推导各功能端口
             detokenizer_port = port_base + 1
             rpc_port = port_base + 2
             metrics_port = port_base + 3
             load_collector_port = port_base + 5
             if dp_rank is None:
-                # TokenizerManager to DataParallelController
+                # TokenizerManager -> DataParallelController 这一路
                 scheduler_input_port = port_base + 4
             else:
+                # 具体某个 DP worker：使用外部预先分配好的 worker_ports
                 assert worker_ports is not None
                 scheduler_input_port = worker_ports[dp_rank]
 
             try:
                 if dp_rank is None:
+                    # 仅在为 controller 这一路分配端口时检查各端口是否可用
                     wait_port_available(dist_init_port, "dist_init_port")
                     wait_port_available(port_base, "port_base")
                     wait_port_available(detokenizer_port, "detokenizer_port")
@@ -8875,9 +8893,10 @@ class PortArgs:
                     wait_port_available(rpc_port, "rpc_port")
                     wait_port_available(metrics_port, "metrics_port")
                     if server_args.nnodes > 1:
+                        # 多机场景才需要 load_collector 端口
                         wait_port_available(load_collector_port, "load_collector_port")
-                # Check scheduler_input_port only for dp.
-                # Skip check when using worker_ports since the port is already bound by our ZMQ socket
+                # scheduler_input_port 只在 dp 场景下检查。
+                # 使用 worker_ports 时跳过检查，因为该端口已被我们自己的 ZMQ socket 绑定。
                 if dp_rank is None or worker_ports is None:
                     wait_port_available(scheduler_input_port, "scheduler_input_port")
             except ValueError:
