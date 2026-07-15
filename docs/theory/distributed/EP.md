@@ -122,6 +122,33 @@ Dispatch (all-to-all #1)          Combine (all-to-all #2)
 
 > SGLang 把 dispatch/combine 抽象成 `BaseDispatcher`（`token_dispatcher/base.py`），并为多种通信后端提供实现：标准、DeepEP、Mooncake、NIXL、Mori、FlashInfer、NPU FuseEP（见 §8）。
 
+### 4.4 通信量分析
+
+设 $T$ = token 数、$k$ = 每 token 激活的专家数（`router_topk`）、$d$ = `hidden_size`。**不考虑本地专家（local expert）优化**时：
+
+- **dispatch**：每个 token 被复制 $k$ 份发往它选中的 $k$ 个 expert，每份大小 $d$：
+
+$$
+\text{dispatch} = T \times k \times d
+$$
+
+- **combine**：FFN 之后，每个 token 在 $k$ 个 expert 上各产生一份 $d$ 大小的输出，送回原卡（再本地加权求和）：
+
+$$
+\text{combine} = T \times k \times d
+$$
+
+二者**理论上对称相等**（发出去几份就收回几份），单次 MoE 层 EP 通信量上界：
+
+$$
+\text{单层 EP 通信（元素数）} = 2\,T\,k\,d
+$$
+
+**两点实际修正：**
+
+1. **要乘 dtype 字节数**：上式是元素个数。SGLang 中 **dispatch 常用 FP8**（省带宽，`hidden_size/2` 甚至更小，另带 `topk_ids` / `topk_weights` / scaling factors 等少量元数据），**combine 常用 BF16**（精度，`hidden_size × 2` 字节）。故实际字节数 **dispatch 通常比 combine 小**（见 `token_dispatcher/flashinfer.py` 的 `combine_payload_size_per_token = hidden_size * 2`）。
+2. **本地专家不走网络**：token 选中的 $k$ 个 expert 中若有若干个恰在本卡（local expert），这部分不产生网络通信。所以 $2Tkd$ 是**上界**，真实网络量 < 此值，且与 EP 路数、专家分布（受 EPLB 影响）强相关。
+
 ---
 
 ## 5. 数值示例：手算一次 EP 路由
