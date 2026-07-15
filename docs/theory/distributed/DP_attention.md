@@ -209,6 +209,7 @@ python -m sglang.launch_server --model <MLA-model> --tp-size 8 --dp-size 8 --ena
 2. **负载不均导致 padding 浪费**：各 DP rank 的 token 数不等时，MAX_LEN 模式会 padding；SUM_LEN 缓解但 all-reduce 缓冲更大。框架按代价自动选模式。
 3. **主要面向 MLA / 大 MoE 模型**：标准 MHA 且无大 MoE 时，普通 TP 已足够，DP attention 收益有限。
 4. **切分约束**：`tp_size` 必须能被 `attn_dp_size * attn_cp_size` 整除。
+5. **单条长 seq 的 attention 延迟比 TP 高**：一句话总结——单条长 seq 的 attention，DP attention 因整条序列压在一张卡、没有 head 分摊而比 TP 慢；但它换来的是高并发吞吐、省 KV Cache 显存、免 all-reduce，适合多请求而非单条长 seq。真要给单条超长 seq 提速，正确做法是叠加 **CP**（按 token 维切分该序列，见 `CP.md`），而不是指望 DP attention——这也是 `enable_dp_attention` 常作为 zigzag CP 前置条件的原因。
 
 ---
 
