@@ -184,10 +184,21 @@ class ToolStrictLevel(IntEnum):
     OFF: No strict validation
     FUNCTION: Enables structural tag constraints for all tools
     PARAMETER: Enforces strict parameter validation for all tools
+
+    中译：定义工具调用（tool call）解析与校验的严格程度。取值递增，
+    级别越高约束越强（IntEnum，可用 >= 比较）。由环境变量
+    SGLANG_TOOL_STRICT_LEVEL 控制，默认 OFF；在
+    FunctionCallParser.get_structure_constraint / get_legacy_structural_tag
+    中据此决定是否给模型输出加约束。
     """
 
+    # 中译：OFF——不做任何强制校验/约束，模型自由生成工具调用，仅事后解析。
     OFF = 0
+    # 中译：FUNCTION——为所有工具启用「结构化标签」约束，即使请求未显式指定 strict，
+    #       也在解码时约束模型按工具的起止标记格式产出（保证可被解析），但不强制参数 schema。
     FUNCTION = 1
+    # 中译：PARAMETER——最严格：在 FUNCTION 基础上，进一步用工具声明的 parameters schema
+    #       强制约束参数（等价于对所有工具启用 strict=True）。
     PARAMETER = 2
 
 
