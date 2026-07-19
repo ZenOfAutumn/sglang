@@ -1,62 +1,62 @@
 /*
-    Cache-Aware Load Balancing Router
+    缓存感知负载均衡路由器（Cache-Aware Load Balancing Router）
 
-    This router combines two strategies to optimize both cache utilization and request distribution:
+    本路由器结合两种策略，同时优化缓存利用率与请求分布：
 
-    1. Cache-Aware Routing (Approximate Tree)
-    2. Load Balancing (Shortest Queue with Balance Thresholds)
+    1. 缓存感知路由（近似基数树 Approximate Tree）
+    2. 负载均衡（带均衡阈值的最短队列 Shortest Queue）
 
-    The router dynamically switches between these strategies based on load conditions:
-    - Uses load balancing when the system is imbalanced
-    - Uses cache-aware routing when the system is balanced
+    路由器会根据负载状况在两种策略之间动态切换：
+    - 当系统负载失衡时，使用负载均衡
+    - 当系统负载均衡时，使用缓存感知路由
 
-    A system is considered imbalanced if both conditions are met:
-    1. (max - min) > abs_threshold
-    2. max > rel_threshold * min
+    仅当同时满足以下两个条件时，系统才被判定为「失衡」：
+    1. (max - min) > abs_threshold        （最大与最小负载的绝对差超过绝对阈值）
+    2. max > rel_threshold * min          （最大负载超过最小负载的相对倍数）
 
-    Strategy Details:
+    策略细节：
 
-    1. Cache-Aware Routing (Approximate Tree)
+    1. 缓存感知路由（近似基数树）
     -------------------------------------------
-    This strategy maintains an approximate radix tree for each worker based on request history,
-    eliminating the need for direct cache state queries. The tree stores raw text characters
-    instead of token IDs to avoid tokenization overhead.
+    该策略基于请求历史为每个 worker 维护一棵近似基数树（radix tree），
+    从而无需直接查询 worker 的缓存状态。树中存储的是原始文本字符
+    而非 token ID，以避免分词开销。
 
-    Process:
-    a. For each request, find the worker with the highest prefix match
-    b. If match rate > cache_threshold:
-    Route to the worker with highest match (likely has relevant data cached)
-    c. If match rate ≤ cache_threshold:
-    Route to the worker with smallest tree size (most available cache capacity)
-    d. Background maintenance:
-    Periodically evict least recently used leaf nodes to prevent memory overflow
+    流程：
+    a. 对每个请求，找出前缀匹配率最高的 worker
+    b. 若匹配率 > cache_threshold：
+       路由到匹配率最高的 worker（很可能已缓存相关数据）
+    c. 若匹配率 ≤ cache_threshold：
+       路由到树规模最小的 worker（拥有最多可用缓存容量）
+    d. 后台维护：
+       周期性淘汰最近最少使用（LRU）的叶子节点，防止内存溢出
 
-    2. Load Balancing (Shortest Queue)
+    2. 负载均衡（最短队列）
     -------------------------------------------
-    This strategy tracks pending request counts per worker and routes new requests
-    to the least busy worker when the system is detected to be imbalanced.
+    该策略跟踪每个 worker 的待处理请求数，当检测到系统失衡时，
+    将新请求路由到最空闲的 worker。
 
-    Configuration Parameters:
+    配置参数：
     ------------------------
-    1. cache_threshold: (float, 0.0 to 1.0)
-    Minimum prefix match ratio to use highest-match routing.
-    Below this threshold, routes to worker with most available cache space.
+    1. cache_threshold：（浮点数，0.0 ~ 1.0）
+       使用「最高匹配路由」的最小前缀匹配率。
+       低于该阈值时，路由到拥有最多可用缓存空间的 worker。
 
-    2. balance_abs_threshold: (integer)
-    Absolute difference threshold for load imbalance detection.
-    System is potentially imbalanced if (max_load - min_load) > abs_threshold
+    2. balance_abs_threshold：（整数）
+       负载失衡检测的绝对差阈值。
+       当 (max_load - min_load) > abs_threshold 时，系统可能失衡。
 
-    3. balance_rel_threshold: (float)
-    Relative ratio threshold for load imbalance detection.
-    System is potentially imbalanced if max_load > min_load * rel_threshold
-    Used in conjunction with abs_threshold to determine final imbalance state.
+    3. balance_rel_threshold：（浮点数）
+       负载失衡检测的相对比值阈值。
+       当 max_load > min_load * rel_threshold 时，系统可能失衡。
+       与 abs_threshold 共同判定最终的失衡状态。
 
-    4. eviction_interval_secs: (integer)
-    Interval between LRU eviction cycles for the approximate trees.
+    4. eviction_interval_secs：（整数）
+       近似树的 LRU 淘汰周期（间隔秒数）。
 
-    5. max_tree_size: (integer)
-    Maximum nodes per tree. When exceeded, LRU leaf nodes are evicted
-    during the next eviction cycle.
+    5. max_tree_size：（整数）
+       每棵树的最大节点数。超出后，将在下一次淘汰周期中
+       淘汰最近最少使用（LRU）的叶子节点。
 */
 
 use std::sync::Arc;
@@ -73,13 +73,12 @@ use super::{
 };
 use crate::core::{Worker, WorkerType, UNKNOWN_MODEL_ID};
 
-/// Tag used to isolate prefill/decode/regular worker pools in the cache_aware tree key.
+/// 用于在 cache_aware 的树键中隔离 prefill/decode/regular 三类 worker 池的标签。
 ///
-/// Trees are keyed by `pool::model` so that an alternating prefill→decode call sequence
-/// for the same model cannot evict each other's tenants. Without this isolation, the
-/// `tree.insert(text, url)` at the end of every `select_worker` call would overwrite
-/// the previous pool's tenant for the same prompt and collapse cache_aware into a
-/// flip-flop between pools.
+/// 树以 `pool::model` 作为键，从而使得同一模型下 prefill→decode 交替的调用序列
+/// 不会互相驱逐对方的租户(tenant)。若不做这一隔离，每次 `select_worker` 末尾
+/// 的 `tree.insert(text, url)` 就会就相同 prompt 覆盖掉上一个池的租户，
+/// 从而使 cache_aware 退化为在两个池之间来回振荡。
 fn pool_tag(worker_type: &WorkerType) -> &'static str {
     match worker_type {
         WorkerType::Regular => "regular",
@@ -88,10 +87,12 @@ fn pool_tag(worker_type: &WorkerType) -> &'static str {
     }
 }
 
+/// 将池标签与模型名拼接为复合树键，格式为 `pool::model`。
 fn make_tree_key(pool: &str, model: &str) -> String {
     format!("{}::{}", pool, model)
 }
 
+/// 根据 worker 的类型与模型 ID 生成其对应的树键。
 fn tree_key_for_worker(worker: &dyn Worker) -> String {
     make_tree_key(
         pool_tag(worker.worker_type()),
@@ -99,19 +100,23 @@ fn tree_key_for_worker(worker: &dyn Worker) -> String {
     )
 }
 
-/// Cache-aware routing policy
+/// 缓存感知路由策略
 ///
-/// Routes requests based on cache affinity when load is balanced,
-/// switches to shortest-queue routing when load is imbalanced.
-/// Maintains separate trees per `(pool, model)` so that prefill, decode, and
-/// regular worker pools cannot evict each other's tenants.
-/// Supports mesh synchronization of tree operations across cluster nodes.
-/// When mesh is not enabled, the policy works independently without synchronization.
+/// 当负载均衡时，根据缓存亲和性路由请求；
+/// 当负载失衡时，切换为最短队列路由。
+/// 为每个 `(pool, model)` 组合维护独立的树，从而使 prefill、decode
+/// 和 regular 三类 worker 池不会互相驱逐对方的租户。
+/// 支持将树操作通过 mesh 在集群节点间同步。
+/// 当未启用 mesh 时，该策略独立工作、无需同步。
 #[derive(Debug)]
 pub struct CacheAwarePolicy {
+    /// 缓存感知策略的配置（阈值、树容量、淘汰周期等）。
     config: CacheAwareConfig,
+    /// 以 `pool::model` 为键的多棵近似树；使用 DashMap 以支持分片并发访问。
     trees: Arc<DashMap<String, Arc<Tree>>>,
+    /// 可选的 mesh 同步管理器；为 None 时不进行跨节点同步。
     mesh_sync: OptionalMeshSyncManager,
+    /// 后台 LRU 淘汰任务句柄；保存以维持任务存活（前缀下划线表示仅持有、不直接使用）。
     _eviction_task: Option<PeriodicTask>,
 }
 
@@ -123,7 +128,7 @@ impl CacheAwarePolicy {
     pub fn with_config(config: CacheAwareConfig) -> Self {
         let trees = Arc::new(DashMap::<String, Arc<Tree>>::new());
 
-        // Start background eviction thread if configured
+        // 若配置了淘汰周期(> 0)，则启动后台淘汰任务
         let eviction_task = if config.eviction_interval_secs > 0 {
             let trees_clone = Arc::clone(&trees);
             let max_tree_size = config.max_tree_size;
@@ -132,6 +137,7 @@ impl CacheAwarePolicy {
                 config.eviction_interval_secs,
                 "Eviction",
                 move || {
+                    // 逐棵遍历树，按最大节点数限制淘汰多余的（LRU）叶子节点
                     for tree_ref in trees_clone.iter() {
                         let tree_key = tree_ref.key();
                         let tree = tree_ref.value();
@@ -156,7 +162,8 @@ impl CacheAwarePolicy {
         }
     }
 
-    /// Set mesh sync manager (can be called after construction)
+    /// 设置 mesh 同步管理器（可在构造完成后调用）。
+    /// 若传入的 mesh_sync 非空，则从 mesh 恢复已同步的树状态。
     pub fn set_mesh_sync(&mut self, mesh_sync: OptionalMeshSyncManager) {
         self.mesh_sync = mesh_sync.clone();
         if mesh_sync.is_some() {
@@ -164,9 +171,9 @@ impl CacheAwarePolicy {
         }
     }
 
-    /// Initialize the tree with worker URLs (used only during initial setup)
+    /// 用 worker 的 URL 初始化树（仅在初始化阶段使用）。
     pub fn init_workers(&self, workers: &[Arc<dyn Worker>]) {
-        // Group workers by (pool, model) so each pool gets its own isolated tree.
+        // 按 (pool, model) 对 worker 分组，使每个池拥有自己隔离的树。
         let mut grouped: std::collections::HashMap<String, Vec<&Arc<dyn Worker>>> =
             std::collections::HashMap::new();
         for worker in workers {
@@ -187,7 +194,7 @@ impl CacheAwarePolicy {
         }
     }
 
-    /// Add a single worker to the tree (incremental update)
+    /// 向树中新增单个 worker（增量更新）。
     pub fn add_worker(&self, worker: &dyn Worker) {
         let tree_key = tree_key_for_worker(worker);
         let tree = self
@@ -197,7 +204,7 @@ impl CacheAwarePolicy {
         tree.insert("", worker.url());
     }
 
-    /// Remove a worker from the tree
+    /// 从树中移除一个 worker。
     pub fn remove_worker(&self, worker: &dyn Worker) {
         let tree_key = tree_key_for_worker(worker);
         if let Some(tree) = self.trees.get(&tree_key) {
@@ -205,23 +212,22 @@ impl CacheAwarePolicy {
         }
     }
 
-    /// Remove a worker by URL (removes from all model trees for backward compatibility)
+    /// 按 URL 移除 worker（为向后兼容，从所有模型树中移除）。
     pub fn remove_worker_by_url(&self, url: &str) {
-        // Remove from all trees since we don't know which model it belongs to
+        // 因为无法得知它属于哪个模型，故从所有树中都移除
         for tree_ref in self.trees.iter() {
             tree_ref.value().remove_tenant(url);
         }
     }
 
-    /// Restore tree state from mesh store
-    /// This is called during initialization to rebuild trees from synchronized state
+    /// 从 mesh 存储中恢复树状态。
+    /// 在初始化时调用，用以根据已同步的状态重建树。
     fn restore_tree_state_from_mesh(&self) {
         if let Some(ref mesh_sync) = self.mesh_sync {
-            // Get all tree states from mesh
-            // We need to iterate through all models that have tree states
-            // For now, we'll restore trees for models that are already in our trees map
-            // In a full implementation, we might want to query mesh for all tree states
-
+            // 从 mesh 获取所有树状态：
+            // 需要遍历所有拥有树状态的模型。
+            // 目前仅为已存在于本地 trees 映射中的模型恢复树；
+            // 完整实现中可能需要向 mesh 查询全部树状态。
             for tree_ref in self.trees.iter() {
                 let tree_key = tree_ref.key();
                 if let Some(tree_state) = mesh_sync.get_tree_state(tree_key) {
@@ -232,7 +238,7 @@ impl CacheAwarePolicy {
                     );
 
                     let tree = tree_ref.value();
-                    // Apply all operations to rebuild the tree
+                    // 重放所有操作以重建这棵树
                     for operation in &tree_state.operations {
                         match operation {
                             TreeOperation::Insert(insert_op) => {
@@ -248,9 +254,9 @@ impl CacheAwarePolicy {
         }
     }
 
-    /// Normalize a tree key for mesh synchronization, converting an accidentally
-    /// empty key to `UNKNOWN_MODEL_ID` for consistency. In current code the
-    /// composite `pool::model` key is never empty, so this is defensive.
+    /// 为 mesh 同步规范化树键：为保持一致性，将意外出现的空键
+    /// 转换为 `UNKNOWN_MODEL_ID`。当前代码中复合键 `pool::model` 永远不会为空，
+    /// 故此处属于防御性处理。
     fn normalize_mesh_model_id(tree_key: &str) -> &str {
         if tree_key.is_empty() {
             UNKNOWN_MODEL_ID
@@ -259,17 +265,17 @@ impl CacheAwarePolicy {
         }
     }
 
-    /// Apply remote tree operation from mesh.
+    /// 应用来自 mesh 的远程树操作。
     ///
-    /// `mesh_key` is the opaque key the operation was originally synced under;
-    /// `select_worker` / `select_worker_min_load` send tree operations to mesh
-    /// keyed by the composite `pool::model`, and any future receive path is
-    /// expected to forward that same string back here unchanged. The argument
-    /// is kept as `&str` so the mesh layer can stay key-agnostic.
+    /// `mesh_key` 是该操作最初同步时所使用的不透明键；
+    /// `select_worker` / `select_worker_min_load` 向 mesh 发送树操作时
+    /// 以复合键 `pool::model` 作为键，且将来的接收路径预期会原样
+    /// 把同一个字符串回传到这里。参数保持为 `&str`，以便 mesh 层
+    /// 可以保持对键无感知。
     ///
-    /// Note: `PolicyRegistry::apply_remote_tree_operation` (the only forwarder)
-    /// currently has no in-process callers; the receive path is not yet wired,
-    /// so this method is reachable only via tests today.
+    /// 注意：`PolicyRegistry::apply_remote_tree_operation`（唯一的转发者）
+    /// 目前在进程内没有调用方；接收路径尚未接通，
+    /// 因此该方法目前仅能通过测试触及。
     pub fn apply_remote_tree_operation(&self, mesh_key: &str, operation: &TreeOperation) {
         let tree_key = Self::normalize_mesh_model_id(mesh_key);
 
@@ -296,7 +302,7 @@ impl CacheAwarePolicy {
         }
     }
 
-    /// Run cache eviction to prevent unbounded growth
+    /// 执行缓存淘汰，防止树无限增长。
     pub fn evict_cache(&self, max_size: usize) {
         for tree_ref in self.trees.iter() {
             let tree_key = tree_ref.key();
@@ -306,6 +312,8 @@ impl CacheAwarePolicy {
         }
     }
 
+    /// 失衡时按最短队列选择 worker：选择当前负载最小的健康 worker，
+    /// 并同样更新缓存树（即使处于失衡模式）以维护亲和性状态。
     fn select_worker_min_load(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -315,7 +323,7 @@ impl CacheAwarePolicy {
         max_load: usize,
         min_load: usize,
     ) -> Option<usize> {
-        // Log load balancing trigger (only compute worker loads if debug enabled)
+        // 记录负载均衡触发日志（仅在启用 debug 时才计算各 worker 负载）
         if tracing::enabled!(tracing::Level::DEBUG) {
             let worker_loads: Vec<(&str, usize)> =
                 workers.iter().map(|w| (w.url(), w.load())).collect();
@@ -325,24 +333,24 @@ impl CacheAwarePolicy {
             );
         }
 
-        // Use shortest queue when imbalanced
+        // 失衡时采用最短队列:选负载最小的健康 worker
         let min_load_idx = healthy_indices
             .iter()
             .min_by_key(|&&idx| workers[idx].load())
             .copied()?;
 
-        // Even in imbalanced mode, update the tree to maintain cache state
+        // 即使处于失衡模式，也要更新树以维护缓存状态
         if let Some(text) = request_text {
-            // Get the tree reference without locking the entire HashMap
-            // DashMap only locks the specific shard containing this key
+            // 仅获取该键对应的树引用，无需锁住整个 HashMap；
+            // DashMap 只会锁住包含该键的那个分片。
             let tree = self.trees.get(tree_key).map(|entry| entry.value().clone());
 
             if let Some(tree) = tree {
                 let worker_url = workers[min_load_idx].url();
-                // Now we can work with the tree without holding the HashMap lock
+                // 现在可在不持有 HashMap 锁的情况下操作这棵树
                 tree.insert(text, worker_url);
 
-                // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
+                // 若启用 mesh，则同步插入操作（未启用时为空操作）
                 if let Some(ref mesh_sync) = self.mesh_sync {
                     use smg_mesh::tree_ops::TreeInsertOp;
                     let op = TreeOperation::Insert(TreeInsertOp {
@@ -364,7 +372,7 @@ impl CacheAwarePolicy {
             }
         }
 
-        // Increment processed counter
+        // 递增被选中 worker 的「已处理请求」计数器
         workers[min_load_idx].increment_processed();
 
         Some(min_load_idx)
@@ -385,19 +393,19 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             return None;
         }
 
-        // Determine the (pool, model) key for this set of workers — the router pre-filters
-        // so every healthy worker here belongs to the same pool and same model.
+        // 确定这组 worker 的 (pool, model) 键——路由层已预先过滤，
+        // 因此这里每个健康 worker 都属于同一个池且同一个模型。
         let pivot = workers[healthy_indices[0]].as_ref();
         let tree_key = tree_key_for_worker(pivot);
 
-        // Get current load statistics - compute min/max in single pass without allocation
+        // 获取当前负载统计——一次遍历即算出 min/max，无额外内存分配
         let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
             let load = w.load();
             (min.min(load), max.max(load))
         });
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
-        // Check if load is imbalanced
+        // 判断负载是否失衡（需同时满足绝对差与相对比两个阈值）
         let is_imbalanced = max_load.saturating_sub(min_load) > self.config.balance_abs_threshold
             && (max_load as f32) > (min_load as f32 * self.config.balance_rel_threshold);
 
@@ -412,16 +420,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             );
         }
 
-        // Use cache-aware routing when balanced
+        // 负载均衡时使用缓存感知路由
         let text = request_text.unwrap_or("");
 
-        // Get the tree reference without locking the entire HashMap
-        // DashMap only locks the specific shard containing this key
+        // 仅获取该键对应的树引用，无需锁住整个 HashMap；
+        // DashMap 只会锁住包含该键的那个分片。
         let tree = self.trees.get(&tree_key).map(|entry| entry.value().clone());
 
         if let Some(tree) = tree {
-            // Now we work with the tree without holding the HashMap lock
-            // Use prefix_match_with_counts to avoid redundant chars().count() calls
+            // 现在在不持有 HashMap 锁的情况下操作这棵树；
+            // 使用 prefix_match_with_counts 以避免重复的 chars().count() 调用
             let result = tree.prefix_match_with_counts(text);
             let match_rate = if result.input_char_count == 0 {
                 0.0
@@ -429,16 +437,16 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 result.matched_char_count as f32 / result.input_char_count as f32
             };
 
-            // Select worker without String allocation
+            // 选择 worker（避免 String 分配）
             let selected_idx = if match_rate > self.config.cache_threshold {
-                // Cache hit path: find worker by URL (compare &str directly, no allocation)
+                // 缓存命中路径:按 URL 查找 worker（直接比较 &str，无分配）
                 let tenant_url: &str = &result.tenant;
                 workers
                     .iter()
                     .position(|w| w.url() == tenant_url)
                     .filter(|&idx| workers[idx].is_healthy())
             } else {
-                // Low cache match: use worker with minimum load
+                // 缓存匹配率较低:退而选择负载最小的 worker
                 healthy_indices
                     .iter()
                     .min_by_key(|&&idx| workers[idx].load())
@@ -446,10 +454,10 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
             };
 
             if let Some(idx) = selected_idx {
-                // Update the tree with this request (use worker URL directly, no allocation)
+                // 用本次请求更新树（直接使用 worker URL，无分配）
                 tree.insert(text, workers[idx].url());
 
-                // Sync insert operation to mesh if enabled (no-op if mesh is not enabled)
+                // 若启用 mesh，则同步插入操作（未启用时为空操作）
                 if let Some(ref mesh_sync) = self.mesh_sync {
                     use smg_mesh::tree_ops::TreeInsertOp;
                     let op = TreeOperation::Insert(TreeInsertOp {
@@ -462,19 +470,19 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                     }
                 }
 
-                // Increment processed counter
+                // 递增被选中 worker 的「已处理请求」计数器
                 workers[idx].increment_processed();
 
                 return Some(idx);
             }
 
-            // Selected worker no longer exists or unhealthy, remove stale tenant from tree
+            // 被选中的 worker 已不存在或不健康，从树中移除这个陈旧的租户
             if match_rate > self.config.cache_threshold {
                 let tenant_url: &str = &result.tenant;
                 tree.remove_tenant(tenant_url);
                 debug!("Removed stale worker {} from cache tree", tenant_url);
 
-                // Sync removal to mesh if enabled (no-op if mesh is not enabled)
+                // 若启用 mesh，则同步移除操作（未启用时为空操作）
                 if let Some(ref mesh_sync) = self.mesh_sync {
                     use smg_mesh::tree_ops::TreeRemoveOp;
                     let op = TreeOperation::Remove(TreeRemoveOp {
@@ -487,7 +495,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
                 }
             }
 
-            // Fallback to first healthy worker
+            // 兜底:退回到第一个健康 worker
             healthy_indices.first().copied()
         } else {
             warn!(
@@ -505,9 +513,9 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
     }
 
     fn on_request_complete(&self, worker_url: &str, success: bool) {
-        // Could track success rates per worker for more intelligent routing
+        // 未来可按 worker 统计成功率，以实现更智能的路由
         if !success {
-            // Optionally reduce affinity for failed requests
+            // 可选：对失败的请求降低其亲和性
             tracing::debug!(
                 "Request to {} completed with success={}",
                 worker_url,
@@ -521,7 +529,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
     }
 
     fn needs_request_text(&self) -> bool {
-        true // Cache-aware policy needs request text for cache affinity
+        true // 缓存感知策略需要请求文本来计算缓存亲和性
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

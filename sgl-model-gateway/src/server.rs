@@ -515,21 +515,39 @@ async fn v1_tokenizers_remove(
     tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
 }
 
+/// HTTP 服务器运行配置
+///
+/// 该结构体承载启动网关 HTTP 服务所需的顶层配置，
+/// 是对 `RouterConfig` 的一层封装，额外补充了服务器监听、
+/// 日志、服务发现、指标、请求处理以及优雅关闭等运行期参数。
 pub struct ServerConfig {
+    /// 服务器绑定的监听主机地址（如 0.0.0.0）
     pub host: String,
+    /// 服务器绑定的监听端口
     pub port: u16,
+    /// 路由器核心配置（路由模式、策略、后端、限流等）
     pub router_config: RouterConfig,
+    /// 允许的最大请求体大小（字节）
     pub max_payload_size: usize,
+    /// 日志文件输出目录（None 表示仅输出到标准输出）
     pub log_dir: Option<String>,
+    /// 日志级别（如 debug/info/warn/error）
     pub log_level: Option<String>,
+    /// 是否以结构化 JSON 格式输出日志（否则为纯文本）
     pub json_log: bool,
+    /// 服务发现配置（如 Kubernetes 服务发现），未启用时为 None
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
+    /// Prometheus 指标暴露配置，未启用时为 None
     pub prometheus_config: Option<PrometheusConfig>,
+    /// 单个请求的整体超时时间（秒）
     pub request_timeout_secs: u64,
+    /// 用于提取请求 ID 的自定义 HTTP 头列表
     pub request_id_headers: Option<Vec<String>>,
+    /// 优雅关闭期间等待进行中请求完成的宽限期（秒）
     pub shutdown_grace_period_secs: u64,
-    /// Control plane authentication configuration
+    /// 控制面认证配置（JWT / API Key / 审计），未启用时为 None
     pub control_plane_auth: Option<crate::auth::ControlPlaneAuthConfig>,
+    /// Mesh 集群互联服务配置，未启用时为 None
     pub mesh_server_config: Option<MeshServerConfig>,
 }
 
@@ -693,7 +711,25 @@ pub fn build_app(
         .with_state(app_state)
 }
 
+/// 网关服务启动入口。
+///
+/// 该函数按顺序完成整个 model gateway 的初始化与启动，主要步骤包括:
+/// 1. 初始化 OpenTelemetry 链路追踪与日志系统(全局仅初始化一次);
+/// 2. 按需启动 Prometheus 指标服务;
+/// 3. 若启用 Mesh，则构建并启动集群互联服务(状态存储、同步管理、分区探测、限流窗口重置);
+/// 4. 构建 `AppContext`、任务队列 `JobQueue` 与各类工作流引擎 `WorkflowEngines`;
+/// 5. 异步提交分词器加载、worker 初始化、MCP 服务初始化等后台任务(不阻塞启动);
+/// 6. 构建路由管理器 `RouterManager`，并启动健康检查、负载监控、并发限流与请求队列;
+/// 7. 按需启动 Kubernetes 服务发现;
+/// 8. 构建 Axum 应用并绑定监听地址，支持 TLS/非 TLS，注册优雅关闭信号后开始对外服务。
+///
+/// # 参数
+/// - `config`: 服务器运行配置，见 [`ServerConfig`]。
+///
+/// # 返回
+/// 正常关闭返回 `Ok(())`；初始化或监听失败时返回对应错误。
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    // 全局标记:确保日志系统在整个进程生命周期内只初始化一次
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
     if let Some(trace_config) = &config.router_config.trace_config {
@@ -736,7 +772,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let (mesh_handler, mesh_sync_manager) = if let Some(mesh_server_config) =
         &config.mesh_server_config
     {
-        // Create HA sync manager with stores first
+        // 先创建带状态存储的高可用(HA)同步管理器
         use smg_mesh::{partition::PartitionDetector, stores::StateStores, sync::MeshSyncManager};
         let stores = Arc::new(StateStores::with_self_name(
             mesh_server_config.self_name.clone(),
@@ -746,19 +782,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             mesh_server_config.self_name.clone(),
         ));
 
-        // Create partition detector
+        // 创建网络分区探测器
         let partition_detector = Arc::new(PartitionDetector::default());
 
-        // Initialize rate-limit hash ring with current membership
+        // 使用当前成员列表初始化限流哈希环
         sync_manager.update_rate_limit_membership();
 
-        // Start rate limit window reset task
-        let window_manager = RateLimitWindow::new(sync_manager.clone(), 1); // Reset every 1 second
+        // 启动限流窗口重置任务
+        let window_manager = RateLimitWindow::new(sync_manager.clone(), 1); // 每 1 秒重置一次
         spawn(async move {
             window_manager.start_reset_task().await;
         });
 
-        // Create mesh server builder and build with stores
+        // 创建 mesh 服务构建器，并带上状态存储进行构建
         use smg_mesh::service::MeshServerBuilder;
         let builder = MeshServerBuilder::new(
             mesh_server_config.self_name.clone(),
@@ -767,7 +803,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         );
         let (mesh_server, handler) = builder.build_with_stores(Some(stores.clone()));
 
-        // Spawn the mesh server with stores and partition detector
+        // 带上状态存储与分区探测器启动 mesh 服务
         let stores_for_server = stores.clone();
         let sync_manager_for_server = sync_manager.clone();
         let partition_detector_for_server = partition_detector.clone();
@@ -813,10 +849,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         .set(worker_job_queue)
         .expect("JobQueue should only be initialized once");
 
-    // Initialize typed workflow engines
+    // 初始化各类型的工作流引擎
     let engines = WorkflowEngines::new(&config.router_config);
 
-    // Subscribe logging to all workflow engines
+    // 为所有工作流引擎订阅日志
     engines.subscribe_all(Arc::new(LoggingSubscriber)).await;
 
     app_context
@@ -828,8 +864,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.health_check.timeout_secs
     );
 
-    // Submit startup tokenizer job if tokenizer path is configured
-    // This runs before worker initialization to ensure tokenizer is available
+    // 如果配置了分词器路径，则提交启动阶段的分词器加载任务
+    // 该任务在 worker 初始化之前执行，以确保分词器可用
     if let Some(tokenizer_source) = config
         .router_config
         .tokenizer_path
@@ -869,7 +905,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.mode
     );
 
-    // Submit worker initialization job to queue
+    // 向任务队列提交 worker 初始化任务
     let job_queue = app_context
         .worker_job_queue
         .get()
@@ -897,9 +933,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         info!("No MCP config provided, skipping MCP server initialization");
     }
 
-    // Start background refresh for ALL MCP servers (static + dynamic in LRU cache)
+    // 为所有 MCP 服务(静态配置 + LRU 缓存中的动态)启动后台刷新
     if let Some(mcp_manager) = app_context.mcp_manager.get() {
-        let refresh_interval = Duration::from_secs(600); // 10 minutes
+        let refresh_interval = Duration::from_secs(600); // 10 分钟
         let _refresh_handle =
             Arc::clone(mcp_manager).spawn_background_refresh_all(refresh_interval);
         debug!("Started background refresh for all MCP servers (every 10 minutes)");
@@ -957,10 +993,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         }
     }
 
-    // Set mesh sync manager to worker registry and policy registry if mesh is enabled
-    // This allows these components to sync state across mesh nodes when mesh is enabled,
-    // but they work independently without mesh when mesh is disabled.
-    // Using thread-safe set_mesh_sync method that works with Arc-wrapped registries
+    // 若启用了 mesh，则将 mesh 同步管理器设置到 worker 注册表和策略注册表
+    // 这样启用 mesh 时这些组件可在各 mesh 节点间同步状态；
+    // 未启用 mesh 时它们则独立工作、互不影响。
+    // 使用线程安全的 set_mesh_sync 方法，可作用于被 Arc 包裹的注册表
     if let Some(ref sync_manager) = mesh_sync_manager {
         app_context
             .worker_registry
@@ -973,7 +1009,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         info!("Mesh sync manager set on policy registry");
     }
 
-    // Get mesh cluster state and port before moving mesh_handler into app_state
+    // 在将 mesh_handler 移入 app_state 之前，先取出 mesh 集群状态与端口
     let mesh_cluster_state = mesh_handler.as_ref().map(|h| h.state.clone());
     let mesh_port = config
         .mesh_server_config
@@ -1034,7 +1070,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         api_key: config.router_config.api_key.clone(),
     };
 
-    // Initialize control plane authentication if configured
+    // 若已配置，则初始化控制面认证
     let control_plane_auth_state =
         crate::auth::ControlPlaneAuthState::try_init(config.control_plane_auth.as_ref()).await;
 
@@ -1047,11 +1083,11 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.cors_allowed_origins.clone(),
     );
 
-    // TcpListener::bind accepts &str and handles IPv4/IPv6 via ToSocketAddrs
+    // TcpListener::bind 接受 &str，并通过 ToSocketAddrs 自动处理 IPv4/IPv6
     let bind_addr = format!("{}:{}", config.host, config.port);
     info!("Starting server on {}", bind_addr);
 
-    // Parse address and set up graceful shutdown (common to both TLS and non-TLS)
+    // 解析监听地址并设置优雅关闭(TLS 与非 TLS 场景通用)
     let addr: std::net::SocketAddr = bind_addr
         .parse()
         .map_err(|e| format!("Invalid address: {}", e))?;
@@ -1090,8 +1126,8 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     }
 
-    // HA handler shutdown is handled by the signal in mesh_run! macro
-    // No need to manually shutdown here
+    // HA handler 的关闭由 mesh_run! 宏中的信号处理
+    // 此处无需手动关闭
 
     Ok(())
 }

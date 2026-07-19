@@ -36,28 +36,81 @@ impl std::fmt::Display for AppContextBuildError {
 
 impl std::error::Error for AppContextBuildError {}
 
+/// 应用全局上下文,聚合 Router 运行所需的全部共享组件。
+///
+/// 相当于整个网关的「依赖注入容器」:HTTP 请求处理器、后台任务、各路由器都从这里
+/// 拿到 client、注册表、存储、解析器等依赖。
+///
+/// - 实现 `Clone`,但字段几乎都用 `Arc` 包裹,克隆只增加引用计数、共享同一底层实例(廉价)。
+/// - 构造统一走 [`AppContextBuilder`],由 [`AppContext::from_config`] 从配置一次性初始化所有组件。
 #[derive(Clone)]
 pub struct AppContext {
+    /// 共享 HTTP 客户端,向所有后端 worker 转发请求。
+    /// 按配置带连接池、超时与可选 TLS/mTLS(见 [`AppContextBuilder::with_client`])。
     pub client: Client,
+
+    /// Router 完整运行时配置(策略、端口、存储后端、TLS、各类开关等)。
     pub router_config: RouterConfig,
+
+    /// 全局限流器(令牌桶),None 表示不限并发。
     pub rate_limiter: Option<Arc<TokenBucket>>,
+
+    // ---- 注册表与解析器 ----
+    /// 分词器注册表,按 model_id / 自定义名称管理已加载的 tokenizer,供 gRPC / IGW 模式使用。
     pub tokenizer_registry: Arc<TokenizerRegistry>,
+
+    /// 推理内容(reasoning / thinking)解析器工厂,按需创建故为 Option。
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
+
+    /// 工具调用(function / tool call)解析器工厂,按需创建故为 Option。
     pub tool_parser_factory: Option<ToolParserFactory>,
+
+    /// worker 注册表,维护所有后端 worker 的地址、类型、健康状态,是路由决策的数据源。
     pub worker_registry: Arc<WorkerRegistry>,
+
+    /// 策略注册表,持有当前生效的负载均衡策略(见 [`crate::config::PolicyConfig`])及其运行时状态。
     pub policy_registry: Arc<PolicyRegistry>,
+
+    /// 路由器管理器,统筹多个子路由器(如 PD 分离下的 Prefill/Decode 路由)。
+    /// 非 IGW / 多路由场景可能为 None。
     pub router_manager: Option<Arc<RouterManager>>,
+
+    // ---- 持久化存储(trait 对象,可为内存 / Redis / Postgres / Oracle 等实现) ----
+    /// Responses API 的持久化存储后端。
     pub response_storage: Arc<dyn ResponseStorage>,
+
+    /// 会话(conversation)元数据存储后端。
     pub conversation_storage: Arc<dyn ConversationStorage>,
+
+    /// 会话条目(单条消息 item)存储后端。
     pub conversation_item_storage: Arc<dyn ConversationItemStorage>,
+
+    /// 负载监控器,周期性拉取各 worker 实时负载供负载均衡策略使用。
     pub load_monitor: Option<Arc<LoadMonitor>>,
+
+    /// 配置中指定的 reasoning 解析器名称(未配置则为 None),用于选择具体解析器实现。
     pub configured_reasoning_parser: Option<String>,
+
+    /// 配置中指定的 tool call 解析器名称(未配置则为 None)。
     pub configured_tool_parser: Option<String>,
+
+    // ---- OnceLock 延迟初始化容器(构建后注入一次,规避循环依赖) ----
+    /// worker 后台任务队列;JobQueue 需在 AppContext 构建后才能注入,运行期仅设置一次。
     pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
+
+    /// 工作流引擎集合(如 Responses / Chat 等工作流步骤引擎),构建后注入一次。
     pub workflow_engines: Arc<OnceLock<WorkflowEngines>>,
+
+    /// MCP(Model Context Protocol)管理器,初始为空配置,MCP server 后续通过任务注册。
     pub mcp_manager: Arc<OnceLock<Arc<McpManager>>>,
+
+    /// WASM 模块管理器,仅在配置启用 WASM 插件时创建。
     pub wasm_manager: Option<Arc<WasmModuleManager>>,
+
+    /// worker 服务层,封装基于注册表与任务队列的 worker 增删改查等业务操作。
     pub worker_service: Arc<WorkerService>,
+
+    /// 在途请求追踪器,统计当前正在处理的请求数,用于优雅关闭与可观测性。
     pub inflight_tracker: Arc<InFlightRequestTracker>,
 }
 

@@ -8,16 +8,16 @@ use dashmap::DashMap;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-/// Reason a [`WorkerRegistry::add`] call refused the spec.
+/// [`WorkerRegistry::add`] 调用拒绝某个 spec（worker 规格）的原因。
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum AddWorkerError {
-    /// The spec's mode (plain vs prefill/decode) conflicts with workers
-    /// already registered for one of its `model_ids`. The router does
-    /// not support mixed PD + plain pools on a single model: the
-    /// resolver derives the PD-vs-plain shape from the registered
-    /// workers, and a mixed pool would silently degrade to whichever
-    /// shape happens to be healthy when the other is breaker-open,
-    /// surfacing the wrong error code to clients.
+    /// spec 的模式（plain 普通模式 vs prefill/decode 预填充/解码模式）与
+    /// 该 spec 的某个 `model_ids` 下已注册的 worker 发生冲突。router 不
+    /// 支持在单个模型上混用 PD（PD 分离）与 plain（普通）worker 池：
+    /// resolver（解析器）会根据已注册的 worker 推导出该模型是 PD 还是
+    /// plain 形态；一旦混用，当其中一侧因熔断器打开（breaker-open）而不
+    /// 可用时，就会静默降级到恰好健康的另一侧形态，从而向客户端返回错误
+    /// 的错误码。
     #[error(
         "worker {worker:?} for model {model:?} would mix PD ({pd_mode}) with plain workers on \
          the same model — sgl-router does not support mixed pools. Use one of: only Plain \
@@ -26,92 +26,89 @@ pub enum AddWorkerError {
     MixedPdAndPlain {
         worker: WorkerId,
         model: ModelId,
-        /// The role of the *incoming* worker that triggered the conflict
-        /// (the *existing* worker has the opposite role).
+        /// 触发本次冲突的*新加入* worker 的角色
+        /// （*已存在*的 worker 则是相反的角色）。
         pd_mode: &'static str,
     },
 }
 
+/// Worker 注册表：维护 worker 到 ID、模型到 worker 的双向索引。
 #[derive(Debug, Default)]
 pub struct WorkerRegistry {
+    /// 主索引：WorkerId -> Worker。所有 worker 实体都存放在这里，
+    /// 其余索引仅持有 WorkerId 引用。
     by_id: DashMap<WorkerId, Arc<Worker>>,
+    /// 反向索引：ModelId -> 服务该模型的 WorkerId 集合。
+    /// 用于按模型快速检索候选 worker（`workers_for`）。
     by_model: DashMap<ModelId, HashSet<WorkerId>>,
-    /// Serializes the validate→insert section of `add_with_cb` so the
-    /// `MixedPdAndPlain` check is atomic with the subsequent write. Two
-    /// concurrent registrations from `manager::register_one` for the
-    /// same model with conflicting modes could otherwise both observe
-    /// an empty pool and both insert, leaving the registry in a mixed
-    /// state — the exact corruption the check is meant to prevent.
-    /// Reads (`workers_for`, `get`, `len`, …) stay lock-free against
-    /// the underlying DashMaps; only writes through `add_with_cb` /
-    /// `remove` take this lock so contention is bounded by registry
-    /// mutation rate (worker-discovery events), not request rate.
+    /// 将 `add_with_cb` 中“校验→插入”这段临界区串行化，使得
+    /// `MixedPdAndPlain`（混用检查）与随后的写入操作保持原子性。否则，
+    /// 来自 `manager::register_one` 的两个并发注册，若针对同一模型且模式
+    /// 冲突，可能都观察到空池并都执行插入，从而让注册表进入混用状态——
+    /// 这正是该检查要预防的破坏。
+    /// 读操作（`workers_for`、`get`、`len` 等）对底层 DashMap 保持无锁；
+    /// 只有经过 `add_with_cb` / `remove` 的写操作才会获取此锁，因此锁竞争
+    /// 仅受注册表变更频率（worker 发现事件）约束，而非请求速率。
     write: Mutex<()>,
 }
 
 impl WorkerRegistry {
+    /// 添加一个 worker，使用默认熔断器配置（阈值 = 3）。
+    /// 是 `add_with_cb(spec, None)` 的便捷封装。
     pub fn add(&self, spec: WorkerSpec) -> Result<(), AddWorkerError> {
         self.add_with_cb(spec, None)
     }
 
-    /// Add a worker, optionally supplying a circuit-breaker config.
-    /// Pass `None` to use the circuit-breaker default (threshold = 3).
+    /// 添加一个 worker，可选地提供熔断器（circuit-breaker）配置。
+    /// 传入 `None` 表示使用熔断器默认配置（阈值 = 3）。
     ///
-    /// Re-adding an existing `WorkerId` is an upsert: the prior entry's
-    /// `by_model` memberships are cleared first so a model that the new
-    /// spec no longer serves stops resolving to this worker.  Without the
-    /// pre-removal step a worker whose model set shrank would still appear
-    /// in `workers_for(<dropped model>)` because `by_id.get(...)` would
-    /// return the new worker via the stale model→id index.
+    /// 重复添加一个已存在的 `WorkerId` 属于 upsert（更新插入）：会先清除
+    /// 旧条目在 `by_model` 中的所有成员关系，这样新 spec 不再服务的模型
+    /// 就不会再解析到该 worker。若缺少这一“先移除”步骤，一个模型集合缩
+    /// 小了的 worker 仍会出现在 `workers_for(<已移除的模型>)` 中，因为
+    /// `by_id.get(...)` 会通过陈旧的 模型→ID 索引返回新的 worker。
     ///
-    /// Returns [`AddWorkerError::MixedPdAndPlain`] when adding the spec
-    /// would mix PD (prefill/decode) workers with plain workers on the
-    /// same model. The conflict is detected against the *existing*
-    /// registry state — re-adding the same worker id is fine (the prior
-    /// entry is removed first), and adding a worker whose own
-    /// `model_ids` are all unmixed is fine even if other models in the
-    /// process have a mix of modes.
+    /// 当添加该 spec 会导致同一模型上 PD（prefill/decode）worker 与 plain
+    /// worker 混用时，返回 [`AddWorkerError::MixedPdAndPlain`]。冲突是相对
+    /// *现有*注册表状态来检测的——重复添加相同的 worker id 没问题（会先移
+    /// 除旧条目）；只要某个 worker 自身的 `model_ids` 都不混用，即便进程内
+    /// 其他模型存在模式混用，添加它也没问题。
     ///
-    /// On rejection the registry is **not** mutated. If the rejected
-    /// spec carries an id that already has an entry, the prior entry
-    /// stays put — it's the caller's responsibility to decide whether
-    /// to evict it (and, importantly, to also clean up sidecar state
-    /// in `KvEventIndex` / `ActiveLoadRegistry` if so). Doing that
-    /// cleanup here would leak orphan state into those sidecars when
-    /// a caller actually wanted to keep the prior entry.
+    /// 被拒绝时，注册表**不会**被修改。如果被拒绝的 spec 携带的 id 已有对
+    /// 应条目，旧条目会原样保留——是否驱逐它由调用方决定（并且，重要的是，
+    /// 若驱逐还需清理 `KvEventIndex` / `ActiveLoadRegistry` 中的附属状态）。
+    /// 如果在这里做清理，当调用方本想保留旧条目时，就会向那些附属结构泄漏
+    /// 出孤儿状态。
     pub fn add_with_cb(
         &self,
         spec: WorkerSpec,
         cb: Option<CircuitBreakerConfig>,
     ) -> Result<(), AddWorkerError> {
+        // 记录新加入 worker 的模式，用于后续混用检查。
         let incoming_mode = spec.mode;
-        // Hold the write lock for the entire validate→insert sequence.
-        // Without it, two concurrent callers for conflicting modes on
-        // the same model can both see an empty pool and both proceed
-        // to insert, producing the mixed PD+plain state the check
-        // exists to prevent.
+        // 在整个“校验→插入”序列期间持有写锁。
+        // 否则，两个针对同一模型、模式冲突的并发调用方，可能都看到空池并都
+        // 继续执行插入，从而产生该检查本应预防的 PD+plain 混用状态。
         //
-        // Mutex poisoning here means a previous writer panicked while
-        // holding the lock — and since the critical section spans
-        // `remove_locked` + several `by_model` updates + the final
-        // `by_id.insert`, a panic mid-section can leave the registry
-        // with a partial entry across the two DashMaps. Recovering via
-        // `PoisonError::into_inner` would silently continue against
-        // that half-written state; propagating the panic instead
-        // surfaces the corruption to `manager::register_one`'s task
-        // and ultimately trips `supervise_critical_tasks → mark_unready`
-        // so the pod stops taking traffic. That's the right outcome.
+        // 此处 Mutex 中毒（poisoning）意味着上一个写入方在持锁时发生了
+        // panic——而由于临界区涵盖 `remove_locked` + 若干次 `by_model` 更
+        // 新 + 最后的 `by_id.insert`，中途 panic 可能在两个 DashMap 之间留
+        // 下一个残缺条目。通过 `PoisonError::into_inner` 恢复会针对这个写
+        // 了一半的状态静默继续；相反，向上传播 panic 会把这一破坏暴露给
+        // `manager::register_one` 的任务，并最终触发
+        // `supervise_critical_tasks → mark_unready`，使该 pod 停止接收流量。
+        // 这才是正确的结果。
         let _guard = self.write.lock().unwrap();
-        // Validate against existing workers BEFORE we mutate. Re-adding
-        // the same id is an upsert; pretend the prior entry is gone for
-        // the purposes of the check (otherwise an upsert of an unmixed
-        // worker would self-conflict if its current entry already
-        // serves the model).
+        // 在修改之前先针对现有 worker 做校验。重复添加相同 id 属于 upsert；
+        // 为了检查目的，假装旧条目已不存在（否则，一个不混用的 worker 做
+        // upsert 时，如果它当前的条目已在服务该模型，就会与自身冲突）。
         for model in &spec.model_ids {
             for existing in self.workers_for(model) {
+                // 跳过自身：同 id 的重复添加是 upsert，不算冲突。
                 if existing.id == spec.id {
                     continue;
                 }
+                // 若新旧模式不能共存（plain 与 PD 混用），拒绝本次添加。
                 if modes_are_mixed(incoming_mode, existing.mode()) {
                     return Err(AddWorkerError::MixedPdAndPlain {
                         worker: spec.id,
@@ -121,31 +118,36 @@ impl WorkerRegistry {
                 }
             }
         }
+        // 校验通过，构造 worker 实体（携带熔断器配置）。
         let w = Arc::new(Worker::with_cb_config(spec, cb));
         let id = w.id.clone();
+        // 先移除旧条目（若存在），确保 upsert 时陈旧的模型索引被清理。
         self.remove_locked(&id);
+        // 为该 worker 服务的每个模型建立 模型→ID 反向索引。
         for m in &w.model_ids {
             self.by_model
                 .entry(m.clone())
                 .or_default()
                 .insert(id.clone());
         }
+        // 最后写入主索引。
         self.by_id.insert(id, w);
         Ok(())
     }
 
+    /// 从注册表中移除指定 worker。
     pub fn remove(&self, id: &WorkerId) {
-        // Mirror `add_with_cb`'s write-lock acquisition so removals
-        // don't race with concurrent adds (a stale `workers_for` snapshot
-        // could otherwise let an add succeed against a peer that's
-        // about to be removed, or vice versa).
+        // 与 `add_with_cb` 一样获取写锁，使移除操作不会与并发的添加操作竞
+        // 争（否则一份陈旧的 `workers_for` 快照可能让一次添加相对一个即将
+        // 被移除的对端成功，反之亦然）。
         let _guard = self.write.lock().unwrap();
         self.remove_locked(id);
     }
 
-    /// Internal removal that assumes the write lock is already held.
-    /// Use this from any path that has acquired `self.write`.
+    /// 内部移除逻辑，假定调用方已持有写锁。
+    /// 任何已获取 `self.write` 的路径都应调用此函数。
     fn remove_locked(&self, id: &WorkerId) {
+        // 先从主索引移除；若确实存在，再清理它在各模型下的反向索引。
         if let Some((_, w)) = self.by_id.remove(id) {
             for m in &w.model_ids {
                 if let Some(mut set) = self.by_model.get_mut(m) {
@@ -155,29 +157,33 @@ impl WorkerRegistry {
         }
     }
 
+    /// 返回服务指定模型的所有 worker（不区分熔断器状态）。
+    /// 通过 模型→ID 反向索引查出 ID 集合，再回主索引取出 worker 实体。
     pub fn workers_for(&self, model: &ModelId) -> Vec<Arc<Worker>> {
         self.by_model
             .get(model)
             .map(|ids| {
                 ids.iter()
+                    // ID 可能因并发移除而失效，用 filter_map 跳过缺失项。
                     .filter_map(|i| self.by_id.get(i).map(|w| Arc::clone(&w)))
                     .collect()
             })
             .unwrap_or_default()
     }
 
+    /// 返回服务指定模型且当前可用（熔断器未打开）的 worker 列表。
     pub fn healthy_workers_for(&self, model: &ModelId) -> Vec<Arc<Worker>> {
-        // Use `would_allow` (non-mutating) for filtering — `allow()` would
-        // claim a half-open probe slot for every enumerated candidate,
-        // starving the worker that the policy actually picks. The probe
-        // is claimed at dispatch time by `forward_*_to` in
-        // [`crate::proxy`].
+        // 过滤时使用 `would_allow`（不产生副作用）——而 `allow()` 会为每个
+        // 被枚举的候选占用一个半开（half-open）探测名额，从而让策略真正选
+        // 中的那个 worker 反而被“饿死”。探测名额是在派发时由
+        // [`crate::proxy`] 中的 `forward_*_to` 占用的。
         self.workers_for(model)
             .into_iter()
             .filter(|w| w.breaker.would_allow())
             .collect()
     }
 
+    /// 返回服务指定模型且模式匹配（Plain/Prefill/Decode）的 worker 列表。
     pub fn workers_for_mode(&self, model: &ModelId, mode: WorkerMode) -> Vec<Arc<Worker>> {
         self.workers_for(model)
             .into_iter()
@@ -185,36 +191,36 @@ impl WorkerRegistry {
             .collect()
     }
 
+    /// 返回已注册 worker 的总数。
     pub fn len(&self) -> usize {
         self.by_id.len()
     }
 
+    /// 注册表是否为空。
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
     }
 
+    /// 按 ID 获取单个 worker。
     pub fn get(&self, id: &WorkerId) -> Option<Arc<Worker>> {
         self.by_id.get(id).map(|w| Arc::clone(&w))
     }
 
-    /// Snapshot of every registered worker, across all models and modes,
-    /// regardless of breaker state. Order is unspecified (iterates the
-    /// underlying `DashMap`).
+    /// 返回所有已注册 worker 的快照，跨全部模型与模式，且不区分熔断器状态。
+    /// 顺序未定义（直接遍历底层 `DashMap`）。
     ///
-    /// Used by fleet-wide admin fan-out (e.g. `/flush_cache`) that targets
-    /// every worker the router knows about rather than one model's pool, and
-    /// by the `/metrics` scrape path to render per-worker gauges
-    /// (`sgl_router_worker_health`, `_cb_state`, `_inflight_requests`) plus
-    /// the pool-size gauge. The metrics path samples this fresh on each
-    /// scrape rather than pushing, so a removed worker stops appearing
-    /// immediately.
+    /// 用于面向整个集群的管理性 fan-out（例如 `/flush_cache`）——它面向
+    /// router 已知的每一个 worker，而非某个模型的池；也用于 `/metrics`
+    /// 抓取路径，渲染每个 worker 的指标（`sgl_router_worker_health`、
+    /// `_cb_state`、`_inflight_requests`）以及池大小指标。metrics 路径在每
+    /// 次抓取时都重新采样（而非推送），因此被移除的 worker 会立即不再出现。
     pub fn all(&self) -> Vec<Arc<Worker>> {
         self.by_id.iter().map(|e| Arc::clone(e.value())).collect()
     }
 }
 
-/// `true` when the two modes can't coexist for the same model — i.e.
-/// one is `Plain` and the other is `Prefill` or `Decode`.
+/// 当两种模式无法在同一模型上共存时返回 `true`——即一方是 `Plain`
+/// 而另一方是 `Prefill` 或 `Decode`。
 fn modes_are_mixed(a: WorkerMode, b: WorkerMode) -> bool {
     matches!(
         (a, b),
@@ -287,8 +293,8 @@ mod tests {
     #[test]
     fn all_lists_multi_model_worker_once() {
         let r = WorkerRegistry::default();
-        // "a" serves two models; `all` must still list it once,
-        // unlike a per-model enumeration which would double-count.
+        // “a”服务两个模型；`all` 必须仍只列出它一次，
+        // 不同于按模型枚举会重复计数。
         let _ = r.add(spec("a", WorkerMode::Plain, &["m1", "m2"]));
         let _ = r.add(spec("b", WorkerMode::Plain, &["m1"]));
         let mut urls: Vec<String> = r.all().iter().map(|w| w.url.clone()).collect();
@@ -296,13 +302,12 @@ mod tests {
         assert_eq!(urls, vec!["http://a:30000", "http://b:30000"]);
     }
 
-    /// `healthy_workers_for` must drop workers whose breaker is Open.
-    /// An earlier version of this test asserted `healthy.len() == 2`
-    /// against two workers with untouched breakers — i.e., it pinned
-    /// only the no-op case (both Closed) and would have passed even if
-    /// `healthy_workers_for` ignored the breaker entirely and was a
-    /// thin alias for `workers_for`. Tripping one breaker and asserting
-    /// the surviving set excludes it is the actual contract.
+    /// `healthy_workers_for` 必须剔除熔断器处于 Open（打开）状态的
+    /// worker。本测试的早期版本对两个熔断器未被触碰的 worker 断言
+    /// `healthy.len() == 2`——即它只针对空操作情形（两者都 Closed），
+    /// 即便 `healthy_workers_for` 完全忽略熔断器、仅仅是 `workers_for`
+    /// 的薄封装别名，也能通过。真正的契约是：触发一个熔断器，并
+    /// 断言存活集合不包含它。
     #[test]
     fn healthy_subset_filters_via_breaker() {
         use crate::health::circuit_breaker::CircuitBreakerConfig;
@@ -311,8 +316,8 @@ mod tests {
 
         let r = WorkerRegistry::default();
         let _ = r.add_with_cb(spec("ok", WorkerMode::Plain, &["m"]), None);
-        // Give "bad" a threshold=1 breaker so a single record_failure
-        // flips it to Open.
+        // 给 "bad" 一个阈值=1 的熔断器，这样一次 record_failure 就能把它
+        // 翻转到 Open 状态。
         let _ = r.add_with_cb(
             spec("bad", WorkerMode::Plain, &["m"]),
             Some(CircuitBreakerConfig {
@@ -324,6 +329,7 @@ mod tests {
         bad.breaker.record_failure();
         assert!(
             !bad.breaker.would_allow(),
+            // 健康性断言：阈值=1 + 一次失败必须使熔断器进入 Open。
             "sanity: threshold=1 + one failure must Open the breaker",
         );
 
@@ -331,18 +337,18 @@ mod tests {
         assert_eq!(
             healthy.len(),
             1,
+            // 只有熔断器非 Open 的 worker 应当存活。
             "only the worker with a non-Open breaker should survive",
         );
         assert_eq!(healthy[0].id, WorkerId("ok".into()));
     }
 
-    /// PD prefill/decode workers and plain workers cannot coexist on the
-    /// same model. The resolver bases its PD-vs-plain shape on registered
-    /// workers; mixing the two forces a fallback to whichever bucket
-    /// happens to be healthy when the other is breaker-open, surfacing
-    /// the wrong 5xx code (`no_healthy_workers` instead of
-    /// `no_prefill_workers_available`). Reject the conflicting add up
-    /// front so the operator sees the misconfiguration immediately.
+    /// PD prefill/decode worker 与 plain worker 无法在同一模型上共存。
+    /// resolver 基于已注册 worker 确定其 PD-vs-plain 形态；一旦混用，当其
+    /// 中一侧因熔断器打开而不可用时，就会被迫回退到恰好健康的另一桶，
+    /// 从而返回错误的 5xx 码（返回 `no_healthy_workers` 而不是
+    /// `no_prefill_workers_available`）。先行拒绝冲突的添加，让运维人员
+    /// 立即发现该配置错误。
     #[test]
     fn plain_then_pd_for_same_model_is_rejected() {
         let r = WorkerRegistry::default();
@@ -355,7 +361,7 @@ mod tests {
             msg.contains("PD") && msg.contains("plain"),
             "error must name both modes; got: {msg}"
         );
-        // Existing plain worker survives the rejection.
+        // 已存在的 plain worker 在拒绝后应存活。
         assert_eq!(
             r.workers_for_mode(&ModelId("m".into()), WorkerMode::Plain)
                 .len(),
@@ -411,10 +417,9 @@ mod tests {
         );
     }
 
-    /// Re-adding a worker with a shrunken `model_ids` must drop the worker
-    /// from the models it no longer serves.  The earlier implementation
-    /// only updated `by_id`, leaving the stale `by_model` entries pointing
-    /// at the new worker.
+    /// 以缩小的 `model_ids` 重新添加一个 worker 时，必须将该 worker 从它
+    /// 不再服务的模型中移除。早期实现只更新了 `by_id`，遗留了陈旧的
+    /// `by_model` 条目仍指向新 worker。
     #[test]
     fn re_add_with_shrunken_model_set_drops_stale_indexes() {
         let r = WorkerRegistry::default();
@@ -425,17 +430,18 @@ mod tests {
         assert_eq!(
             r.workers_for(&ModelId("m2".into())).len(),
             0,
+            // 重新添加后 w1 不再服务 m2。
             "w1 no longer serves m2 after re-add"
         );
         assert_eq!(
             r.workers_for(&ModelId("m1".into())).len(),
             1,
+            // w1 仍服务 m1。
             "w1 still serves m1"
         );
     }
 
-    /// Re-adding the same id with a different mode reflects in
-    /// `workers_for_mode`.
+    /// 以不同模式重新添加相同 id，应体现在 `workers_for_mode` 中。
     #[test]
     fn re_add_with_different_mode_updates_mode_filter() {
         let r = WorkerRegistry::default();
@@ -453,26 +459,24 @@ mod tests {
         );
     }
 
-    /// On a rejected upsert with `MixedPdAndPlain`, the registry is
-    /// **not** mutated — the prior entry for the rejected id stays
-    /// put. Eviction (with the matching `KvEventIndex` /
-    /// `ActiveLoadRegistry` cleanup) is the manager's responsibility;
-    /// doing it here would leak orphan state in those sidecars.
+    /// 当 upsert 因 `MixedPdAndPlain` 被拒绝时，注册表**不会**被修改——
+    /// 被拒绝 id 的旧条目会原样保留。驱逐（及配套的 `KvEventIndex` /
+    /// `ActiveLoadRegistry` 清理）是 manager 的职责；在这里做会向那些
+    /// 附属结构泄漏孤儿状态。
     #[test]
     fn upsert_rejected_with_mixed_modes_leaves_registry_unchanged() {
         let r = WorkerRegistry::default();
-        // Healthy PD pool on model m.
+        // 模型 m 上有一个健康的 PD 池。
         let _ = r.add(spec("p", WorkerMode::Prefill, &["m"]));
         let _ = r.add(spec("d", WorkerMode::Decode, &["m"]));
-        // Re-add "p" with Plain mode — discovery has reported a role flip.
-        // The decode worker "d" is still on m, so validation rejects.
+        // 以 Plain 模式重新添加 "p"——发现机制报告了一次角色翻转。
+        // 解码 worker "d" 仍在 m 上，因此校验拒绝。
         let err = r
             .add(spec("p", WorkerMode::Plain, &["m"]))
             .expect_err("plain upsert must be rejected when peer decode worker remains");
         assert!(err.to_string().contains("plain"), "got: {err}");
-        // Prior "p" entry survives (still Prefill). The registry
-        // deliberately does NOT auto-evict on rejection — eviction
-        // (and the matching sidecar cleanup) is the caller's call.
+        // 旧的 "p" 条目存活（仍为 Prefill）。注册表故意不在拒绝时自动驱
+        // 逐——驱逐（及配套的附属状态清理）由调用方决定。
         let p = r
             .get(&WorkerId("p".into()))
             .expect("prior entry must remain — caller owns the cleanup");
@@ -489,9 +493,9 @@ mod tests {
         );
     }
 
-    /// A *new* (not-yet-registered) worker rejected with `MixedPdAndPlain`
-    /// must not affect the pool. Combined with the upsert test above,
-    /// this pins that rejection never mutates registry state on its own.
+    /// 一个*新的*（尚未注册的）worker 因 `MixedPdAndPlain` 被拒绝时，不得
+    /// 影响池。结合上面的 upsert 测试，这锁定了：拒绝本身绝不会修改
+    /// 注册表状态。
     #[test]
     fn rejected_new_add_leaves_pool_untouched() {
         let r = WorkerRegistry::default();
@@ -508,34 +512,29 @@ mod tests {
         assert!(r.get(&WorkerId("p".into())).is_none());
     }
 
-    /// Concurrent registrations from `manager::register_one` race against
-    /// each other: each spawned task calls `add_with_cb` in parallel, and
-    /// the validate-then-insert sequence inside that method is **not**
-    /// atomic. Two threads adding workers of conflicting modes for the
-    /// same model can both pass the existing-workers check (each sees an
-    /// empty pool) and both proceed to insert, leaving the registry in a
-    /// mixed PD+plain state — exactly the corruption the
-    /// `MixedPdAndPlain` check is supposed to prevent.
+    /// 来自 `manager::register_one` 的并发注册会相互竞争：每个被生成的
+    /// 任务都并行调用 `add_with_cb`，而该方法内部的“先校验后插入”序
+    /// 列**不是**原子的。两个为同一模型添加模式冲突 worker 的线程，
+    /// 可能都通过现有 worker 检查（各自看到空池）并都继续插入，从而让
+    /// 注册表进入 PD+plain 混用状态——正是 `MixedPdAndPlain` 检查本应
+    /// 预防的破坏。
     ///
-    /// Invariant we pin: for every model, the resulting pool must be
-    /// EITHER all-Plain OR all-PD, never a mix. We don't care which
-    /// "winner" mode is selected — the racing manager already serialises
-    /// per-WorkerId so it's the cross-id case that needs atomicity here.
+    /// 我们锁定的不变式：对每个模型，最终的池必须要么全为 Plain，要
+    /// 么全为 PD，绝不混用。我们不关心究竟选中哪种“胜出”模式——竞
+    /// 争中的 manager 已按 WorkerId 串行化，因此这里需要原子性的是跨 id
+    /// 的情形。
     #[test]
     fn concurrent_conflicting_modes_never_produce_mixed_pool() {
         use std::sync::Arc;
         use std::sync::Barrier;
         use std::thread;
 
-        // All threads target one shared model so every `add_with_cb`
-        // racer contends on the same `workers_for("m")` slot — that's
-        // what makes the read-validate-write window of one thread
-        // overlap with another's mutate. An earlier variant spread the
-        // load across 4 models and did not reliably reproduce the bug
-        // (per-slot contention was diluted to ~N/4 threads). 200
-        // iterations × 16 threads triggers the race within the first
-        // few iterations on the author's machine; post-fix the
-        // invariant must hold across every iteration.
+        // 所有线程都针对同一个共享模型，因此每个 `add_with_cb` 竞争者都在
+        // 同一个 `workers_for("m")` 槽位上争用——这正是使一个线程的“读-
+        // 校验-写”窗口与另一个线程的修改重叠的原因。早期变体把负载分
+        // 散到 4 个模型上，无法稳定复现该 bug（每槽位竞争被稀释到约
+        // N/4 个线程）。200 次迭代 × 16 线程在作者机器上能在前几次迭
+        // 代内触发该竞争；修复后，该不变式必须在每一次迭代中都成立。
         const N_THREADS: usize = 16;
         const ITER: usize = 200;
 
@@ -546,11 +545,9 @@ mod tests {
             for t in 0..N_THREADS {
                 let r = Arc::clone(&r);
                 let barrier = Arc::clone(&barrier);
-                // Half the threads register Plain workers, half register
-                // Prefill, all on the same model. With a non-atomic
-                // validate→write inside `add_with_cb`, a Plain and a
-                // Prefill thread both see an empty pool and both
-                // succeed.
+                // 一半线程注册 Plain worker，另一半注册 Prefill，全部在同一模型
+                // 上。若 `add_with_cb` 内部的 校验→写入 非原子，一个 Plain 线
+                // 程和一个 Prefill 线程会都看到空池并都成功。
                 let mode = if t % 2 == 0 {
                     WorkerMode::Plain
                 } else {
@@ -566,7 +563,7 @@ mod tests {
                 h.join().unwrap();
             }
 
-            // Invariant check: model is single-mode.
+            // 不变式检查：模型为单一模式。
             let model = ModelId("m".into());
             let plain = r.workers_for_mode(&model, WorkerMode::Plain).len();
             let prefill = r.workers_for_mode(&model, WorkerMode::Prefill).len();
@@ -574,15 +571,17 @@ mod tests {
             let pd = prefill + decode;
             assert!(
                 plain == 0 || pd == 0,
+                // 第 {iter} 次迭代：注册表持有混用池——plain={plain}，
+                // prefill={prefill}，decode={decode}。`add_with_cb` 中的
+                // MixedPdAndPlain 检查在并发调用方之间不是原子的。
                 "iter {iter}: registry holds a mixed pool — \
                  plain={plain}, prefill={prefill}, decode={decode}. \
                  The MixedPdAndPlain check in `add_with_cb` is not atomic \
                  across concurrent callers.",
             );
-            // Sanity: the first thread to take the lock must succeed
-            // (no peer exists yet). Defends against a degenerate "fix"
-            // that satisfies the single-mode invariant by silently
-            // rejecting every add.
+            // 健康性断言：第一个拿到锁的线程必须成功（此时尚无对端）。
+            // 防御一种退化的“修复”——它通过静默拒绝每一次添加来满足单
+            // 一模式不变式。
             assert!(
                 plain + pd >= 1,
                 "iter {iter}: no workers were registered — \

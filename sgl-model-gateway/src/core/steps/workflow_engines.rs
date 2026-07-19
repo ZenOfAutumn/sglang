@@ -1,7 +1,7 @@
-//! Typed workflow engines collection
+//! 强类型工作流引擎集合
 //!
-//! This module provides a collection of typed workflow engines for different workflow types.
-//! Each workflow type has its own engine with compile-time type safety.
+//! 本模块为不同类型的工作流提供一组强类型的工作流引擎。
+//! 每种工作流类型都拥有自己专用的引擎，并具备编译期类型安全保证。
 
 use std::sync::Arc;
 
@@ -17,106 +17,108 @@ use super::{
 };
 use crate::config::RouterConfig;
 
-/// Type alias for local worker workflow engine
+/// 本地 worker 工作流引擎的类型别名
 pub type LocalWorkerEngine =
     WorkflowEngine<LocalWorkerWorkflowData, InMemoryStore<LocalWorkerWorkflowData>>;
 
-/// Type alias for external worker workflow engine
+/// 外部 worker 工作流引擎的类型别名
 pub type ExternalWorkerEngine =
     WorkflowEngine<ExternalWorkerWorkflowData, InMemoryStore<ExternalWorkerWorkflowData>>;
 
-/// Type alias for worker removal workflow engine
+/// worker 移除工作流引擎的类型别名
 pub type WorkerRemovalEngine =
     WorkflowEngine<WorkerRemovalWorkflowData, InMemoryStore<WorkerRemovalWorkflowData>>;
 
-/// Type alias for worker update workflow engine
+/// worker 更新工作流引擎的类型别名
 pub type WorkerUpdateEngine =
     WorkflowEngine<WorkerUpdateWorkflowData, InMemoryStore<WorkerUpdateWorkflowData>>;
 
-/// Type alias for MCP registration workflow engine
+/// MCP 注册工作流引擎的类型别名
 pub type McpEngine = WorkflowEngine<McpWorkflowData, InMemoryStore<McpWorkflowData>>;
 
-/// Type alias for tokenizer registration workflow engine
+/// 分词器注册工作流引擎的类型别名
 pub type TokenizerEngine =
     WorkflowEngine<TokenizerWorkflowData, InMemoryStore<TokenizerWorkflowData>>;
 
-/// Type alias for WASM registration workflow engine
+/// WASM 注册工作流引擎的类型别名
 pub type WasmRegistrationEngine =
     WorkflowEngine<WasmRegistrationWorkflowData, InMemoryStore<WasmRegistrationWorkflowData>>;
 
-/// Type alias for WASM removal workflow engine
+/// WASM 移除工作流引擎的类型别名
 pub type WasmRemovalEngine =
     WorkflowEngine<WasmRemovalWorkflowData, InMemoryStore<WasmRemovalWorkflowData>>;
 
-/// Collection of typed workflow engines
+/// 强类型工作流引擎集合
 ///
-/// Each workflow type has its own engine with compile-time type safety.
-/// This replaces the old `WorkflowEngine<AnyWorkflowData, ...>` approach.
+/// 每种工作流类型都拥有自己专用的引擎，并具备编译期类型安全保证。
+/// 它取代了旧的 `WorkflowEngine<AnyWorkflowData, ...>` 方式(去除了运行期类型擦除)。
+///
+/// 各引擎均以 `Arc` 包裹，可在多个组件间共享并安全并发访问。
 #[derive(Clone, Debug)]
 pub struct WorkflowEngines {
-    /// Engine for local worker registration workflows
+    /// 本地 worker 注册工作流引擎
     pub local_worker: Arc<LocalWorkerEngine>,
-    /// Engine for external worker registration workflows
+    /// 外部 worker 注册工作流引擎
     pub external_worker: Arc<ExternalWorkerEngine>,
-    /// Engine for worker removal workflows
+    /// worker 移除工作流引擎
     pub worker_removal: Arc<WorkerRemovalEngine>,
-    /// Engine for worker update workflows
+    /// worker 更新工作流引擎
     pub worker_update: Arc<WorkerUpdateEngine>,
-    /// Engine for MCP server registration workflows
+    /// MCP 服务注册工作流引擎
     pub mcp: Arc<McpEngine>,
-    /// Engine for tokenizer registration workflows
+    /// 分词器注册工作流引擎
     pub tokenizer: Arc<TokenizerEngine>,
-    /// Engine for WASM module registration workflows
+    /// WASM 模块注册工作流引擎
     pub wasm_registration: Arc<WasmRegistrationEngine>,
-    /// Engine for WASM module removal workflows
+    /// WASM 模块移除工作流引擎
     pub wasm_removal: Arc<WasmRemovalEngine>,
 }
 
 impl WorkflowEngines {
-    /// Create and initialize all workflow engines with their workflow definitions
+    /// 创建并初始化所有工作流引擎，并为其注册对应的工作流定义
     pub fn new(router_config: &RouterConfig) -> Self {
-        // Create local worker engine
+        // 创建本地 worker 引擎
         let local_worker = WorkflowEngine::new();
         local_worker
             .register_workflow(create_local_worker_workflow(router_config))
             .expect("local_worker_registration workflow should be valid");
 
-        // Create external worker engine
+        // 创建外部 worker 引擎
         let external_worker = WorkflowEngine::new();
         external_worker
             .register_workflow(create_external_worker_workflow())
             .expect("external_worker_registration workflow should be valid");
 
-        // Create worker removal engine
+        // 创建 worker 移除引擎
         let worker_removal = WorkflowEngine::new();
         worker_removal
             .register_workflow(create_worker_removal_workflow())
             .expect("worker_removal workflow should be valid");
 
-        // Create worker update engine
+        // 创建 worker 更新引擎
         let worker_update = WorkflowEngine::new();
         worker_update
             .register_workflow(create_worker_update_workflow())
             .expect("worker_update workflow should be valid");
 
-        // Create MCP engine
+        // 创建 MCP 引擎
         let mcp = WorkflowEngine::new();
         mcp.register_workflow(create_mcp_registration_workflow())
             .expect("mcp_registration workflow should be valid");
 
-        // Create tokenizer engine
+        // 创建分词器引擎
         let tokenizer = WorkflowEngine::new();
         tokenizer
             .register_workflow(create_tokenizer_registration_workflow())
             .expect("tokenizer_registration workflow should be valid");
 
-        // Create WASM registration engine
+        // 创建 WASM 注册引擎
         let wasm_registration = WorkflowEngine::new();
         wasm_registration
             .register_workflow(create_wasm_module_registration_workflow())
             .expect("wasm_module_registration workflow should be valid");
 
-        // Create WASM removal engine
+        // 创建 WASM 移除引擎
         let wasm_removal = WorkflowEngine::new();
         wasm_removal
             .register_workflow(create_wasm_module_removal_workflow())
@@ -134,7 +136,7 @@ impl WorkflowEngines {
         }
     }
 
-    /// Subscribe an event subscriber to all workflow engines
+    /// 将一个事件订阅者订阅到所有工作流引擎
     pub async fn subscribe_all<S: EventSubscriber + 'static>(&self, subscriber: Arc<S>) {
         self.local_worker
             .event_bus()

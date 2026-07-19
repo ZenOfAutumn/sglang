@@ -27,17 +27,25 @@
 - 高级负载均衡，包含缓存感知的请求复用、负载感知（power-of-two）选择，以及按模型的策略覆盖。
 
 ## 特性亮点
-- 多种负载均衡策略（`random`、`round_robin`、`cache_aware`、`power_of_two`、`bucket`），并支持 DP 感知调度。
-- 多模型 HTTP 服务与推理网关路由，支持按模型的特定策略。
-- Prefill/decode 分离，包括 bootstrap 端口处理与缓存感知的合并。
-- gRPC 路由，完全采用 Rust 实现的分词器加载、推理解析器选择与工具解析器集成，面向 OpenAI 兼容端点——在流式与非流式模式下支持 DeepSeek、Llama、Kimi K2、Qwen、GPT-OSS、Mistral、Step-3、GLM4、GLM4.7 及其他具备推理能力的模型。
+
+### API 管理与集成
 - 兼容 OpenAI 的 `/v1/chat/completions`、`/v1/responses`、`/v1/conversations`、`/v1/embeddings`、`/v1/rerank`、`/v1/classify` 端点。
 - **分词 API**：提供 tokenize（`/v1/tokenize`）和 detokenize（`/v1/detokenize`）的 HTTP 端点并支持批量；以及用于动态注册的分词器管理 API。
 - **解析器端点**：推理解析器（`/parse/reasoning`）和函数调用解析器（`/parse/function_call`），用于分离推理内容并提取工具调用。
 - 原生 MCP 客户端集成，支持所有 MCP 传输协议（STDIO、HTTP、SSE 和 Streamable）以实现工具执行循环。
 - 可插拔的历史连接器：内存、禁用、Oracle ATP 或 PostgreSQL（支持连接池与凭据）。
-- 可靠性控制：带抖动的重试、按 worker 范围的熔断器、带可选队列的令牌桶限流器，以及缓存刷新 API。
+
+### 负载均衡与路由
+- 多种负载均衡策略（`random`、`round_robin`、`cache_aware`、`power_of_two`、`bucket`），并支持 DP 感知调度。
+- 多模型 HTTP 服务与推理网关路由，支持按模型的特定策略。
+- Prefill/decode 分离，包括 bootstrap 端口处理与缓存感知的合并。
+- gRPC 路由，完全采用 Rust 实现的分词器加载、推理解析器选择与工具解析器集成，面向 OpenAI 兼容端点——在流式与非流式模式下支持 DeepSeek、Llama、Kimi K2、Qwen、GPT-OSS、Mistral、Step-3、GLM4、GLM4.7 及其他具备推理能力的模型。
 - 面向常规与 PD 工作负载的服务发现，支持独立的选择器（selector）。
+
+### 可靠性控制
+- 可靠性控制：带抖动的重试、按 worker 范围的熔断器、带可选队列的令牌桶限流器，以及缓存刷新 API。
+
+### 可观测性
 - **全面的可观测性**：覆盖 HTTP、路由器、worker、熔断器、重试、发现、MCP 与数据库各层的 40+ 项 Prometheus 指标；支持带 OTLP 导出的 OpenTelemetry 追踪；以及带请求 ID 透传的结构化日志。
 
 ## 文档

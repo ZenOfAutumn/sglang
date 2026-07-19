@@ -12,91 +12,128 @@ pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 500;
 pub const DEFAULT_TCP_KEEPALIVE_SECS: u64 = 30;
 
-/// Main router configuration
+/// 路由器主配置
+///
+/// 该结构体聚合了整个 model gateway 运行所需的全部配置项，
+/// 包括路由模式、负载均衡策略、网络监听、限流、重试、熔断、
+/// 健康检查、分词器、历史存储后端、TLS/mTLS 以及 WASM 等能力开关。
+/// 通常由 CLI 参数或配置文件构建而来。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
+    /// 路由模式：常规单模型、PD（Prefill-Decode）分离或 OpenAI 兼容等
     pub mode: RoutingMode,
+    /// 与后端 worker 的连接方式（HTTP 或 gRPC），未指定时使用默认值
     #[serde(default)]
     pub connection_mode: ConnectionMode,
+    /// 负载均衡/路由策略（如 random、round_robin、cache_aware 等）
     pub policy: PolicyConfig,
+    /// 路由服务器绑定的监听主机地址（如 0.0.0.0）
     pub host: String,
+    /// 路由服务器绑定的监听端口
     pub port: u16,
+    /// 允许的最大请求体大小（字节）
     pub max_payload_size: usize,
+    /// 单个请求的整体超时时间（秒）
     pub request_timeout_secs: u64,
+    /// 等待 worker 启动并完成注册的超时时间（秒）
     pub worker_startup_timeout_secs: u64,
+    /// worker 启动检查之间的轮询间隔（秒）
     pub worker_startup_check_interval_secs: u64,
+    /// 是否启用数据并行（DP）感知调度
     pub dp_aware: bool,
+    /// 访问 worker 时使用的 API 密钥（可选）
     pub api_key: Option<String>,
+    /// 服务发现配置（如 Kubernetes 服务发现），未启用时为 None
     pub discovery: Option<DiscoveryConfig>,
+    /// Prometheus 指标暴露配置，未启用时为 None
     pub metrics: Option<MetricsConfig>,
+    /// OpenTelemetry 链路追踪配置，未启用时为 None
     pub trace_config: Option<TraceConfig>,
+    /// 日志文件输出目录（None 表示仅输出到标准输出）
     pub log_dir: Option<String>,
+    /// 日志级别（如 debug/info/warn/error）
     pub log_level: Option<String>,
+    /// 用于提取请求 ID 的自定义 HTTP 头列表
     pub request_id_headers: Option<Vec<String>>,
+    /// 上游 HTTP 连接池中空闲连接的存活超时时间（秒）
     #[serde(default = "default_pool_idle_timeout_secs")]
     pub pool_idle_timeout_secs: u64,
+    /// 建立新的上游 HTTP 连接的超时时间（秒）
     #[serde(default = "default_connect_timeout_secs")]
     pub connect_timeout_secs: u64,
+    /// 每个上游主机在连接池中保留的最大空闲连接数
     #[serde(default = "default_pool_max_idle_per_host")]
     pub pool_max_idle_per_host: usize,
+    /// 上游 HTTP 连接的 TCP keepalive 空闲时间（秒）
     #[serde(default = "default_tcp_keepalive_secs")]
     pub tcp_keepalive_secs: u64,
-    /// Set to -1 to disable rate limiting
+    /// 最大并发请求数；设为 -1 表示禁用限流
     pub max_concurrent_requests: i32,
+    /// 达到并发上限时，待处理请求的排队队列大小
     pub queue_size: usize,
+    /// 请求在队列中允许等待的最长时间（秒）
     pub queue_timeout_secs: u64,
-    /// If not set, defaults to max_concurrent_requests
+    /// 令牌桶补充速率（每秒令牌数）；未设置时默认取 max_concurrent_requests
     pub rate_limit_tokens_per_second: Option<i32>,
+    /// CORS 允许的来源列表
     pub cors_allowed_origins: Vec<String>,
+    /// 请求重试策略配置
     pub retry: RetryConfig,
+    /// 熔断器配置
     pub circuit_breaker: CircuitBreakerConfig,
-    /// When true, overrides retry.max_retries to 1
+    /// 为 true 时，将 retry.max_retries 强制覆盖为 1（等效于禁用重试）
     #[serde(default)]
     pub disable_retries: bool,
-    /// When true, overrides circuit_breaker.failure_threshold to u32::MAX
+    /// 为 true 时，将 circuit_breaker.failure_threshold 覆盖为 u32::MAX（等效于禁用熔断）
     #[serde(default)]
     pub disable_circuit_breaker: bool,
+    /// worker 健康检查配置
     pub health_check: HealthCheckConfig,
+    /// 是否启用 IGW（推理网关）模式以支持多模型
     #[serde(default)]
     pub enable_igw: bool,
-    /// Can be a HuggingFace model ID or local path
+    /// 模型路径：可以是 HuggingFace 模型 ID 或本地路径
     pub model_path: Option<String>,
-    /// Overrides model_path tokenizer if provided
+    /// 显式分词器路径；若提供则覆盖 model_path 中的分词器
     pub tokenizer_path: Option<String>,
+    /// 聊天模板路径
     pub chat_template: Option<String>,
+    /// 历史记录存储后端类型（memory/none/oracle/postgres/redis）
     #[serde(default = "default_history_backend")]
     pub history_backend: HistoryBackend,
-    /// Required when history_backend = "oracle"
+    /// Oracle 数据库配置；当 history_backend = "oracle" 时必填
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oracle: Option<OracleConfig>,
-    /// Required when history_backend = "postgres"
+    /// PostgreSQL 数据库配置；当 history_backend = "postgres" 时必填
     #[serde(skip_serializing_if = "Option::is_none")]
     pub postgres: Option<PostgresConfig>,
-    /// Required when history_backend = "redis"
+    /// Redis 数据库配置；当 history_backend = "redis" 时必填
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redis: Option<RedisConfig>,
-    /// For reasoning models (e.g., deepseek-r1, qwen3)
+    /// 推理模型的思维链解析器（如 deepseek-r1、qwen3）
     pub reasoning_parser: Option<String>,
-    /// For tool-call interactions
+    /// 工具调用（tool-call）交互的解析器
     pub tool_call_parser: Option<String>,
+    /// 分词器多级缓存配置（L0/L1）
     #[serde(default)]
     pub tokenizer_cache: TokenizerCacheConfig,
-    /// Server TLS certificate (PEM)
+    /// 服务端 TLS 证书（PEM 格式）；不参与序列化
     #[serde(skip)]
     pub server_cert: Option<Vec<u8>>,
-    /// Server TLS private key (PEM)
+    /// 服务端 TLS 私钥（PEM 格式）；不参与序列化
     #[serde(skip)]
     pub server_key: Option<Vec<u8>>,
-    /// Combined certificate + key in PEM format, loaded from client_cert_path and client_key_path during config creation
+    /// 客户端身份凭证：PEM 格式的证书+私钥合并内容，
+    /// 在配置创建阶段从 client_cert_path 与 client_key_path 加载；不参与序列化
     #[serde(skip)]
     pub client_identity: Option<Vec<u8>>,
-    /// PEM format, loaded from ca_cert_paths during config creation
+    /// CA 证书列表（PEM 格式），在配置创建阶段从 ca_cert_paths 加载
     #[serde(default)]
     pub ca_certificates: Vec<Vec<u8>>,
-    /// Loaded from mcp_config_path during config creation
+    /// MCP 配置，在配置创建阶段从 mcp_config_path 加载；不参与序列化
     #[serde(skip)]
     pub mcp_config: Option<smg_mcp::McpConfig>,
-    /// Enable WASM support
+    /// 是否启用 WASM（WebAssembly）扩展支持
     #[serde(default)]
     pub enable_wasm: bool,
 }
@@ -175,24 +212,43 @@ fn default_history_backend() -> HistoryBackend {
     HistoryBackend::Memory
 }
 
-/// Routing mode configuration
+/// 路由模式配置
+///
+/// 定义网关如何组织与调度后端 worker，共有三种模式：
+/// - `Regular`：常规模式，所有 worker 同时承担 prefill 与 decode
+/// - `PrefillDecode`：PD 分离模式，prefill 与 decode 由不同节点分别承担
+/// - `OpenAI`：OpenAI 兼容模式，转发到 OpenAI 风格的后端
+///
+/// 序列化时通过内部标签字段 `type` 区分具体模式。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum RoutingMode {
+    /// 常规模式：每个 worker 同时处理 prefill 和 decode
     #[serde(rename = "regular")]
-    Regular { worker_urls: Vec<String> },
+    Regular {
+        /// worker URL 列表
+        worker_urls: Vec<String>,
+    },
+    /// PD（Prefill-Decode）分离模式：prefill 与 decode 分别由不同节点承担
     #[serde(rename = "prefill_decode")]
     PrefillDecode {
-        /// With optional bootstrap ports
+        /// prefill 节点 URL 列表，每项可附带可选的 bootstrap 端口
         prefill_urls: Vec<(String, Option<u16>)>,
+        /// decode 节点 URL 列表
         decode_urls: Vec<String>,
+        /// prefill 节点的专用路由策略；为 None 时回退到主策略
         #[serde(skip_serializing_if = "Option::is_none")]
         prefill_policy: Option<PolicyConfig>,
+        /// decode 节点的专用路由策略；为 None 时回退到主策略
         #[serde(skip_serializing_if = "Option::is_none")]
         decode_policy: Option<PolicyConfig>,
     },
+    /// OpenAI 兼容模式：转发到 OpenAI 风格的后端
     #[serde(rename = "openai")]
-    OpenAI { worker_urls: Vec<String> },
+    OpenAI {
+        /// worker URL 列表
+        worker_urls: Vec<String>,
+    },
 }
 
 impl RoutingMode {
@@ -248,75 +304,99 @@ pub enum ManualAssignmentMode {
     MinGroup,
 }
 
-/// Policy configuration for routing
+/// 路由负载均衡策略配置。
+///
+/// 决定 Router 收到请求后如何在多个后端 worker 之间挑选目标。不同策略在
+/// 「负载均衡效果」和「KV cache 命中率 / 会话亲和性」之间做不同权衡:
+/// - Random / RoundRobin:最简单,只追求负载均摊,不考虑缓存局部性。
+/// - CacheAware / PrefixHash:面向 KV cache,让相同前缀的请求尽量落到同一 worker 以提升缓存命中。
+/// - PowerOfTwo / Bucket:基于实时负载做更精细的均衡。
+/// - Manual / ConsistentHashing:提供会话粘性(sticky session),同一会话稳定路由到同一 worker。
+///
+/// 序列化时通过 `type` 字段区分具体策略(内部标签枚举),例如 `{"type": "cache_aware", ...}`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PolicyConfig {
+    /// 随机策略:每次从可用 worker 中等概率随机选一个,无状态、开销最小。
     #[serde(rename = "random")]
     Random,
 
+    /// 轮询策略:按顺序依次分配请求,保证请求数在 worker 间均匀分布。
     #[serde(rename = "round_robin")]
     RoundRobin,
 
+    /// 缓存感知策略:基于 radix tree(基数树)记录各 worker 已缓存的 token 前缀,
+    /// 优先把相同前缀的请求路由到已有对应 KV cache 的 worker 以提升命中率;
+    /// 负载失衡超过阈值时退回负载均衡,兼顾缓存局部性与均衡。
     #[serde(rename = "cache_aware")]
     CacheAware {
+        /// 前缀匹配率阈值:请求与某 worker 缓存前缀的匹配比例 ≥ 该值时判定命中并优先路由。
         cache_threshold: f32,
+        /// 负载均衡绝对差阈值:worker 间负载(请求数)绝对差超过该值时触发均衡而非追缓存。
         balance_abs_threshold: usize,
+        /// 负载均衡相对比阈值:最大 / 最小负载比超过该值时触发均衡。
         balance_rel_threshold: f32,
+        /// radix tree 驱逐周期(秒),周期性清理过期 / 冷门的缓存前缀节点。
         eviction_interval_secs: u64,
+        /// radix tree 允许的最大节点数,超过后触发驱逐以限制内存占用。
         max_tree_size: usize,
     },
 
+    /// Power-of-Two-Choices 策略:随机抽取两个 worker,选其中负载更低者,
+    /// 以极小开销逼近最优负载均衡效果。
     #[serde(rename = "power_of_two")]
-    PowerOfTwo { load_check_interval_secs: u64 },
+    PowerOfTwo {
+        /// 负载信息的刷新间隔(秒),周期性拉取各 worker 的实时负载用于比较。
+        load_check_interval_secs: u64,
+    },
 
+    /// 分桶(bucket)策略:将 worker 按负载划分到不同桶中,在满足负载均衡约束的前提下路由。
     #[serde(rename = "bucket")]
     Bucket {
-        /// Absolute load difference threshold for load balancing
+        /// 负载均衡的绝对差阈值(worker 间负载绝对差超过此值触发均衡)。
         balance_abs_threshold: usize,
-        /// Relative load ratio threshold for load balancing
+        /// 负载均衡的相对比阈值(最大/最小负载比超过此值触发均衡)。
         balance_rel_threshold: f32,
-        /// Interval between bucket boundary adjustment cycles (seconds)
+        /// 桶边界调整周期(秒),周期性根据实时负载重新划分桶边界。
         bucket_adjust_interval_secs: usize,
     },
 
-    /// Manual routing policy with sticky sessions using DashMap.
-    /// - X-SMG-Routing-Key: Routes to a cached worker or assigns a new one
-    /// - Provides true sticky sessions with zero key redistribution on worker add
-    /// - Falls back to random selection if no routing key is provided
-    /// - Supports LRU eviction when cache size exceeds max_entries
+    /// 手动路由策略,基于 DashMap 实现会话粘性(sticky session):
+    /// - 通过 X-SMG-Routing-Key 请求头把同一路由键固定路由到缓存的 worker,或为新键分配一个 worker;
+    /// - 提供真正的会话粘性——新增 worker 时不会重新分布已有键(零重分布);
+    /// - 若请求未携带路由键,则退回随机选择;
+    /// - 缓存条目超出上限时按 LRU / TTL 驱逐。
     #[serde(rename = "manual")]
     Manual {
-        /// Interval between TTL eviction cycles (seconds, default: 60)
+        /// TTL 驱逐周期(秒,默认 60):周期性扫描并驱逐超过空闲时间的映射。
         #[serde(default = "default_manual_eviction_interval_secs")]
         eviction_interval_secs: u64,
-        /// Maximum idle time before eviction (seconds, default: 14400 = 4 hours)
+        /// 条目被驱逐前允许的最大空闲时间(秒,默认 14400 = 4 小时)。
         #[serde(default = "default_manual_max_idle_secs")]
         max_idle_secs: u64,
-        /// Assignment mode for new routing keys (default: random)
+        /// 为新路由键分配 worker 的方式(默认 random),见 [`ManualAssignmentMode`]。
         #[serde(default)]
         assignment_mode: ManualAssignmentMode,
     },
 
-    /// Consistent hashing policy using hash ring for session affinity:
-    /// - X-SMG-Target-Worker: Direct routing to a specific worker by URL
-    /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
-    /// - Provides O(log n) lookup with minimal redistribution (~1/N keys) on topology change
+    /// 一致性哈希策略,使用哈希环实现会话亲和性:
+    /// - 通过 X-SMG-Target-Worker 请求头按 URL 直接路由到指定 worker;
+    /// - 通过 X-SMG-Routing-Key 请求头做一致性哈希路由以保持会话亲和;
+    /// - 查找复杂度 O(log n),拓扑变化时只需重分布约 1/N 的键(N 为 worker 数)。
     #[serde(rename = "consistent_hashing")]
     ConsistentHashing,
 
-    /// Prefix hash policy for KV cache-aware load balancing.
-    /// A lightweight alternative to cache_aware radix tree.
-    /// Routes requests based on prefix token hash for cache locality.
-    /// - Uses consistent hash ring with bounded load balancing
-    /// - Walks ring if worker is overloaded (load > avg * load_factor)
-    /// - O(log n) lookup instead of O(prefix_len) radix tree traversal
+    /// 前缀哈希策略,面向 KV cache 的轻量级负载均衡,是 cache_aware 基数树的简化替代:
+    /// - 根据请求前缀 token 的哈希路由,以获得缓存局部性;
+    /// - 使用带有界负载均衡(bounded load)的一致性哈希环;
+    /// - 当目标 worker 过载(负载 > 平均值 * load_factor)时沿环向后寻找下一个 worker;
+    /// - 查找复杂度 O(log n),优于基数树遍历的 O(prefix_len)。
     #[serde(rename = "prefix_hash")]
     PrefixHash {
-        /// Number of prefix tokens to hash (default: 256)
+        /// 参与哈希的前缀 token 数量(默认 256):只对请求前 N 个 token 做哈希以判定缓存归属。
         #[serde(default = "default_prefix_token_count")]
         prefix_token_count: usize,
-        /// Load factor threshold - walk ring if load > avg * factor (default: 1.25)
+        /// 负载因子阈值(默认 1.25):当某 worker 负载 > 平均负载 * 该因子时视为过载,沿环换下一个 worker。
         #[serde(default = "default_load_factor")]
         load_factor: f64,
     },

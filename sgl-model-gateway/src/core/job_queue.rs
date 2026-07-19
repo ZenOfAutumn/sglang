@@ -117,15 +117,29 @@ impl Default for JobQueueConfig {
     }
 }
 
-/// Job queue manager for worker validation and removal operations
+/// 控制面异步任务队列管理器。
+///
+/// 负责 worker 注册/更新/移除、MCP、WASM、tokenizer 等控制面操作的排队与并发执行。
+/// 设计目标是让这些操作「非阻塞」:
+///
+/// - 调用方通过 [`JobQueue::submit`] 把 [`Job`] 投递进内部 channel 后立即返回;
+/// - 后台 dispatcher 任务从 channel 取出 Job,在信号量限流下 spawn 独立任务异步执行(见 [`JobQueue::new`]);
+/// - 执行状态按 worker URL 记录在 `status_map` 中供查询;
+/// - 独立后台任务按 5 分钟 TTL 清理陈旧状态。
 pub struct JobQueue {
-    /// Channel for submitting jobs
+    /// 任务提交通道的发送端(mpsc,容量即 `queue_capacity`)。队列满则返回错误而非阻塞。
     tx: mpsc::Sender<Job>,
-    /// Weak reference to AppContext to avoid circular dependencies
+
+    /// 对 [`AppContext`] 的弱引用,打破 AppContext ↔ JobQueue 的循环强引用。
+    /// 执行前 `upgrade()`,若为 None 说明 AppContext 已释放(网关关闭中),则拒绝/跳过任务。
     context: Weak<AppContext>,
-    /// Job status tracking by worker URL
+
+    /// 按 worker URL(或 MCP/WASM/tokenizer 标识)记录任务状态(pending/processing/failed)。
+    /// 用 DashMap 支持并发读写;成功即移除,失败保留供查询,并由清理任务按 TTL 回收。
     status_map: Arc<DashMap<String, JobStatus>>,
-    /// Semaphore to limit concurrent job execution
+
+    /// 限制并发执行数的信号量(许可数即 `max_concurrent_jobs`)。
+    /// dispatcher 每取一个 Job 先获取许可,任务结束时自动释放,实现并发上限与背压。
     concurrency_limit: Arc<Semaphore>,
 }
 

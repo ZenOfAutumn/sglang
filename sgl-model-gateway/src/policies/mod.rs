@@ -1,7 +1,10 @@
-//! Load balancing policies for SGLang router
+//! SGLang router 的负载均衡策略
 //!
-//! This module provides a unified abstraction for routing policies that work
-//! across both regular and prefill-decode (PD) routing modes.
+//! 本模块为路由策略提供统一抽象，同时适用于普通（Regular）路由
+//! 与 Prefill-Decode（PD，预填充/解码分离）路由两种模式。
+//!
+//! 所有具体策略（随机、轮询、二选一、缓存感知、前缀哈希、一致性哈希、
+//! 手动、分桶等）都实现同一个 [`LoadBalancingPolicy`] trait，以便可插拔地替换。
 
 use std::{fmt::Debug, sync::Arc};
 
@@ -34,62 +37,64 @@ pub use registry::PolicyRegistry;
 pub use round_robin::RoundRobinPolicy;
 pub use tree::PrefixMatchResult;
 
-/// Core trait for load balancing policies
+/// 负载均衡策略的核心 trait。
 ///
-/// This trait provides a unified interface for implementing routing algorithms
-/// that can work with both regular single-worker selection and PD dual-worker selection.
+/// 它为各种路由算法提供统一接口，既适用于普通模式的单 Worker 选择，
+/// 也适用于 PD 模式的双 Worker（Prefill + Decode）选择。
+///
+/// 大多数方法都提供了默认空实现，无状态策略无需重写；
+/// 仅 `select_worker`、`name`、`as_any` 为必须实现的方法。
 #[async_trait]
 pub trait LoadBalancingPolicy: Send + Sync + Debug {
-    /// Select a single worker from the available workers
+    /// 从可用 Worker 中选出一个，返回其在 `workers` 中的下标。
     ///
-    /// This is used for regular routing mode where requests go to a single worker.
-    /// Now uses Arc<dyn Worker> for better performance and to avoid unnecessary cloning.
+    /// 用于普通路由模式（请求发往单个 Worker）。
+    /// 使用 `Arc<dyn Worker>` 以获得更好性能并避免不必要的克隆。
     ///
-    /// # Arguments
-    /// * `workers` - Available workers to select from
-    /// * `info` - Additional information for routing decisions
+    /// # 参数
+    /// * `workers` - 可供选择的 Worker 列表
+    /// * `info` - 路由决策所需的附加信息（请求文本、token、头部、哈希环等）
     async fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
         info: &SelectWorkerInfo<'_>,
     ) -> Option<usize>;
 
-    /// Update policy state after request completion
+    /// 请求完成后更新策略状态。
     ///
-    /// This is called when a request completes (successfully or not) to allow
-    /// policies to update their internal state.
+    /// 当一个请求完成（无论成功与否）时被调用，供策略更新其内部状态。
     fn on_request_complete(&self, _worker_url: &str, _success: bool) {
-        // Default: no-op for stateless policies
+        // 默认：无状态策略无需处理
     }
 
-    /// Get policy name for metrics and debugging
+    /// 获取策略名称（用于指标与调试）。
     fn name(&self) -> &'static str;
 
-    /// Check if this policy needs request text for routing decisions
+    /// 该策略是否需要请求文本来做路由决策。
     fn needs_request_text(&self) -> bool {
-        false // Default: most policies don't need request text
+        false // 默认：大多数策略不需要请求文本
     }
 
-    /// Update worker load information
+    /// 更新 Worker 的负载信息。
     ///
-    /// This is called periodically with current load information for load-aware policies.
+    /// 针对负载感知类策略，由外部监控周期性传入当前负载信息。
     fn update_loads(&self, _loads: &std::collections::HashMap<String, isize>) {
-        // Default: no-op for policies that don't use load information
+        // 默认：不使用负载信息的策略无需处理
     }
 
-    /// Set mesh sync manager
+    /// 设置 mesh 同步管理器（用于多实例间状态同步）。
     fn set_mesh_sync(&mut self, _mesh_sync: OptionalMeshSyncManager) {
-        // Default: no-op for policies that don't use mesh sync
+        // 默认：不使用 mesh 同步的策略无需处理
     }
 
-    /// Reset any internal state
+    /// 重置策略的内部状态。
     ///
-    /// This is useful for policies that maintain state (e.g., round-robin counters).
+    /// 对维护状态的策略（如轮询的游标）很有用。
     fn reset(&self) {
-        // Default: no-op for stateless policies
+        // 默认：无状态策略无需处理
     }
 
-    /// Get as Any for downcasting
+    /// 返回 `Any` 以支持向下转型（downcast）到具体策略类型。
     fn as_any(&self) -> &dyn std::any::Any;
 }
 

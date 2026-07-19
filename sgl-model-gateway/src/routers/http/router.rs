@@ -130,24 +130,47 @@ impl Router {
         }
     }
 
-    /// Select worker for a specific model considering circuit breaker state
+    /// 为指定模型选择一个 worker（会考虑熔断器状态）。
+    ///
+    /// 该方法是负载均衡的入口：从注册表中筛选出「服务该模型、HTTP 连接、
+    /// 常规类型」的所有 worker，过滤掉不可用（熔断打开或不健康）的实例，
+    /// 再交由该模型对应的路由策略（Policy）选出最终的一个 worker。
+    ///
+    /// # 参数
+    /// - `model_id`: 目标模型 ID（可选）。仅在开启 IGW（内部网关，`enable_igw`）
+    ///   时才按模型区分 worker；否则忽略模型维度。
+    /// - `text`: 请求文本（可选），供 cache-aware / 一致性哈希等策略计算路由。
+    /// - `headers`: 请求头（可选），供依赖头部信息的策略（如手动/亲和路由）使用。
+    ///
+    /// # 返回
+    /// - `Some(worker)`: 选中的可用 worker。
+    /// - `None`: 无可用 worker，或策略未能选出（例如全部熔断/不健康）。
     async fn select_worker_for_model(
         &self,
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
     ) -> Option<Arc<dyn Worker>> {
+        // 是否按模型维度筛选 worker：仅在开启 IGW 时才生效；
+        // 未开启时置为 None，表示所有 worker 共用一个池，不区分模型。
         let effective_model_id = if !self.enable_igw { None } else { model_id };
 
-        // Get workers for the specified model O(1), filtered by connection mode
+        // 从注册表按条件 O(1) 取出候选 worker：
+        // - 指定模型（或不限模型）
+        // - 类型为 Regular（常规推理 worker）
+        // - 连接方式为 HTTP
+        // - 不限运行时类型
+        // - 最后一个参数为 false：先取「全部」worker，可用性由下一步自行过滤
         let workers = self.worker_registry.get_workers_filtered(
             effective_model_id,
             Some(WorkerType::Regular),
             Some(ConnectionMode::Http),
-            None,  // any runtime type
-            false, // get all workers, we'll filter by is_available() next
+            None,  // 任意运行时类型
+            false, // 取全部 worker，随后再按 is_available() 过滤
         );
 
+        // 过滤出「当前可用」的 worker：即熔断器未打开且健康检查通过的实例。
+        // 若没有任何可用 worker，直接返回 None。
         let available: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| w.is_available())
@@ -157,30 +180,36 @@ impl Router {
             return None;
         }
 
-        // Get the appropriate policy for this model
+        // 获取该模型对应的路由/负载均衡策略；未指定模型或无专属策略时回退到默认策略。
         let policy = match model_id {
             Some(model) => self.policy_registry.get_policy_or_default(model),
             None => self.policy_registry.get_default_policy(),
         };
 
-        // Get cached hash ring for consistent hashing (O(log n) lookup)
+        // 获取该模型缓存好的一致性哈希环，供一致性哈希类策略做 O(log n) 查找。
+        // 若未指定模型则使用占位的 UNKNOWN_MODEL_ID。
         let hash_ring = self
             .worker_registry
             .get_hash_ring(effective_model_id.unwrap_or(UNKNOWN_MODEL_ID));
 
+        // 交由策略在可用 worker 列表中选择：
+        // - request_text: 请求文本（cache-aware / 哈希路由使用）
+        // - tokens: HTTP 路径没有 token 信息，一律传 None（PrefixHash 需走 gRPC）
+        // - headers / hash_ring: 供相应策略使用
+        // 策略返回选中 worker 在 `available` 中的下标；若返回 None 则整体返回 None。
         let idx = policy
             .select_worker(
                 &available,
                 &SelectWorkerInfo {
                     request_text: text,
-                    tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
+                    tokens: None, // HTTP 无 token 信息，PrefixHash 请使用 gRPC
                     headers,
                     hash_ring,
                 },
             )
             .await?;
 
-        // Record worker selection metric (Layer 3)
+        // 记录 worker 选择指标（第 3 层可观测性指标）。
         Metrics::record_worker_selection(
             metrics_labels::WORKER_REGULAR,
             metrics_labels::CONNECTION_HTTP,
@@ -188,6 +217,7 @@ impl Router {
             policy.name(),
         );
 
+        // 返回策略选中的 worker（克隆 Arc，共享底层实例）。
         Some(available[idx].clone())
     }
 
@@ -270,6 +300,23 @@ impl Router {
         response
     }
 
+    /// 执行「单次」类型化请求的路由转发（不含重试）。
+    ///
+    /// 这是重试循环内部真正执行一次请求转发的核心方法：由调用方
+    /// （`RetryExecutor`）根据返回结果决定是否重试。因此本方法只负责
+    /// 「选 worker → 发请求 → 记录本次结果」这一条链路，不关心重试策略。
+    ///
+    /// # 泛型约束
+    /// - `T`: 具体的请求体类型，需实现 [`GenerationRequest`]（用于提取路由所需信息）、
+    ///   可序列化（`serde::Serialize`，用于转发给上游）以及 `Clone`。
+    ///
+    /// # 参数
+    /// - `headers`: 原始请求头（可选），会在转发前克隆并注入链路追踪上下文。
+    /// - `typed_req`: 强类型的请求体，转发给选中的 worker。
+    /// - `route`: 上游路由路径（如 `/v1/chat/completions`），`'static` 生命周期。
+    /// - `model_id`: 目标模型 ID（可选），用于按模型选择 worker 和路由策略。
+    /// - `is_stream`: 是否为流式响应，影响熔断结果的记录时机。
+    /// - `text`: 请求的文本内容，供 cache-aware 等策略做 worker 选择。
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -279,6 +326,9 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
+        // 1) 根据模型 ID、请求文本和请求头，按当前负载均衡策略选出一个可用 worker。
+        //    若所有 worker 的熔断器都处于打开状态或不健康，则没有可用 worker，
+        //    直接返回 503，让上层决定是否重试。
         let worker = match self
             .select_worker_for_model(model_id, Some(text), headers)
             .await
@@ -292,39 +342,52 @@ impl Router {
             }
         };
 
+        // 2) 获取该模型对应的路由/负载均衡策略；若未指定模型或该模型无专属策略，
+        //    则回退到默认策略。
         let policy = match model_id {
             Some(model) => self.policy_registry.get_policy_or_default(model),
             None => self.policy_registry.get_default_policy(),
         };
 
+        // 3) 仅在「cache_aware」或「manual」策略下创建负载守卫（WorkerLoadGuard）。
+        //    该守卫在创建时将 worker 的负载计数 +1，并在 Drop 时自动 -1，
+        //    使这两类策略能感知到 worker 的实时并发负载。其他策略无需负载计数，
+        //    因此此处返回 None 以避免额外开销。
         let load_guard = ["cache_aware", "manual"]
             .contains(&policy.name())
             .then(|| WorkerLoadGuard::new(worker.clone(), headers));
 
-        // Note: Using borrowed reference avoids heap allocation
+        // 4) 发出「请求已发送」事件用于可观测性。
+        //    注：这里使用借用引用（&），避免堆分配开销。
         events::RequestSentEvent { url: worker.url() }.emit();
+        // 克隆请求头并注入分布式链路追踪（trace）上下文，
+        // 使上游 worker 能够串联到同一条调用链。
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
+        // 5) 真正把类型化请求转发给选中的 worker，并拿到响应。
+        //    load_guard 会随请求生命周期存活，请求结束后被 Drop 从而释放负载计数。
         let response = self
             .send_typed_request(headers, typed_req, route, &worker, is_stream, load_guard)
             .await;
 
+        // 6) 发出「响应已接收」事件用于可观测性。
         events::RequestReceivedEvent {}.emit();
 
         let status = response.status();
-        // For streaming responses, the wrapped body (`BreakerTrackedStream`)
-        // records the circuit-breaker outcome once the stream actually
-        // terminates (success on clean end, failure on mid-stream error).
-        // Recording it eagerly here based on the initial status code would
-        // mask "200-then-broken" workers — every request would tick a
-        // success before the stream had a chance to error out.
+        // 7) 记录熔断器结果（成功/失败）。
+        //    对于流式响应：被包装的响应体（`BreakerTrackedStream`）会在流真正
+        //    结束时才记录熔断结果（正常结束记成功，中途出错记失败）。
+        //    如果在这里仅凭初始状态码就急于记录，会掩盖「先返回 200 后中途断流」
+        //    的问题 —— 每个请求都会在流有机会报错之前先记一次成功。
+        //    因此仅对「非流式」响应在此立即记录本次调用结果。
         if !is_stream {
             worker.record_outcome(status.is_success());
         }
 
-        // Record worker errors for server errors (5xx)
+        // 8) 对服务端错误（5xx）额外记录 worker 层面的错误指标，
+        //    便于监控上游服务的健康状况。
         if status.is_server_error() {
             Metrics::record_worker_error(
                 metrics_labels::WORKER_REGULAR,
@@ -333,6 +396,7 @@ impl Router {
             );
         }
 
+        // 9) 返回本次响应，由上层重试逻辑决定是否需要再次尝试。
         response
     }
 

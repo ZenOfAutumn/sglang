@@ -29,23 +29,52 @@ use crate::{
     protocols::worker_spec::WorkerConfigRequest,
 };
 
+/// Kubernetes 服务发现配置。
+///
+/// Router 在 K8s 环境中运行时，会根据这里的配置去 watch 集群里符合条件的 Pod，
+/// 并把它们动态注册/注销为后端 worker,从而免去手工维护 worker 地址列表。
+/// 支持三种拓扑:普通模式(Regular)、PD 分离模式(Prefill/Decode)、以及 IGW 混合模式。
 #[derive(Debug, Clone)]
 pub struct ServiceDiscoveryConfig {
+    /// 是否启用服务发现。false 时使用静态 worker 列表,不 watch K8s。
     pub enabled: bool,
+
+    /// 普通模式下筛选 worker Pod 的 label 选择器(键值需全部匹配)。
+    /// 如 {"app": "sglang-worker"};空 map 表示不匹配任何 Pod。
     pub selector: HashMap<String, String>,
+
+    /// 轮询 / 兜底检查间隔,即使 watch 断流也会周期性对账一次。
     pub check_interval: Duration,
+
+    /// 访问 worker 的服务端口(HTTP 推理端口),拼到 Pod IP 上构成 worker 地址。
     pub port: u16,
+
+    /// 限定 watch 的命名空间;None 表示跨全部命名空间发现。
     pub namespace: Option<String>,
-    // PD mode specific configuration
+
+    // ---- PD 分离模式专用 ----
+    /// 是否启用 PD(Prefill/Decode)分离模式,开启后按下列两个选择器分别发现两类 worker。
     pub pd_mode: bool,
+
+    /// PD 模式下筛选 Prefill(预填充)worker Pod 的 label 选择器。
     pub prefill_selector: HashMap<String, String>,
+
+    /// PD 模式下筛选 Decode(解码)worker Pod 的 label 选择器。
     pub decode_selector: HashMap<String, String>,
-    // Bootstrap port annotation specific to mooncake implementation
+
+    /// 读取 bootstrap 端口的 Pod annotation 键(默认 "sglang.ai/bootstrap-port")。
+    /// PD 分离依赖 mooncake 传输,Prefill/Decode 通过该端口建立 KV 传输连接。
     pub bootstrap_port_annotation: String,
-    // Router node discovery for mesh
+
+    // ---- 用于 mesh 的 Router 节点发现 ----
+    /// 筛选 Router 节点 Pod 的 label 选择器,用于多 Router 组成 mesh 时互相发现。
     pub router_selector: HashMap<String, String>,
+
+    /// 读取 mesh 高可用(HA)通信端口的 Router Pod annotation 键(默认 "sglang.ai/ha-port")。
     pub router_mesh_port_annotation: String,
-    // When true (IGW mode), also discover selector pods as Regular workers alongside PD workers
+
+    /// IGW(混合网关)模式开关。true 时除按 PD 选择器发现 Prefill/Decode worker 外,
+    /// 还用 `selector` 把命中的 Pod 作为 Regular worker 一并发现(两类 worker 共存)。
     pub igw_mode: bool,
 }
 

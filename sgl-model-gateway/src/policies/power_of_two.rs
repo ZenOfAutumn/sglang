@@ -1,4 +1,9 @@
-//! Power-of-two choices load balancing policy
+//! Power-of-two choices（二选一）负载均衡策略
+//!
+//! 核心思想：不去全局扫描所有 Worker 找最优，而是随机抽取两个 Worker，
+//! 只在这两者之间选负载更低的一个。相比「全局最小负载」，它以极小的
+//! 协调开销就能显著改善尾部负载（避免所有请求同时涌向同一个「当前最空闲」
+//! 节点导致的负载振荡），是经典的 "Power of Two Choices" 结论。
 
 use std::{
     collections::HashMap,
@@ -12,17 +17,21 @@ use tracing::debug;
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::core::Worker;
 
-/// Power-of-two choices policy
+/// Power-of-two choices（二选一）策略。
 ///
-/// Randomly selects two workers and routes to the one with lower load.
-/// This provides good load distribution with minimal coordination overhead.
+/// 随机选取两个 Worker，并把请求路由到其中负载较低的那个。
+/// 这样能在极低的协调开销下获得良好的负载分布。
 #[derive(Debug)]
 pub struct PowerOfTwoPolicy {
-    /// Cached load information from external monitoring
+    /// 来自外部监控（LoadMonitor）的缓存负载信息。
+    ///
+    /// key 为 Worker 的 URL，value 为该 Worker 的负载（此处为 token 级负载，
+    /// 保真度高于本地请求计数）。由 `update_loads` 周期性刷新。
     cached_loads: RwLock<HashMap<String, isize>>,
 }
 
 impl PowerOfTwoPolicy {
+    /// 创建一个负载缓存为空的策略实例。
     pub fn new() -> Self {
         Self {
             cached_loads: RwLock::new(HashMap::new()),
@@ -32,37 +41,46 @@ impl PowerOfTwoPolicy {
 
 #[async_trait]
 impl LoadBalancingPolicy for PowerOfTwoPolicy {
+    /// 在候选 Worker 中按「二选一」策略选出一个，返回其在 `workers` 中的下标。
+    ///
+    /// 步骤：先过滤出健康 Worker；随机抽取两个不同的健康 Worker；
+    /// 比较二者负载（优先用 token 级负载，缺失则回退到请求计数），选负载较低者。
     async fn select_worker(
         &self,
         workers: &[Arc<dyn Worker>],
         _info: &SelectWorkerInfo<'_>,
     ) -> Option<usize> {
+        // 仅在健康 Worker 中选择
         let healthy_indices = get_healthy_worker_indices(workers);
 
+        // 没有健康 Worker：无法选择
         if healthy_indices.is_empty() {
             return None;
         }
 
+        // 只有一个健康 Worker：直接返回它，无需二选一
         if healthy_indices.len() == 1 {
             return Some(healthy_indices[0]);
         }
 
-        // Select two random workers - use offset to guarantee different selection in O(1)
+        // 随机抽取两个 Worker —— 用偏移量在 O(1) 内保证抽到的两个互不相同
         let mut rng = rand::rng();
         let idx1 = rng.random_range(0..healthy_indices.len());
-        // Pick idx2 from remaining indices: offset by 1 + random from (len-1) to guarantee different
+        // 从其余下标中挑 idx2：以 idx1 为基准 +1 再加上 [0, len-1) 的随机偏移并取模，
+        // 从而必定落在与 idx1 不同的位置上
         let idx2 =
             (idx1 + 1 + rng.random_range(0..healthy_indices.len() - 1)) % healthy_indices.len();
 
+        // 将「健康列表内下标」映射回「原始 workers 数组下标」
         let worker_idx1 = healthy_indices[idx1];
         let worker_idx2 = healthy_indices[idx2];
         let worker1 = &workers[worker_idx1];
         let worker2 = &workers[worker_idx2];
 
-        // Access cached loads safely
+        // 安全地读取缓存负载（读锁获取失败时降级为 None）
         let loads_guard = self.cached_loads.read().ok();
 
-        // Try to get high-fidelity token loads for BOTH workers
+        // 尝试为「两个」Worker 都取到高保真的 token 级负载
         let load1_tokens = loads_guard
             .as_ref()
             .and_then(|m| m.get(worker1.url()).copied());
@@ -70,21 +88,22 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
             .as_ref()
             .and_then(|m| m.get(worker2.url()).copied());
 
-        // If either worker is missing token data (e.g. monitor failure),
-        // we must degrade BOTH to request counts to ensure fairness.
+        // 若任一 Worker 缺失 token 数据（如监控采集失败），
+        // 必须把「两个」都降级为请求计数来比较，以保证公平性
+        // （避免用「token 负载」与「请求数」这类不可比的指标做比较）。
         let (load1, load2) = match (load1_tokens, load2_tokens) {
             (Some(t1), Some(t2)) => {
-                // Both have token data. Compare Tokens.
+                // 两者都有 token 数据：直接按 token 负载比较
                 (t1, t2)
             }
             _ => {
-                // If One or both are missing token data.
-                // Fallback to local request counts for BOTH.
+                // 其一或两者缺失 token 数据：
+                // 两者都回退到本地请求计数进行比较
                 (worker1.load() as isize, worker2.load() as isize)
             }
         };
 
-        // Select worker with lower load
+        // 选出负载较低的 Worker（相等时优先选第一个）
         let selected_idx = if load1 <= load2 {
             worker_idx1
         } else {
@@ -100,28 +119,33 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
             workers[selected_idx].url()
         );
 
-        // Increment processed counter
+        // 递增被选中 Worker 的「已处理请求」计数器
         workers[selected_idx].increment_processed();
 
         Some(selected_idx)
     }
 
+    /// 策略名称（用于注册表查找与指标标签）。
     fn name(&self) -> &'static str {
         "power_of_two"
     }
 
+    /// 由外部监控周期性调用，用最新负载快照整体替换缓存。
+    /// 写锁获取失败时静默跳过本次更新（下次刷新会补上）。
     fn update_loads(&self, loads: &HashMap<String, isize>) {
         if let Ok(mut cached) = self.cached_loads.write() {
             *cached = loads.clone();
         }
     }
 
+    /// 支持向下转型（downcast）到具体类型，便于按需访问具体策略实现。
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 }
 
 impl Default for PowerOfTwoPolicy {
+    /// 默认实例等价于 `new()`：负载缓存为空。
     fn default() -> Self {
         Self::new()
     }
