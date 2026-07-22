@@ -547,7 +547,25 @@ impl Router {
         }
     }
 
-    // Send typed request directly without conversion
+    /// 将已序列化的强类型请求直接转发给指定 worker，并返回其响应（支持非流式与流式）。
+    ///
+    /// 与需要先转换请求体的路径不同，本方法直接把 `typed_req` 序列化为 JSON 发送，
+    /// 避免额外的中间转换。主要职责：
+    /// 1. 根据是否启用数据并行（`dp_aware`）决定目标 URL 与请求体（需时注入 `data_parallel_rank`）；
+    /// 2. 透传 `Authorization` 与白名单内的入站请求头；
+    /// 3. 区分非流式/流式两种响应处理路径；
+    /// 4. 通过熔断器（circuit breaker）记录调用成败，并通过 `WorkerLoadGuard` 维护负载计数。
+    ///
+    /// # 参数
+    /// * `headers` - 入站请求头；仅转发通过白名单的头。
+    /// * `typed_req` - 强类型请求体，将被序列化为 JSON。
+    /// * `route` - 目标路由路径（如 `/generate`），拼接在 worker URL 后。
+    /// * `worker` - 目标 worker（提供 URL、api_key 与熔断器）。
+    /// * `is_stream` - 是否为流式（SSE）响应，决定下游读取与熔断计账的方式。
+    /// * `load_guard` - 可选的负载守卫；流式时会挂载到响应体以延长其生命周期。
+    ///
+    /// # 返回
+    /// 构造好的 `Response`：成功时透传上游状态码、头与响应体；失败时返回相应错误响应。
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
@@ -560,10 +578,14 @@ impl Router {
         let worker_url = worker.url();
         let api_key = worker.api_key().clone();
 
-        // Static key string to avoid per-request allocations
+        // 使用静态字符串键，避免每个请求都重复分配
         const DP_RANK_KEY: &str = "data_parallel_rank";
 
+        // 数据并行（dp_aware）与普通模式采用不同的请求构造方式：
+        // - dp_aware：需从 worker_url 中解析出 dp_rank，并将其注入请求体；
+        // - 普通模式：直接将强类型请求序列化为 JSON 发送。
         let mut request_builder = if self.dp_aware {
+            // worker_url 形如 "http://host:port@<dp_rank>"，拆分出前缀与 dp_rank
             let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
                 Ok(tup) => tup,
                 Err(e) => {
@@ -586,9 +608,9 @@ impl Router {
             };
 
             if let Some(map) = json_val.as_object_mut() {
-                // Use static key string to avoid allocation
+                // 将 dp_rank 注入请求体顶层对象（使用静态键避免分配）
                 map.insert(DP_RANK_KEY.to_string(), serde_json::json!(dp_rank));
-                // Only serialize if debug logging is enabled to avoid CPU overhead
+                // 仅在开启 DEBUG 日志时才序列化打印，避免不必要的 CPU 开销
                 if tracing::enabled!(tracing::Level::DEBUG) {
                     debug!(
                         "Modified request body: {}",
@@ -608,17 +630,19 @@ impl Router {
         } else {
             self.client
                 .post(format!("{}{}", worker_url, route))
-                .json(typed_req) // Use json() directly with typed request
+                .json(typed_req) // 直接以强类型请求体序列化为 JSON
         };
 
+        // 若 worker 配置了 api_key，则添加 Bearer 鉴权头
         if let Some(key) = api_key {
-            // Pre-allocate string with capacity to avoid reallocation
+            // 预先按容量分配字符串（"Bearer " 共 7 字节 + key 长度），避免重分配
             let mut auth_header = String::with_capacity(7 + key.len());
             auth_header.push_str("Bearer ");
             auth_header.push_str(&key);
             request_builder = request_builder.header("Authorization", auth_header);
         }
 
+        // 透传入站请求头，但仅限白名单内（避免转发 Host、Content-Length 等不宜透传的头）
         if let Some(headers) = headers {
             for (name, value) in headers {
                 if header_utils::should_forward_request_header(name.as_str()) {
@@ -627,6 +651,7 @@ impl Router {
             }
         }
 
+        // 发送请求；若在得到任何响应前就失败（如 TCP 层错误），需处理熔断计账
         let res = match request_builder.send().await {
             Ok(res) => res,
             Err(e) => {
@@ -635,16 +660,13 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // For streaming requests the caller skips the eager
-                // `record_outcome` on the assumption that a
-                // `BreakerTrackedStream` will tick the breaker on drop —
-                // but no tracked stream is installed when send() fails
-                // before any response stream exists. Record the failure
-                // here so a worker flapping at the TCP layer doesn't
-                // stay permanently selectable. Non-streaming requests
-                // are already covered by the caller's
-                // `worker.record_outcome(status.is_success())`, so
-                // gating on `is_stream` avoids double-counting.
+                // 对于流式请求，调用方会跳过立即的 `record_outcome`，
+                // 因为假定 `BreakerTrackedStream` 会在 drop 时推动熔断器——
+                // 但当 send() 在任何响应流存在之前就失败时，根本没有
+                // 安装 tracked 流。因此在此处记录失败，避免一个在 TCP 层
+                // 频繁抖动的 worker 永远保持可选。非流式请求已由调用方的
+                // `worker.record_outcome(status.is_success())` 覆盖，
+                // 因此用 `is_stream` 隔离可避免重复计数。
                 if is_stream {
                     worker.record_outcome(false);
                 }
@@ -656,7 +678,7 @@ impl Router {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         if !is_stream {
-            // For non-streaming requests, preserve headers
+            // 非流式：保留上游响应头，并一次性读取完整响应体
             let response_headers = header_utils::preserve_response_headers(res.headers());
 
             let response = match res.bytes().await {
@@ -672,25 +694,22 @@ impl Router {
                 }
             };
 
-            // load_guard dropped here automatically after response body is read
+            // 读完响应体后，load_guard 在此处随函数返回自动 drop（递减负载计数）
             response
         } else {
-            // Preserve headers for streaming response
+            // 流式：保留上游响应头
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
+            // 确保为 SSE 设置正确的 content-type
             response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
 
-            // Pass the reqwest byte stream straight through as the response body.
-            // Dropping the response body drops this stream, which closes the
-            // upstream HTTP connection and lets the engine abort generation —
-            // no spawned task or channel needed. `BreakerTrackedStream`
-            // updates the worker's circuit breaker exactly once on drop:
-            // success on clean end, failure on stream error, neither on
-            // client disconnect. For non-2xx responses we pre-mark the
-            // wrapper as Errored — otherwise the small error body would
-            // stream cleanly to `None` and Drop would record a spurious
-            // success (and the streaming branch also skips the eager
-            // `record_outcome` above).
+            // 将 reqwest 的字节流直接作为响应体透传。
+            // drop 响应体会 drop 这个流，从而关闭上游 HTTP 连接，让引擎中止
+            // 生成——无需额外的 spawn 任务或 channel。`BreakerTrackedStream`
+            // 在 drop 时恰好更新一次 worker 熔断器：正常结束记成功，
+            // 流错误记失败，客户端断开则不记。对于非 2xx 响应，我们预先
+            // 将包装器标记为 Errored——否则小体积的错误体会干净地流完到 `None`，
+            // 使 Drop 误记一次虚假的成功（且流式分支也跳过了上面的立即
+            // `record_outcome`）。
             let mut tracked = BreakerTrackedStream::new(
                 res.bytes_stream(),
                 worker.clone(),
@@ -705,8 +724,8 @@ impl Router {
             *response.status_mut() = status;
             *response.headers_mut() = response_headers;
 
-            // Attach load guard to response body for proper RAII lifecycle
-            // Guard is dropped when response body is consumed or client disconnects
+            // 将负载守卫挂载到响应体上，以维护正确的 RAII 生命周期：
+            // 当响应体被消费完毕或客户端断开时，守卫才会被 drop（递减负载）
             if let Some(guard) = load_guard {
                 response = AttachedBody::wrap_response(response, guard);
             }

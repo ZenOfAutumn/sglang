@@ -23,13 +23,13 @@ use crate::{
     routers::grpc::client::GrpcClient,
 };
 
-/// Default worker priority (mid-range on 0-100 scale)
+/// worker 默认优先级（0-100 区间的中间值）
 pub const DEFAULT_WORKER_PRIORITY: u32 = 50;
 
-/// Default worker cost factor (baseline cost)
+/// worker 默认成本因子（基准成本）
 pub const DEFAULT_WORKER_COST: f32 = 1.0;
 
-/// Default HTTP client timeout for worker requests (in seconds)
+/// worker 请求的默认 HTTP 客户端超时（单位：秒）
 pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS: u64 = 30;
 
 static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -39,8 +39,14 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("Failed to create worker HTTP client")
 });
 
+/// 按「路由键（routing key）」维度统计的 worker 活跃负载。
+///
+/// 用于会话亲和等场景：以 routing_key 为粒度记录当前有多少个在途请求，
+/// 便于观测某个 worker 上活跃的路由键数量。内部用 `DashMap` 支持并发读写。
 pub struct WorkerRoutingKeyLoad {
+    /// 所属 worker 的 URL（仅用于指标标签与日志）
     url: String,
+    /// 各路由键当前的活跃请求计数；计数归零时会移除对应条目
     active_routing_keys: dashmap::DashMap<String, usize>,
 }
 
@@ -52,10 +58,12 @@ impl WorkerRoutingKeyLoad {
         }
     }
 
+    /// 返回当前处于活跃状态的路由键数量（而非请求总数）。
     pub fn value(&self) -> usize {
         self.active_routing_keys.len()
     }
 
+    /// 递增指定路由键的活跃计数（键不存在时从 0 开始）。
     pub fn increment(&self, routing_key: &str) {
         *self
             .active_routing_keys
@@ -64,6 +72,9 @@ impl WorkerRoutingKeyLoad {
         self.update_metrics();
     }
 
+    /// 递减指定路由键的活跃计数；归零时移除该键。
+    ///
+    /// 若计数已为 0 或键不存在（异常情况），仅记录 warn 日志而不做处理。
     pub fn decrement(&self, routing_key: &str) {
         use dashmap::mapref::entry::Entry;
 
@@ -108,51 +119,53 @@ impl fmt::Debug for WorkerRoutingKeyLoad {
     }
 }
 
-/// Core worker abstraction that represents a backend service
+/// 表示一个后端服务的核心 worker 抽象。
+///
+/// 各种连接方式（HTTP / gRPC）与角色（Regular / Prefill / Decode）的 worker
+/// 都实现该 trait，向路由层提供统一的能力：健康检查、负载与熔断、元数据访问等。
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug {
-    /// Get the worker's URL
+    /// 获取 worker 的 URL
     fn url(&self) -> &str;
-    /// Get the worker's API key
+    /// 获取 worker 的 API key
     fn api_key(&self) -> &Option<String>;
-    /// Get the worker's type (Regular, Prefill, or Decode)
-    /// Returns a reference to avoid cloning on every access
+    /// 获取 worker 的类型（Regular、Prefill 或 Decode）。
+    /// 返回引用以避免每次访问都克隆。
     fn worker_type(&self) -> &WorkerType;
 
-    /// Get the worker's connection mode (HTTP or gRPC)
-    /// Returns a reference to avoid cloning on every access
+    /// 获取 worker 的连接模式（HTTP 或 gRPC）。
+    /// 返回引用以避免每次访问都克隆。
     fn connection_mode(&self) -> &ConnectionMode;
 
-    /// Get the bootstrap hostname for PD mode
-    /// Returns cached hostname parsed from URL at construction time
+    /// 获取 PD 模式下的 bootstrap 主机名。
+    /// 返回构造时从 URL 解析并缓存的主机名。
     fn bootstrap_host(&self) -> &str {
         &self.metadata().bootstrap_host
     }
 
-    /// Get the bootstrap port for PD mode
-    /// Returns cached port from WorkerType::Prefill
+    /// 获取 PD 模式下的 bootstrap 端口。
+    /// 返回从 `WorkerType::Prefill` 缓存的端口。
     fn bootstrap_port(&self) -> Option<u16> {
         self.metadata().bootstrap_port
     }
 
-    /// Check if the worker is currently healthy
+    /// 检查 worker 当前是否健康
     fn is_healthy(&self) -> bool;
 
-    /// Set the worker's health status
+    /// 设置 worker 的健康状态
     fn set_healthy(&self, healthy: bool);
 
-    /// Perform an async health check on the worker
+    /// 对 worker 执行异步健康检查
     async fn check_health_async(&self) -> WorkerResult<()>;
 
-    /// Synchronous health check wrapper (for compatibility)
+    /// 同步健康检查包装器（用于兼容）
     ///
-    /// # Deprecation Notice
-    /// This method creates a new Tokio runtime for each call, which is expensive.
-    /// Prefer using `check_health_async()` within an async context instead.
+    /// # 废弃提示
+    /// 该方法每次调用都会创建一个新的 Tokio 运行时，开销很大。
+    /// 请在异步上下文中优先使用 `check_health_async()`。
     ///
-    /// # Performance Warning
-    /// Creating a runtime per call has significant overhead. Only use this
-    /// method when you cannot use the async version.
+    /// # 性能警告
+    /// 每次调用都创建运行时开销显著。仅在无法使用异步版本时才使用本方法。
     #[deprecated(
         since = "0.4.6",
         note = "Use check_health_async() instead. This method creates a new Tokio runtime per call."
@@ -168,94 +181,94 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .block_on(self.check_health_async())
     }
 
-    /// Get the current load (number of active requests)
+    /// 获取当前负载（在途请求数）
     fn load(&self) -> usize;
 
-    /// Increment the load counter
+    /// 递增负载计数器
     fn increment_load(&self);
 
-    /// Decrement the load counter
+    /// 递减负载计数器
     fn decrement_load(&self);
 
-    /// Reset the load counter to 0 (for sync/recovery)
+    /// 将负载计数器重置为 0（用于同步/恢复）
     fn reset_load(&self) {}
 
-    /// Get the worker routing key load tracker
+    /// 获取按路由键维度的负载跟踪器
     fn worker_routing_key_load(&self) -> &WorkerRoutingKeyLoad;
 
-    /// Get the number of processed requests
+    /// 获取已处理请求数
     fn processed_requests(&self) -> usize;
 
-    /// Increment the processed requests counter
+    /// 递增已处理请求计数器
     fn increment_processed(&self);
 
-    /// Get worker-specific metadata
+    /// 获取 worker 专属元数据
     fn metadata(&self) -> &WorkerMetadata;
 
-    /// Get the circuit breaker for this worker
+    /// 获取该 worker 的熔断器
     fn circuit_breaker(&self) -> &CircuitBreaker;
 
-    /// Check if the worker is available (healthy + circuit closed/half-open)
+    /// 检查 worker 是否可用（健康 + 熔断器处于关闭/半开状态）
     fn is_available(&self) -> bool {
         self.is_healthy() && self.circuit_breaker().can_execute()
     }
 
-    /// Record the outcome of a request to this worker
+    /// 记录一次向该 worker 发起请求的结果（成功/失败）
     fn record_outcome(&self, success: bool) {
         self.circuit_breaker().record_outcome(success);
     }
 
-    /// Check if this worker is DP-aware
+    /// 该 worker 是否支持数据并行（DP-aware）
     fn is_dp_aware(&self) -> bool {
         false
     }
 
-    /// Get the base URL without any DP rank suffix
+    /// 获取不带任何 DP rank 后缀的基础 URL
     fn base_url(&self) -> &str {
         self.url()
     }
 
-    /// Get DP rank if this is a DP-aware worker
+    /// 若为 DP-aware worker，获取其 DP rank
     fn dp_rank(&self) -> Option<usize> {
         None
     }
 
-    /// Get DP size if this worker is part of a DP group
+    /// 若该 worker 属于某个 DP 组，获取其 DP 大小
     fn dp_size(&self) -> Option<usize> {
         None
     }
 
-    /// Transform a request for DP-aware routing
+    /// 为 DP-aware 路由变换请求
     async fn prepare_request(&self, req: serde_json::Value) -> WorkerResult<serde_json::Value> {
         Ok(req)
     }
 
-    /// Get the actual endpoint URL for requests
+    /// 获取请求实际使用的完整端点 URL
     fn endpoint_url(&self, route: &str) -> String {
         format!("{}{}", self.base_url(), route)
     }
 
-    /// Check if this worker can handle a specific request
+    /// 检查该 worker 是否能处理某个具体请求
     fn can_handle(&self, _req: &serde_json::Value) -> bool {
         true
     }
 
-    /// Get the model ID this worker serves
-    /// Checks ModelCards first, then falls back to labels
+    /// 获取该 worker 服务的模型 ID。
+    /// 优先查 ModelCards，其次回退到 labels。
     fn model_id(&self) -> &str {
-        // Check ModelCards first
+        // 优先查 ModelCards
         self.metadata()
             .models
             .first()
             .map(|m| m.id.as_str())
             .or_else(|| {
-                // Fall back to labels
+                // 回退到 labels
                 self.metadata().labels.get("model_id").map(|s| s.as_str())
             })
             .unwrap_or(UNKNOWN_MODEL_ID)
     }
 
-    /// Get the priority of this worker (higher value = higher priority)
+    /// 获取该 worker 的优先级（值越大优先级越高）
     fn priority(&self) -> u32 {
         self.metadata()
             .labels
@@ -264,7 +277,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .unwrap_or(DEFAULT_WORKER_PRIORITY)
     }
 
-    /// Get the cost factor of this worker (baseline = 1.0)
+    /// 获取该 worker 的成本因子（基准 = 1.0）
     fn cost(&self) -> f32 {
         self.metadata()
             .labels
@@ -273,47 +286,47 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .unwrap_or(DEFAULT_WORKER_COST)
     }
 
-    /// Get tokenizer path for a specific model.
+    /// 获取指定模型的 tokenizer 路径。
     fn tokenizer_path(&self, model_id: &str) -> Option<&str> {
         self.metadata()
             .find_model(model_id)
             .and_then(|m| m.tokenizer_path.as_deref())
     }
 
-    /// Get reasoning parser for a specific model.
+    /// 获取指定模型的推理（reasoning）解析器。
     fn reasoning_parser(&self, model_id: &str) -> Option<&str> {
         self.metadata()
             .find_model(model_id)
             .and_then(|m| m.reasoning_parser.as_deref())
     }
 
-    /// Get tool parser for a specific model.
+    /// 获取指定模型的工具（tool）解析器。
     fn tool_parser(&self, model_id: &str) -> Option<&str> {
         self.metadata()
             .find_model(model_id)
             .and_then(|m| m.tool_parser.as_deref())
     }
 
-    /// Get chat template for a specific model.
+    /// 获取指定模型的 chat 模板。
     fn chat_template(&self, model_id: &str) -> Option<&str> {
         self.metadata()
             .find_model(model_id)
             .and_then(|m| m.chat_template.as_deref())
     }
 
-    /// Get the default provider type for this worker.
-    /// `None` means native/passthrough.
+    /// 获取该 worker 的默认 provider 类型。
+    /// `None` 表示原生/透传。
     fn default_provider(&self) -> Option<&ProviderType> {
         self.metadata().default_provider.as_ref()
     }
 
-    /// Get provider for a specific model.
-    /// Priority: ModelCard.provider > worker.default_provider
+    /// 获取指定模型的 provider。
+    /// 优先级：ModelCard.provider > worker.default_provider
     fn provider_for_model(&self, model_id: &str) -> Option<&ProviderType> {
         self.metadata().provider_for_model(model_id)
     }
 
-    /// Check if a model is a classifier (has id2label mapping).
+    /// 检查模型是否为分类器（具有 id2label 映射）。
     fn is_classifier(&self, model_id: &str) -> bool {
         self.metadata()
             .find_model(model_id)
@@ -321,8 +334,8 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .unwrap_or(false)
     }
 
-    /// Get the id2label mapping for a classification model.
-    /// Returns None if model is not a classifier or not found.
+    /// 获取分类模型的 id2label 映射。
+    /// 若模型不是分类器或未找到，返回 None。
     fn id2label(&self, model_id: &str) -> Option<&std::collections::HashMap<u32, String>> {
         self.metadata()
             .find_model(model_id)
@@ -330,7 +343,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .map(|m| &m.id2label)
     }
 
-    /// Get the number of classification labels for a model.
+    /// 获取模型的分类标签数量。
     fn num_labels(&self, model_id: &str) -> u32 {
         self.metadata()
             .find_model(model_id)
@@ -338,8 +351,8 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .unwrap_or(0)
     }
 
-    /// Get label for a class index from a classification model.
-    /// Returns generic label (LABEL_N) if model not found or index not in mapping.
+    /// 从分类模型中获取某个类别下标对应的标签。
+    /// 若模型未找到或下标不在映射中，返回通用标签（LABEL_N）。
     fn get_label(&self, model_id: &str, class_idx: u32) -> String {
         self.metadata()
             .find_model(model_id)
@@ -347,41 +360,41 @@ pub trait Worker: Send + Sync + fmt::Debug {
             .unwrap_or_else(|| format!("LABEL_{}", class_idx))
     }
 
-    /// Check if this worker supports a specific model.
-    /// If models list is empty, worker accepts any model.
+    /// 检查该 worker 是否支持指定模型。
+    /// 若 models 列表为空，则 worker 接受任意模型。
     fn supports_model(&self, model_id: &str) -> bool {
         self.metadata().supports_model(model_id)
     }
 
-    /// Check if this worker supports an endpoint for a given model.
-    /// Falls back to default_model_type if model not found.
+    /// 检查该 worker 是否为指定模型支持某个端点。
+    /// 若模型未找到，则回退到 default_model_type。
     fn supports_endpoint(&self, model_id: &str, endpoint: Endpoint) -> bool {
         self.metadata().supports_endpoint(model_id, endpoint)
     }
 
-    /// Get all models this worker can serve.
+    /// 获取该 worker 能服务的所有模型。
     fn models(&self) -> &[ModelCard] {
         &self.metadata().models
     }
 
-    /// Set models for this worker (for lazy discovery).
-    /// Default implementation does nothing - only BasicWorker supports this.
+    /// 为该 worker 设置模型列表（用于延迟发现）。
+    /// 默认实现不做任何事——只有 BasicWorker 支持此操作。
     fn set_models(&self, _models: Vec<ModelCard>) {
-        // Default: no-op. BasicWorker overrides this.
+        // 默认：空实现。BasicWorker 会重写该方法。
     }
 
-    /// Check if models have been discovered for this worker.
-    /// Returns true if models were set via set_models() or if metadata has models.
+    /// 检查该 worker 是否已完成模型发现。
+    /// 若通过 set_models() 设置过模型，或元数据中已有模型，则返回 true。
     fn has_models_discovered(&self) -> bool {
         !self.metadata().models.is_empty()
     }
 
-    /// Get or create a gRPC client for this worker
-    /// Returns None for HTTP workers, Some(client) for gRPC workers
+    /// 为该 worker 获取或创建一个 gRPC 客户端。
+    /// HTTP worker 返回 None，gRPC worker 返回 Some(client)。
     async fn get_grpc_client(&self) -> WorkerResult<Option<Arc<GrpcClient>>>;
 
-    /// Reset the gRPC client connection (for reconnection scenarios)
-    /// No-op for HTTP workers
+    /// 重置 gRPC 客户端连接（用于重连场景）。
+    /// HTTP worker 为空操作。
     async fn reset_grpc_client(&self) -> WorkerResult<()> {
         Ok(())
     }
@@ -389,16 +402,16 @@ pub trait Worker: Send + Sync + fmt::Debug {
     async fn http_health_check(&self) -> WorkerResult<bool>;
 }
 
-/// Connection mode for worker communication
+/// worker 通信的连接模式
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ConnectionMode {
-    /// HTTP/REST connection
+    /// HTTP/REST 连接
     #[default]
     Http,
-    /// gRPC connection
+    /// gRPC 连接
     Grpc {
-        /// Optional port for gRPC endpoint (if different from URL)
+        /// gRPC 端点的可选端口（若与 URL 中的不同）
         #[serde(skip_serializing_if = "Option::is_none")]
         #[serde(default)]
         port: Option<u16>,
@@ -406,9 +419,8 @@ pub enum ConnectionMode {
 }
 
 impl ConnectionMode {
-    /// Check if this connection mode matches another, with special handling for gRPC
-    /// This allows matching any gRPC connection regardless of port when comparing
-    /// Grpc { port: None } as a wildcard
+    /// 检查本连接模式是否与另一个匹配，并对 gRPC 做特殊处理。
+    /// 当把 `Grpc { port: None }` 作为通配符时，可匹配任意端口的 gRPC 连接。
     pub fn matches(&self, filter: &ConnectionMode) -> bool {
         match (self, filter) {
             (ConnectionMode::Http, ConnectionMode::Http) => true,
@@ -418,7 +430,7 @@ impl ConnectionMode {
         }
     }
 
-    /// Get the metric label for this connection mode
+    /// 获取该连接模式对应的指标标签
     pub fn as_metric_label(&self) -> &'static str {
         match self {
             ConnectionMode::Http => metrics_labels::CONNECTION_HTTP,
@@ -439,17 +451,17 @@ impl fmt::Display for ConnectionMode {
     }
 }
 
-/// Runtime implementation type for workers
+/// worker 的运行时实现类型
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum RuntimeType {
-    /// SGLang runtime (default)
+    /// SGLang 运行时（默认）
     #[default]
     Sglang,
-    /// vLLM runtime
+    /// vLLM 运行时
     Vllm,
-    /// External OpenAI-compatible API (not local inference)
-    /// Used for routing to external providers like OpenAI, Azure OpenAI, xAI, etc.
+    /// 外部 OpenAI 兼容 API（非本地推理）。
+    /// 用于路由到 OpenAI、Azure OpenAI、xAI 等外部提供商。
     External,
 }
 
@@ -467,7 +479,7 @@ impl std::str::FromStr for RuntimeType {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Use eq_ignore_ascii_case to avoid to_lowercase() allocation
+        // 使用 eq_ignore_ascii_case 避免 to_lowercase() 的分配
         if s.eq_ignore_ascii_case("sglang") {
             Ok(RuntimeType::Sglang)
         } else if s.eq_ignore_ascii_case("vllm") {
@@ -483,14 +495,14 @@ impl std::str::FromStr for RuntimeType {
 /// Worker type classification
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum WorkerType {
-    /// Regular worker for standard routing
+    /// 用于标准路由的普通 worker
     Regular,
-    /// Prefill worker for PD disaggregated mode
+    /// PD 分离模式下的 Prefill worker
     Prefill {
-        /// Bootstrap port for communication with decode workers
+        /// 与 decode worker 通信所用的 bootstrap 端口
         bootstrap_port: Option<u16>,
     },
-    /// Decode worker for PD disaggregated mode
+    /// PD 分离模式下的 Decode worker
     Decode,
 }
 
@@ -508,7 +520,7 @@ impl fmt::Display for WorkerType {
 }
 
 impl WorkerType {
-    /// Get the metric label for this worker type
+    /// 获取该 worker 类型对应的指标标签
     pub fn as_metric_label(&self) -> &'static str {
         match self {
             WorkerType::Regular => metrics_labels::WORKER_REGULAR,
@@ -518,20 +530,20 @@ impl WorkerType {
     }
 }
 
-/// Health check configuration
+/// 健康检查配置
 #[derive(Debug, Clone)]
 pub struct HealthConfig {
-    /// Timeout for health checks in seconds
+    /// 健康检查超时（单位：秒）
     pub timeout_secs: u64,
-    /// Interval between health checks in seconds
+    /// 两次健康检查之间的间隔（单位：秒）
     pub check_interval_secs: u64,
-    /// Health check endpoint path
+    /// 健康检查的端点路径
     pub endpoint: String,
-    /// Number of consecutive failures before marking unhealthy
+    /// 标记为不健康前需连续失败的次数
     pub failure_threshold: u32,
-    /// Number of consecutive successes before marking healthy
+    /// 标记为健康前需连续成功的次数
     pub success_threshold: u32,
-    /// Whether to disable health checks for this worker
+    /// 是否对该 worker 禁用健康检查
     pub disable_health_check: bool,
 }
 
@@ -548,51 +560,51 @@ impl Default for HealthConfig {
     }
 }
 
-/// Metadata associated with a worker
+/// 与 worker 关联的元数据
 #[derive(Debug, Clone)]
 pub struct WorkerMetadata {
-    /// Worker URL
+    /// worker URL
     pub url: String,
-    /// Worker type
+    /// worker 类型
     pub worker_type: WorkerType,
-    /// Connection mode
+    /// 连接模式
     pub connection_mode: ConnectionMode,
-    /// Runtime type (for gRPC workers)
+    /// 运行时类型（针对 gRPC worker）
     pub runtime_type: RuntimeType,
-    /// Additional labels/tags
+    /// 附加的 label / 标签
     pub labels: std::collections::HashMap<String, String>,
-    /// Health check configuration
+    /// 健康检查配置
     pub health_config: HealthConfig,
     /// API key
     pub api_key: Option<String>,
-    /// Cached bootstrap hostname (parsed from URL at construction time)
+    /// 缓存的 bootstrap 主机名（构造时从 URL 解析）
     pub bootstrap_host: String,
-    /// Cached bootstrap port (from WorkerType::Prefill)
+    /// 缓存的 bootstrap 端口（来自 WorkerType::Prefill）
     pub bootstrap_port: Option<u16>,
-    /// Models this worker can serve.
-    /// If empty, worker accepts any model (backward compatible behavior).
+    /// 该 worker 能服务的模型。
+    /// 若为空，则 worker 接受任意模型（向后兼容行为）。
     pub models: Vec<ModelCard>,
-    /// Default provider for this worker (used when model doesn't specify one).
-    /// `None` means native/passthrough.
+    /// 该 worker 的默认 provider（当模型未指定时使用）。
+    /// `None` 表示原生/透传。
     pub default_provider: Option<ProviderType>,
-    /// Default model type for unknown models (defaults to LLM capabilities).
+    /// 未知模型的默认模型类型（默认为 LLM 能力）。
     pub default_model_type: ModelType,
 }
 
 impl WorkerMetadata {
-    /// Find a model card by ID (including aliases)
+    /// 按 ID 查找模型卡（包含别名）
     pub fn find_model(&self, model_id: &str) -> Option<&ModelCard> {
         self.models.iter().find(|m| m.matches(model_id))
     }
 
-    /// Check if this worker can serve a given model.
-    /// If models list is empty, worker accepts any model (backward compatible).
+    /// 检查该 worker 是否能服务指定模型。
+    /// 若 models 列表为空，则 worker 接受任意模型（向后兼容）。
     pub fn supports_model(&self, model_id: &str) -> bool {
         self.models.is_empty() || self.find_model(model_id).is_some()
     }
 
-    /// Check if this worker supports an endpoint for a given model.
-    /// Falls back to default_model_type if model not found.
+    /// 检查该 worker 是否为指定模型支持某个端点。
+    /// 若模型未找到，则回退到 default_model_type。
     pub fn supports_endpoint(&self, model_id: &str, endpoint: Endpoint) -> bool {
         if let Some(model) = self.find_model(model_id) {
             model.supports_endpoint(endpoint)
@@ -601,21 +613,21 @@ impl WorkerMetadata {
         }
     }
 
-    /// Get the provider for a given model.
-    /// Returns the model's provider if found, otherwise the worker's default provider.
+    /// 获取指定模型的 provider。
+    /// 若找到模型则返回其 provider，否则返回 worker 的默认 provider。
     pub fn provider_for_model(&self, model_id: &str) -> Option<&ProviderType> {
         self.find_model(model_id)
             .and_then(|m| m.provider.as_ref())
             .or(self.default_provider.as_ref())
     }
 
-    /// Get all model IDs this worker can serve
+    /// 获取该 worker 能服务的所有模型 ID
     pub fn model_ids(&self) -> impl Iterator<Item = &str> {
         self.models.iter().map(|m| m.id.as_str())
     }
 }
 
-/// Basic worker implementation
+/// 基础 worker 实现
 #[derive(Clone)]
 pub struct BasicWorker {
     pub metadata: WorkerMetadata,
@@ -626,12 +638,12 @@ pub struct BasicWorker {
     pub consecutive_failures: Arc<AtomicUsize>,
     pub consecutive_successes: Arc<AtomicUsize>,
     pub circuit_breaker: CircuitBreaker,
-    /// Lazily initialized gRPC client for gRPC workers.
-    /// Uses OnceCell for lock-free reads after initialization.
+    /// gRPC worker 的延迟初始化 gRPC 客户端。
+    /// 使用 OnceCell，初始化后可无锁读取。
     pub grpc_client: Arc<OnceCell<Arc<GrpcClient>>>,
-    /// Runtime-mutable models override (for lazy discovery)
-    /// When set, overrides metadata.models for routing decisions.
-    /// Uses std::sync::RwLock for synchronous access in supports_model().
+    /// 运行时可变的模型覆盖（用于延迟发现）。
+    /// 一旦设置，将在路由决策中覆盖 metadata.models。
+    /// 使用 std::sync::RwLock 以便在 supports_model() 中同步访问。
     pub models_override: Arc<StdRwLock<Option<Vec<ModelCard>>>>,
 }
 
@@ -648,18 +660,18 @@ impl fmt::Debug for BasicWorker {
 
 impl BasicWorker {
     pub fn normalised_url(&self) -> WorkerResult<&str> {
-        // Use rfind directly - no need for redundant contains() check
-        // rfind already returns None if '@' is not found
-        // e.g., "http://[::1]:8080@0" -> "http://[::1]:8080" and "0"
+        // 直接用 rfind——无需额外的 contains() 检查；
+        // 若未找到 '@'，rfind 会直接返回 None。
+        // 例如："http://[::1]:8080@0" -> "http://[::1]:8080" 与 "0"
         if let Some(at_pos) = self.url().rfind('@') {
             let base_url = &self.url()[..at_pos];
             let rank_str = &self.url()[at_pos + 1..];
 
-            // Validate that the rank part is actually a number
+            // 校验 rank 部分确实是一个数字
             if rank_str.parse::<usize>().is_ok() {
                 Ok(base_url)
             } else {
-                // The '@' is not a DP rank separator, return full URL
+                // 这个 '@' 并非 DP rank 分隔符，返回完整 URL
                 Ok(self.url())
             }
         } else {
@@ -713,14 +725,14 @@ impl Worker for BasicWorker {
             ConnectionMode::Grpc { .. } => self.grpc_health_check().await?,
         };
 
-        // Get worker type label for metrics
+        // 获取用于指标的 worker 类型标签
         let worker_type_str = self.metadata.worker_type.as_metric_label();
 
         if health_result {
             self.consecutive_failures.store(0, Ordering::Release);
             let successes = self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1;
 
-            // Record health check success metric
+            // 记录健康检查成功指标
             Metrics::record_worker_health_check(worker_type_str, metrics_labels::CB_SUCCESS);
 
             if !self.is_healthy()
@@ -734,7 +746,7 @@ impl Worker for BasicWorker {
             self.consecutive_successes.store(0, Ordering::Release);
             let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
 
-            // Record health check failure metric
+            // 记录健康检查失败指标
             Metrics::record_worker_health_check(worker_type_str, metrics_labels::CB_FAILURE);
 
             if self.is_healthy()
@@ -802,14 +814,14 @@ impl Worker for BasicWorker {
     }
 
     fn supports_model(&self, model_id: &str) -> bool {
-        // Check models_override first (for lazy discovery)
+        // 优先检查 models_override（用于延迟发现）
         if let Ok(guard) = self.models_override.read() {
             if let Some(ref models) = *guard {
-                // Models were discovered - check if this model is supported
+                // 已发现模型——检查是否支持该模型
                 return models.iter().any(|m| m.matches(model_id));
             }
         }
-        // Fall back to metadata.models (empty = wildcard = supports nothing until discovery)
+        // 回退到 metadata.models（为空 = 通配符 = 在发现前不支持任何模型）
         self.metadata.supports_model(model_id)
     }
 
@@ -825,13 +837,13 @@ impl Worker for BasicWorker {
     }
 
     fn has_models_discovered(&self) -> bool {
-        // Check if models_override has been set
+        // 检查 models_override 是否已被设置
         if let Ok(guard) = self.models_override.read() {
             if guard.is_some() {
                 return true;
             }
         }
-        // Fall back to checking metadata.models
+        // 回退到检查 metadata.models
         !self.metadata.models.is_empty()
     }
 
@@ -839,8 +851,8 @@ impl Worker for BasicWorker {
         match self.metadata.connection_mode {
             ConnectionMode::Http => Ok(None),
             ConnectionMode::Grpc { .. } => {
-                // OnceCell provides lock-free reads after initialization.
-                // get_or_try_init only acquires internal lock on first call.
+                // OnceCell 在初始化后提供无锁读取。
+                // get_or_try_init 仅在首次调用时获取内部锁。
                 let client = self
                     .grpc_client
                     .get_or_try_init(|| async {
@@ -879,8 +891,8 @@ impl Worker for BasicWorker {
     }
 
     async fn reset_grpc_client(&self) -> WorkerResult<()> {
-        // OnceCell doesn't support resetting. This is intentional for lock-free performance.
-        // If a connection fails, the worker should be removed and re-added.
+        // OnceCell 不支持重置。这是为了无锁性能而有意为之的设计。
+        // 若连接失败，应将该 worker 移除后重新添加。
         tracing::debug!(
             "reset_grpc_client called for {} (no-op with OnceCell)",
             self.metadata.url
@@ -952,22 +964,22 @@ impl Worker for BasicWorker {
     }
 }
 
-/// A DP-aware worker that handles data-parallel routing
+/// 处理数据并行路由的 DP-aware worker
 #[derive(Debug, Clone)]
 pub struct DPAwareWorker {
-    /// The underlying basic worker
+    /// 底层的基础 worker
     base_worker: BasicWorker,
-    /// DP rank for this worker
+    /// 该 worker 的 DP rank
     dp_rank: usize,
-    /// Total DP size
+    /// DP 总大小
     dp_size: usize,
-    /// Base URL without DP suffix
+    /// 不带 DP 后缀的基础 URL
     base_url: String,
 }
 
 impl DPAwareWorker {
-    /// Create a new DP-aware worker with a pre-configured base worker
-    /// This is primarily used by the builder pattern
+    /// 基于一个预配置的基础 worker 创建新的 DP-aware worker。
+    /// 主要由建造者（builder）模式使用。
     pub fn with_base_worker(
         base_worker: BasicWorker,
         base_url: String,
@@ -1100,12 +1112,11 @@ impl Worker for DPAwareWorker {
     }
 }
 
-/// RAII guard for worker load management
+/// 用于 worker 负载管理的 RAII 守卫。
 ///
-/// Automatically decrements worker load when dropped. Can be attached to
-/// an axum Response to tie the guard's lifetime to the response body,
-/// which is essential for streaming responses where the function returns
-/// immediately but the stream continues in the background.
+/// 在 drop 时自动递减 worker 负载。可挂载到 axum 的 Response 上，
+/// 将守卫的生命周期与响应体绑定——这对流式响应至关重要：
+/// 函数会立即返回，但数据流仍在后台持续推送。
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
     routing_key: Option<String>,
@@ -1139,11 +1150,10 @@ impl Drop for WorkerLoadGuard {
     }
 }
 
-/// Body wrapper that holds an attached value.
+/// 携带一个附加值的响应体包装器。
 ///
-/// When this body is dropped (stream ends or client disconnects),
-/// the attached value is dropped automatically. This is useful for RAII guards
-/// like WorkerLoadGuard that need to be tied to a response body's lifetime.
+/// 当该响应体被 drop 时（流结束或客户端断开），附加值会被自动 drop。
+/// 这对于需要与响应体生命周期绑定的 RAII 守卫（如 WorkerLoadGuard）很有用。
 pub struct AttachedBody<T> {
     inner: Body,
     _attached: T,
@@ -1189,7 +1199,7 @@ impl<T: Send + Unpin + 'static> http_body::Body for AttachedBody<T> {
     }
 }
 
-/// Health checker handle with graceful shutdown
+/// 带优雅关闭能力的健康检查器句柄
 pub(crate) struct HealthChecker {
     #[allow(dead_code)]
     handle: tokio::task::JoinHandle<()>,
@@ -1205,12 +1215,12 @@ impl fmt::Debug for HealthChecker {
 }
 
 impl HealthChecker {
-    /// Create a new HealthChecker
+    /// 创建一个新的 HealthChecker
     pub fn new(handle: tokio::task::JoinHandle<()>, shutdown: Arc<AtomicBool>) -> Self {
         Self { handle, shutdown }
     }
 
-    /// Shutdown the health checker gracefully
+    /// 优雅地关闭健康检查器
     #[allow(dead_code)]
     pub async fn shutdown(self) {
         self.shutdown.store(true, Ordering::Release);
@@ -1218,9 +1228,9 @@ impl HealthChecker {
     }
 }
 
-/// Helper to convert Worker trait object to WorkerInfo struct
+/// 辅助函数：将 Worker trait 对象转换为 WorkerInfo 结构体
 pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
-    // Cache references that are used multiple times to avoid redundant method calls
+    // 缓存多次使用的引用，避免重复的方法调用
     let worker_type = worker.worker_type();
     let connection_mode = worker.connection_mode();
     let url = worker.url();

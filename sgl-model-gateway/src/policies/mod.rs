@@ -98,13 +98,44 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
-/// Configuration for cache-aware policy
+/// 缓存感知（cache-aware）路由策略的配置。
+///
+/// 策略针对每个请求的路由键（通常为 prompt 前缀）计算各 worker 的缓存前缀匹配率：
+/// 匹配率高于 [`Self::cache_threshold`] 时优先复用缓存；否则选择缓存树较小的 worker，
+/// 为新前缀预留更多缓存空间。发生明显负载失衡时，策略会优先纠正负载而不是保持缓存亲和性。
 #[derive(Debug, Clone)]
 pub struct CacheAwareConfig {
+    /// 走缓存命中路径的最小前缀匹配率，取值应在 `0.0..=1.0`。
+    ///
+    /// 当最佳 worker 的匹配率严格大于该值时，请求会路由至该 worker 以复用其 KV cache；
+    /// 否则路由至缓存树规模最小的健康 worker。较低的值倾向于缓存亲和，较高的值倾向于
+    /// 将低相似度请求分散到可用缓存空间更多的 worker。默认值为 `0.5`。
     pub cache_threshold: f32,
+
+    /// 判定 worker 负载失衡所需满足的最小绝对请求数差。
+    ///
+    /// 仅当最大负载与最小负载之差严格大于此值，且也满足
+    /// [`Self::balance_rel_threshold`] 时，策略才将负载视为失衡并优先选择较空闲的 worker。
+    /// 默认值为 `32`。
     pub balance_abs_threshold: usize,
+
+    /// 判定 worker 负载失衡所需满足的最小相对负载比。
+    ///
+    /// 仅当 `max_load > min_load * balance_rel_threshold`，且也满足
+    /// [`Self::balance_abs_threshold`] 时，策略才判定失衡。该参数应大于等于 `1.0`；
+    /// 值越小，策略越积极地为负载均衡牺牲缓存命中率。默认值为 `1.1`。
     pub balance_rel_threshold: f32,
+
+    /// 缓存前缀树按大小执行 LRU 淘汰的周期，单位为秒。
+    ///
+    /// 每个周期都会将超过 [`Self::max_tree_size`] 的树裁剪到容量限制以内。设为 `0` 时不启动
+    /// 后台淘汰任务，适合测试或由外部机制负责内存控制的场景。默认值为 `30` 秒。
     pub eviction_interval_secs: u64,
+
+    /// 单个 worker 的单棵缓存前缀树允许保留的最大节点数。
+    ///
+    /// 超过此上限的节点不会立即删除，而是在下一次 `eviction_interval_secs` 触发时按 LRU
+    /// 淘汰叶子节点。该值越大，能保留的历史前缀越多，但占用的内存也越高。默认值为 `10_000`。
     pub max_tree_size: usize,
 }
 
@@ -120,10 +151,27 @@ impl Default for CacheAwareConfig {
     }
 }
 
+/// 分桶（bucket）路由策略的配置。
+///
+/// 分桶策略把 worker 划分到若干负载区间（桶）中，并周期性地根据负载分布调整分桶，
+/// 从而在保持较低协调开销的同时平滑负载。以下阈值用于判定何时需要重新分桶。
 #[derive(Debug, Clone)]
 pub struct BucketConfig {
+    /// 判定负载失衡所需满足的最小绝对请求数差。
+    ///
+    /// 仅当最大负载与最小负载之差严格大于此值，且也满足 [`Self::balance_rel_threshold`]
+    /// 时，才视为失衡。默认值为 `32`。
     pub balance_abs_threshold: usize,
+
+    /// 判定负载失衡所需满足的最小相对负载比。
+    ///
+    /// 仅当 `max_load > min_load * balance_rel_threshold`，且也满足
+    /// [`Self::balance_abs_threshold`] 时，才判定失衡。默认值为 `1.0001`（对失衡极为敏感）。
     pub balance_rel_threshold: f32,
+
+    /// 后台重新调整分桶的周期，单位为秒。
+    ///
+    /// 每隔该间隔，策略会依据最新负载分布重新计算分桶边界。默认值为 `5` 秒。
     pub bucket_adjust_interval_secs: usize,
 }
 
@@ -137,7 +185,11 @@ impl Default for BucketConfig {
     }
 }
 
-/// Helper function to filter healthy workers and return their indices
+/// 辅助函数：筛选出健康的 worker 并返回它们在原始列表中的下标。
+///
+/// 「健康」需同时满足两个条件：worker 自身被标记为健康（`is_healthy`），
+/// 且其熔断器（circuit breaker）当前允许执行（`can_execute`）。各策略在选择前
+/// 通常先调用本函数，避免把请求路由到不可用或处于熔断状态的 worker。
 pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usize> {
     workers
         .iter()
@@ -147,10 +199,10 @@ pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usi
         .collect()
 }
 
-/// Helper function to normalize model_id to a key for policy lookups.
+/// 辅助函数：将 `model_id` 归一化为用于策略查找的键。
 ///
-/// Returns UNKNOWN_MODEL_ID for empty model_ids to ensure consistent behavior
-/// across single-model and multi-model deployments.
+/// 当 `model_id` 为空时返回 [`crate::core::UNKNOWN_MODEL_ID`]，以保证单模型与多模型
+/// 部署下的行为保持一致（空模型 ID 始终映射到同一个已知键）。
 #[inline]
 pub(crate) fn normalize_model_key(model_id: &str) -> &str {
     if model_id.is_empty() {
@@ -160,21 +212,28 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
     }
 }
 
-/// Information passed to policy for worker selection
+/// 传递给策略用于选择 worker 的上下文信息。
+///
+/// 不同策略按需读取其中的字段：例如缓存感知策略使用请求文本，前缀哈希策略使用
+/// token 序列，基于头部的策略使用 HTTP 头，一致性哈希策略使用预构建的哈希环。
+/// 未使用到的字段保持为 `None` 即可。
 #[derive(Debug, Clone, Default)]
 pub struct SelectWorkerInfo<'a> {
-    /// Request text for cache-aware routing
+    /// 用于缓存感知路由的请求文本（通常为 prompt），据此计算前缀匹配率。
     pub request_text: Option<&'a str>,
-    /// Tokenized request for prefix-hash routing
-    /// Used by PrefixHashPolicy for token-based prefix hashing
+    /// 用于前缀哈希路由的分词结果。
+    ///
+    /// 由 `PrefixHashPolicy` 使用，基于 token 序列做前缀哈希以实现前缀亲和路由。
     pub tokens: Option<&'a [u32]>,
-    /// HTTP headers for header-based routing policies
-    /// Policies can extract routing information from headers like:
-    /// - X-SMG-Target-Worker: Direct routing to a specific worker by index
-    /// - X-SMG-Routing-Key: Consistent hash routing for session affinity
+    /// 用于基于头部的路由策略的 HTTP 头。
+    ///
+    /// 策略可从头部提取路由信息，例如：
+    /// - `X-SMG-Target-Worker`：按下标直接路由到指定 worker；
+    /// - `X-SMG-Routing-Key`：按一致性哈希路由以实现会话亲和。
     pub headers: Option<&'a http::HeaderMap>,
-    /// Pre-computed hash ring for O(log n) consistent hashing
-    /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
+    /// 预先构建好的哈希环，用于 O(log n) 复杂度的一致性哈希。
+    ///
+    /// 由 `WorkerRegistry` 构建并缓存后透传进来，避免每个请求都重复构建哈希环。
     pub hash_ring: Option<Arc<HashRing>>,
 }
 

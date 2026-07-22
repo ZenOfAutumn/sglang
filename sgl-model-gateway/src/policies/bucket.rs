@@ -309,31 +309,65 @@ impl LoadBalancingPolicy for BucketPolicy {
     }
 }
 
+/// 单个模型的“桶”状态。桶策略按请求文本长度（字符数）把请求映射到不同
+/// 的 prefill worker：把 `[0, l_max]` 的长度区间切分成若干连续区段，每个区
+/// 段（一个 [`Boundary`]）对应一个 worker。这样长度相近的请求会稳定落到同
+/// 一个 worker，有利于 prefix cache 命中；后台线程再根据实际负载动态调整区
+/// 段边界，使各 worker 的总负载趋于均等。
 #[derive(Debug, Clone)]
 pub struct Bucket {
+    /// 长度区间的上界（字符数）。初始化时用它均分区段（`gap = l_max / worker_cnt`），
+    /// 分配完成后会被抬升为 `usize::MAX`，使最后一个区段能覆盖所有超长请求。
     l_max: usize,
+    /// 当前桶内的 prefill worker 数量，等于 `prefill_worker_urls` 的长度。
+    /// worker 增删时同步更新，用于计算每桶目标负载 `load_total / bucket_cnt`。
     bucket_cnt: usize,
+    /// 该模型下所有可用的 prefill worker URL 列表（区段划分的对象）。
+    /// 用 `Arc<Mutex<_>>` 包裹，以便与后台边界调整线程、选路线程共享并安全并发访问。
     pub prefill_worker_urls: Arc<Mutex<Vec<String>>>,
+    /// 滑动窗口内的总负载（所有未过期请求的字符数之和）。
+    /// 每次 `post_process_request` 加上新请求、减去过期请求，用于边界重算。
     load_total: usize,
+    /// 负载统计的滑动窗口长度（毫秒），值为 `bucket_adjust_interval_secs * 1000`。
+    /// 超过该时长的历史请求会被淘汰，因此负载只反映最近一段时间的流量。
     pub period: usize,
+    /// 上一次调整边界时记录的“单桶负载”（`load_total / bucket_cnt`）。
+    /// 与本次新算出的单桶负载对比，只有变化超过 2 倍才真正重算边界，避免抖动。
     bucket_load: usize,
+    /// 当前的区段划分：每个 [`Boundary`] 记录一个字符数区间 `[min, max]` 及其
+    /// 对应的 worker URL。`find_boundary` 对它做二分查找来定位目标 worker。
     boundary: Vec<Boundary>,
+    /// 滑动窗口内的请求队列（按时间先后排列）。队首是最老的请求，
+    /// `post_process_request` 从队首淘汰过期请求、从队尾追加新请求。
     request_list: VecDeque<SequencerRequest>,
+    /// 滑动窗口内每条请求的负载映射：请求 id -> 字符数。
+    /// `adjust_boundary` 会把其中的负载值排序，据此按累计负载重新划分区段边界。
     t_req_loads: HashMap<String, usize>,
+    /// 每个 worker URL 当前累计的字符数负载。用于判断负载是否失衡
+    /// （`select_worker` 中比较最大/最小负载），失衡时改用最小负载 worker。
+    /// 同样用 `Arc<Mutex<_>>` 以便跨线程共享。
     pub chars_per_url: Arc<Mutex<HashMap<String, usize>>>,
 }
 
+/// 滑动窗口内记录的一次请求，用于负载统计与过期淘汰。
 #[derive(Debug, Clone)]
 pub struct SequencerRequest {
+    /// 请求的唯一标识（UUID），作为 `t_req_loads` 的键。
     pub id: String,
+    /// 该请求的负载大小，即请求文本的字符数。
     pub char_cnt: usize,
+    /// 请求进入的时间戳，用于判断是否超出滑动窗口 `period` 而过期。
     pub timestamp: SystemTime,
+    /// 该请求被路由到的 prefill worker URL；过期淘汰时据此回滚对应 worker 的负载。
     pub prefill_worker_url: String,
 }
 
+/// 一个字符数区段到 worker 的映射，是桶划分的基本单元。
 #[derive(Debug, Clone)]
 pub struct Boundary {
+    /// 该区段对应的 prefill worker URL。
     pub url: String,
+    /// 字符数区间 `[min, max]`（闭区间）：请求长度落在此范围内即命中该 worker。
     pub range: [usize; 2],
 }
 
