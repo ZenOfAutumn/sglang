@@ -291,16 +291,40 @@ impl RoutingMode {
     }
 }
 
-/// Assignment mode for manual policy when encountering a new routing key
+/// Manual(手动/粘性会话)策略在遇到**新路由键**时的 worker 分配方式。
+///
+/// Manual 策略通过请求头 `X-SMG-Routing-Key` 提供会话粘性(sticky session):
+/// 同一路由键会被稳定映射到同一个 worker。当某个路由键**第一次**出现(即
+/// `routing_map` 中还没有它的映射)时,需要为它挑选一个初始 worker,本枚举
+/// 就决定了这次「首次分配」采用何种挑选策略。一旦分配完成,后续相同路由键的
+/// 请求都会复用该映射,只有在原 worker 变得不健康时才会重新分配。
+///
+/// > 注意:本模式只影响**新键的初始分配**,不影响已建立映射的粘性行为。
+///
+/// 序列化时使用 snake_case,例如 `"random"`、`"min_load"`、`"min_group"`。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ManualAssignmentMode {
-    /// Random selection (default)
+    /// 随机分配(默认):从当前健康的 worker 中等概率随机挑选一个。
+    ///
+    /// 开销最小、无需读取 worker 负载信息,适合各 worker 能力相近、
+    /// 且路由键数量足够大能自然均摊到各 worker 的场景。
     #[default]
     Random,
-    /// Select worker with minimum running requests
+
+    /// 最小负载分配:挑选**当前运行中请求数(load)最少**的 worker。
+    ///
+    /// 依据 `Worker::load()`(即正在处理的请求数)选择负载最低者;若存在
+    /// 多个并列最小值,则在这些候选中随机选一个以打散热点。适合请求处理
+    /// 时长差异较大、希望把新会话导向更空闲实例的场景。
     MinLoad,
-    /// Select worker with minimum active routing keys
+
+    /// 最小分组分配:挑选**当前绑定路由键数量最少**的 worker。
+    ///
+    /// 依据 `Worker::worker_routing_key_load()`(即该 worker 上活跃路由键
+    /// 的数量)选择绑定会话最少者;并列最小值同样随机打散。相比 `MinLoad`
+    /// 关注的是「会话/键的分布均衡」而非「实时请求负载」,适合希望各 worker
+    /// 承载的独立会话数尽量均匀的场景。
     MinGroup,
 }
 
