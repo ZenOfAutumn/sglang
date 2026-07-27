@@ -4,6 +4,13 @@
 > 说明每种算法「解决什么底层矛盾、以什么结构运转、边界在哪里、为何演化出来」。
 > 所有策略均实现统一的 [`LoadBalancingPolicy`](./mod.rs) trait，
 > `select_worker` 返回被选中 Worker 在候选数组中的下标。
+>
+> 本文档为**总览**，仅保留每种算法的核心原理与取舍。较复杂的算法另有独立详解文档（含数学推导、实现细节）：
+> - [POWER_OF_TWO_ZH.md](./POWER_OF_TWO_ZH.md) — Power of Two Choices（二选一）
+> - [PREFIX_HASH_ZH.md](./PREFIX_HASH_ZH.md) — Prefix Hash（前缀哈希）
+> - [CONSISTENT_HASHING_ZH.md](./CONSISTENT_HASHING_ZH.md) — Consistent Hashing（一致性哈希）
+> - [CACHE_AWARE_ZH.md](./CACHE_AWARE_ZH.md) — Cache Aware（缓存感知）
+> - [BUCKET_ZH.md](./BUCKET_ZH.md) — Bucket（分桶）
 
 ---
 
@@ -113,180 +120,20 @@ $$
 \text{selected} = \arg\min_{i \in \{a,b\}} \text{load}(i), \quad a,b \sim \text{Uniform}(\mathcal{H}),\ a \neq b
 $$
 
-理论结论（Mitzenmacher）：全局最忙 Worker 的期望负载从随机的 $O(\log n / \log\log n)$ 降到 $O(\log\log n)$——**只用两次采样就获得接近全局最优的尾部收益**，却避免了扫描全局带来的观测成本与「羊群效应」。
-
-#### 举例：为什么「看两个」就够了
-
-设有 $n = 100$ 个 Worker，用「全局最忙 Worker 的队列长度」衡量是否均衡（越小越均衡）。
-
-- **随机选 1（Random）**：每个请求闭眼丢给一台。总有机器「连续中奖」堆积，最忙者队列长度约 $\dfrac{\log n}{\log\log n} = \dfrac{\log 100}{\log\log 100} \approx \dfrac{4.6}{1.5} \approx 3$（量级示意）。
-- **随机选 2 取较空（Power of Two）**：每个请求随机挑 2 台、比较后丢给更空的那台。最忙者队列长度骤降到约 $\log\log n = \log\log 100 \approx 1.5$（量级示意）。
-
-用超市收银台类比：100 个收银台，「随机选 1」= 蒙眼冲向某个台子，必然有的排长队、有的空着；「随机选 2」= 随便瞟 **2 个**台子、走人少的那个——不必比较全部 100 个，只看 2 个就足以避开长队。
-
-**为什么是 2 而不是 3、4？** 关键在概率抑制：一台机器要变「最忙」，在 Power of Two 下必须**连续**在「被抽中的两台里更空」，其概率约为 $(1/n)^2$ 量级，相比随机选 1 的 $1/n$ 急剧变小——这正是负载从 $\log n$ 降到 $\log\log n$ 的根源。而选 3 个变成 $(1/n)^3$，**边际收益已微乎其微**，却要多付一次负载比较成本。因此「2」是观测成本与均衡质量的甜点：
-
-| 方案 | 决策成本 | 最忙 Worker 负载（量级） | 效果 |
-|---|---|---|---|
-| 随机选 1 | 最低 | $\sim \log n / \log\log n$ | 易出热点 |
-| **随机选 2 取优** | 低（多看 1 台） | $\sim \log\log n$ | 显著均衡 |
-| 查全部 $n$ 台取最优 | 高（$O(n)$ + 羊群效应） | $\sim 1$ | 均衡但成本高且易振荡 |
-
-#### 数学原理：最忙 Worker 负载为何是 $\log\log n$
-
-设把 $n$ 个球（请求）投入 $n$ 个桶（Worker），关注**最大桶高**（即最忙 Worker 的负载）。用 $\beta_k$ 表示「高度 $\ge k$ 的桶所占比例」，通过归纳递推估计其量级。
-
-**① 随机选 1（$d=1$）—— 独立泊松近似**
-
-每个桶的高度近似服从 $\text{Poisson}(1)$。桶高 $\ge k$ 的概率约 $\dfrac{1}{k!}$，故：
-
-$$
-\Pr[\text{某桶高度} \ge k] \approx \frac{1}{k!}, \qquad \mathbb{E}[\text{高度}\ge k \text{ 的桶数}] \approx \frac{n}{k!}
-$$
-
-令该期望降到 $O(1)$（即最大高度阈值），需 $k! \approx n$。由 Stirling 公式 $k! \approx (k/e)^k$ 反解：
-
-$$
-k^* \approx \frac{\ln n}{\ln \ln n} = \Theta\!\left(\frac{\log n}{\log\log n}\right)
-$$
-
-这就是随机选 1 的最大负载量级。
-
-**② 随机选 2 取较空（$d=2$）—— 递推的「平方坍缩」**
-
-核心变化：一个球**只有**当它随机选中的 **两个**桶**都**已达到高度 $\ge k$ 时，才可能把某桶推到 $k+1$。两次独立采样，故：
-
-$$
-\beta_{k+1} \;\lesssim\; \big(\beta_k\big)^{2}
-$$
-
-这是一个**平方递推**。从某个常数基准 $\beta_{k_0} \le \tfrac{1}{2}$ 出发迭代：
-
-$$
-\beta_{k_0+j} \;\lesssim\; \left(\tfrac{1}{2}\right)^{2^{j}}
-$$
-
-指数上出现 $2^{j}$——**双重指数衰减**。要让 $\beta_k$ 小到对应「不足一个桶」（即 $\beta_k \cdot n < 1$，$\beta_k < 1/n$），只需：
-
-$$
-2^{\,j} \gtrsim \log_2 n \;\Longrightarrow\; j \gtrsim \log_2 \log_2 n
-$$
-
-于是最大高度：
-
-$$
-k^{*} \;=\; k_0 + j \;=\; \frac{\ln\ln n}{\ln 2} + \Theta(1) \;=\; \Theta(\log\log n)
-$$
-
-**③ 一般 $d$ 选一（$d\ge 2$）**
-
-同理递推变为 $\beta_{k+1} \lesssim (\beta_k)^{d}$，指数塔底数变成 $d$：
-
-$$
-k^{*} \;=\; \frac{\ln\ln n}{\ln d} + \Theta(1)
-$$
-
-对照三种情形，可一眼看出「$d=1 \to d=2$ 是质变，$d=2 \to d\ge3$ 只是常数因子改良」：
-
-| 采样数 $d$ | 递推关系 | 最大负载量级 | 相对 $d=2$ |
-|---|---|---|---|
-| $1$ | $\beta_{k+1}\approx \beta_k/k$（无平方） | $\Theta\!\big(\tfrac{\log n}{\log\log n}\big)$ | — |
-| $2$ | $\beta_{k+1}\lesssim \beta_k^{2}$ | $\Theta(\log\log n)$ | 基准 |
-| $d\ge 3$ | $\beta_{k+1}\lesssim \beta_k^{d}$ | $\dfrac{\log\log n}{\log d}+\Theta(1)$ | 仅差常数因子 $\tfrac{1}{\log d}$ |
-
-**结论**：$d=1$ 无平方项，衰减是「阶乘级」，反解得 $\log n/\log\log n$；$d\ge2$ 引入 $\beta_k^{d}$ 的**多重指数（幂塔）衰减**，反解得 $\log\log n$。从 1 到 2 把「单指数」变成「双重指数」，是量级跃迁；从 2 再往上只把幂塔底数由 2 变成 $d$，仅改变常数系数 $1/\log d$——这从数学上精确解释了前文「2 是甜点」的直觉。
-
-> 说明：以上为 Azar–Broder–Karlin–Upfal / Mitzenmacher 结果的直觉化推导，省略了误差项与集中不等式的严格证明，量级（$\Theta$）结论成立。
-
-代码中的关键工程细节（**指标兼容性降级**）：
-
-```text
-// 若任一 Worker 缺 token 级负载，两者都降级为请求计数比较
-match (load1_tokens, load2_tokens) {
-    (Some(t1), Some(t2)) => 使用 (t1, t2)                // 同为 token 负载
-    否则                 => 使用 (worker1.load(), worker2.load())  // 同为请求计数
-}
-```
-
-这修复了一个隐蔽 bug：绝不能拿「token 负载(如 50000)」与「请求数(如 5)」比较，否则量纲不可比会导致灾难性误判。
-
-### `load_tokens` 的含义与更新周期
-
-Power of Two 的选择质量取决于「负载信号有多准、多新」。本仓库对负载采用**两级信号 + 后台异步刷新**：
-
-**① `load_tokens` 是什么（高保真信号）**
-
-- 语义：某个 Worker 上**当前尚未处理完的总 token 数**，而非「请求条数」。它直接对应 GPU 上排队/在算的实际计算量，因此比请求计数更能反映真实压力（1 个 8k-token 的长请求远重于 5 个 32-token 的短请求）。
-- 来源：`LoadMonitor` 向每个 HTTP Worker 的负载接口拉取，解析响应 JSON 的 `aggregate.total_tokens` 字段：
-
-```text
-// src/core/worker_manager.rs · parse_load_response
-json["aggregate"]["total_tokens"]  // 解析为 isize
-// 请求失败 / 非 2xx / JSON 解析失败 / 字段缺失 → 返回 -1（视为无效）
-```
-
-- 存储：策略内部用 `cached_loads: RwLock<HashMap<String, isize>>` 缓存，key 为 Worker URL，value 即该 token 负载快照。
-- **降级信号**：若某 Worker 在缓存中缺失（监控失败、字段缺失等），`select_worker` 会把参与比较的**两个** Worker **都**回退到本地请求计数 `worker.load()`，保证量纲一致（即前述兼容性降级）。
-
-**① bis 引擎侧 `total_tokens` 究竟怎么算（数值语义在 Worker 端定义）**
-
-该数值由**推理引擎（SGLang server）**自己维护，网关只是拉取。SGLang 调度器在 `/v1/loads` 的负载查询逻辑（`scheduler_components/load_inquirer.py`）中如下计算：
-
-$$
-\text{total\_tokens} \;=\; \underbrace{\text{num\_used\_tokens}}_{\text{运行中已占用}} \;+\; \sum_{\text{req}\,\in\,\text{等待队列}} \text{req.seqlen}
-$$
-
-```python
-# load_inquirer.py（引擎侧）
-num_used_tokens, _ = pool_stats_observer.get_pool_stats().get_kv_token_stats()
-num_total_tokens = num_used_tokens + sum(
-    req.seqlen for queue in waiting_queues for req in queue
-)
-```
-
-两项的物理含义：
-
-- **第一项 `num_used_tokens`（KV Cache 真实占用）**：由 `pool_stats_observer` 计算——
-  $$
-  \text{num\_used\_tokens} = \text{max\_total\_num\_tokens} - (\text{available\_size} + \text{evictable\_size})
-  $$
-  即「KV 池总容量 − 空闲可分配槽位 − 可淘汰的前缀缓存」，反映 GPU 上正在运行的请求实际吃掉的 KV 槽位（含受保护、不可淘汰的前缀缓存）。hybrid-SWA 模型取 `max(full, swa)`，SSM/Mamba、HiSparse 会叠加各自的分层统计。
-
-- **第二项 `Σ req.seqlen`（排队负债）**：所有等待队列中每个请求的完整输入序列长度之和。等待队列组成随模式而变：普通模式为主等待队列；PD-Prefill 追加 `bootstrap_queue`；PD-Decode 追加 `prealloc/transfer/retracted` 等子队列。
-
-**一句话**：`total_tokens` = 该 Worker「已在 GPU 上跑着的（running）+ 已收到但排队等 prefill 的（waiting）」token 总债，比「请求条数」精确得多，也正是 SGLang DP 负载均衡 `total_tokens` 方法所用的核心信号。
-
-> ⚠️ 字段结构注意：SGLang 原生 `/v1/loads` 返回形如 `{"loads":[{"num_total_tokens":N, ...}]}`（无 `aggregate` 层、字段名为 `num_total_tokens`），而网关当前解析的是 `aggregate.total_tokens`。若直连该版本引擎且中间无格式转换层，网关会解析失败得到 `-1`，从而使 P2C 退化为按请求计数比较——接入时需确认二者的响应格式已对齐。
-
-**② 更新周期（后台定时，非每请求）**
-
-负载采集被**从请求热路径中剥离**，改由 `LoadMonitor` 后台任务周期性拉取，避免每个请求都去查询负载：
-
-$$
-\text{每隔 } \tau_\text{load} \text{ 秒：并发拉取所有 Worker 负载} \;\to\; \text{整体替换策略缓存} \;\to\; \text{watch 广播快照}
-$$
-
-关键参数与行为：
-
-- **间隔** $\tau_\text{load}$ = `PolicyConfig::PowerOfTwo { load_check_interval_secs }`，CLI/默认值为 **5 秒**（见 `main.rs` 的 `parse_policy`）。
-- **触发条件**：`monitor_loop` 每个 tick 先检查是否存在 Power of Two 策略；**没有则跳过拉取**（零开销），有才并发采集。
-- **更新方式**：`update_loads` 用最新快照**整体替换**旧缓存（`*cached = loads.clone()`），而非增量合并；写锁获取失败则静默跳过，等下一周期补上。
-- **空结果保护**：若本轮没拉到任何负载，则**不覆盖**旧缓存并告警，避免把「采集失败」误当「负载为 0」。
-
-**③ 这带来一个固有的「陈旧窗口」**
-
-由于是定时快照，策略看到的负载**最多陈旧 $\tau_\text{load}$ 秒**。当状态陈旧程度远超负载变化速度（$\Delta_\text{state} \gg \tau_\text{load}$ 的反向情形）时，二选一会退化为「近似随机」——这正是「边界与反模式」中所述的极限：$\tau_\text{load}$ 调大则观测开销低但信号旧，调小则信号新但采集压力大，需按流量抖动幅度权衡。
+理论结论（Mitzenmacher）：全局最忙 Worker 的期望负载从随机的 $O(\log n / \log\log n)$ 降到 $O(\log\log n)$——**只用两次采样就获得接近全局最优的尾部收益**，却避免了扫描全局带来的观测成本与「羊群效应」。负载信号优先用 token 级 `load_tokens`，缺失时两者一起降级为请求计数，保证量纲一致。
 
 ### 高阶结构化类比
 等价于分布式哈希负载均衡中的 **"the power of two random choices"**，也类比 CPU 调度里的**局部窥探**（只看邻近核心而非全局队列）以规避全局锁竞争。
 
 ### 边界与反模式
-- **边界**：与「全局最少负载」的分界线是**观测范围**。全局最少负载会因所有请求同时看到同一个「最空闲」节点而振荡（$A$ 空 → 全涌向 $A$ → $A$ 过载 → 全涌向 $B$）；二选一用随机采样天然打散这种同步。
-- **极限**：负载数据严重过期（$\Delta_\text{state} \gg \tau_\text{load}$）时退化为近似随机。
+- **边界**：与「全局最少负载」的分界线是**观测范围**。全局最少负载会因所有请求同时看到同一个「最空闲」节点而振荡；二选一用随机采样天然打散这种同步。
+- **极限**：负载数据严重过期时退化为近似随机（负载由后台 `LoadMonitor` 定时刷新，存在陈旧窗口）。
 - **反模式**：在负载信号缺失/延迟大的环境里强行相信采样值。
 
 ### 演进动机
 推翻了「必须扫描全局才能优化尾延迟」的假设。它是**观测成本**与**均衡质量**之间的帕累托最优点。
+
+> 📖 数学推导（$\log\log n$ 由来）、`load_tokens` 语义与更新周期等完整细节见 [POWER_OF_TWO_ZH.md](./POWER_OF_TWO_ZH.md)。
 
 ---
 
@@ -301,49 +148,7 @@ $$
 \text{worker} = \text{Ring.lookup}\big(\text{xxh3}(\text{tokens}[0{:}N])\big), \quad N = \texttt{prefix\_token\_count}\ (\text{默认 }256)
 $$
 
-核心假设：**相同前缀 → 相同哈希 → 相同 Worker → KV Cache 命中**。但纯亲和会造成热点，因此加了**有界负载均衡**。
-
-#### `load_factor` 的详细计算方式
-
-对应实现见 `PrefixHashPolicy::load_ok`（`src/policies/prefix_hash.rs`）。每次选路时，先在**健康 Worker**集合上计算全局指标，再对候选 Worker 做「负载是否可接受」判定：
-
-```text
-// 1) 仅统计健康 Worker
-//    注意：这里的 worker.load() 是“活跃请求数”（在途/并发请求数），
-//    而非 token 数——它由请求进入时 +1、完成时 -1 的原子计数器维护。
-total_load  = Σ worker.load()   // 所有健康 Worker 的当前活跃请求数之和
-num_workers = 健康 Worker 数量
-
-// 2) 计算“含本次请求”的人均负载（+1 用于模拟即将进入的这一个请求）
-avg_load    = (total_load + 1) / num_workers
-
-// 3) 由 load_factor 放大得到可接受负载阈值
-threshold   = avg_load * load_factor        // load_factor 默认 1.25
-
-// 4) 判定：候选 Worker 负载 ≤ 阈值 即视为“负载 OK”
-load_ok     = worker.load() <= threshold
-```
-
-用公式表示，即候选 Worker $w$ 被判定为可接受当且仅当：
-
-$$
-\text{load}(w) \;\le\; \underbrace{\frac{\left(\sum_{i} \text{load}(w_i)\right) + 1}{\text{num\_workers}}}_{\text{avg\_load}} \times \texttt{load\_factor}
-$$
-
-**关键细节：**
-- **`+1` 的含义**：把「即将到来的这次请求」计入人均，避免在低负载时阈值被算得过低而误判过载。
-- **`load_factor` 的语义**：允许单个 Worker 的负载最多达到人均的 `load_factor` 倍。默认 `1.25` 表示「最多超出平均 25%」。
-  - 取值越大 → 越偏向**缓存亲和**（更容忍热点，命中率高，但负载更不均）。
-  - 取值越接近 `1.0` → 越偏向**均衡**（更早触发迁移，命中率下降）。
-- **边界短路**：当 `total_load == 0` 或 `num_workers == 0` 时，`load_ok` 直接返回 `true`（无负载可比，直接走缓存亲和）。
-
-#### 判定后的选路分支（结合阈值）
-
-1. **RingHit**：哈希环命中的初始 Worker 满足 `load_ok` → 直接选它（最佳情况，缓存亲和成立）。
-2. **LoadBalanceWalk**：初始 Worker 过载（不满足 `load_ok`）→ 在**同样满足 `load_ok`** 的健康 Worker 中挑负载最小者；若**所有** Worker 都过载，则退回使用初始 Worker（放弃迁移，避免无意义抖动）。
-3. **FallbackLeastLoad**：无哈希环或环查找失败 → 忽略亲和，直接选负载最小的健康 Worker。
-
-即在「缓存亲和」与「负载上限」之间由 `load_factor` 设定了一个可调的安全阀。
+核心假设：**相同前缀 → 相同哈希 → 相同 Worker → KV Cache 命中**。但纯亲和会造成热点，因此加了**有界负载均衡**：候选 Worker 负载超过「人均 × `load_factor`」（默认 1.25）阈值时判定为过载，触发迁移。选路分为 RingHit（命中且不过载）、LoadBalanceWalk（过载则在未过载 Worker 中选最小负载）、FallbackLeastLoad（无环则选最小负载）三个分支。
 
 ### 高阶结构化类比
 等价于 **NUMA 调度的缓存亲和 + 负载封顶**：优先让线程回到其缓存所在的 NUMA 节点，但当该节点过载时允许迁移，避免亲和性演变成拥塞。
@@ -360,6 +165,8 @@ $$
 
 ### 演进动机
 它是 cache_aware「太重」时的轻量替代：用哈希近似代替显式前缀树，把更新成本从 $O(\text{prefix\_len})$ 降到 $O(1)$。
+
+> 📖 `load_factor` 的精确计算方式与三分支选路逻辑等完整细节见 [PREFIX_HASH_ZH.md](./PREFIX_HASH_ZH.md)。
 
 ---
 
@@ -382,48 +189,7 @@ $$
 4. 随机兜底
 
 ### 高阶结构化类比
-经典的 **Chord DHT / Amazon Dynamo** 环形拓扑——用「环 + 顺时针查找」把「成员变更的爆炸半径」限制在 $1/N$。
-
-#### 什么是「环形拓扑」
-
-把哈希值空间（如 $[0, 2^{32})$ 或 $[0, 2^{160})$）想象成一个**首尾相接的圆环**：最大值的下一个位置又回到 $0$。然后：
-
-1. **节点上环**：对每个 Worker（节点）用哈希函数 $\text{hash}(\text{节点标识})$ 算出一个位置，把它「钉」在环上。
-2. **数据/请求上环**：对每个 key（这里是前缀哈希或 routing key）同样算 $\text{hash}(k)$，落到环上某点。
-3. **归属规则**：从 key 的位置**顺时针**走，遇到的**第一个节点**就是它的归属 Worker（若不健康则继续顺时针跳到下一个）。
-
-这样「查找」退化为「在有序的节点位置数组里做二分查找」——即代码中的 $O(\log n)$。
-
-```text
-        0 / 2^32
-          ┌───●B───┐
-       ●A │        │ key k  → 顺时针遇到的第一个节点是 C，归属 C
-          │        ●C
-          └───●D───┘
-   环上顺序: A → B → C → D → （回到 A）
-```
-
-#### Chord DHT（2001，MIT）
-
-- **背景**：P2P 分布式哈希表，目标是在没有中心目录的情况下，让任意节点都能高效定位「某个 key 存在哪个节点」。
-- **核心贡献**：
-  - 将节点与 key 映射到同一个 $2^{m}$ 的环（**identifier ring**）；key 归属其顺时针后继节点（successor）。
-  - 用 **finger table（指针表）** 让每个节点缓存若干「间隔指数级增大」的后继，从而把查找从 $O(N)$ 降到 $O(\log N)$ 跳。
-  - 节点加入/离开时，只影响其**相邻区间**的 key，迁移量约 $1/N$。
-- **对本项目的映射**：我们不需要 finger table（Worker 数量少、环在网关本地预构建），但「节点与 key 同环、顺时针找后继」的**归属规则完全一致**。
-
-#### Amazon Dynamo（2007）
-
-- **背景**：亚马逊购物车等高可用存储，追求「永远可写」与弹性伸缩。
-- **在一致性哈希上的关键改进**：
-  - **虚拟节点（virtual nodes / vnodes）**：每个物理节点在环上放置**多个**虚拟位置，解决「节点少时环分布不均、扩容负载迁移不均」的问题。这正是本文档下方“极限”里提到的**虚拟节点缓解均匀性**的来源。
-  - **副本与 N/R/W**：key 顺时针的前 $N$ 个节点各存一份副本（本项目不涉及存储副本，仅借用环定位思想）。
-- **对本项目的映射**：`HashRing` 为每个 Worker 生成多个虚拟节点以改善均匀性，思路直接来自 Dynamo 的 vnodes。
-
-#### 为什么迁移量是 $1/N$
-
-普通取模 $\text{hash}(k) \bmod n$：当 $n$ 从 $N$ 变为 $N+1$ 时，**绝大多数 key 的取模结果都会变**，接近 100% 重映射。
-环形拓扑下增删一个节点，只有**落在该节点所负责的那段环弧**上的 key 需要改归属，其余 key 的「顺时针后继」不变——受影响比例约为该弧长占整个环的比例，即约 $1/N$。这就是「成员变更的爆炸半径被限制在 $1/N$」的直观来源。
+经典的 **Chord DHT / Amazon Dynamo** 环形拓扑——把节点与 key 映射到同一个首尾相接的哈希环，key 顺时针找第一个健康节点作为归属，用「环 + 顺时针查找」把「成员变更的爆炸半径」限制在 $1/N$。`HashRing` 借用 Dynamo 的**虚拟节点**思路改善分布均匀性。
 
 ### 边界与反模式
 - **边界**：与 Manual 的分界线是**扩容行为**。一致性哈希在加节点时**会**重分布约 $1/N$ 的 key；Manual 加节点时**完全不**重分布已有会话。
@@ -432,6 +198,8 @@ $$
 
 ### 演进动机
 推翻了「取模映射」在动态拓扑下的可用性假设，是所有需要「稳定亲和 + 弹性伸缩」场景的基石。
+
+> 📖 环形拓扑原理、Chord/Dynamo 溯源与 $1/N$ 迁移量推导等完整细节见 [CONSISTENT_HASHING_ZH.md](./CONSISTENT_HASHING_ZH.md)。
 
 ---
 
@@ -472,6 +240,8 @@ $$
 
 ### 演进动机
 它推翻了「所有健康实例等价」的假设，把路由从「无状态副本选择」进化为「**状态位置选择**」——这是模型网关区别于普通 L4/L7 负载均衡器的分水岭。
+
+> 📖 双模式切换、基数树结构与 NUMA 类比等完整细节见 [CACHE_AWARE_ZH.md](./CACHE_AWARE_ZH.md)。
 
 ---
 
@@ -515,42 +285,7 @@ $$
 
 其中 $x$ 是本次请求的**字符数**（`request_text.chars().count()`，故 `needs_request_text() = true`）。选桶用**二分查找** `find_boundary`（边界有序），复杂度 $O(\log N)$。
 
-**初始边界**是等分的：`gap = l_max / worker_cnt`（`l_max` 初值 4096），最后一个桶的上界扩到 `usize::MAX` 兜底任意超长请求。
-
-### 双层机制：静态分桶 + 动态再平衡
-
-**① 请求期（select_worker）——分桶为主、失衡时降级为最小负载**
-
-每次选 Worker 时，先读取滑动窗口内各 Worker 的累计字符负载 `chars_per_url`，用**双阈值**判断是否失衡（与 Cache Aware 同构）：
-
-$$
-\text{imbalanced} \iff (\text{max} - \text{min}) > \tau_\text{abs} \;\wedge\; \text{max} > \tau_\text{rel} \cdot \text{min}
-$$
-
-- **未失衡** → 走 **Bucket 分桶**：按请求长度二分命中所属区间的 Worker（长度决定归属，可预测、稳定）。
-- **已失衡** → 临时降级为**最小负载优先**：直接选当前累计字符最少的 Worker，牺牲长度亲和换取快速再平衡。
-
-选定后 `post_process_request` 会：把本次 `char_cnt` 累加到该 URL 的负载、生成一条带时间戳的 `SequencerRequest` 入队，并**淘汰超出滑动窗口**（`period = bucket_adjust_interval_secs × 1000` ms）的历史请求、回滚其负载。即负载统计是一个**时间滑动窗口**，只反映最近一段时间的流量。
-
-**② 后台期（adjust_boundary）——按负载分位重划边界**
-
-后台线程每隔 `bucket_adjust_interval_secs`（默认 5s）对每个模型的桶做一次边界重算，目标是让**每个桶承担的总负载尽量均等**：
-
-1. 计算目标单桶负载 `new_single_bucket_load = 总负载 / worker_cnt`；
-2. **迟滞（hysteresis）保护**：若新旧单桶负载相差不到 2 倍（且旧值非 0），认为无需调整，直接跳过——避免边界频繁抖动；
-3. 否则把窗口内所有请求长度**排序**，按"累积负载达到单桶目标"为切点，依次给每个 Worker 划定新的 `[min, max]` 区间（本质是**按负载做等分位切分**，而非按长度等分）。
-
-这样，如果短请求特别多，短请求区间会被切得更细（多个 Worker 分摊）；长请求稀疏，则由少数 Worker 覆盖大长度区间——**边界随真实长度分布自适应**。
-
-### 关键数据结构
-| 字段 | 作用 |
-|---|---|
-| `boundary: Vec<Boundary>` | 有序的 `{url, [min,max]}` 列表，二分选桶的依据 |
-| `chars_per_url` | 各 Worker 在滑动窗口内的累计字符负载（失衡判断 + 重划分位） |
-| `request_list: VecDeque<SequencerRequest>` | 按时间排序的请求队列，用于滑动窗口过期淘汰 |
-| `period` | 滑动窗口长度（ms），等于调整间隔 |
-
-桶以 `normalize_model_key(model_id)` 为 key 隔离，不同模型各自维护独立分桶与负载窗口。Worker 增删（`add_prefill_url` / `remove_prefill_url`）会重置边界并同步 `chars_per_url`。
+策略采用**双层机制**：请求期以分桶为主，用双阈值检测失衡、失衡时降级为最小负载 Worker；后台线程每隔 `bucket_adjust_interval_secs`（默认 5s）按滑动窗口内的真实负载分位**重划桶边界**（含迟滞保护避免抖动）。桶以 `normalize_model_key(model_id)` 为 key 按模型隔离。
 
 ### 高阶结构化类比
 类似磁盘的**分区/分级存储**或数据库的**范围分片（range sharding）**——按 key（这里是"请求长度"）的区间把负载路由到固定分片，再用后台任务按实际数据分布**动态调整分片边界**（类比 HBase Region Split / 自动 rebalance）。也可类比 CPU 调度里把长短任务分到不同队列的**多级队列**思想。
@@ -565,6 +300,124 @@ $$
 
 ### 演进动机
 在 PD 分离下，prefill 是"算力密集、成本随长度线性增长"的阶段。把"按长度分片 + 按负载自适应重划边界"结合，既保留了**同长度请求路由稳定**的可预测性，又通过后台再平衡与请求期失衡降级，避免了静态分片在流量倾斜时的僵化——这是为"长度即成本"这一 prefill 特性量身定制的均衡器。
+
+> 📖 双层机制（请求期分桶 + 后台边界重划）、关键数据结构与初始边界等完整细节见 [BUCKET_ZH.md](./BUCKET_ZH.md)。
+
+---
+
+## 8.5 各路由策略异同点横向比较
+
+前面各章「纵向」深挖了每种策略的原理，本节从若干正交维度做「横向」对照，帮助在同一坐标系里看清它们的异同与取舍。
+
+### 8.5.1 总览对比表
+
+| 维度 | Random | Round Robin | Power of Two | Prefix Hash | Consistent Hashing | Cache Aware | Manual | Bucket |
+|---|---|---|---|---|---|---|---|---|
+| **核心目标** | 期望均匀 | 请求数均匀 | 抑制尾延迟 | 前缀亲和(近似) | 拓扑稳定亲和 | 前缀亲和(精确) | 绝对会话粘性 | 长度分片均衡 |
+| **主要估计项** | 无 | 无 | $Q_i$ | $H_i$(近似) | 亲和稳定性 | $H_i$(精确)+$Q_i$ | 会话绑定 | 长度→成本 |
+| **是否感知负载** | 否 | 否 | 是(采样) | 是(有界) | 否 | 是(失衡切换) | 否 | 是(失衡切换) |
+| **是否感知缓存** | 否 | 否 | 否 | 是(近似) | 否 | 是(精确) | 否 | 否 |
+| **决策输入** | 候选集 | 候选集 | 负载采样 | token前缀+环 | key/header | 请求文本 | routing key | 请求字符数 |
+| **内部状态** | 无 | 原子游标 | 负载缓存表 | 无(依赖外部环) | 哈希环 | 近似基数树 | key→Worker映射 | 分桶+滑窗 |
+| **时间复杂度** | $O(1)$ | $O(1)$ | $O(1)$ | $O(\log n)$ | $O(\log n)$ | $O(\text{prefix\_len})$ | $O(1)$ | $O(\log N)$ |
+| **空间复杂度** | $O(1)$ | $O(1)$ | $O(\text{workers})$ | $O(1)$ | $O(\text{workers}\times v_n)$ | $O(\text{total\_tokens})$ | $O(\text{keys})$ | $O(\text{window})$ |
+| **确定性** | 无(随机) | 确定 | 半随机 | 确定(同前缀) | 确定(同key) | 半确定(随负载切换) | 确定(粘死) | 确定(同长度) |
+| **扩缩容迁移量** | — | — | — | ~$1/N$(环) | ~$1/N$ | 自适应 | 0(已有会话) | 重划边界 |
+| **需请求文本** | 否 | 否 | 否 | 否(需token) | 否 | 是 | 否 | 是 |
+
+### 8.5.2 三条主轴上的谱系定位
+
+绝大多数差异可以投影到三条正交主轴上：
+
+**① 信息利用度（无信息 → 全信息）**
+
+$$
+\text{Random} \prec \text{Round Robin} \prec \text{Power of Two} \prec \text{Prefix Hash} \prec \text{Cache Aware}
+$$
+
+从「假设后端完全同质、零信息」逐步演进到「精确感知每台机器的缓存内容与实时负载」。信息越多，单次决策越接近最优，但观测/维护成本也越高。
+
+**② 亲和强度（无亲和 → 绝对粘性）**
+
+$$
+\text{Random/RR} \prec \text{Power of Two} \prec \text{Cache Aware} \prec \text{Consistent Hashing} \prec \text{Manual}
+$$
+
+从「不关心请求落在哪」到「同一 key 永远粘死同一 Worker」。亲和越强，缓存/会话复用越好，但负载偏斜风险越大、弹性越差。
+
+**③ 均衡刚性（柔性期望均衡 → 刚性约束均衡）**
+
+$$
+\text{Random(柔)} \prec \text{Power of Two} \prec \text{Round Robin} \prec \text{Bucket(按长度硬分片)}
+$$
+
+从「靠大数定律长期均匀」到「用确定规则强约束分配」。
+
+> 关键洞察：**亲和强度与均衡刚性天然对抗**。Cache Aware / Prefix Hash / Bucket 之所以都内置「双阈值失衡检测 + 降级」，正是为了在这条对抗轴上安放一个可调的安全阀——平时吃亲和红利，失衡时退回均衡。
+
+### 8.5.3 关键「分界线」速查（两两易混策略的本质区别）
+
+| 对比 | 相同点 | 本质区别（分界线） |
+|---|---|---|
+| Random vs Round Robin | 都不感知成本/缓存，$O(1)$ 无输入依赖 | **有无记忆**：Random 无状态只保证期望均匀；RR 有原子游标保证任意 $N$ 连续请求恰好各覆盖一次 |
+| Round Robin vs Power of Two | 都不感知缓存 | **是否感知负载**：RR 假设每请求等成本；P2C 用两次采样估计真实负载 $Q_i$，专治成本方差大 |
+| Power of Two vs 全局最少负载 | 都选负载低者 | **观测范围**：P2C 只看 2 个、用随机采样打散羊群效应；全局最少会因同步涌向"最空节点"而振荡 |
+| Prefix Hash vs Cache Aware | 都优化前缀缓存复用 $H_i$ | **精度 vs 可预测**：前者固定长度前缀哈希、$O(\log n)$ 稳定；后者基数树精确最长匹配、$O(\text{prefix\_len})$ |
+| Prefix Hash vs Consistent Hashing | 都基于哈希环 | **优化对象**：前缀哈希优化"相同前缀→同 Worker"的缓存命中；一致性哈希优化"拓扑变化下映射稳定" |
+| Consistent Hashing vs Manual | 都做 key→Worker 亲和 | **扩容行为**：一致性哈希扩容迁移 $1/N$；Manual 扩容对已有会话**零迁移**（只在故障时才动） |
+| Cache Aware vs Bucket | 都用"双阈值失衡检测 + 降级最小负载" | **一等公民**：Cache Aware 是**前缀缓存亲和**(有状态)；Bucket 是**请求长度分片**(无状态、不感知 KV) |
+
+### 8.5.4 失衡降级机制对比（三个"双模式"策略）
+
+Power of Two、Cache Aware、Bucket 都会在某种"失衡"下切换行为，但触发条件与降级目标不同：
+
+| 策略 | 常态模式 | 失衡判据 | 降级模式 | 负载指标 |
+|---|---|---|---|---|
+| Power of Two | 两采样取低者 | 无显式失衡开关（本身即抑制热点） | — | token 负载(退化为请求计数) |
+| Prefix Hash | 哈希环命中 Worker | `load(w) > avg×load_factor` | 同样满足 load_ok 的最小负载 Worker | 活跃请求数 |
+| Cache Aware | 前缀亲和 / 树最小 | $(max-min)>\tau_{abs} \wedge max>\tau_{rel}\cdot min$ | pending 最少的 Worker | pending 请求数 |
+| Bucket | 按长度二分命中桶 | 同 Cache Aware 双阈值 | 累计字符最少的 Worker | 滑窗内累计字符数 |
+
+可见 Prefix Hash 用「人均×倍率」的**有界负载**做单点判据，而 Cache Aware/Bucket 用「极差 + 比值」的**双阈值**做全局判据——前者防单点过热，后者防全局倾斜。
+
+### 8.5.5 状态与故障行为对比
+
+| 策略 | 有无共享可变状态 | 需后台任务 | 扩缩容影响 | 单 Worker 故障时 |
+|---|---|---|---|---|
+| Random | 无 | 否 | 立即纳入候选 | 健康集自动剔除 |
+| Round Robin | 原子游标 | 否 | 取模基准漂移 | 健康集自动剔除 |
+| Power of Two | 负载缓存表 | 是(LoadMonitor 定时拉取) | 下周期纳入 | 剔除+缓存陈旧窗口 |
+| Prefix Hash | 无(环外部维护) | 否 | 环重建、迁移 $1/N$ | 顺时针跳过 |
+| Consistent Hashing | 哈希环 | 否(环由 Registry 预建) | 迁移 $1/N$ | 顺时针跳到下一健康节点 |
+| Cache Aware | 每 Worker 基数树 | 是(LRU 淘汰) | 树自适应 | 剔除+对应树弃用 |
+| Manual | key→Worker 映射 | 是(idle 淘汰) | 已有会话不迁移 | 立即切备用候选(最多2个) |
+| Bucket | 分桶+滑窗队列 | 是(定时重划边界) | 重置边界 | 移除 URL、重划边界 |
+
+### 8.5.6 分布式部署（多 router 节点）各策略的额外兼容性工作
+
+当把网关从单实例扩展为 **多 router 节点 Mesh 集群**（`--enable-mesh`，见 [MESH_DEPLOYMENT.md](../../MESH_DEPLOYMENT.md)）时，每个节点各自持有一份策略内部状态。策略状态是否需要、以及如何跨节点保持一致，直接决定了路由质量。理解这一点要先厘清 **Mesh 到底同步了什么**：
+
+**Mesh 已经全局同步的公共底座（所有策略免费共享）：**
+
+- **Worker 成员与健康/负载状态**：由 `WorkerRegistry` 通过 `mesh_sync.sync_worker_state` 用 CRDT 同步（见 `src/core/worker_registry.rs`）。因此所有节点看到**一致的健康 Worker 集合 $\mathcal{H}$**。
+- **哈希环**：并非直接同步环本身，而是各节点**从同步后的 worker 列表本地重建**（`rebuild_hash_ring`）。因为哈希函数与 worker 集合确定，各节点重建出的环**天然一致**，无需额外同步。
+
+**Mesh 不会自动同步的部分：策略私有的内部状态**。`LoadBalancingPolicy::set_mesh_sync` 默认是空实现，**当前仅 `CacheAwarePolicy` 真正接入了 mesh**（同步基数树操作）。其余策略的内部状态都是**节点本地**的。
+
+据此，各策略在分布式下需处理的额外兼容性工作如下：
+
+| 策略 | 私有状态是否需跨节点一致 | 当前 mesh 支持 | 分布式下的额外兼容性工作 / 影响 |
+|---|---|---|---|
+| **Random** | 否 | 天然兼容 | 无。无状态，各节点独立随机，期望均匀性不受节点数影响。 |
+| **Round Robin** | 游标建议一致，但非必须 | 未同步（游标本地） | 各节点持有独立原子游标 → **全局不再是严格轮转**，只是「N 份独立轮转」的叠加。总体仍近似均匀，通常可接受；若要严格全局轮转需自行引入共享计数器（不推荐，热点）。 |
+| **Power of Two** | 否（负载已全局同步） | 负载经 Worker 状态同步 | 基本兼容。负载信号来自全局同步的 Worker 状态，各节点看到一致负载视图。注意**采样是各节点独立随机**，多节点并发采样可能短暂放大对某 Worker 的偏好，但 P2C 的随机性本身即可打散，影响有限。 |
+| **Prefix Hash** | 否（环可本地重建一致） | 环一致 + 负载全局同步 | 兼容性最好之一。相同前缀在任意节点都哈希到**同一 Worker**，天然跨节点缓存亲和；有界负载判据用的是全局同步负载，判定一致。**无需额外工作**。 |
+| **Consistent Hashing** | 否（环可本地重建一致） | 环一致 | 兼容性最好之一。相同 routing key 在任意节点映射到**同一 Worker**，会话亲和天然跨节点成立；扩缩容时各节点基于一致的 worker 列表重建环，迁移集合一致。**无需额外工作**。 |
+| **Cache Aware** | **是**（前缀树必须协同） | **已接入 mesh**（唯一） | 需要 mesh，否则各节点独立维护基数树 → 命中率随节点数下降。启用后通过 `sync_tree_operation` / `apply_remote_tree_operation` 同步树操作（CRDT），并在 `set_mesh_sync` 时 `restore_tree_state_from_mesh` 恢复。**代价**：树操作的 gossip 流量与最终一致延迟；失衡判据用的 pending 是本地计数，各节点可能对失衡判断不完全同步。 |
+| **Manual** | **是**（绑定必须一致才粘性） | **未同步**（绑定本地） | ⚠️ **最需注意**。`key → [worker₁, worker₂]` 绑定存于**本地 DashMap，不跨节点同步**。多节点下同一 key 若被负载均衡打到不同 router 节点，各节点可能**独立建立不同绑定**，破坏「绝对粘性」。兼容做法：① 在入口层用 **一致性哈希/会话保持** 把同一 key 的请求固定路由到同一 router 节点；或 ② 改用 Consistent Hashing（其亲和可无状态跨节点复现）。 |
+| **Bucket** | 边界建议一致，但非必须 | 未同步（分桶+滑窗本地） | 各节点独立维护滑动窗口与桶边界 → 不同节点的边界可能因各自看到的局部流量而**短暂分化**。因边界重划是自适应的，长期趋同、总体仍均衡；对可预测性要求高时需接受这种节点间边界差异。 |
+
+**一句话总结**：**无状态策略（Random）与「亲和可由公共底座无状态复现」的策略（Prefix Hash、Consistent Hashing）在分布式下零额外成本**；**依赖全局负载的策略（Power of Two）靠 Worker 状态同步即可**；**依赖策略私有状态的策略里，只有 Cache Aware 做了 mesh 同步，而 Manual 的会话绑定不跨节点同步，是多节点部署下最需要在入口层额外兜底的策略**；Round Robin、Bucket 的本地状态不影响正确性、只影响全局均衡的严格程度。
 
 ---
 

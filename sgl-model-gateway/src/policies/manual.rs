@@ -159,29 +159,67 @@ impl ManualPolicy {
         }
     }
 
+    /// 根据路由键选择 worker,并维护该路由键的粘性路由记录。
+    ///
+    /// 该方法是 Manual 策略实现会话粘性的核心:同一个 `routing_id` 会优先复用
+    /// 历史候选 worker。只有首次看到该路由键,或其全部历史候选均已被移除/
+    /// 处于不健康状态时,才按照 [`ManualAssignmentMode`] 重新选择 worker。
+    ///
+    /// # 参数
+    ///
+    /// - `workers`:当前 worker 列表。映射中保存的是 URL 而非列表下标,因此即使
+    ///   worker 列表发生增删或重排,仍可通过 URL 找回原 worker。
+    /// - `routing_id`:从请求头提取出的路由键,用于查询或创建粘性路由记录。
+    /// - `healthy_indices`:`workers` 中所有健康 worker 的下标。调用方必须保证
+    ///   该切片非空且每个下标均有效;健康 worker 为空的情况已由
+    ///   `select_worker_impl` 提前处理。
+    ///
+    /// # 返回值
+    ///
+    /// 返回 `(worker 下标, 执行分支)`,其中执行分支用于可观测性指标:
+    ///
+    /// - [`ExecutionBranch::OccupiedHit`]:已有映射,且历史候选中仍有健康 worker;
+    /// - [`ExecutionBranch::OccupiedMiss`]:已有映射,但历史候选均不可用,已重新分配;
+    /// - [`ExecutionBranch::Vacant`]:首次遇到该路由键,已创建新的映射。
+    ///
+    /// `DashMap::entry` 会对当前路由键对应的分片加锁,使并发到达的同键请求
+    /// 原子地完成「查询或创建」,避免它们分别建立不同的初始映射。
     fn select_by_routing_id(
         &self,
         workers: &[Arc<dyn Worker>],
         routing_id: &str,
         healthy_indices: &[usize],
     ) -> (usize, ExecutionBranch) {
+        // 将请求头中的借用字符串转换为映射所需的自有键。映射需要跨请求保存,
+        // 因此不能直接持有仅在当前请求生命周期内有效的 `&str`。
         let routing_id = RoutingId::new(routing_id);
 
         match self.routing_map.entry(routing_id) {
             Entry::Occupied(mut entry) => {
+                // 每次访问都刷新时间戳,避免仍在使用的粘性映射被后台 TTL 任务驱逐。
                 let node = entry.get_mut();
                 node.last_access = Instant::now();
+
+                // 候选 URL 按历史顺序查找:只返回仍存在于当前 worker 列表、且下标
+                // 位于 healthy_indices 中的候选。命中后保持原映射,实现会话粘性。
                 if let Some(idx) =
                     find_healthy_worker(&node.candi_worker_urls, workers, healthy_indices)
                 {
                     (idx, ExecutionBranch::OccupiedHit)
                 } else {
+                    // 映射存在但所有历史候选均不可用。按配置的 assignment_mode
+                    // 从健康 worker 中重新分配,并把新 URL 加入候选列表。
                     let selected_idx = self.select_new_worker(workers, healthy_indices);
+
+                    // 候选列表最多保留 MAX_CANDIDATE_WORKERS 个 URL。加入新候选时
+                    // 会先移除最旧项,既限制内存占用,也保留最近的故障转移目标。
                     node.push_bounded(workers[selected_idx].url().to_string());
                     (selected_idx, ExecutionBranch::OccupiedMiss)
                 }
             }
             Entry::Vacant(entry) => {
+                // 首次遇到该路由键:按配置模式选择初始 worker,并以其 URL 建立
+                // 粘性映射。后续同键请求将优先复用此候选。
                 let selected_idx = self.select_new_worker(workers, healthy_indices);
                 entry.insert(Node {
                     candi_worker_urls: vec![workers[selected_idx].url().to_string()],
