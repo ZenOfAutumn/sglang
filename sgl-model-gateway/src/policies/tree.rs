@@ -39,14 +39,48 @@ fn new_tenant_map() -> DashMap<TenantId, u64> {
 /// Using Arc<str> allows cheap cloning and comparison.
 pub type TenantId = Arc<str>;
 
-/// Result of a prefix match operation, including char counts to avoid recomputation.
+/// 一次前缀匹配（`prefix_match_with_counts`）的结果。
+///
+/// 基数树以**字符**为粒度记录各租户（tenant，即 worker URL）历史请求的前缀。
+/// 对一段输入文本做前缀匹配后，本结构返回「命中了哪个租户、命中多长、输入多长」，
+/// 供 Cache Aware 策略计算**缓存匹配率**并据此选路。
+///
+/// # 字段随附的设计意图
+///
+/// 之所以把 `matched_char_count` 与 `input_char_count` **一并返回**，是为了避免
+/// 调用方再次遍历字符串调用 `chars().count()`（`str` 的字符数为 $O(n)$，因为
+/// UTF-8 变长编码）。匹配过程本就沿字符逐步推进，顺带累计计数即可，属零额外开销。
+///
+/// # 典型用法（见 `src/policies/cache_aware.rs`）
+///
+/// ```text
+/// let result = tree.prefix_match_with_counts(text);
+/// // 匹配率 = 命中字符数 / 输入字符数；输入为空时约定为 0
+/// let match_rate = if result.input_char_count == 0 {
+///     0.0
+/// } else {
+///     result.matched_char_count as f32 / result.input_char_count as f32
+/// };
+/// // 匹配率 > cache_threshold 时，优先路由到 result.tenant 对应的 worker（缓存命中）
+/// ```
+///
+/// 若 `result.tenant` 指向的 worker 已不存在或不健康，调用方会据此把该陈旧
+/// 租户从树中移除（`remove_tenant`）。
 #[derive(Debug, Clone)]
 pub struct PrefixMatchResult {
-    /// The tenant that owns the matched prefix (zero-copy)
+    /// 命中前缀所属的租户（即拥有该缓存前缀的 worker URL）。
+    ///
+    /// 类型为 [`TenantId`]（`Arc<str>`），支持**零拷贝**克隆与比较；
+    /// 上层可直接以 `&str` 与 worker URL 比较来定位目标 worker，无需再分配字符串。
     pub tenant: TenantId,
-    /// Number of characters matched
+    /// 本次输入与该租户前缀成功匹配的**字符数**（最长公共前缀长度，按字符计）。
+    ///
+    /// 值域为 `0..=input_char_count`：为 0 表示无任何前缀命中，
+    /// 等于 `input_char_count` 表示输入被完整覆盖。
     pub matched_char_count: usize,
-    /// Total number of characters in the input text
+    /// 输入文本的**总字符数**（`text.chars().count()`）。
+    ///
+    /// 作为匹配率的分母；为 0（空输入）时调用方约定匹配率为 0，需自行避免除零。
     pub input_char_count: usize,
 }
 

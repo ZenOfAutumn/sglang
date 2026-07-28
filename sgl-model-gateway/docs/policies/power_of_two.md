@@ -146,13 +146,15 @@ num_total_tokens = num_used_tokens + sum(
 
 两项的物理含义：
 
-- **第一项 `num_used_tokens`（KV Cache 真实占用）**：由 `pool_stats_observer` 计算——
-  $$
-  \text{num\_used\_tokens} = \text{max\_total\_num\_tokens} - (\text{available\_size} + \text{evictable\_size})
-  $$
+- **第一项 `num_used_tokens`（KV Cache 真实占用）**：由 `pool_stats_observer.get_pool_stats()` 拿到 KV 池快照后，再经 `get_kv_token_stats()` 计算——
+$$
+\text{num\_used\_tokens} = \text{max\_total\_num\_tokens} - (\text{available\_size} + \text{evictable\_size})
+$$
   即「KV 池总容量 − 空闲可分配槽位 − 可淘汰的前缀缓存」，反映 GPU 上正在运行的请求实际吃掉的 KV 槽位（含受保护、不可淘汰的前缀缓存）。hybrid-SWA 模型取 `max(full, swa)`，SSM/Mamba、HiSparse 会叠加各自的分层统计。
 
 - **第二项 `Σ req.seqlen`（排队负债）**：所有等待队列中每个请求的完整输入序列长度之和。等待队列组成随模式而变：普通模式为主等待队列；PD-Prefill 追加 `bootstrap_queue`；PD-Decode 追加 `prealloc/transfer/retracted` 等子队列。
+
+  > ⚠️ **未扣除 prefix cache 命中，为上界估计**：该项直接累加每个排队请求的**完整** `seqlen`，并不会先做 radix tree / prefix cache 匹配、扣除已命中的前缀长度。因此对 P 节点而言，一个请求即使大部分前缀已被缓存（真实只需 prefill 未命中的增量 token），排队负债里仍按完整 `seqlen` 计入。这会让 `total_tokens` 在**高前缀复用**场景下**高估** prefill 节点的真实待处理负载，可能把请求导向本可复用缓存的节点，反而降低命中率。此近似偏保守（宁可高估），换取无需在负载查询热路径上做前缀匹配的低开销;若需精确扣除，则要求引擎在统计等待队列时对每个请求先做前缀匹配，代价明显更高。
 
 **一句话**：`total_tokens` = 该 Worker「已在 GPU 上跑着的（running）+ 已收到但排队等 prefill 的（waiting）」token 总债，比「请求条数」精确得多，也正是 SGLang DP 负载均衡 `total_tokens` 方法所用的核心信号。
 
@@ -190,4 +192,62 @@ $$
 ## 演进动机
 
 推翻了「必须扫描全局才能优化尾延迟」的假设。它是**观测成本**与**均衡质量**之间的帕累托最优点。
+
+## 参数配置
+
+策略参数定义见 `PolicyConfig::PowerOfTwo`（`src/config/types.rs`）。P2C 仅有一个策略级参数。
+
+| 参数 | 类型 | 默认值 | 含义 | 调参影响 |
+|---|---|---|---|---|
+| `load_check_interval_secs` | `u64` | `5` | 负载刷新间隔 $\tau_\text{load}$（秒）：`LoadMonitor` 每隔此时间并发拉取所有 Worker 的 `total_tokens` 并整体替换缓存 | 调小 → 信号更新鲜但采集压力/引擎查询开销大；调大 → 开销低但陈旧窗口变长，剧烈抖动下易退化为近似随机 |
+
+> 该间隔对应 CLI/默认值 5 秒（见 `main.rs` 的 `parse_policy`）。负载来源与 `total_tokens` 语义详见本文档「负载信号」及 [worker_load_note.md](./worker_load_note.md)。
+
+## 下游 Worker 节点增删对本策略的影响
+
+Power of Two **几乎无私有拓扑状态**——它只维护一份 `cached_loads`（URL → token 负载）快照，由后台 `LoadMonitor` 周期性整体替换。因此对增删的适应几乎是「自动」的：
+
+- **新增 Worker**：进入 `WorkerRegistry` 后，下一轮 `LoadMonitor`（默认 5s）拉取时会把新 Worker 的负载纳入快照；在首次采集完成前，新 Worker 在缓存中缺失，二选一时命中它会**降级为本地请求计数**比较（见 [worker_load_note.md](./worker_load_note.md)）。新 Worker 初始负载低，会自然吸引较多请求，实现快速填充。
+- **移除 Worker**：从注册表移除后不再参与随机采样；其在 `cached_loads` 中的陈旧条目会在下一轮**整体替换**时消失，不会造成误选。
+- **陈旧窗口叠加**：增删后最多有一个 $\tau_\text{load}$ 的窗口，快照尚未反映最新拓扑，此期间对新增/移除 Worker 的负载判断可能短暂失真。
+- **Mesh 多节点**：负载来自全局同步的 Worker 状态，各节点对新增/移除后的负载视图最终一致。
+
+**一句话**：增删对 P2C **无需状态迁移**，靠后台负载快照的整体刷新自动适配；唯一影响是新增 Worker 在首个采集周期内因缓存缺失而走请求计数降级路径。
+
+## 优缺点、使用场景、局限性与优化迭代方向
+
+### 优点
+
+- **抑制尾延迟**：二选一随机采样天然打散「羊群效应」，避免全局最少负载策略的振荡（全涌向同一空闲节点）。
+- **高保真负载信号**：主路径用引擎 `total_tokens`（running + waiting 的 token 负债），比请求条数更能反映真实计算成本。
+- **低观测开销**：负载采集从请求热路径剥离，由 `LoadMonitor` 后台定时拉取，选路本身只需比较两个缓存值。
+- **优雅降级**：`total_tokens` 缺失时两个 Worker 同时回退到本地请求计数，量纲一致、不失效。
+- **分布式友好**：负载来自全局同步的 Worker 状态，各节点视图一致。
+
+### 缺点
+
+- **信号有陈旧窗口**：负载最多陈旧 $\tau_\text{load}$ 秒，剧烈抖动下可能基于过期数据决策。
+- **不感知缓存亲和**：纯负载导向，不考虑 KV Cache 复用，共享前缀场景命中率不如 cache_aware / prefix_hash。
+- **`total_tokens` 为上界估计**：排队负债未扣除 prefix cache 命中，高前缀复用场景会高估 prefill 负载。
+- **格式耦合**：依赖引擎 `/v1/loads` 的 `aggregate.total_tokens` 字段，格式不对齐会解析失败退化为请求计数。
+
+### 使用场景
+
+- **突发负载、请求成本方差大**（长短请求混合）、对尾延迟（P99）敏感的服务。
+- 无明显共享前缀、缓存亲和收益低，主要矛盾是负载均衡的流量。
+- 需要负载感知但又不想承担全局扫描或前缀树开销的通用场景。
+
+### 局限性
+
+- 负载变化速度远快于 $\tau_\text{load}$ 时，二选一退化为近似随机。
+- 依赖引擎正确暴露 token 负载；直连不兼容格式的引擎时精度丧失。
+- 仅在同类池内两两比较，不解决跨池（P/D）的负载协同。
+
+### 优化迭代方向
+
+- **自适应采集间隔**：按流量抖动幅度动态调整 $\tau_\text{load}$，在信号新鲜度与采集压力间自平衡。
+- **精确排队负债**：引擎侧统计等待队列时扣除 prefix cache 命中长度，消除 prefill 负载高估。
+- **格式自适应**：兼容 `aggregate.total_tokens` 与原生 `num_total_tokens` 两种响应，避免解析失败降级。
+- **多信号融合**：将 token 负载与缓存亲和信号加权，形成「负载 + 命中率」的联合目标。
+- **采样数可调**：从 2 选 1 推广到 $d$ 选 1（power of $d$ choices），在均衡质量与采样开销间权衡。
 
