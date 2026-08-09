@@ -492,3 +492,59 @@ if self._war_barrier_enabled:
 
 > 注意区分方向：本屏障是「调度等前向」（写等读，WAR）；而 `run_batch` 里还有一处反向的 `forward_stream.wait_stream(schedule_stream)`，那是「前向等调度」，保证前向所依赖的调度准备已就绪（属于 RAW，读等写），两者配合维持跨 stream 的正确时序。
 
+## 加速器代号对照（Accelerator Naming）
+
+SGLang 源码里到处是 `cuda` / `hip` / `npu` / `hpu` / `xpu` / `musa` 这类三字母缩写，它们分别对应不同厂商的加速卡。下表汇总了各后端的**代号、硬件、通信库与判定函数**。
+
+| 代号 | 全称 | 厂商 / 硬件 | `device_type`（`torch.device`） | 分布式后端 | 判定函数 | 后端目录 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `cuda` | Compute Unified Device Architecture | NVIDIA GPU（A100 / H100 / H200 / B200） | `cuda` | `nccl` | `is_cuda()` | 主线（默认） |
+| `rocm` / `hip` | Radeon Open Compute / Heterogeneous-computing Interface for Portability | AMD GPU（MI250 / MI300X / MI355） | **`cuda`**（见下方注意） | `nccl`（实为 RCCL） | `is_hip()` | 主线（与 CUDA 共用） |
+| `npu` | Neural Processing Unit | 华为昇腾 Ascend（910B / 910C） | `npu` | `hccl` | `is_npu()` | `hardware_backend/npu/` |
+| `hpu` | Habana Processing Unit | Intel Habana Gaudi（Gaudi2 / Gaudi3） | `hpu` | `hccl` | `is_hpu()` | —（仅分支适配） |
+| `xpu` | 通用加速器代号（非缩写） | Intel GPU（Arc / Ponte Vecchio / Battlemage） | `xpu` | `xccl` | `is_xpu()` | `hardware_backend/xpu/` |
+| `musa` | Meta-computing Unified System Architecture | 摩尔线程（Moore Threads）GPU | `musa` | `mccl` | `is_musa()` | `hardware_backend/musa/` |
+| `cpu` | Central Processing Unit | x86（AMX）/ ARM64 | `cpu` | `gloo` | `is_cpu()` | `hardware_backend/cpu/` |
+| `mlx` | MLX 框架 | Apple Silicon（M 系列，统一内存） | `mps` | —（单机） | — | `hardware_backend/mlx/` |
+
+**权威定义位置**：`python/sglang/srt/platforms/device_mixin.py` 的 `_DEVICE_TO_DISTRIBUTED_BACKEND` 字典与 `PlatformEnum` 枚举；判定函数在 `python/sglang/srt/utils/common.py`。
+
+### 三个容易踩的坑
+
+**1. ROCm 的 `device_type` 仍然是 `"cuda"`，不是 `"rocm"`。**
+PyTorch 把 HIP 做成了 `torch.cuda.*` 的二进制垫片（binary shim），`torch.device("rocm")` **并不存在**。所以 AMD 卡上：
+
+- `torch.cuda.is_available()` 返回 `True`；
+- 区分 N 卡还是 A 卡要看 `torch.version.hip is not None`，这正是 `is_hip()` 的实现；
+- `device_name` 是 `"rocm"`（用于展示/标识），但 `device_type` 保持 `"cuda"`（用于建 tensor）。
+
+代码里的注释说得很直白：
+
+```14:20:python/sglang/srt/platforms/rocm.py
+class RocmDeviceMixin(CudaDeviceMixin):
+    """ROCm device ops — identical surface to CUDA via torch.cuda's HIP shim."""
+
+    _enum: PlatformEnum = PlatformEnum.ROCM
+    device_name: str = "rocm"
+    # device_type stays "cuda" — torch.device("cuda") is the only valid
+    # device-type string for HIP devices in PyTorch.
+```
+
+因此源码中常见的 `is_cuda_alike() = is_cuda() or is_hip()` 表示「走 CUDA 那套 API 的设备」，而非「NVIDIA 卡」。
+
+**2. `hccl` 被两家共用。** 昇腾（NPU）和 Gaudi（HPU）的集合通信库**恰好同名**，都叫 HCCL，但分别是 Huawei Collective Communication Library 与 Habana Collective Communications Library，二者毫无关系。看到 `hccl` 需结合 `device_type` 判断是哪家。
+
+**3. 别把 `npu` / `hpu` / `xpu` 搞混：**
+
+- `npu` → 华为昇腾；
+- `hpu` → Intel Gaudi；
+- `xpu` → Intel GPU（跟 `hpu` 同属 Intel，但是两条完全不同的产品线）。
+
+### 与集合通信的关系
+
+各家通信库虽然名字不同，但都实现了同一套集合通信原语语义（all-reduce / all-gather / reduce-scatter / all-to-all），因此 `parallel_state.py` 中的 TP / DP / EP 逻辑是**设备无关**的，只在建 `ProcessGroup` 时按上表选择 backend 字符串。
+
+需要注意的是每个 `GroupCoordinator` 会同时持有**两个**通信组：`device_group`（NCCL/HCCL/XCCL 等，走加速器）和 `cpu_group`（固定为 `gloo`，走 CPU，用于对象与元数据同步）。因此即便在 NPU/HPU 上，CPU 侧同步走的仍是 gloo。
+
+关于原语本身的语义与通信量分析，参见 `docs/theory/distributed/collective_communication.md`；关于带宽层次对 TP/EP 的影响，参见 `docs/theory/distributed/cost_model.md` §7–§8。
+

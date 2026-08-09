@@ -215,7 +215,8 @@ python -m sglang.launch_server --model <MLA-model> --tp-size 8 --dp-size 8 --ena
 
 ## 参考与延伸
 
-- 同目录：`TP.md`（张量并行，DP attention 的基础）、`../MLA.md`（MLA 与 KV Cache 压缩）。
+- 同目录：`TP.md`（张量并行，DP attention 的基础）、`SP.md`（序列并行，与 DP-attention 共用同一套
+  `ScatterMode` gather/scatter 机制，对比见其 §7.2）、`CP.md`（上下文并行）、`../MLA.md`（MLA 与 KV Cache 压缩）。
 - SGLang 代码：`python/sglang/srt/layers/dp_attention.py`、`python/sglang/srt/managers/data_parallel_controller.py`。
 - 相关文档：`python/sglang/srt/managers/README_data_parallel_controller_zh.md`。
 

@@ -338,6 +338,7 @@ Decode 节点各阶段：
 - **分层 KV 缓存 HiCache（L1/L2/L3）**：先读 `docs/theory/cache/hicache_transfer_zh.md`（五条传输路径 write/load-back/prefetch/backup/evict 与配套 drawio 图），再读 `mem_cache/hiradix_cache.py` 与 `managers/cache_controller.py`；关注「独立 CUDA stream + 后台线程异步搬运」与前向计算的 overlap。自测：能说清一条请求从 L3 预取到回载入 L1 的完整时序与异步重叠点。
 - **PD 分离**：先读 `srt/disaggregation/README_zh.md` 与本文 2.2.1 的 PD 时间轴，再读 `disaggregation/prefill.py` / `decode.py`；关注 bootstrap 建链、prealloc 预分配、跨节点 KV 传输（Mooncake/NIXL/MORI）。自测：prefill 节点与 decode 节点各多出哪些阶段？
 - **KV 容量与预算**：读 `docs/theory/cache/kv_cache_capacity_zh.md`，理解 `max_total_num_tokens` 如何推算、`PrefillAdder` 的准入预算与 `init_req_max_new_tokens` 的一致性约束。
+- **并行（TP/DP/EP/PP/CP）**：本表中「张量/专家并行」一行的**展开版**见 `docs/parallelism_learning_plan_zh.md`（约 3 周的独立子计划，含五种并行的对比、源码落点、动手实验与选型原则）。建议**先完成并行子计划再学 PD 分离**——PD 的 P/D 两端内部都是 TP/DP/EP 组合，且并行度常不相同。
 
 ### 阶段 7：贡献与扩展（第 6 周）
 

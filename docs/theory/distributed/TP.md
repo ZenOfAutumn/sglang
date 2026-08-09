@@ -424,5 +424,6 @@ SGLang 中 attention 还支持 **DP attention**（`use_dp_attention_reduce`）�
 ## 参考与延伸
 
 - 经典论文：Megatron-LM（Shoeybi et al., 2019），本文的列并行 / 行并行组合即源自此。
-- 同目录其他理论文档：`../MLA.md`（MLA 与 TP 下的 KV cache 切分）、`../Glossary.md`（术语表）。
+- 同目录：`SP.md`（序列并行——消除 TP 残留的激活冗余，把 all-reduce 拆成 reduce-scatter + all-gather）、
+  `collective_communication.md`（通信原语详解）、`../MLA.md`（MLA 与 TP 下的 KV cache 切分）、`../Glossary.md`（术语表）。
 - SGLang 代码：`python/sglang/srt/layers/linear.py`、`vocab_parallel_embedding.py`、`distributed/parallel_state.py`。

@@ -7,16 +7,24 @@ use tracing::info;
 
 use crate::observability::metrics::Metrics;
 
-/// Circuit breaker configuration
+/// Worker 熔断器配置。
+///
+/// 熔断器按 `Closed -> Open -> HalfOpen -> Closed` 的状态机工作：
+/// - `Closed`：正常放行请求，并统计连续成功/失败次数；
+/// - `Open`：拒绝路由请求，使故障 Worker 进入冷却期；
+/// - `HalfOpen`：冷却结束后的探测状态，暂时放行请求以判断 Worker 是否恢复。
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerConfig {
-    /// Number of consecutive failures to open the circuit
+    /// `Closed` 状态下触发熔断所需的连续失败次数。
+    /// 任意一次成功都会把连续失败计数清零。
     pub failure_threshold: u32,
-    /// Success threshold to close circuit from half-open
+    /// `HalfOpen` 状态下恢复为 `Closed` 所需的连续成功次数。
     pub success_threshold: u32,
-    /// Duration to wait before attempting half-open
+    /// `Open` 状态的冷却时长；到期后在下一次状态检查时转为 `HalfOpen`。
     pub timeout_duration: Duration,
-    /// Time window for failure counting
+    /// 预留的失败统计窗口配置。
+    ///
+    /// 注意：当前实现只统计连续失败，尚未依据该时间窗口淘汰历史失败。
     pub window_duration: Duration,
 }
 
@@ -31,19 +39,21 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
-/// Circuit breaker state constants for atomic storage
+/// 熔断器状态的原子存储编码，避免在请求热路径上加锁。
 const STATE_CLOSED: u8 = 0;
 const STATE_OPEN: u8 = 1;
 const STATE_HALF_OPEN: u8 = 2;
 
-/// Circuit breaker state
+/// Worker 熔断器状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitState {
-    /// Normal operation - requests are allowed
+    /// 关闭：Worker 正常，请求可以执行。
     Closed,
-    /// Circuit is open - requests are rejected
+    /// 打开：Worker 正在冷却，请求不可执行。
     Open,
-    /// Testing if service has recovered - limited requests allowed
+    /// 半开：冷却期已结束，允许探测请求判断 Worker 是否恢复。
+    ///
+    /// 当前实现没有限制并发探测数，因此处于半开状态时可能同时放行多个请求。
     HalfOpen,
 }
 
@@ -79,49 +89,63 @@ impl CircuitState {
             STATE_CLOSED => CircuitState::Closed,
             STATE_OPEN => CircuitState::Open,
             STATE_HALF_OPEN => CircuitState::HalfOpen,
-            _ => CircuitState::Closed, // Default to closed for safety
+            // 原子值理论上只可能是上述三个常量；遇到异常值时按 Closed 处理，避免永久阻断流量。
+            _ => CircuitState::Closed,
         }
     }
 }
 
-/// Get current time as milliseconds since an arbitrary epoch.
-/// Uses Instant for monotonic time, converting to ms for atomic storage.
+/// 返回进程启动后经过的单调时钟毫秒数。
+///
+/// 这里不用系统墙上时钟，避免系统时间回拨或校时导致冷却时长计算异常；
+/// 转换为 `u64` 是为了能通过原子变量无锁保存时间点。
 #[inline]
 fn now_ms() -> u64 {
-    // Use a static reference point for consistent timing
+    // 所有熔断器共享同一个进程内时间原点，确保不同时间戳可直接相减。
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let start = START.get_or_init(Instant::now);
     start.elapsed().as_millis() as u64
 }
 
-/// Circuit breaker implementation using lock-free atomics for hot paths.
+/// 面向 Worker 请求的无锁熔断器。
 ///
-/// This implementation avoids RwLock contention by using atomic operations
-/// for state checks (the most common operation). Only state transitions
-/// use compare-and-swap which is still lock-free.
+/// 路由选择会频繁调用 `can_execute`，因此状态、计数器和时间戳均使用原子变量，
+/// 避免 `RwLock` 在高并发热路径上的竞争。状态转换使用 CAS 或原子交换完成。
+///
+/// 典型状态流转：
+/// 1. `Closed` 下连续失败达到 `failure_threshold`，转为 `Open`；
+/// 2. `Open` 持续 `timeout_duration` 后，下一次查询状态时惰性转为 `HalfOpen`；
+/// 3. `HalfOpen` 下连续成功达到 `success_threshold`，转回 `Closed`；
+/// 4. `HalfOpen` 下任意一次失败，立即重新转为 `Open` 并开始新一轮冷却。
 #[derive(Debug)]
 pub struct CircuitBreaker {
-    /// Circuit state stored as atomic u8 (0=Closed, 1=Open, 2=HalfOpen)
+    /// 当前状态：0=`Closed`、1=`Open`、2=`HalfOpen`。
     state: AtomicU8,
+    /// 当前连续失败次数；记录成功或进入 `HalfOpen`/`Closed` 时清零。
     consecutive_failures: AtomicU32,
+    /// 当前连续成功次数；记录失败或发生状态转换时清零。
     consecutive_successes: AtomicU32,
+    /// 生命周期内累计失败次数，仅用于统计，不参与状态判断。
     total_failures: AtomicU64,
+    /// 生命周期内累计成功次数，仅用于统计，不参与状态判断。
     total_successes: AtomicU64,
-    /// Last failure time in milliseconds (from now_ms())
+    /// 最近一次失败相对于进程时间原点的毫秒数；0 表示尚无失败。
     last_failure_time_ms: AtomicU64,
-    /// Last state change time in milliseconds (from now_ms())
+    /// 最近一次状态变化相对于进程时间原点的毫秒数，用于计算 Open 冷却期。
     last_state_change_ms: AtomicU64,
+    /// 状态转换阈值与冷却时长配置。
     config: CircuitBreakerConfig,
+    /// 指标标签，通常用于区分不同 Worker。
     metric_label: String,
 }
 
 impl CircuitBreaker {
-    /// Create a new circuit breaker with default configuration
+    /// 使用默认配置创建熔断器，初始状态为 `Closed`。
     pub fn new() -> Self {
         Self::with_config_and_label(CircuitBreakerConfig::default(), String::new())
     }
 
-    /// Create a new circuit breaker with custom configuration and metric label
+    /// 使用指定配置和指标标签创建熔断器，并发布初始 `Closed` 状态指标。
     pub fn with_config_and_label(config: CircuitBreakerConfig, metric_label: String) -> Self {
         let init_state = CircuitState::Closed;
         Metrics::set_worker_cb_state(&metric_label, init_state.to_int());
@@ -138,12 +162,15 @@ impl CircuitBreaker {
         }
     }
 
-    /// Get the metric label
+    /// 返回该熔断器上报监控指标时使用的标签。
     pub fn metric_label(&self) -> &str {
         &self.metric_label
     }
 
-    /// Check if a request can be executed (lock-free hot path)
+    /// 判断当前是否允许向 Worker 发送请求。
+    ///
+    /// 这是路由选择的无锁热路径。调用 `state()` 时也会顺便检查 `Open`
+    /// 冷却期是否结束，因此该方法可能触发 `Open -> HalfOpen` 状态转换。
     #[inline]
     pub fn can_execute(&self) -> bool {
         let state = self.state();
@@ -154,13 +181,13 @@ impl CircuitBreaker {
         }
     }
 
-    /// Get the current state (lock-free)
+    /// 返回当前状态；若 `Open` 冷却已到期，会先惰性切换到 `HalfOpen`。
     #[inline]
     pub fn state(&self) -> CircuitState {
         self.check_and_update_state_returning()
     }
 
-    /// Check and update state, returning the current state (lock-free)
+    /// 检查冷却期限并返回最新状态，全程无锁。
     #[inline]
     fn check_and_update_state_returning(&self) -> CircuitState {
         let current_state_int = self.state.load(Ordering::Acquire);
@@ -172,7 +199,7 @@ impl CircuitBreaker {
             let timeout_ms = self.config.timeout_duration.as_millis() as u64;
 
             if elapsed_ms >= timeout_ms {
-                // Try to transition to HalfOpen using CAS
+                // 多线程可能同时发现冷却到期；通过 CAS 保证只有一个线程完成状态转换。
                 if self
                     .state
                     .compare_exchange(
@@ -193,14 +220,14 @@ impl CircuitBreaker {
                     self.publish_gauge_metrics();
                     return CircuitState::HalfOpen;
                 }
-                // Another thread already transitioned, re-read the state
+                // CAS 失败说明其他线程已修改状态，重新读取其最终结果。
                 return CircuitState::from_int(self.state.load(Ordering::Acquire));
             }
         }
         current_state
     }
 
-    /// Record the outcome of a request
+    /// 记录一次真实 Worker 请求的结果，并同步更新熔断状态和监控指标。
     pub fn record_outcome(&self, success: bool) {
         if success {
             self.record_success();
@@ -213,7 +240,10 @@ impl CircuitBreaker {
         self.publish_gauge_metrics();
     }
 
-    /// Record a successful request
+    /// 记录一次成功。
+    ///
+    /// 成功会清空连续失败计数；若当前为 `HalfOpen`，连续成功达到
+    /// `success_threshold` 后关闭熔断器。`Closed` 下的成功只更新计数。
     pub fn record_success(&self) {
         self.total_successes.fetch_add(1, Ordering::Relaxed);
         self.consecutive_failures.store(0, Ordering::Release);
@@ -234,13 +264,18 @@ impl CircuitBreaker {
         }
     }
 
-    /// Record a failed request
+    /// 记录一次失败。
+    ///
+    /// 失败会清空连续成功计数并更新时间戳：
+    /// - `Closed`：连续失败达到阈值后进入 `Open`；
+    /// - `HalfOpen`：一次失败就立即回到 `Open`，重新开始冷却；
+    /// - `Open`：只更新统计，不重复执行状态转换。
     pub fn record_failure(&self) {
         self.total_failures.fetch_add(1, Ordering::Relaxed);
         self.consecutive_successes.store(0, Ordering::Release);
         let failures = self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1;
 
-        // Update last failure time atomically
+        // 最近失败时间用于统计展示；Open 冷却本身从 last_state_change_ms 开始计算。
         self.last_failure_time_ms.store(now_ms(), Ordering::Release);
 
         let current_state = CircuitState::from_int(self.state.load(Ordering::Acquire));
@@ -258,7 +293,10 @@ impl CircuitBreaker {
         }
     }
 
-    /// Transition to a new state (uses CAS for lock-free operation)
+    /// 原子切换到目标状态，并重置与新状态不兼容的连续计数。
+    ///
+    /// `swap` 返回旧状态；只有状态确实发生变化时才更新时间戳、日志和指标，
+    /// 避免多个并发请求重复发布同一状态转换。
     fn transition_to(&self, new_state: CircuitState) {
         let new_state_int = new_state.to_int();
         let old_state_int = self.state.swap(new_state_int, Ordering::AcqRel);
@@ -290,27 +328,27 @@ impl CircuitBreaker {
         }
     }
 
-    /// Get the number of consecutive failures
+    /// 返回当前连续失败次数。
     pub fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures.load(Ordering::Acquire)
     }
 
-    /// Get the number of consecutive successes
+    /// 返回当前连续成功次数。
     pub fn consecutive_successes(&self) -> u32 {
         self.consecutive_successes.load(Ordering::Acquire)
     }
 
-    /// Get total failures
+    /// 返回熔断器生命周期内累计失败次数。
     pub fn total_failures(&self) -> u64 {
         self.total_failures.load(Ordering::Relaxed)
     }
 
-    /// Get total successes
+    /// 返回熔断器生命周期内累计成功次数。
     pub fn total_successes(&self) -> u64 {
         self.total_successes.load(Ordering::Relaxed)
     }
 
-    /// Get time since last failure
+    /// 返回距最近一次失败经过的时间；从未失败时返回 `None`。
     pub fn time_since_last_failure(&self) -> Option<Duration> {
         let last_ms = self.last_failure_time_ms.load(Ordering::Acquire);
         if last_ms == 0 {
@@ -321,33 +359,33 @@ impl CircuitBreaker {
         }
     }
 
-    /// Get time since last state change
+    /// 返回距最近一次状态变化经过的时间。
     pub fn time_since_last_state_change(&self) -> Duration {
         let last_ms = self.last_state_change_ms.load(Ordering::Acquire);
         let elapsed_ms = now_ms().saturating_sub(last_ms);
         Duration::from_millis(elapsed_ms)
     }
 
-    /// Check if the circuit is in a half-open state
+    /// 判断是否处于 `HalfOpen`；调用时可能触发冷却到期后的惰性状态转换。
     pub fn is_half_open(&self) -> bool {
         self.state() == CircuitState::HalfOpen
     }
 
-    /// Record a test success (for health check probing)
+    /// 记录一次探测成功；仅在 `HalfOpen` 状态下计入恢复判断。
     pub fn record_test_success(&self) {
         if self.is_half_open() {
             self.record_success();
         }
     }
 
-    /// Record a test failure (for health check probing)
+    /// 记录一次探测失败；仅在 `HalfOpen` 状态下重新打开熔断器。
     pub fn record_test_failure(&self) {
         if self.is_half_open() {
             self.record_failure();
         }
     }
 
-    /// Reset the circuit breaker to closed state
+    /// 手动重置为 `Closed`，并清空连续成功和失败计数。累计计数不会清零。
     pub fn reset(&self) {
         self.transition_to(CircuitState::Closed);
         self.consecutive_failures.store(0, Ordering::Release);
@@ -355,12 +393,12 @@ impl CircuitBreaker {
         self.publish_gauge_metrics();
     }
 
-    /// Force the circuit to open (for manual intervention)
+    /// 手动强制进入 `Open`，从此刻开始计算新的冷却周期。
     pub fn force_open(&self) {
         self.transition_to(CircuitState::Open);
     }
 
-    /// Get circuit breaker statistics
+    /// 获取当前状态及累计/连续计数的统计快照。
     pub fn stats(&self) -> CircuitBreakerStats {
         CircuitBreakerStats {
             state: self.state(),
@@ -409,7 +447,9 @@ impl Default for CircuitBreaker {
     }
 }
 
-/// Circuit breaker statistics
+/// 熔断器统计快照。
+///
+/// `total_*` 仅用于观测，`consecutive_*` 才参与当前状态转换判断。
 #[derive(Debug, Clone)]
 pub struct CircuitBreakerStats {
     pub state: CircuitState,

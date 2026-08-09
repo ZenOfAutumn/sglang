@@ -18,6 +18,7 @@
 | `int4fp8_utils.py` | Quark 量化相关工具：fp8 张量缩放量化、int4 列向量化、int4 打包为 int32。 |
 | `layernorm.py` | 归一化层：RMSNorm、LayerNorm、GemmaRMSNorm、Gemma3RMSNorm 多平台实现。 |
 | `linear.py` | 线性层全家族：Replicated/Column/Row 并行、Merged/QKV 并行线性层及量化方法接入（改编自 vLLM）。 |
+| `QKVParallelLinear_zh.md` | 专题文档：`QKVParallelLinear` 的融合原理、按头切分、GQA/MQA 的 KV 头复制与权重加载的两层偏移。 |
 | `logits_processor.py` | logits 处理器：`LogitsProcessor`、`LogitsProcessorOutput`、`LogitsMetadata`，负责输出 logits 计算与元数据。 |
 | `model_parallel.py` | torch 张量并行通用工具：`ColwiseParallelSharded`、`RowwiseParallelMaybeWait` 等并行风格。 |
 | `modelopt_utils.py` | NVIDIA ModelOpt 量化相关常量，如量化配置选择 `QUANT_CFG_CHOICES`。 |
@@ -32,6 +33,7 @@
 | `sparse_pooler.py` | 稀疏嵌入池化：`SparsePooler`、`SparseEmbeddingOutput`。 |
 | `torchao_utils.py` | torchao 量化工具：投影过滤器与将 torchao 配置应用到模型。 |
 | `vocab_parallel_embedding.py` | 词表并行嵌入：`VocabParallelEmbedding`、`ParallelLMHead` 及分片索引（改编自 vLLM）。 |
+| `vocab_parallel_embedding_zh.md` | 专题文档：词表维切分、两步 padding、四段布局、mask + all-reduce 前向与 LM head 权重绑定。 |
 
 ## 子目录
 | 子目录 | 说明 |

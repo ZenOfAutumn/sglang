@@ -5,6 +5,9 @@
 > 最后对应到 SGLang 中 `layers/utils/cp_utils.py` 与 `enable_prefill_cp` 的真实实现。
 >
 > 前置阅读：`TP.md`（张量并行）、`DP_attention.md`。CP 在 SGLang 中**主要用于 prefill 阶段**长序列。
+>
+> ⚠️ **不要混淆 CP 与 SP**：两者都切序列维，但 SP（`SP.md`）在进 attention 前会 all-gather 回完整序列、
+> attention 算子无需修改；而 CP **带着分片做 attention**，必须改算子并处理 causal 负载不均。对比见 `SP.md` §7.1。
 
 ## 目录
 
@@ -202,7 +205,7 @@ python -m sglang.launch_server --model <long-context-MLA-model> \
 
 ## 参考与延伸
 
-- 同目录：`TP.md`（张量并行）、`DP.md`（数据并行）、`PP.md`（流水线并行）、`EP.md`（专家并行）、`DP_attention.md`。
+- 同目录：`TP.md`（张量并行）、`SP.md`（序列并行，与 CP 的对比见其 §7.1）、`DP.md`（数据并行）、`PP.md`（流水线并行）、`EP.md`（专家并行）、`DP_attention.md`。
 - SGLang 代码：`python/sglang/srt/layers/utils/cp_utils.py`、`python/sglang/srt/distributed/parallel_state.py`（`_ATTN_CP`）、`python/sglang/srt/layers/dp_attention.py`。
 - 相关方法：Ring Attention / zigzag context parallelism（负载均衡的 causal CP）。
 
