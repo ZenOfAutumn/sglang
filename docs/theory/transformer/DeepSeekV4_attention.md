@@ -1,6 +1,6 @@
 # DeepSeek-V4-Pro 注意力变体（DSv4：滑窗 + CSA + HCA）原理详解
 
-> 本文承接 [`NSA_DSA.md`](./NSA_DSA.md)，讲清 SGLang 中 **DeepSeek-V4-Pro（代码中称 DSv4）**
+> 本文承接 [`NSA_DSA.md`](NSA_DSA.md)，讲清 SGLang 中 **DeepSeek-V4-Pro（代码中称 DSv4）**
 > 注意力的**原理**。核心结论：DSv4 在 V3.2 DSA「闪电索引器 + top-k 单分支」之上，重新引入了
 > **压缩**与**滑窗**，做成三路互补的注意力——
 >

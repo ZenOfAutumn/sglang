@@ -177,7 +177,7 @@ SGLang 用 `DataParallelController`（下称 **DPC**，进程名 `sglang::data_p
 | 方法                    | 分发函数                                    | 策略                                                                   |
 | ----------------------- | ------------------------------------------- | ---------------------------------------------------------------------- |
 | `round_robin`           | `round_robin_scheduler`（`:764`）           | 轮询，跳过非存活 worker，计数器取模回绕                                |
-| `follow_bootstrap_room` | `follow_bootstrap_room_scheduler`（`:782`） | 按`bootstrap_room % len(workers)` 选 rank，**PD 分离配对**用（见 §7） |
+| `follow_bootstrap_room` | `follow_bootstrap_room_scheduler`（`:782`） | 按`bootstrap_room % len(workers)` 选 rank；**仅 PD 分离的 prefill 侧**用，使 decode 可反推出 KV 所在 rank（见 §7） |
 | `total_requests`        | `total_requests_scheduler`（`:796`）        | 选当前累计**请求数**最少的 rank                                        |
 | `total_tokens`          | `total_tokens_scheduler`（`:803`）          | 选当前累计**token 数**最少的 rank（token 相同时用请求数 tie-break）    |
 
@@ -311,40 +311,138 @@ gpu_id = base_gpu_id + (pp_rank % 2) * 4 + tp_rank
 
 PD（Prefill-Decode）分离部署中，prefill 和 decode 是**两个独立集群**，各有自己的 DPC。
 一个请求先在某个 prefill rank 算出 KV Cache，再点对点传给某个 decode rank 继续解码。
-问题来了：**如何保证第 r 号 prefill 副本产出的 KV，恰好被配对的 decode 副本消费？**
+问题来了：**decode rank 怎么知道该去哪个 prefill rank 上取 KV？**
 
-轮询做不到——两端各自独立轮询，编号对不上。解法是**确定性哈希**：
+> ⚠️ 一个常见误解：以为两端各自对 `bootstrap_room` 取模、算出**同一个 rank 号**配对。
+> **并非如此**——decode 侧默认走 `round_robin`，它的 rank 号与 prefill 的 rank 号无关。
+> 真正的机制是「**decode 单向反查 prefill**」，见下。
+
+### 7.1 两端的负载均衡策略是不对称的
+
+`load_balance_method` 默认 `auto`，由 `_handle_load_balance_method`（`server_args.py:1493`）解析：
+
+```python
+# server_args.py:1499
+if self.load_balance_method == "auto":
+    # - non-PD: round_robin
+    # - PD prefill: follow_bootstrap_room
+    # - PD decode: round_robin
+    self.load_balance_method = (
+        "follow_bootstrap_room"
+        if self.disaggregation_mode == "prefill"
+        else "round_robin"
+    )
+```
+
+即：
+
+| 集群        | 策略                    | rank 由什么决定             |
+| ----------- | ----------------------- | --------------------------- |
+| **Prefill** | `follow_bootstrap_room` | `bootstrap_room % dp_size`（确定性） |
+| **Decode**  | `round_robin`           | 轮询计数器（与 room 无关）  |
+
+所以 `bootstrap_room` 取模**只作用在 prefill 一侧**，用来把请求钉在一个可被反推的 rank 上。
+
+### 7.2 配对靠 decode 反查 prefill
+
+decode 收到请求后，用 room 去算**对端**（prefill）的 rank：
+
+```python
+# disaggregation/decode.py:607
+def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
+    prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
+    if prefill_info is None:
+        return None                       # 走慢路径，先拉对端拓扑
+
+    if req.disagg_prefill_dp_rank is not None:
+        return req.disagg_prefill_dp_rank  # ① 外部 router 已指定，优先级最高
+
+    if prefill_info.dp_size == 1:
+        return 0                           # ② 对端只有一个副本，无需推断
+
+    if (
+        prefill_info.follow_bootstrap_room
+        and not envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get()
+    ):
+        return req.bootstrap_room % prefill_info.dp_size   # ③ 取模反推
+
+    return None                            # ④ 回退：向 prefill 侧实际查询
+```
+
+**关键点：取模的除数是 `prefill_info.dp_size`——prefill 集群的规模，不是 decode 自己的。**
+`prefill_info` 是 decode 通过 `GET /route` 从 bootstrap server 拉取并缓存的对端并行拓扑：
+
+```python
+# disaggregation/common/conn.py:96，PrefillServerInfo
+# Topology fields (fetched from bootstrap server)
+attn_tp_size: int
+attn_cp_size: int
+dp_size: int          # ← 反推取模用的就是它
+pp_size: int
+page_size: Optional[int]
+kv_cache_dtype: Optional[str]
+follow_bootstrap_room: bool   # ← 对端是否真的按 room 分发，决定能否用取模反推
+```
+
+解析出 rank 后，用它初始化 receiver，建立到该 prefill rank 的点对点连接：
+
+```python
+# disaggregation/decode.py:578
+prefill_dp_rank = self._resolve_prefill_dp_rank(req)
+if prefill_dp_rank is not None:
+    decode_req.kv_receiver.init(prefill_dp_rank)
+```
+
+### 7.3 完整数据流
 
 ```
                  router 生成随机 bootstrap_room（每请求唯一，63-bit）
                               │
-              ┌───────────────┴───────────────┐
-              ▼（同一 room 同时下发两端）          ▼
-   Prefill DPC                        Decode DPC
-   room % len(workers) = r            room % len(workers) = r   ← 取模结果必然一致
-              │                                │
-              ▼                                ▼
-   Prefill DP rank r  ──KV Cache 点对点传输──▶  Decode DP rank r
+              ┌───────────────┴────────────────┐
+              ▼（同一 room 同时下发两端）           ▼
+   Prefill DPC                          Decode DPC
+   follow_bootstrap_room                round_robin
+   p = room % prefill_dp_size           d = 轮询计数器  ← 与 p 无关！
+              │                                 │
+              ▼                                 ▼
+   Prefill DP rank p                     Decode DP rank d
+        （算 KV）                               │
+              ▲                                 │ 用 room % prefill_dp_size
+              │                                 │ 反推出 p（对端拓扑从
+              └──── KV Cache 点对点传输 ◀────────┘ bootstrap server 拉取）
 ```
 
-`bootstrap_room` 是 router 为每个请求生成的一次性配对 ID，prefill/decode 两端 DPC
-用**同一个 room 做同样的取模** `bootstrap_room % len(workers)`，从而命中相互配对的 rank，
-保证 KV Cache 传输不错位。这正是 `follow_bootstrap_room` 策略（§5）在 prefill 侧作为默认值的原因。
+配对的正确性来自「**decode 能算出 prefill 在哪**」，而不是「两侧 rank 号相同」。
 
-### 数值示例
+### 7.4 为什么这样设计
 
-设两端各 4 个 DP rank，某请求 `bootstrap_room = 8675309`：
+若强行要求两端 rank 相等，就必须 `prefill_dp_size == decode_dp_size`，两个集群被迫同构。
+而 PD 分离的核心诉求恰恰是**两侧资源配比独立可调**（prefill 算力密集、decode 显存与带宽密集，
+最优配比通常不是 1:1）。单向反查解耦了这一约束：decode 只要知道对端的 `dp_size`，
+就能在两侧规模任意的情况下正确寻址。
 
-$$
-8675309 \bmod 4 = 1
-$$
+### 7.5 数值示例
 
-于是 prefill DP rank 1 算 KV，decode DP rank 1 接收——两端一致。
-另一请求 `bootstrap_room = 8675310` → `% 4 = 2`，两端都命中 rank 2。
+设 **prefill 集群 4 个 DP rank、decode 集群 6 个 DP rank**（规模不同，这在 PD 分离里很常见）。
 
-> 断言保护：若 `req.bootstrap_room` 为 `None`，说明请求被**直接发到 prefill/decode 实例而非经 router**
-> （只有 router 才注入该字段），DPC 会直接报错提示「请发给 router」。
-> 详见 `README_data_parallel_controller_zh.md` §2.3。
+| 请求 | bootstrap_room | prefill rank `room % 4` | decode rank（轮询） | decode 反推的 prefill rank |
+| ---- | -------------- | ----------------------- | ------------------- | -------------------------- |
+| A    | 8675309        | `8675309 % 4 = 1`       | 0                   | `8675309 % 4 = 1` ✅        |
+| B    | 8675310        | `8675310 % 4 = 2`       | 1                   | `8675310 % 4 = 2` ✅        |
+| C    | 8675311        | `8675311 % 4 = 3`       | 2                   | `8675311 % 4 = 3` ✅        |
+
+可见 decode rank 与 prefill rank **完全不相等**（请求 A 是 `0 ← 1`，B 是 `1 ← 2`），
+但每个 decode rank 都能准确反推出 KV 所在的 prefill rank，传输不错位。
+
+### 7.6 旁路与保护
+
+- **外部 router 直接指定**：`req.disagg_prefill_dp_rank` 非空时直接采用，跳过取模（分支 ①）。
+- **强制查询**：`follow_bootstrap_room=False`（对端未按 room 分发，取模推断不成立），
+  或设置环境变量 `SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK` 时，
+  返回 `None` 走慢路径——向 prefill 侧**实际查询** room 落在哪个 rank，而非靠取模推断（分支 ④）。
+- **断言保护**：若 `req.bootstrap_room` 为 `None`，说明请求被**直接发到 prefill 实例而非经 router**
+  （只有 router 才注入该字段），`follow_bootstrap_room_scheduler`（`:783`）会直接报错提示「请发给 router」。
+  详见 `README_data_parallel_controller_zh.md` §2.3。
 
 ---
 
@@ -464,8 +562,9 @@ SGLang 里带「DP」字样的东西有三个，层级完全不同，务必分�
    负载感知策略（`total_tokens`）更均衡，但要维护负载视图、承受快照延迟（见 §8）。
 3. **分发器是单点**：只有 `node_rank==0` 跑 `event_loop` 分发，它是调度中枢，
    CPU 压力集中于此（见 §4.2）。
-4. **PD 分离的配对约束**：跨集群时必须用 `follow_bootstrap_room` 做确定性配对（§7），
-   不能随意换成轮询，否则 KV Cache 传输会错位。
+4. **PD 分离的配对约束**：**prefill 侧**必须用 `follow_bootstrap_room` 做确定性分发（§7），
+   否则 decode 无法用取模反推出 KV 所在的 rank，只能回退到向 prefill 实际查询（多一次往返）。
+   decode 侧则不受此限制，用轮询即可——两端 rank 号本就不要求相等。
 5. **外部 router 会架空负载均衡**：一旦外部 router 注入 `routed_dp_rank`，DPC 的策略被绕过，
    路由质量取决于外部 router——但 DPC 的进程管理职责仍在。
 

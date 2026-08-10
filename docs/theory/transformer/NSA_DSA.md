@@ -11,7 +11,7 @@
 >
 > **后续演进**：DeepSeek-V4-Pro（代码中称 DSv4）又把压缩分支与滑窗加了回来，做成「滑窗 +
 > 压缩 + 稀疏选择」的多路融合，并把索引器从 FP8 下探到 FP4。详见
-> [`DeepSeekV4_attention.md`](./DeepSeekV4_attention.md)。
+> [`DeepSeekV4_attention.md`](DeepSeekV4_attention.md)。
 
 ## 目录
 
