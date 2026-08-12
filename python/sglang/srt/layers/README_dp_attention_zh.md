@@ -123,7 +123,66 @@ local_attn_tp_rank = local_tp_rank % local_attn_tp_size
 
 TP / CP 相关的 getter（`get_attention_tp_group` 等）则是对 `sglang.srt.distributed` 中通信组的薄封装。
 
-### 3.1 `_DP_MAX_LEN_WITH_IDLE`
+### 3.1 示例：一次初始化后各 rank 的状态取值
+
+以 `--tp-size 4 --dp-size 2 --enable-dp-attention --moe-dense-tp-size 2` 为例。
+
+先算两套坐标的参数：
+
+- **全局**：\(\mathrm{attn\_dp\_size} = 2\)，\(\mathrm{attn\_tp\_size} = 4 / 2 / 1 = 2\)（`attn_cp_size` 默认为 1）。
+- **局部**：\(\mathrm{local\_tp\_size} = \mathrm{moe\_dense\_tp\_size} = 2\)，子组个数为 \(\mathrm{tp\_size} / \mathrm{local\_tp\_size} = 2\)，故 \(\mathrm{local\_dp\_size} = \max(1, 2 / 2) = 1\)，\(\mathrm{local\_attn\_tp\_size} = 2 / 1 = 2\)。
+
+`initialize_dp_attention()` 执行后，4 个进程各自的全局状态如下：
+
+| tp_rank | `_ATTN_DP_RANK` | `_ATTN_DP_SIZE` | `_LOCAL_ATTN_DP_RANK` | `_LOCAL_ATTN_DP_SIZE` |
+|---|---|---|---|---|
+| 0 | 0 | 2 | 0 | 1 |
+| 1 | 0 | 2 | 0 | 1 |
+| 2 | 1 | 2 | 0 | 1 |
+| 3 | 1 | 2 | 0 | 1 |
+
+解读：
+
+- **全局系列**（`_ATTN_DP_*`）描述 attention 的 DP 划分——rank 0/1 组成第 0 个 attn-TP 组、rank 2/3 组成第 1 个，两组各处理不同请求，KV Cache 只复制 2 份而非 4 份。
+- **local 系列**（`_LOCAL_ATTN_DP_*`）描述 dense 层的划分——本例中 \(\mathrm{moe\_dense\_tp\_size} = 2\)，恰好等于 \(\mathrm{attn\_tp\_size}\)，于是每个 dense 子组内部**只有一份数据**（\(\mathrm{local\_dp\_size} = 1\)），dense 层在子组内做纯 TP、不再二次 DP 切分，因此局部 rank 恒为 0。
+
+> ⚠️ `moe_dense_tp_size` 目前只接受 `None`、`1`、`tp_size` 三种取值（`server_args.py` 的断言：`"moe_dense_tp_size only supports None, 1, or tp_size currently"`）。本例取值 \(2\) 之所以合法，是因为它正好等于 `tp_size`。
+
+**对比三种取值**
+
+同样在 \(\mathrm{tp\_size}=4,\ \mathrm{dp\_size}=2\) 下，三种取值算出的 local 系列如下：
+
+| `moe_dense_tp_size` | `local_tp_size` | 子组个数 | `_LOCAL_ATTN_DP_SIZE` | dense 层行为 |
+|---|---|---|---|---|
+| `2`（`== tp_size`，本例） | 2 | 2 | 1 | 子组内纯 TP |
+| `1` | 1 | 4 | 1 | 每卡自成子组，完全不切 TP（fully-DP） |
+| `None` | 4 | 1 | **2**（= `_ATTN_DP_SIZE`） | 跟随全局 TP，local 与全局一致 |
+
+`None` 一行走的是 `initialize_dp_attention` 里的短路分支：
+
+```python
+if moe_dense_tp_size is None:
+    # 未单独指定 dense TP 度时，局部与全局一致
+    _LOCAL_ATTN_DP_SIZE = _ATTN_DP_SIZE
+else:
+    # 否则局部 DP 度 = 全局 DP 度 / dense 子组个数
+    _LOCAL_ATTN_DP_SIZE = max(1, dp_size // (tp_size // moe_dense_tp_size))
+```
+
+此时上表最后两列变成 `_LOCAL_ATTN_DP_RANK = _ATTN_DP_RANK`、`_LOCAL_ATTN_DP_SIZE = 2`。
+
+**典型读取方式**——任意层内部无需透传参数，直接调 getter：
+
+```python
+if is_dp_attention_enabled():
+    dp_rank = get_attention_dp_rank()        # 0..1，决定本 rank 负责哪批请求
+    dp_size = get_attention_dp_size()        # 2
+    start, length = get_dp_local_info(forward_batch)  # 用的是全局 DP rank
+```
+
+> 未开启 DP attention 时，`_ATTN_DP_SIZE = _LOCAL_ATTN_DP_SIZE = 1`、两个 rank 变量均为 0，所有 getter 退化，上层代码无需分支。
+
+### 3.2 `_DP_MAX_LEN_WITH_IDLE`
 
 通过 HF config 中是否存在 `hybrid_override_pattern` 字段，识别混合 SSM（Mamba + Attention）模型：
 
@@ -135,7 +194,7 @@ _DP_MAX_LEN_WITH_IDLE = (
 
 这类模型的 Mamba 状态更新要求**每个 rank 都必须有输入**，即使该 rank 本轮没有分到 token。因此需要走 MAX_LEN 模式，用「伪造行」让空闲 rank 也参与计算。
 
-### 3.2 `disable_dp_size()` 上下文管理器
+### 3.3 `disable_dp_size()` 上下文管理器
 
 用于投机采样（speculative decoding）的 draft worker：draft 模型的并行度可能与 target 模型不同，运行期间需要临时屏蔽 DP 划分。
 

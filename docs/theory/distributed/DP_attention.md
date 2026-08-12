@@ -494,6 +494,51 @@ SGLang 的实现很巧妙：直接让 `_MOE_DP = _ATTN_CP`（`parallel_state.py:
 
 all-reduce 后 global buffer = `[a0, b0, b1]`，即所有 rank 的 token 拼接结果。MoE 在这 3 个 token 上计算，算完 scatter 把位置 0 还给 rank 0、位置 1~2 还给 rank 1。
 
+### 4.3 数值直觉（MAX_LEN / all-gather 版）
+
+同样的输入——rank 0 有 1 个 token `[a0]`，rank 1 有 2 个 token `[b0, b1]`——换成 MAX_LEN 模式：
+
+\[
+\mathrm{max\_len} = \max(1, 2) = 2, \qquad \text{global buffer 行数} = \mathrm{max\_len} \times D = 2 \times 2 = 4
+\]
+
+关键差别：**每个 rank 先把自己的数据 padding 到等长的 \(\mathrm{max\_len}\) 行**，再做 all-gather。
+
+| rank | 本地 buffer（padding 后，各 2 行） |
+| --- | --- |
+| rank 0 | `[a0, PAD]` ← 只有 1 个真 token，补 1 行 |
+| rank 1 | `[b0, b1]` ← 正好 2 行，无需补 |
+
+`all_gather_into_tensor` 按 rank 顺序拼接：
+
+| 全局位置 | 来源 | 内容 |
+| --- | --- | --- |
+| 0 | rank 0 第 0 行 | `a0` |
+| 1 | rank 0 第 1 行 | `PAD` ← 冗余 |
+| 2 | rank 1 第 0 行 | `b0` |
+| 3 | rank 1 第 1 行 | `b1` |
+
+结果 global buffer = `[a0, PAD, b0, b1]`，共 4 行，其中 1 行是浪费的 padding。
+
+**与 SUM_LEN 的三点对比**
+
+| | SUM_LEN（§4.2） | MAX_LEN（本节） |
+| --- | --- | --- |
+| buffer 行数 | 3（\(\mathrm{sum\_len}\)，无浪费） | 4（\(\mathrm{max\_len} \times D\)，含 1 行 PAD） |
+| 各 rank 起始偏移 | 前缀和，**不等距**（0, 1） | \(\mathrm{rank} \times \mathrm{max\_len}\)，**等距**（0, 2） |
+| 通信原语 | `all_reduce`（写 0 + 求和） | `all_gather_into_tensor`（直接拼接） |
+
+MAX_LEN 的偏移是**等距**的，这正是它能用 symmetric memory 的原因：所有 rank 分配的 buffer 大小完全一致，地址可静态推算；也因此 CUDA Graph 下固定选它（形状不随 batch 变化）。
+
+**什么时候 MAX_LEN 反而更省？** 把上例改成两个 rank 各有 2 个 token（decode 阶段的典型情形）：
+
+- MAX_LEN：\(\mathrm{max\_len} \times D = 2 \times 2 = 4\) 行，**零 padding 浪费**，且 all-gather 通信量约为 \(4\)；
+- SUM_LEN：\(\mathrm{sum\_len} = 4\) 行，但 all-reduce 通信量约为 \(4 \times 2 = 8\)（等价于 reduce_scatter + all_gather）。
+
+此时 MAX_LEN 通信量只有 SUM_LEN 的一半。这就是 `get_dp_padding_mode` 中判据 \(\mathrm{sum\_len} \times 2 \geq \mathrm{max\_len} \times \mathrm{dp\_size}\) 的由来——**decode 阶段各 rank token 数接近，MAX_LEN 几乎不产生 padding，却省掉 all-reduce 的 2 倍系数**；而 prefill 阶段长度悬殊（如 4096 vs 32），\(\mathrm{max\_len} \times D\) 会远大于 \(\mathrm{sum\_len}\)，padding 浪费压倒一切，故强制走 SUM_LEN。
+
+> **极端反例**：4 个 rank，token 数分别为 `[1000, 1, 1, 1]`。MAX_LEN 需 \(1000 \times 4 = 4000\) 行（浪费 \(3997\) 行）；SUM_LEN 只需 \(1003\) 行。这就是长度差异大时 MAX_LEN 不可用的直观原因。
+
 ---
 
 ## 5. 两种 padding 模式：MAX_LEN 与 SUM_LEN

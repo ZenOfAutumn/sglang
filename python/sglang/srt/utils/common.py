@@ -688,6 +688,15 @@ def is_pin_memory_available(device=None) -> bool:
 
 
 class LayerFn(Protocol):
+    """「层工厂」的类型协议：一个可调用对象，按下标构造出单个 layer。
+
+    调用约定：接收层的全局下标 idx 和名称前缀 prefix，返回一个 nn.Module。
+    prefix 用于给权重命名（决定该层参数在 state_dict 中的键前缀），
+    以便与 checkpoint 里的权重名对齐。
+
+    示例（以某模型的 decoder layer 为例）:
+        >>> layer_fn = lambda idx, prefix: MyDecoderLayer(config, idx, prefix=prefix)
+    """
 
     def __call__(self, idx: int, prefix: str) -> torch.nn.Module: ...
 
@@ -701,13 +710,50 @@ def make_layers(
     return_tuple: bool = False,
     offloader_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.nn.Module, int, int]:
-    """Make a list of layers with the given layer function"""
-    # circular imports
+    """用给定的「层工厂」构造模型的 decoder layer 列表，并处理流水线并行（PP）切分。
+
+    核心行为：返回的 ModuleList 长度始终是完整的 num_hidden_layers，但只有本
+    PP rank 负责的区间 [start_layer, end_layer) 是「真实层」，区间外的位置一律用
+    PPMissingLayer（前向直接透传的占位层）填充。这样做的好处是各 rank 上的层编号
+    在全局保持一致——KV cache、权重加载都靠全局 layer_id 对齐（详见 PP 文档 §7.2）。
+
+    不传 pp_rank/pp_size 时退化为「不切分」：整段 [0, num_hidden_layers) 都是真实层。
+
+    参数:
+        num_hidden_layers: 模型总层数 L，例如 32。
+        layer_fn: 层工厂，签名见 LayerFn；按下标构造单个 layer。
+        pp_rank: 当前 PP stage 编号；与 pp_size 同时为 None 时不做 PP 切分。
+        pp_size: PP stage 总数；与 pp_rank 同时为 None 时不做 PP 切分。
+        prefix: 权重名前缀，会通过 add_prefix(idx, prefix) 拼到每层上。
+        return_tuple: 透传给 PPMissingLayer——决定占位层前向返回单值还是元组，
+            需与真实层 forward 的返回形态保持一致（如模型层返回 (hidden, residual)
+            元组时应置 True），否则占位处的输出结构会对不上。
+        offloader_kwargs: 透传给 offloader 的额外参数（如把部分层权重卸载到 CPU/磁盘）；
+            None 时按空 dict 处理。
+
+    返回:
+        - 传了 pp_rank 与 pp_size：返回 (modules, start_layer, end_layer)，
+          modules 为长度 L 的 ModuleList，[start_layer, end_layer) 为真实层。
+        - 否则：只返回 modules（注意：此分支不返回三元组，尽管类型注解写的是 Tuple）。
+
+    示例:
+        # 例 1：不做 PP 切分，32 层全部实例化。
+        >>> layers = make_layers(32, layer_fn)          # 返回一个 ModuleList
+        >>> len(layers)                                  # 32，全是真实层
+
+        # 例 2：PP=4，取 rank 1。全局仍是 32 个槽位，仅 [8,16) 为真实层，
+        #        其余为 PPMissingLayer 占位。
+        >>> mods, s, e = make_layers(32, layer_fn, pp_rank=1, pp_size=4)
+        >>> len(mods), s, e                              # (32, 8, 16)
+    """
+    # 延迟导入以避免循环依赖（这些模块反过来也会引用本文件）。
     from sglang.srt.distributed import get_pp_indices
     from sglang.srt.layers.utils import PPMissingLayer
     from sglang.srt.utils.offloader import get_offloader
 
+    # 若启用 PP，总层数至少要 >= stage 数，否则无法给每个 stage 分到层。
     assert not pp_size or num_hidden_layers >= pp_size
+    # 计算本 rank 负责的层区间；未开 PP 时就是整段 [0, L)。
     start_layer, end_layer = (
         get_pp_indices(
             num_hidden_layers,
@@ -717,8 +763,12 @@ def make_layers(
         if pp_rank is not None and pp_size is not None
         else (0, num_hidden_layers)
     )
+    # 拼装完整长度的 ModuleList：前缀占位 + 本段真实层 + 后缀占位。
     modules = torch.nn.ModuleList(
+        # [0, start_layer)：本 rank 之前的层，用占位层顶位（不占显存、前向透传）。
         [PPMissingLayer(return_tuple=return_tuple) for _ in range(start_layer)]
+        # [start_layer, end_layer)：本 rank 真正实例化的 decoder layer；
+        # 外层用 offloader 包一下，以支持按需卸载权重。
         + get_offloader().wrap_modules(
             (
                 layer_fn(idx=idx, prefix=add_prefix(idx, prefix))
@@ -726,13 +776,16 @@ def make_layers(
             ),
             **(offloader_kwargs or {}),
         )
+        # [end_layer, num_hidden_layers)：本 rank 之后的层，同样用占位层顶位。
         + [
             PPMissingLayer(return_tuple=return_tuple)
             for _ in range(end_layer, num_hidden_layers)
         ]
     )
+    # 未开 PP：只返回 ModuleList，保持旧调用方的解包方式不变。
     if pp_rank is None or pp_size is None:
         return modules
+    # 开了 PP：额外返回层区间，供调用方遍历 [start_layer, end_layer)。
     return modules, start_layer, end_layer
 
 

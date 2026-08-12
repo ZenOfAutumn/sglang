@@ -105,6 +105,20 @@ $$
 \text{bubble ratio} \approx \frac{p-1}{m + p - 1}
 $$
 
+这个式子可以手推出来。把「一个 micro-batch 在一个 stage 上算一次」的时间记作 **1 个时间单位 $t$**（即上面时序图里每个 `F` 格子），并假设各 stage 计算量相等：
+
+- **理想时间（无气泡）**：稳态下每个 $t$ 就吐出一个 micro-batch 的进度，$m$ 个 micro-batch 理想耗时 $T_\text{ideal} = m$。
+- **实际时间**：末 stage 要先等第一个 micro-batch «爬完» 前面 $p-1$ 个 stage（填充期 $p-1$ 个 $t$），才能连续处理 $m$ 个 micro-batch（$m$ 个 $t$），故 $T_\text{actual} = (p-1) + m = m + p - 1$。
+- **气泡占比 = 多出来的空转 / 实际总时间**：
+
+$$
+\text{bubble ratio} = \frac{T_\text{actual} - T_\text{ideal}}{T_\text{actual}} = \frac{(m+p-1) - m}{m+p-1} = \frac{p-1}{m+p-1}
+$$
+
+两个极端可以拿来自检：$m=1$（朴素 PP）代入得 $\frac{p-1}{p}$，即利用率仅 $1/p$，正好对应 [§3](#3-朴素-pp-的致命问题流水线气泡)；$m \to \infty$ 时比值 $\to 0$，填充/排空的固定开销被稀释。
+
+> 注意这是**理想化下界**：实际会偏大，因为公式假设了各 stage 耗时相等（忽略首/末 stage 额外背负 embedding / LM Head 造成的 straggler，见 [§11](#11-局限与权衡)）、且未计入 stage 间 P2P 通信开销。
+
 **结论：micro-batch 数 $m$ 越远大于 stage 数 $p$，气泡占比越小、流水线越满。** 这就是 PP 高效运行的前提。
 
 ---
@@ -145,6 +159,41 @@ stage 边界上传递的不是权重，而是**激活张量**——上一 stage 
 - 为避免某些后端 `isend` 阻塞导致的**环形死锁**，SGLang 按 **PP rank 奇偶**决定收发顺序（偶数 rank 先发后收，奇数 rank 先收后发），保证每对相邻 stage 总有一发一收同时就绪。
 
 除了激活，PP 环上还单向传递**请求元数据**（`recv_reqs` 沿环转发），保证各 stage 看到一致的请求顺序。
+
+### 6.1 PP × TP 组合时的 P2P 拓扑：相同 tp_rank 点对点，无需分发
+
+当每个 stage 内部又做 TP 时，一个常见疑问是：激活传到下一 stage，是否要先汇聚到一个节点、再分发到该 stage 的每个 TP rank？**不需要。** 传递发生在**相同 tp_rank 之间**，是 TP_size 条并行的点对点链路，各传各的。
+
+原因在 PP 进程组的构造（`parallel_state.py:2285`）：
+
+```python
+num_pipeline_model_parallel_groups = world_size // pipeline_model_parallel_size  # = TP_size（无 DP 时）
+for pp_group_idx in range(num_pipeline_model_parallel_groups):
+    ranks = list(range(pp_group_idx, world_size, num_pipeline_model_parallel_groups))
+```
+
+以 TP=2、PP=2（共 4 卡，rank 按 TP 优先展平）为例：
+
+| global rank | (pp_rank, tp_rank) |
+| ----------- | ------------------ |
+| 0           | (pp0, tp0)         |
+| 1           | (pp0, tp1)         |
+| 2           | (pp1, tp0)         |
+| 3           | (pp1, tp1)         |
+
+`num_pipeline_model_parallel_groups = 4//2 = 2`，于是建出两个 PP group：`[0, 2]`（tp0 那条）和 `[1, 3]`（tp1 那条）。stage 边界上就是 **TP_size 条并行 P2P**：
+
+```
+          stage 0                    stage 1
+   ┌──────────────────┐      ┌──────────────────┐
+   │ rank0 (tp0)  hid  │ ───► │ rank2 (tp0)  hid  │   链路 A
+   │ rank1 (tp1)  hid  │ ───► │ rank3 (tp1)  hid  │   链路 B
+   └──────────────────┘      └──────────────────┘
+```
+
+**为什么不用分发**：TP 的 layer 边界上，`hidden_states` 在每个 TP rank 上是**完整且相同**的——attention/MLP 内部虽按张量维切分，但每层末尾有一次 all-reduce 把结果聚合回完整的 $s \times d_\text{model}$。所以发送端每个 tp_rank 都已持有完整激活、接收端每个 tp_rank 也正需要完整激活，一一对应直接传即可，既不需要 scatter，也不需要在下一 stage 内部 broadcast。
+
+**代价与权衡**：这 TP_size 条链路传的是相同数据，通信量是理论最小值的 TP_size 倍；但它们走**不同的 GPU pair、并行发生、不争用同一带宽**，且省掉了「汇聚到 tp0 → 发送 → 下一 stage broadcast」那两跳，反而更简单更快。若启用**序列并行（SP）**，边界激活会沿 sequence 维切成 TP_size 片、各 rank 只持一片，此时 PP 依然是 `tp_rank=j → tp_rank=j` 点对点，但传的是分片而非完整，通信量降到 $1/\text{TP\_size}$，同样无需分发。
 
 ---
 

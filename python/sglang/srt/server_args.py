@@ -877,7 +877,7 @@ class ServerArgs:
     deepep_dispatcher_output_dtype: Literal["auto", "bf16", "fp8", "int8", "nvfp4"] = (
         "auto"
     )
-    # 中译：每个 EP rank 上的冗余专家数（用于负载均衡）。
+    # 中译：每层在整个 EP group 中额外分配的冗余 physical expert 总数（用于负载均衡）。
     ep_num_redundant_experts: int = 0
     # 中译：EP 专家分发算法（static/dynamic/fake）。
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
