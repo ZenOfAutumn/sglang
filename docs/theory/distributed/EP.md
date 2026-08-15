@@ -63,11 +63,46 @@ output (s × d)
 
 关键特性：**每个 expert 天然独立**——它只处理分配给它的 token，与其他 expert 无数据依赖。这正是 EP 能按 expert 切分的基础。
 
+### 2.1 逻辑专家、物理专家与本地专家
+
+在没有专家复制时，一个 expert ID 往往同时表示模型中的专家和部署后的专家槽位，因此两者看起来没有区别。启用 EPLB 的冗余专家后，必须区分以下概念：
+
+- **逻辑专家（logical expert）**：模型结构和 checkpoint 定义的专家，是 Router 的语义选择对象。逻辑专家 ID 表示“这个 token 应由哪个专家函数处理”，其数量由模型配置决定，不会因为部署到更多 GPU 或启用冗余副本而增加。
+- **物理专家（physical expert）**：运行时实际放置在某个 rank 上的专家权重槽位。每个物理专家映射到一个逻辑专家，并持有该逻辑专家的权重；同一个逻辑专家可以有一个或多个物理副本。
+- **本地专家（local expert）**：从当前 rank 的视角看到的物理专家。local expert ID 通常只是当前 rank 内部的槽位编号，需要结合 rank 和每 rank 的槽位数才能得到全局 physical expert ID。若还启用了 expert TP，一个本地物理专家在该 rank 上可能只持有权重分片，而非完整权重。
+
+可将三者关系写成：
+
+$$
+\text{logical expert}
+\xrightarrow{\text{复制与放置}}
+\text{physical expert}
+\xrightarrow{\text{按 rank 划分}}
+\text{local expert}
+$$
+
+例如，模型有 4 个逻辑专家 $L_0,L_1,L_2,L_3$，运行时额外提供 2 个冗余槽位。若热点专家 $L_0$ 和 $L_2$ 各复制一次，则 6 个物理专家可以映射为：
+
+$$
+[P_0,P_1,P_2,P_3,P_4,P_5]
+\longrightarrow
+[L_0,L_1,L_2,L_3,L_0,L_2].
+$$
+
+这里 Router 仍然只在 $L_0\sim L_3$ 中选择。例如 token 命中 $L_0$ 后，运行时的 logical-to-physical 映射再从 $P_0$、$P_4$ 中选择一个副本执行，以分散负载。计算完成后，两个物理副本在模型语义上都代表同一个 $L_0$；复制不会产生新的模型专家，也不会扩大 Router 的输出维度。
+
+SGLang 中：
+
+- `topk_ids` 在 Router 选出专家时表达 logical expert ID；
+- `topk_ids_logical_to_physical()` 在 dispatch 前将逻辑 ID 映射为实际 physical expert ID；
+- `physical_to_logical_map` 表示每个物理槽位对应哪个逻辑专家，用于权重加载、统计聚合和 EPLB 重排；
+- 未启用冗余专家时，逻辑专家与物理专家通常是一一映射，二者数量相等，但概念仍不同。
+
 ---
 
 ## 3. EP 的核心思想：按 expert 切分
 
-设总共 $E$ 个 physical expert、EP 路数为 $p$（即 `ep_size`），并假设 $E$ 能被 $p$ 整除，则每个 EP rank 负责 $E/p$ 个 local experts。**只有纯 EP（MoE TP 为 1）时，local expert 才是完整权重**；若同时使用 expert TP，每个 local expert 仍只是一个 TP 分片。为便于说明，本节图示先采用纯 EP。
+设总共 $E_{\text{physical}}$ 个 physical expert、EP 路数为 $p$（即 `ep_size`），并假设 $E_{\text{physical}}$ 能被 $p$ 整除，则每个 EP rank 负责 $E_{\text{physical}}/p$ 个 local experts。未启用冗余专家时，通常有 $E_{\text{physical}}=E_{\text{logical}}$。**只有纯 EP（MoE TP 为 1）时，local expert 才是完整权重**；若同时使用 expert TP，每个 local expert 仍只是一个 TP 分片。为便于说明，本节图示先采用纯 EP。
 
 ```
                 所有 token（经 router 得到 topk_ids）
@@ -189,7 +224,7 @@ EP 的最大实践问题是**专家负载不均**：某些"热门 expert"被大�
 
 SGLang 用 **EPLB（Expert Parallelism Load Balancing）** 缓解：
 
-- 在整个 EP group 中额外分配 `ep_num_redundant_experts` 个 physical expert 槽位，把热点 logical expert 复制到多个位置；该参数是**每层全局冗余槽位总数**，不是每个 rank 的数量；
+- 在整个 EP group 中额外分配 `ep_num_redundant_experts` 个 physical expert 槽位，把热点 logical expert 复制到多个位置；该参数是**每层全局冗余槽位总数**，不是每个 rank 的数量；Router 的逻辑专家集合保持不变，dispatch 前再把 logical expert ID 映射到某个 physical replica；
 - 周期性（`eplb_rebalance_num_iterations`）统计各 expert 的访问频率；启用 EPLB 且未显式指定时，`expert_distribution_recorder_mode` 会自动设为 `stat`；
 - 根据统计结果重新计算 physical-to-logical expert 映射；`ep_dispatch_algorithm=static` 时使用预计算的 logical-expert 到 rank 映射进行分发。
 

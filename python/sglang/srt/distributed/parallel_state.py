@@ -6,22 +6,20 @@
 # Adapted from
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/parallel_state.py
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
-"""Distributed state.
-It takes over the control of the distributed environment from PyTorch.
-The typical workflow is:
+"""分布式状态管理。
+本模块从 PyTorch 手中接管分布式环境的控制权。典型使用流程如下：
 
-- call `init_distributed_environment` to initialize the distributed environment.
-- call `initialize_model_parallel` or `ensure_model_parallel_initialized` to
- initialize the model parallel groups.
+- 调用 `init_distributed_environment` 初始化分布式环境；
+- 调用 `initialize_model_parallel` 或 `ensure_model_parallel_initialized`
+  初始化各类模型并行进程组；
 
-- any code dealing with the distributed stuff
+- 中间可以是任何涉及分布式通信的代码；
 
-- call `destroy_model_parallel` to destroy the model parallel groups.
-- call `destroy_distributed_environment` to destroy the distributed environment.
+- 调用 `destroy_model_parallel` 销毁模型并行进程组；
+- 调用 `destroy_distributed_environment` 销毁分布式环境。
 
-If you only need to use the distributed environment without model/pipeline
- parallelism, you can skip the model parallel initialization and destruction
- steps.
+如果只需要使用分布式环境而不需要模型/流水线并行，可以跳过模型并行的
+初始化与销毁步骤。
 """
 
 import contextlib
@@ -70,11 +68,10 @@ _is_musa = is_musa()
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
-# use int value instead of ReduceOp.SUM to support torch compile
+# 使用 int 值而非 ReduceOp.SUM，以便兼容 torch.compile。
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
-# Reuse the user-provided distributed timeout for model-parallel subgroup
-# creation so runtime collectives do not silently fall back to backend defaults.
+# 复用用户提供的分布式超时来创建模型并行子组，避免运行时集合通信静默退回后端默认超时。
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
 
@@ -82,7 +79,7 @@ def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
         return None
 
-    # Only create HCCL options for default group or MoE-related groups
+    # 仅为默认组或 MoE 相关组创建 HCCL 选项。
     if group_name is not None and "moe" not in group_name:
         return None
 
@@ -110,19 +107,25 @@ class P2PWork:
 def _split_tensor_dict(
     tensor_dict: Dict[str, Union[torch.Tensor, Any]],
 ) -> Tuple[List[Tuple[str, Any]], List[torch.Tensor]]:
-    """Split the tensor dictionary into two parts:
-    1. A list of (key, value) pairs. If the value is a tensor, it is replaced
-         by its metadata.
-    2. A list of tensors.
+    """把张量字典拆分成两部分：
+    1. 一个 (key, value) 列表：若 value 是张量，则替换为它的元数据（TensorMetadata）；
+    2. 一个张量列表。
+
+    这样做便于在通信时先广播/发送元数据（走 CPU 组），再单独传输张量本体（走 device 组）。
+
+    输入示例：
+        {"hidden": torch.randn(2, 4, device="cuda:0"), "step": 3}
+    输出示例：
+        metadata_list = [("hidden", TensorMetadata("cuda", torch.float32, (2, 4))),
+                         ("step", 3)]
+        tensor_list   = [<那个 (2,4) 的 cuda 张量>]
     """
     metadata_list: List[Tuple[str, Any]] = []
     tensor_list: List[torch.Tensor] = []
     for key, value in tensor_dict.items():
         if isinstance(value, torch.Tensor):
-            # Note: we cannot use `value.device` here,
-            # because it contains not only the device type but also the device
-            # index (e.g. "cuda:0"). We only need the device type.
-            # receiving side will set the device index.
+            # 注意：这里不能直接用 `value.device`，因为它不仅含设备类型还含设备索引
+            # （例如 "cuda:0"）。我们只需要设备类型，接收端会自行设置设备索引。
             device = value.device.type
             metadata_list.append(
                 (key, TensorMetadata(device, value.dtype, value.size()))
@@ -137,10 +140,11 @@ _group_name_counter: Dict[str, int] = {}
 
 
 def _get_unique_name(name: str) -> str:
-    """Get a unique name for the group.
-    Example:
-    _get_unique_name("tp") -> "tp:0"
-    _get_unique_name("tp") -> "tp:1"
+    """为进程组生成一个唯一名字（同名调用会自增后缀）。
+
+    输入/输出示例：
+        _get_unique_name("tp") -> "tp:0"
+        _get_unique_name("tp") -> "tp:1"
     """
     if name not in _group_name_counter:
         _group_name_counter[name] = 0
@@ -2027,54 +2031,67 @@ def initialize_model_parallel(
     recovered_rank: bool = False,
 ) -> None:
     """
-    Initialize model parallel groups.
+    初始化模型并行相关的各类进程组。
 
-    Arguments:
-        tensor_model_parallel_size: number of GPUs used for tensor model
-            parallelism.
-        expert_model_parallel_size: number of GPUs used for expert model
-            parallelism.
-        pipeline_model_parallel_size: number of GPUs used for pipeline model
-            parallelism.
-        attention_data_parallel_size: number of GPUs used for attention data
-            parallelism.
-        attention_context_model_parallel_size: number of GPUs used for attention context
-            parallelism.
-        moe_data_model_parallel_size: number of GPUs used for moe data
-            parallelism.
+    本函数在 `world` 组（全部 rank）之上，按照传入的各并行度切分出
+    张量并行（TP）、注意力上下文并行（Attention CP）、注意力张量并行（Attention TP）、
+    MoE 数据并行（MoE DP）、MoE 专家并行（MoE EP）、MoE 张量并行（MoE TP）
+    以及流水线并行（PP）等进程组，并保存到对应的全局变量中。
 
-    Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
-    use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
-    the model pipeline. The present function will
-    create 4 tensor model-parallel groups and 2 pipeline model-parallel groups:
-        4 tensor model-parallel groups:
-            [g0, g1], [g2, g3], [g4, g5], [g6, g7]
-        2 pipeline model-parallel groups:
-            [g0, g2, g4, g6], [g1, g3, g5, g7]
+    参数：
+        tensor_model_parallel_size: 张量并行使用的 GPU 数（即外层 TP 规模，也是
+            一个模型实例内除 PP 外的 rank 域大小）。
+        expert_model_parallel_size: MoE 专家并行（EP）使用的 GPU 数。
+        pipeline_model_parallel_size: 流水线并行（PP）使用的 GPU 数。
+        attention_data_parallel_size: 注意力数据并行（DP Attention）使用的 GPU 数。
+        attention_context_model_parallel_size: 注意力上下文并行（CP）使用的 GPU 数。
+        moe_data_model_parallel_size: MoE 数据并行使用的 GPU 数。
+        backend: 进程组通信后端；为 None 时沿用 world 组的后端。
+        duplicate_tp_group: 是否为 PD 分离多路复用（PD-Multiplexing）的 prefill
+            额外复制一份 TP 组。
+        enable_symm_mem: 是否启用对称内存（影响 Attention TP 是否走 pynccl）。
+        recovered_rank: 弹性场景下标记该 rank 是否为恢复出来的 rank。
 
-    Let's say we use 2 GPUs for attention context parallelism (attn_cp_size=2) and 4 GPUs for
-    attention tensor parallelism (attn_tp_size=4). As for MoE part, we use 2 GPUs for moe data
-    parallelism (moe_dp_size=2) and 4 GPUs for moe expert parallelism (moe_ep_size=4). The present
-    function will create the following groups:
-        2 tensor model-parallel groups:
-            [g0, g1, g2, g3], [g4, g5, g6, g7]
-        4 attention context-parallel groups:
-            [g0, g4], [g1, g5], [g2, g6], [g3, g7]
-        2 moe expert-parallel groups:
-            [g0, g1, g2, g3], [g4, g5, g6, g7]
-        4 moe data-parallel groups:
-            [g0, g4], [g1, g5], [g2, g6], [g3, g7]
+    分解关系（均需整除）：
+        attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
+        moe_tp_size  = tensor_model_parallel_size // moe_ep_size  // moe_dp_size
 
-    Note that for efficiency, the caller should make sure adjacent ranks
-    are on the same DGX box. For example if we are using 2 DGX-1 boxes
-    with a total of 16 GPUs, rank 0 to 7 belong to the first box and
-    ranks 8 to 15 belong to the second box.
+    ------------------------------------------------------------------
+    示例 1（TP + PP）：
+        输入：world_size=8，tensor_model_parallel_size=2，
+              pipeline_model_parallel_size=4，其余为 1。
+        输出分组：
+            4 个张量并行组（TP）：
+                [g0, g1], [g2, g3], [g4, g5], [g6, g7]
+            2 个流水线并行组（PP）：
+                [g0, g2, g4, g6], [g1, g3, g5, g7]
+
+    示例 2（Attention CP/DP + MoE DP/EP）：
+        输入：world_size=8，tensor_model_parallel_size=4，
+              attn_cp_size=2、attn_tp_size=4（attn_dp_size=1），
+              moe_dp_size=2、moe_ep_size=4（moe_tp_size=1）。
+        输出分组：
+            2 个张量并行组（TP）：
+                [g0, g1, g2, g3], [g4, g5, g6, g7]
+            4 个注意力上下文并行组（Attention CP）：
+                [g0, g4], [g1, g5], [g2, g6], [g3, g7]
+            2 个 MoE 专家并行组（MoE EP）：
+                [g0, g1, g2, g3], [g4, g5, g6, g7]
+            4 个 MoE 数据并行组（MoE DP）：
+                [g0, g4], [g1, g5], [g2, g6], [g3, g7]
+
+    注意：为了通信效率，调用方应保证相邻 rank 位于同一台 DGX 机器上。例如使用
+    2 台各 8 卡、共 16 卡的机器时，rank 0~7 属于第一台，rank 8~15 属于第二台。
+
+    返回：无（结果写入 `_TP`、`_ATTN_CP`、`_ATTN_TP`、`_MOE_DP`、`_MOE_EP`、
+    `_MOE_TP`、`_PP` 等全局进程组变量）。
     """
-    # Get world size and rank. Ensure some consistencies.
+    # 获取 world size，并做基本一致性校验。
     assert torch.distributed.is_initialized()
     world_size: int = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
+    # 一个模型实例的 rank 域大小 = TP × PP，必须与总卡数一致。
     if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
         raise RuntimeError(
             f"world_size ({world_size}) is not equal to "
@@ -2082,7 +2099,8 @@ def initialize_model_parallel(
             f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
         )
 
-    # Build the tensor model-parallel groups.
+    # 构建张量并行（TP）组：把连续的 tensor_model_parallel_size 个 rank 归为一组。
+    # 例如 world_size=8、TP=2 时得到 [0,1],[2,3],[4,5],[6,7]。
     num_tensor_model_parallel_groups: int = world_size // tensor_model_parallel_size
     global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
@@ -2096,7 +2114,7 @@ def initialize_model_parallel(
         )
         group_ranks.append(ranks)
 
-    # message queue broadcaster is only used in tensor model parallel group
+    # 消息队列广播器（message queue broadcaster）只在张量并行组内使用。
     _TP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
@@ -2106,6 +2124,8 @@ def initialize_model_parallel(
         recovered_rank=recovered_rank,
     )
 
+    # PD 分离多路复用：为 prefill 复制一份与 TP 相同 rank 划分的独立进程组，
+    # 使 prefill 与 decode 的 TP 通信互不干扰。
     if duplicate_tp_group:
         global _PDMUX_PREFILL_TP_GROUP
         assert (
@@ -2123,10 +2143,14 @@ def initialize_model_parallel(
             _TP.pynccl_comm.disabled = False
             _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
 
+    # 注意力侧的三个并行度：DP（按 token/请求切）、CP（按序列切）、TP（按 head/张量切）。
+    # 三者相乘应等于外层 TP 规模，故 attn_tp_size 由整除推出。
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size
     attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
 
+    # 构建注意力上下文并行（Attention CP）组。
+    # 若 CP 规模等于外层 TP，则整组共享，直接复用 _TP，避免新建冗余组。
     global _ATTN_CP
     assert (
         _ATTN_CP is None
@@ -2134,6 +2158,9 @@ def initialize_model_parallel(
     if attn_cp_size == tensor_model_parallel_size:
         _ATTN_CP = _TP
     else:
+        # 在每个 TP 组内，固定 (dp_idx, attn_tp_idx)，以 attn_tp_size 为步长跨越
+        # CP 维度收集 rank，得到一个 CP 组；因此同一 CP 组内的 rank 拥有相同的
+        # DP/TP 坐标，只在序列切分（CP）维度上不同。
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for dp_idx in range(attn_dp_size):
@@ -2150,6 +2177,7 @@ def initialize_model_parallel(
                     )
                     ranks = list(range(st, en, attn_tp_size))
                     group_ranks.append(ranks)
+        # 备注：上方 group_ranks 在 else 分支起始处已重置为空列表。
         _ATTN_CP = init_model_parallel_group(
             group_ranks,
             get_world_group().local_rank,
@@ -2161,6 +2189,8 @@ def initialize_model_parallel(
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
 
+    # 构建注意力张量并行（Attention TP）组。
+    # 若 attn_tp_size 等于外层 TP，则整组即一个 Attention TP 组，直接复用 _TP。
     global _ATTN_TP
     assert (
         _ATTN_TP is None
@@ -2168,6 +2198,8 @@ def initialize_model_parallel(
     if attn_tp_size == tensor_model_parallel_size:
         _ATTN_TP = _TP
     else:
+        # 每个 TP 组内，把连续的 attn_tp_size 个 rank 归为一个 Attention TP 组；
+        # (cp, dp) 的每种组合各占一段连续区间。
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for cp_dp_combined_idx in range(attn_cp_size * attn_dp_size):
@@ -2195,20 +2227,26 @@ def initialize_model_parallel(
             recovered_rank=recovered_rank,
         )
 
+    # MoE 侧的三个并行度：DP（按 token 切）、EP（按专家切）、TP（切单个专家的张量维）。
+    # 三者相乘应等于外层 TP 规模，故 moe_tp_size 由整除推出。
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
     moe_tp_size = tensor_model_parallel_size // moe_ep_size // moe_dp_size
 
+    # 构建 MoE 数据并行（MoE DP）组。
     global _MOE_DP
     assert _MOE_DP is None, "moe data parallel group is already initialized"
     if attn_cp_size > moe_dp_size:
-        # When moe_dp_size < attn_cp_size, CP ranks must share tokens before MoE.
-        # The MOE_DP group includes these CP partners, so the existing DP
-        # allgather/scatter handles the token sharing.
+        # 当 moe_dp_size < attn_cp_size 时，CP 的各 rank 在进入 MoE 前必须先共享 token。
+        # 此时让 MoE DP 组直接复用 CP 组（_ATTN_CP），从而由已有的 DP allgather/scatter
+        # 承担这部分 token 共享，无需再新建组。
         _MOE_DP = _ATTN_CP
     elif moe_dp_size == tensor_model_parallel_size:
+        # MoE DP 覆盖整个 TP 组时，直接复用 _TP。
         _MOE_DP = _TP
     else:
+        # 在每个 TP 组内，固定 (moe_tp, moe_ep) 的组合坐标 tp_ep_combined_idx，
+        # 以 moe_tp_size*moe_ep_size 为步长跨 DP 维度收集 rank，得到一个 MoE DP 组。
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for tp_ep_combined_idx in range(moe_tp_size * moe_ep_size):
@@ -2226,11 +2264,16 @@ def initialize_model_parallel(
             recovered_rank=recovered_rank,
         )
 
+    # 构建 MoE 专家并行（MoE EP）组。
+    # 若 moe_ep_size 等于外层 TP，则整组即一个 EP 组，直接复用 _TP。
     global _MOE_EP
     assert _MOE_EP is None, "expert model parallel group is already initialized"
     if moe_ep_size == tensor_model_parallel_size:
         _MOE_EP = _TP
     else:
+        # 在每个 TP 组内，固定 (moe_dp_idx, moe_tp_idx)，以 moe_tp_size 为步长跨
+        # EP 维度收集 rank，得到一个 EP 组：组内 rank 拥有相同的 DP/TP 坐标，
+        # 只在专家切分（EP）维度上不同。
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for moe_dp_idx in range(moe_dp_size):
@@ -2253,11 +2296,15 @@ def initialize_model_parallel(
             recovered_rank=recovered_rank,
         )
 
+    # 构建 MoE 张量并行（MoE TP）组：用于切分单个专家的张量维。
+    # 若 moe_tp_size 等于外层 TP，则整组即一个 MoE TP 组，直接复用 _TP。
     global _MOE_TP
     assert _MOE_TP is None, "expert model parallel group is already initialized"
     if moe_tp_size == tensor_model_parallel_size:
         _MOE_TP = _TP
     else:
+        # 每个 TP 组内，把连续的 moe_tp_size 个 rank 归为一个 MoE TP 组；
+        # (ep, dp) 的每种组合各占一段连续区间。
         group_ranks = []
         for tp_group_idx in range(num_tensor_model_parallel_groups):
             for ep_dp_combined_idx in range(moe_ep_size * moe_dp_size):
@@ -2281,7 +2328,9 @@ def initialize_model_parallel(
             recovered_rank=recovered_rank,
         )
 
-    # Build the pipeline model-parallel groups.
+    # 构建流水线并行（PP）组：以 num_pipeline_model_parallel_groups 为步长跨越整个
+    # world 采样 rank，使同一 PP 组内的 rank 分属不同流水线阶段。
+    # 例如 world_size=8、PP=4 时得到 [0,2,4,6],[1,3,5,7]。
     num_pipeline_model_parallel_groups: int = world_size // pipeline_model_parallel_size
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
@@ -2291,7 +2340,7 @@ def initialize_model_parallel(
             range(pp_group_idx, world_size, num_pipeline_model_parallel_groups)
         )
         group_ranks.append(ranks)
-    # pipeline parallel does not need custom allreduce
+    # 流水线并行不需要自定义 all-reduce。
     _PP = init_model_parallel_group(
         group_ranks,
         get_world_group().local_rank,
@@ -2306,15 +2355,23 @@ def create_custom_parallel_group(
     group_ranks: List[int], backend: str = "gloo"
 ) -> Optional[torch.distributed.ProcessGroup]:
     """
-    Create a custom parallel group based on the provided ranks.
+    根据提供的 rank 列表创建一个自定义并行组。
 
-    Args:
-        group_ranks: The list of ranks that the CURRENT process wants to join.
-                     (e.g., Rank 0 passes [0...7], Rank 8 passes [8...15])
-        backend: The communication backend (default: "gloo").
+    各 rank 会先通过 all_gather_object 汇总彼此想加入的组，去重后按统一顺序
+    逐个创建（torch.distributed.new_group 要求所有 rank 以相同顺序集体调用），
+    最后只返回当前 rank 所属的那个组。
 
-    Returns:
-        The ProcessGroup if the current rank is in group_ranks, else None.
+    参数：
+        group_ranks: 当前进程想加入的 rank 列表
+                     （例如 rank 0 传入 [0...7]，rank 8 传入 [8...15]）。
+        backend: 通信后端（默认 "gloo"）。
+
+    返回：
+        若当前 rank 在 group_ranks 中，则返回对应 ProcessGroup；否则返回 None。
+
+    示例（world_size=16）：
+        rank 0~7   传入 [0..7]  -> 得到含 [0..7]  的组；
+        rank 8~15  传入 [8..15] -> 得到含 [8..15] 的组。
     """
     assert torch.distributed.is_initialized()
 
@@ -2348,6 +2405,7 @@ def create_custom_parallel_group(
                 f"Rank {rank} successfully created/joined custom group: {g_ranks}"
             )
 
+    # 仅返回当前 rank 所在的那个组（其余组已在各自的 rank 上创建）。
     return my_new_group
 
 
@@ -2357,9 +2415,8 @@ def ensure_model_parallel_initialized(
     pipeline_model_parallel_size: int,
     backend: Optional[str] = None,
 ) -> None:
-    """Helper to initialize model parallel groups if they are not initialized,
-    or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
-    values if the model parallel groups are initialized.
+    """便捷函数：若模型并行组尚未初始化则初始化它们；若已初始化，则校验
+    张量并行与流水线并行的规模是否与预期一致。
     """
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
     if not model_parallel_is_initialized():
@@ -2385,7 +2442,7 @@ def ensure_model_parallel_initialized(
 
 
 def model_parallel_is_initialized():
-    """Check if tensor and pipeline parallel groups are initialized."""
+    """检查张量并行组与流水线并行组是否已初始化。"""
     return _TP is not None and _PP is not None
 
 
@@ -2394,13 +2451,13 @@ _TP_STATE_PATCHED = False
 
 @contextmanager
 def patch_tensor_parallel_group(tp_group: GroupCoordinator):
-    """Patch the tp group temporarily until this function ends.
+    """临时替换（patch）当前 TP 组，直到本上下文管理器退出时恢复。
 
-    This method is for draft workers of speculative decoding to run draft model
-    with different tp degree from that of target model workers.
+    用于推投解码（speculative decoding）的 draft worker：让 draft 模型以与
+    target 模型不同的 TP 度运行。
 
-    Args:
-        tp_group (GroupCoordinator): the tp group coordinator
+    参数：
+        tp_group (GroupCoordinator): 用于临时生效的 TP 组协调器。
     """
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
@@ -2412,98 +2469,98 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
     try:
         yield
     finally:
-        # restore the original state
+        # 恢复为原来的状态。
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
 
 
 def get_world_size():
-    """Return world size for the world group."""
+    """返回 world 组的进程数（world size）。"""
     return get_world_group().world_size
 
 
 def get_world_rank():
-    """Return my rank for the world group."""
+    """返回当前进程在 world 组内的 rank。"""
     return get_world_group().rank_in_group
 
 
 def get_tensor_model_parallel_world_size():
-    """Return world size for the tensor model parallel group."""
+    """返回张量并行组（TP）的进程数。"""
     return get_tp_group().world_size
 
 
 def get_tensor_model_parallel_rank():
-    """Return my rank for the tensor model parallel group."""
+    """返回当前进程在张量并行组（TP）内的 rank。"""
     return get_tp_group().rank_in_group
 
 
 # ATTN_TP
 def get_attn_tensor_model_parallel_world_size():
-    """Return world size for the attention tensor model parallel group."""
+    """返回注意力张量并行组（Attention TP）的进程数。"""
     return get_attn_tp_group().world_size
 
 
 def get_attn_tensor_model_parallel_rank():
-    """Return my rank for the attention tensor model parallel group."""
+    """返回当前进程在注意力张量并行组（Attention TP）内的 rank。"""
     return get_attn_tp_group().rank_in_group
 
 
 # ATTN_CP
 def get_attn_context_model_parallel_world_size():
-    """Return world size for the attention context model parallel group."""
+    """返回注意力上下文并行组（Attention CP）的进程数。"""
     return get_attn_cp_group().world_size
 
 
 def get_attn_context_model_parallel_rank():
-    """Return my rank for the attention context model parallel group."""
+    """返回当前进程在注意力上下文并行组（Attention CP）内的 rank。"""
     return get_attn_cp_group().rank_in_group
 
 
 def get_pipeline_model_parallel_world_size():
-    """Return world size for the pipeline model parallel group."""
+    """返回流水线并行组（PP）的进程数。"""
     return get_pp_group().world_size
 
 
 def get_pipeline_model_parallel_rank():
-    """Return my rank for the pipeline model parallel group."""
+    """返回当前进程在流水线并行组（PP）内的 rank。"""
     return get_pp_group().rank_in_group
 
 
 # MOE_DP
 def get_moe_data_parallel_world_size():
-    """Return world size for the moe data parallel group."""
+    """返回 MoE 数据并行组（MoE DP）的进程数。"""
     return get_moe_dp_group().world_size
 
 
 def get_moe_data_parallel_rank():
-    """Return my rank for the moe data parallel group."""
+    """返回当前进程在 MoE 数据并行组（MoE DP）内的 rank。"""
     return get_moe_dp_group().rank_in_group
 
 
 # MOE_EP
 def get_moe_expert_parallel_world_size():
-    """Return world size for the moe expert parallel group."""
+    """返回 MoE 专家并行组（MoE EP）的进程数。"""
     return get_moe_ep_group().world_size
 
 
 def get_moe_expert_parallel_rank():
-    """Return my rank for the moe expert parallel group."""
+    """返回当前进程在 MoE 专家并行组（MoE EP）内的 rank。"""
     return get_moe_ep_group().rank_in_group
 
 
 # MOE_TP
 def get_moe_tensor_parallel_world_size():
-    """Return world size for the moe tensor parallel group."""
+    """返回 MoE 张量并行组（MoE TP）的进程数。"""
     return get_moe_tp_group().world_size
 
 
 def get_moe_tensor_parallel_rank():
-    """Return my rank for the moe tensor parallel group."""
+    """返回当前进程在 MoE 张量并行组（MoE TP）内的 rank。"""
     return get_moe_tp_group().rank_in_group
 
 
 def destroy_model_parallel():
-    """Set the groups to none and destroy them."""
+    """把各模型并行组置为 None 并销毁它们。"""
     global _TP
     if _TP:
         _TP.destroy()
@@ -2526,8 +2583,8 @@ def destroy_model_parallel():
 
     global _ATTN_CP
     global _MOE_DP
-    # Destroy _MOE_DP before _ATTN_CP since it may alias _ATTN_CP.
-    # Only destroy if not aliasing another group.
+    # 先销毁 _MOE_DP 再销毁 _ATTN_CP，因为 _MOE_DP 可能是 _ATTN_CP 的别名（同一对象）。
+    # 只有当 _MOE_DP 不是其他组的别名时，才真正销毁它，避免重复销毁。
     if _MOE_DP and _MOE_DP is not _ATTN_CP and _MOE_DP is not _TP:
         _MOE_DP.destroy()
     _MOE_DP = None
@@ -2562,7 +2619,7 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
     with contextlib.suppress(AssertionError):
         torch.distributed.destroy_process_group()
     if shutdown_ray:
-        import ray  # Lazy import Ray
+        import ray  # 延迟导入 Ray
 
         ray.shutdown()
     gc.collect()
@@ -2585,21 +2642,23 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
 
 def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
     """
-    This is a collective operation that returns if each rank is in the same node
-    as the source rank. It tests if processes are attached to the same
-    memory system (shared access to shared memory).
+    一个集合操作：返回每个 rank 是否与 source_rank 位于同一节点。它通过“能否
+    共享同一块共享内存”来判断进程是否附着在同一个内存系统上。
+
+    返回：长度为 world_size 的 List[bool]，第 i 位为 True 表示组内 rank i 与
+    source_rank 在同一节点。
     """
     assert (
         torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL
     ), "in_the_same_node_as should be tested with a non-NCCL group."
-    # local rank inside the group
+    # 组内的本地 rank。
     rank = torch.distributed.get_rank(group=pg)
     world_size = torch.distributed.get_world_size(group=pg)
 
-    # local tensor in each process to store the result
+    # 每个进程各自保存结果的本地张量。
     is_in_the_same_node = torch.tensor([0] * world_size, dtype=torch.int32)
 
-    # global ranks of the processes in the group
+    # 组内各进程的全局 rank。
     ranks = torch.distributed.get_process_group_ranks(pg)
 
     magic_message = b"magic_message"
@@ -2608,7 +2667,7 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
     try:
         with contextlib.suppress(OSError):
             if rank == source_rank:
-                # create a shared memory segment
+                # 创建一块共享内存段。
                 shm = shared_memory.SharedMemory(create=True, size=128)
                 shm.buf[: len(magic_message)] = magic_message
                 torch.distributed.broadcast_object_list(
@@ -2616,15 +2675,15 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
                 )
                 is_in_the_same_node[rank] = 1
             else:
-                # try to open the shared memory segment
+                # 尝试打开那块共享内存段。
                 recv = [None]
                 torch.distributed.broadcast_object_list(
                     recv, src=ranks[source_rank], group=pg
                 )
                 name = recv[0]
-                # fix to https://stackoverflow.com/q/62748654/9191338
-                # Python incorrectly tracks shared memory even if it is not
-                # created by the process. The following patch is a workaround.
+                # 修复 https://stackoverflow.com/q/62748654/9191338：
+                # 即使共享内存不是本进程创建的，Python 也会错误地去追踪它。
+                # 下面的 patch 是一个规避方法。
                 with patch(
                     "multiprocessing.resource_tracker.register",
                     lambda *args, **kwargs: None,

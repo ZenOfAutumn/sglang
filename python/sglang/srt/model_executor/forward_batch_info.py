@@ -35,7 +35,6 @@ from functools import total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
-
 from sglang.srt.distributed.parallel_state import (
     get_moe_expert_parallel_world_size,
     get_tensor_model_parallel_world_size,
@@ -1428,32 +1427,66 @@ def build_inner_fb_view(
 
 
 class PPProxyTensors:
-    # adapted from https://github.com/vllm-project/vllm/blob/d14e98d924724b284dc5eaf8070d935e214e50c0/vllm/sequence.py#L1103
+    """封装流水线并行（PP）阶段之间传递的中间张量。
+
+    在流水线并行中，每个 PP rank 只执行模型的一部分层。除最后一个 rank
+    之外，当前 rank 不会直接生成最终 logits，而是把 ``hidden_states``、
+    ``residual`` 等中间结果放入该容器，交给下一个 PP rank 继续计算。
+
+    该类提供类似字典的按名称读写接口，同时支持按 token 维切片。切片会对
+    容器中的每个张量应用同一个 ``slice``，并返回新的 ``PPProxyTensors``；
+    这使 CUDA Graph 等执行路径可以统一裁剪实际 token 数，而无须感知每种
+    模型具体传递了哪些中间张量。
+
+    说明：本容器只保存张量引用，不会在构造、读取或写入时自动复制张量。
+
+    改编自：
+    https://github.com/vllm-project/vllm/blob/d14e98d924724b284dc5eaf8070d935e214e50c0/vllm/sequence.py#L1103
+    """
+
     tensors: Dict[str, torch.Tensor]
 
-    def __init__(self, tensors):
-        # manually define this function, so that
-        # Dynamo knows `IntermediateTensors()` comes from this file.
-        # Otherwise, dataclass will generate this function by evaluating
-        # a string, and we will lose the information about the source file.
+    def __init__(self, tensors: Dict[str, torch.Tensor]):
+        """使用名称到中间张量的映射创建 PP 代理张量容器。
+
+        这里手动定义初始化方法，使 Dynamo 能够确认该容器的构造函数来自
+        当前源文件。如果改用 ``dataclass`` 自动生成初始化方法，方法会通过
+        动态执行字符串产生，进而丢失源文件位置信息，影响 Dynamo 的追踪。
+
+        参数：
+            tensors: PP 阶段间传递的中间张量映射。键表示张量的语义名称，
+                值为对应的 PyTorch 张量。
+        """
         self.tensors = tensors
 
     def __getitem__(self, key: Union[str, slice]):
+        """按名称读取张量，或沿首维统一切片全部中间张量。
+
+        参数：
+            key: 字符串键用于读取单个张量；切片用于裁剪所有张量。
+
+        返回：
+            字符串键对应的张量，或包含切片后张量的新容器。
+        """
         if isinstance(key, str):
             return self.tensors[key]
         elif isinstance(key, slice):
             return self.__class__({k: v[key] for k, v in self.tensors.items()})
 
     def __setitem__(self, key: str, value: torch.Tensor):
+        """新增或替换指定名称的中间张量。"""
         self.tensors[key] = value
 
     def __len__(self):
+        """返回容器内中间张量的数量，而不是 token 数。"""
         return len(self.tensors)
 
     def __eq__(self, other: object):
+        """判断另一个对象是否为同类型的 PP 代理张量容器。"""
         return isinstance(other, self.__class__) and self
 
     def __repr__(self) -> str:
+        """返回包含内部张量映射的可调试字符串表示。"""
         return f"PPProxyTensors(tensors={self.tensors})"
 
 
