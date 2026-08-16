@@ -16,5 +16,21 @@
 ## 子目录
 | 子目录 | 说明 |
 | --- | --- |
-| `eplb_algorithms` | 专家重平衡算法实现（DeepSeek 原版、向量化版、弹性感知版）。 |
-| `eplb_simulator` | EPLB 离线仿真/分析工具，从记录的专家分布数据回放并评估均衡策略。 |
+| `eplb_algorithms` | 专家重平衡算法实现（DeepSeek 原版、向量化版、弹性感知版）。详见其 `README_zh.md`。 |
+| `eplb_simulator` | EPLB 离线仿真/分析工具，从记录的专家分布数据回放并评估均衡策略。详见其 `README_zh.md`。 |
+
+### `eplb_algorithms/` 文件清单
+| 文件 | 说明 |
+| --- | --- |
+| `__init__.py` | 定义 `EplbAlgorithm` 枚举与统一入口 `rebalance_experts`/`compute_algorithm`，按算法类型分派到 deepseek / deepseek_vec / elasticity_aware，并支持层次化（hierarchical）变体。 |
+| `deepseek.py` | DeepSeek 官方 EPLB 算法（自其仓库拷贝），含均衡装箱 `balanced_packing`、专家复制与层次化重平衡 `rebalance_experts_hierarchical`。 |
+| `deepseek_vec.py` | DeepSeek 算法的向量化实现，按分块（chunkwise）批量生成冗余专家与物理↔逻辑映射，提升大规模计算效率。 |
+| `elasticity_aware.py` | 弹性感知重平衡算法，依据 `active_ranks` 在部分 rank 失效/变动时回退到全局负载均衡策略并复用 deepseek 层次化算法。 |
+| `README_zh.md` | 该子目录的中文说明文档。 |
+
+### `eplb_simulator/` 文件清单
+| 文件 | 说明 |
+| --- | --- |
+| `__init__.py` | 导入并暴露 `reader` 模块。 |
+| `reader.py` | 读取 `per_pass` 模式记录的专家分布数据（`.pt`），聚合各 rank 的全局物理专家计数，并复用 `_convert_global_physical_count_to_logical_count` 转换为逻辑计数，用于离线评估重平衡策略。 |
+| `README_zh.md` | 该子目录的中文说明文档。 |

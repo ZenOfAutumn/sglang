@@ -1079,11 +1079,25 @@ class FusedMoE(torch.nn.Module):
             )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        """MoE 层的前向入口，根据硬件后端与 CUDA Graph 捕获状态选择不同执行路径。
+
+        参数：
+            hidden_states: 输入 token 特征，形状 [num_tokens, hidden_size]。
+            topk_output: 路由输出（可能是 Standard / Bypassed 等不同格式）。
+
+        返回：
+            MoE 层输出，形状 [num_tokens, hidden_size]。
+        """
+        # 分支 1：昇腾（Ascend）NPU 的 FusedEP 专用路径，直接走 NPU 融合实现
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
             return forward_fuseep(self, hidden_states, topk_output)
+        # 分支 2：当前正处于 torch.compile 的「分段（piecewise）CUDA Graph」捕获中，
+        # 需要把整个 MoE 层包装成已注册的自定义算子（custom op），以便被 CUDA Graph 正确捕获。
         if is_in_tc_piecewise_cuda_graph():
+            # 分支 2a：标准 top-k 输出（已算好 topk_weights / topk_ids），
+            # 走标准 piecewise custom op。
             if TopKOutputChecker.format_is_standard(topk_output):
                 return moe_forward_piecewise_cuda_graph_impl(
                     hidden_states,
@@ -1092,6 +1106,9 @@ class FusedMoE(torch.nn.Module):
                     topk_output.router_logits,
                     self.layer_id,
                 )
+            # 分支 2b：Bypassed 输出（top-k 计算被延后/绕过），把路由所需的配置
+            # （top_k、专家分组、纠偏 bias、是否归一化等）传入 bypassed 版 custom op，
+            # 在算子内部再完成路由。
             elif TopKOutputChecker.format_is_bypassed(topk_output):
                 return fused_moe_bypassed_piecewise_cuda_graph_impl(
                     hidden_states,
@@ -1103,34 +1120,54 @@ class FusedMoE(torch.nn.Module):
                     topk_output.topk_config.renormalize,
                     self.layer_id,
                 )
+            # 分支 2c：其它未知格式，兜底直接调用 forward_impl，
+            # 确保整个 moe 层仍有对应的 torch lib 算子注册。
             else:
-                # Make sure there is torch lib op registration for the whole moe layer
+                # 确保整个 moe 层存在 torch lib 算子注册
                 return self.forward_impl(hidden_states, topk_output)
+        # 分支 3：普通（非 piecewise CUDA Graph）路径，直接执行标准实现。
         else:
             return self.forward_impl(hidden_states, topk_output)
 
     def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
+        """MoE 层的标准实现，执行 dispatch -> 专家计算 -> combine 三段主流程。
+
+        参数：
+            hidden_states: 输入 token 特征，形状 [num_tokens, hidden_size]。
+            topk_output: 路由输出（包含 top-k 专家 id 与权重）。
+
+        返回：
+            MoE 层输出，形状 [num_tokens, origin_hidden_size]。
+        """
+        # 记录原始 hidden 维度，combine 后需截回该维度（分发/量化过程可能有 padding）
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
 
+        # 步骤 1（dispatch）：按 top-k 路由把 token 分发到各专家所在位置
+        # （EP 场景下涉及跨卡 all-to-all；单卡则为本地置换）
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
 
+        # 步骤 2（专家计算）：调用量化方法的 apply 执行融合的分组 GEMM + 激活
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
         )
 
+        # 步骤 3（combine）：把专家输出按 top-k 权重加权聚合，还原回每个 token 原位。
+        # 在对称内存上下文中执行，以便复用对称显存（若已启用对称分配）
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
             final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
 
-            # TODO: should we add some conditions here?
+            # TODO: 是否需要在此处补充一些条件判断？
+            # 截回原始 hidden 维度并保证内存连续
             final_hidden_states = final_hidden_states[
                 ..., :origin_hidden_states_dim
             ].contiguous()
 
+        # 分支：仅当需要归并结果、且存在 TP 或 EP 多卡切分时，才做张量并行 all-reduce
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
@@ -1139,18 +1176,35 @@ class FusedMoE(torch.nn.Module):
     def forward_deferred_finalize(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ):
+        """forward_impl 的变体：延后归并（deferred finalize）路径，用于 FlashInfer TRTLLM 后端。
+
+        与标准 forward_impl 的区别：专家计算在 flashinfer_trtllm_deferred_finalize_context
+        上下文中执行，把最终的加权归并（finalize）延后到 combine 阶段进行，
+        以便与后续 kernel 更好地重叠/融合。此路径不做维度截断与 all-reduce。
+
+        参数：
+            hidden_states: 输入 token 特征。
+            topk_output: 路由输出。
+
+        返回：
+            MoE 层输出。
+        """
         assert self.quant_method is not None
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             flashinfer_trtllm_deferred_finalize_context,
         )
 
+        # 步骤 1（dispatch）：按路由分发 token
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
 
+        # 步骤 2（专家计算）：在「延后归并」上下文中执行专家 GEMM，
+        # finalize（加权归并）被推迟到 combine 阶段
         with flashinfer_trtllm_deferred_finalize_context():
             combine_input = self.run_moe_core(dispatch_output=dispatch_output)
 
+        # 步骤 3（combine）：完成聚合与延后的归并
         return self.dispatcher.combine(combine_input=combine_input)
 
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:

@@ -44,6 +44,12 @@ try:
         simulated_ep=1,
         n_rows=None,
     ):
+        """调用 Triton Kernels 完成 Top-K 路由并构造 dispatch/combine 索引。
+
+        输入输出示例：``logits.shape=[4, 8]``、``n_expts_act=2`` 时，为 4 个 token
+        各选 2 个专家，返回 ``RoutingData`` 以及供专家分发和结果回收使用的 gather、
+        scatter 索引；总 token-expert assignment 数为 8。
+        """
         if simulated_ep != 1:
             raise NotImplementedError(
                 "simulated_ep routing is not supported with triton_kernels 3.6.0"
@@ -199,6 +205,70 @@ if _is_musa:
 
 @dataclass
 class TopKConfig:
+    """MoE 路由 Top-K 的统一配置。
+
+    该配置只描述“如何从 router logits 选择专家以及如何表达输出”，不保存模型权重。
+    ``select_experts`` 会读取这些字段，在普通、分组、带偏置、融合或自定义路由路径间分派。
+
+    参数：
+        top_k:
+            每个 token 最终激活的专家总数。若启用融合共享专家，该数值同时包含路由专家
+            和共享专家，例如 ``top_k=8``、``num_fused_shared_experts=1`` 时，实际从
+            router logits 中选择 7 个路由专家，再追加 1 个共享专家。必须大于等于
+            ``num_fused_shared_experts``，且路由部分不能超过可路由专家总数。
+        use_grouped_topk:
+            是否先选择专家组，再从入选组中选择专家。DeepSeek 系列常启用，用于限制
+            token 的路由范围及改善跨节点通信局部性。启用时 ``topk_group`` 和
+            ``num_expert_group`` 必须同时设置。
+        topk_group:
+            每个 token 允许进入的专家组数量，仅在 grouped Top-K 中有效。应满足
+            ``1 <= topk_group <= num_expert_group``。
+        num_expert_group:
+            将全部路由专家划分成多少组。一般要求专家总数可被该值整除；每组专家数为
+            ``num_experts // num_expert_group``。
+        renormalize:
+            是否在选出 Top-K 后重新归一化路由权重。为 ``True`` 时，普通路由专家权重
+            通常满足每个 token 行和为 1；若融合共享专家，则通常只归一化路由专家部分。
+        num_fused_shared_experts:
+            附加到 Top-K 输出中的融合共享专家数量。共享专家不参与普通 router 竞争，
+            而是在路由专家之后追加；其 ID、权重以及 DeepEP 映射由后处理阶段生成。
+        custom_routing_function:
+            可选的自定义专家选择函数。设置后跳过内置 grouped/fused Top-K 路径，由该函数
+            接收 ``hidden_states``、``gating_output``、``topk``、``renormalize`` 并返回
+            ``(topk_weights, topk_ids)``。
+        correction_bias:
+            形状通常为 ``[num_experts]`` 的专家校正偏置，用于负载均衡。它只加到“选择
+            专家所用的分数”上，最终组合权重仍从未加偏置的 score 中取得，避免改变模型
+            原始门控概率语义。
+        torch_native:
+            是否强制使用 PyTorch 原生 Top-K 实现。通常由平台入口动态设置，用于 CPU、
+            XPU 回退、调试或当前融合 kernel 不支持的形状。
+        routed_scaling_factor:
+            路由专家输出或权重的缩放因子。是否在 Top-K 阶段直接乘入权重，由
+            ``apply_routed_scaling_factor_on_output`` 决定；否则通常在后续 MoE 输出阶段应用。
+        apply_routed_scaling_factor_on_output:
+            是否在 Top-K 结果上直接应用 ``routed_scaling_factor``。必须结合具体后端使用，
+            部分 CPU/原生路径尚不支持；为 ``False`` 时仅保存缩放因子供后续阶段处理。
+        fused_shared_experts_scaling_factor:
+            融合共享专家的独立缩放因子，主要用于 AMD/AITER 路径；为 ``None`` 时按 1.0
+            处理。它与路由专家的 ``routed_scaling_factor`` 相互独立。
+        output_format:
+            可选的强制输出格式。``STANDARD`` 立即物化权重和 ID；``TRITON_KERNEL`` 返回
+            Triton 路由元数据；``BYPASSED`` 延迟到后续融合 MoE kernel 内执行 Top-K。
+            为 ``None`` 时根据当前 MoE runner 后端自动选择。
+        scoring_func:
+            router logits 的打分函数。常见值为 ``"softmax"``、``"sigmoid"`` 和
+            ``"sqrtsoftplus"``；并非所有硬件路径都支持全部取值。
+
+    输入输出示例：
+        ``TopKConfig(top_k=2, renormalize=True)`` 配合 ``router_logits.shape=[4,8]``，
+        标准路径输出 ``topk_ids/topk_weights.shape=[4,2]``，每个 token 选择 2 个专家。
+
+        ``TopKConfig(top_k=8, use_grouped_topk=True, num_expert_group=8,
+        topk_group=4, num_fused_shared_experts=1)`` 表示先从 8 个专家组中选 4 组，
+        再选择 7 个路由专家并追加 1 个共享专家，最终输出形状为 ``[num_tokens,8]``。
+    """
+
     top_k: int
     use_grouped_topk: bool = False
     topk_group: Optional[int] = None
@@ -222,13 +292,13 @@ class TopKOutputChecker:
 
     @staticmethod
     def format_is_standard(topk_output: TopKOutput) -> TypeGuard[StandardTopKOutput]:
-        # ===== TO BE REFACTORED ====
-        # The experimental fused topk+pack carrier only exists under the master switch.
+        # ===== 待重构区域 =====
+        # 实验性的 Top-K 与 pack 融合输出类型仅在总开关开启时存在。
         if _SGLANG_EXPERIMENTAL_LORA_OPTI:
             return isinstance(
                 topk_output, (StandardTopKOutput, StandardTopKOutputPacked)
             )
-        # ===== END TO BE REFACTORED ====
+        # ===== 待重构区域结束 =====
         return isinstance(topk_output, StandardTopKOutput)
 
     @staticmethod
@@ -250,16 +320,20 @@ class TopKOutputFormat(IntEnum):
 
 @runtime_checkable
 class TopKOutput(Protocol):
-    """Protocol for top-k outputs in different formats."""
+    """不同 Top-K 输出格式共同遵循的协议。"""
 
     @property
     def format(self) -> TopKOutputFormat:
-        """The format of the output."""
+        """返回当前输出对象的格式枚举值。"""
         ...
 
 
 class StandardTopKOutput(NamedTuple):
-    """Standard top-k output format."""
+    """标准 Top-K 输出：权重、专家 ID 和原始路由 logits。
+
+    输入输出示例：2 个 token、Top-2 路由时，``topk_weights`` 和 ``topk_ids``
+    的形状均为 ``[2, 2]``，``router_logits`` 的形状为 ``[2, num_experts]``。
+    """
 
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
@@ -270,11 +344,11 @@ class StandardTopKOutput(NamedTuple):
         return TopKOutputFormat.STANDARD
 
 
-# ===== TO BE REFACTORED ====
-# Experimental fused topk+pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK) carrier: the FlashInfer
-# routed-MoE packed topk produced fused in the gating kernel. Kept a SEPARATE type rather
-# than a 4th StandardTopKOutput field so the OSS `a, b, _ = topk_output` 3-tuple unpack
-# stays valid; only the gated experimental MoE dispatch reads .packed_topk_ids (getattr).
+# ===== 待重构区域 =====
+# 实验性的 Top-K 与 pack 融合输出载体（SGLANG_OPT_LORA_FUSED_TOPK_PACK）：
+# gating kernel 会同时生成 FlashInfer routed-MoE 所需的 packed Top-K。这里使用独立类型，
+# 而不是给 StandardTopKOutput 添加第 4 个字段，以保持现有 ``a, b, _ = topk_output``
+# 三元组解包兼容；只有受开关控制的实验性 MoE dispatch 会读取 packed_topk_ids。
 class StandardTopKOutputPacked(NamedTuple):
     topk_weights: torch.Tensor
     topk_ids: torch.Tensor
@@ -290,7 +364,7 @@ class StandardTopKOutputPacked(NamedTuple):
 
 
 class TritonKernelTopKOutput(NamedTuple):
-    """Triton kernel top-k output format."""
+    """Triton Kernels 专用 Top-K 输出，保存路由元数据及 gather/scatter 索引。"""
 
     routing_data: RoutingData
     gather_indx: GatherIndx
@@ -302,7 +376,7 @@ class TritonKernelTopKOutput(NamedTuple):
 
 
 class BypassedTopKOutput(NamedTuple):
-    """Bypassed top-k output format."""
+    """延迟路由输出：暂不物化 Top-K 张量，由后续 MoE kernel 内部完成路由。"""
 
     hidden_states: torch.Tensor
     router_logits: torch.Tensor
@@ -315,8 +389,12 @@ class BypassedTopKOutput(NamedTuple):
         return TopKOutputFormat.BYPASSED
 
     def to_standard(self, layer_id: Optional[int] = None) -> StandardTopKOutput:
-        """Materialize routing tensors. Used by MoE kernels that need explicit
-        topk_ids / topk_weights rather than doing routing internally."""
+        """把延迟路由输出物化为标准的 Top-K 张量。
+
+        供需要显式 ``topk_ids`` / ``topk_weights``、无法在内部执行路由的 MoE kernel
+        使用。输入输出示例：若 ``router_logits.shape=[3, 8]`` 且 ``top_k=2``，返回的
+        ``topk_ids`` 与 ``topk_weights`` 形状均为 ``[3, 2]``。
+        """
         return select_experts(
             hidden_states=self.hidden_states,
             router_logits=self.router_logits,
@@ -336,6 +414,11 @@ def _make_round_robin_expert_ids(
     dtype: torch.dtype,
     layer_id: Optional[int] = None,
 ) -> torch.Tensor:
+    """为基准测试生成确定性的轮询专家 ID。
+
+    输入输出示例：``num_tokens=3, topk=2, num_experts=4`` 时，步长为 2，返回
+    ``[[0,2], [1,3], [2,0]]``；``layer_id`` 会整体平移起始专家。
+    """
     if topk == 0:
         return torch.empty((num_tokens, 0), device=device, dtype=dtype)
 
@@ -350,12 +433,17 @@ def _make_round_robin_expert_ids(
 
 
 class TopK(MultiPlatformOp):
-    """
-    Parameters:
-    --top_k: The all number of top experts selected per token, including the fused shared expert(s).
-    --num_fused_shared_experts: num of shared experts, can be activate both in TP or EP mode.
-    --routed_scaling_factor: the scaling factor for routed experts in topk_weights.
-    --fused_shared_experts_scaling_factor: scaling factor for fused shared experts on AMD-platform.
+    """跨平台 MoE Top-K 路由算子。
+
+    参数：
+        top_k: 每个 token 最终选择的专家总数，包含融合的共享专家。
+        num_fused_shared_experts: 融合共享专家数量，可在 TP 或 EP 模式下启用。
+        routed_scaling_factor: 路由专家权重的缩放因子。
+        fused_shared_experts_scaling_factor: AMD 平台上融合共享专家的缩放因子。
+
+    输入输出示例：``TopK(top_k=2)`` 接收 ``hidden_states.shape=[4,d]`` 和
+    ``router_logits.shape=[4,8]``，标准路径输出形状均为 ``[4,2]`` 的专家权重和 ID，
+    表示每个 token 从 8 个专家中选择 2 个。
     """
 
     def __init__(
@@ -378,8 +466,8 @@ class TopK(MultiPlatformOp):
         fused_shared_experts_scaling_factor: Optional[float] = None,
         is_fp4_experts: bool = False,
     ):
-        # NOTE: scoring_func is not used for now, but we keep it for future use
-        # see https://github.com/sgl-project/sglang/pull/4505 for more details
+        # 注意：scoring_func 当前暂未在此处直接使用，但为后续扩展保留。
+        # 详情参见 https://github.com/sgl-project/sglang/pull/4505。
         super().__init__()
 
         if use_grouped_topk:
@@ -395,13 +483,14 @@ class TopK(MultiPlatformOp):
 
         self.deepep_waterfill_balancer = None
         if self.enable_deepep_waterfill:
-            # TODO(ch-wan): Refactor shared-expert fusion and routed TopK fusion.
+            # TODO(ch-wan)：重构共享专家融合与路由 Top-K 融合逻辑。
             top_k -= num_fused_shared_experts
             num_fused_shared_experts = 0
             output_format = TopKOutputFormat.STANDARD
 
-        # flashinfer_mxfp4 backend only: True -> STANDARD (Mxfp4FlashinferTrtllmMoEMethod
-        # consumes), False -> BYPASSED (flashinfer's own mxfp4 kernel). No-op otherwise.
+        # 仅用于 flashinfer_mxfp4 后端：True 表示输出 STANDARD，交给
+        # Mxfp4FlashinferTrtllmMoEMethod 消费；False 表示 BYPASSED，由 FlashInfer 自身的
+        # MXFP4 kernel 在内部完成路由。其他后端忽略该字段。
         self.is_fp4_experts = is_fp4_experts
         self.topk_config = TopKConfig(
             top_k=top_k,
@@ -422,6 +511,11 @@ class TopK(MultiPlatformOp):
     def _apply_deepep_waterfill(
         self, topk_output: TopKOutput, num_tokens: int
     ) -> TopKOutput:
+        """按 DeepEP waterfill 方案扩展 Top-K 结果以改善专家负载均衡。
+
+        输入输出示例：未启用或未配置 balancer 时原样返回；启用后将标准 Top-K 输出
+        交给 ``expand_topk``，其具体列数由 waterfill 策略决定。
+        """
         if self.enable_deepep_waterfill and self.deepep_waterfill_balancer is None:
             raise RuntimeError(
                 "DeepEP waterfill TopK must be prepared by ModelRunner before forward."
@@ -439,6 +533,11 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
+        """使用纯 PyTorch 路径执行 Top-K，主要用于通用回退和可移植执行。
+
+        输入输出示例：``hidden_states=[M,d]``、``router_logits=[M,E]``、Top-K 为 K 时，
+        返回标准输出，其中 ``topk_ids/topk_weights`` 均为 ``[M,K]``。
+        """
         self.topk_config.torch_native = True
         topk_output = select_experts(
             hidden_states=hidden_states,
@@ -458,6 +557,12 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
+        """执行 CUDA/ROCm Top-K，并根据 MoE runner 选择输出格式。
+
+        标准后端立即生成 ``[M,K]`` 的权重和 ID；Triton Kernels 返回路由索引结构；
+        BYPASSED 后端仅封装输入，让后续融合 kernel 完成路由。
+        输入输出示例：``router_logits=[4,8]``、Top-2 时，标准输出的权重和 ID 为 ``[4,2]``。
+        """
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
         elif get_moe_runner_backend().is_triton_kernels():
@@ -475,7 +580,7 @@ class TopK(MultiPlatformOp):
                 if use_standard_for_lora
                 else TopKOutputFormat.BYPASSED
             )
-        # ===== END TO BE REFACTORED ====
+        # ===== 待重构区域结束 =====
         elif get_moe_runner_backend().is_flashinfer_trtllm() or (
             get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
         ):
@@ -484,7 +589,7 @@ class TopK(MultiPlatformOp):
             output_format = TopKOutputFormat.STANDARD
 
         if output_format == TopKOutputFormat.TRITON_KERNEL:
-            # renormalize=True is equivalent to sm_first=False
+            # renormalize=True 等价于 sm_first=False：先选 Top-K，再在选中项内归一化。
             routing_data, gather_idx, scatter_idx = routing(
                 router_logits,
                 self.topk_config.top_k,
@@ -522,6 +627,11 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
+        """执行 CPU Top-K 路由。
+
+        输入输出示例：``hidden_states=[M,d]``、``router_logits=[M,E]``、Top-K 为 K 时，
+        返回标准输出，其中专家权重和 ID 的形状均为 ``[M,K]``。
+        """
         topk_output = select_experts(
             hidden_states=hidden_states,
             layer_id=self.layer_id,
@@ -540,7 +650,11 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
+        """把 NPU Top-K 路由委托给 NPU 专用融合实现。
 
+        输入 ``router_logits=[M,E]`` 时，返回格式由 ``fused_topk_npu`` 决定；标准配置下
+        权重和专家 ID 均为 ``[M,K]``。
+        """
         from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
 
         return fused_topk_npu(
@@ -553,13 +667,18 @@ class TopK(MultiPlatformOp):
         )
 
     def empty_topk_output(self, device: torch.device) -> TopKOutput:
+        """创建零 token 批次对应的空 Top-K 输出。
+
+        输入输出示例：Top-2 且无共享专家时，返回权重和 ID 形状 ``[0,2]``；ID dtype
+        为 int32，权重为 float32。DeepEP 共享专家路径会追加相应的空列。
+        """
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
             topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
             topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
-        # FIXME: router_logits should be of size (0, num_experts)
+        # FIXME：router_logits 理想形状应为 (0, num_experts)，这里暂以 topk 代替。
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
         if self.topk_config.num_fused_shared_experts > 0 and is_deepep_class_backend():
@@ -582,10 +701,15 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
+        """执行 XPU Top-K，并按 K 和专家数判断使用专用 kernel 还是原生回退。
+
+        Top-K 不超过 8 且专家数不超过 256 时使用 XPU kernel；否则使用 PyTorch 路径。
+        输出权重和专家 ID 的形状均为 ``[M,K]``。
+        """
         self.topk_config.torch_native = True
-        # [NOTE] XPU device support for topk kernels
-        #   - support 'topk_softmax' and 'topk_sigmoid'
-        #   - support up to 8 top-k and 256 experts
+        # XPU Top-K kernel 的支持范围：
+        #   - 支持 topk_softmax 和 topk_sigmoid；
+        #   - 最多支持 Top-8 和 256 个专家。
         self.topk_config.torch_native = not (
             self.topk_config.top_k <= 8 and router_logits.shape[1] <= 256
         )
@@ -611,6 +735,13 @@ def fused_topk_torch_native(
     correction_bias: torch.Tensor = None,
     scoring_func: str = "softmax",
 ):
+    """用纯 PyTorch 从路由 logits 中选择每个 token 的 Top-K 专家。
+
+    ``correction_bias`` 只影响专家选择，不直接改变最终权重；最终权重从未加偏置的
+    score 中 gather。输入输出示例：``gating_output.shape=[3,8]``、``topk=2`` 时，
+    返回 ``topk_weights/topk_ids``，形状均为 ``[3,2]``；归一化时每行权重和为 1。
+    """
+
     def scoring_func_impl(gating_output: torch.Tensor) -> torch.Tensor:
         if scoring_func == "softmax":
             return gating_output.softmax(dim=-1)
@@ -650,6 +781,11 @@ def fused_topk_softmax_torch_raw_logits(
     topk: int,
     renormalize: bool,
 ):
+    """直接在原始 logits 上选 Top-K，再按需对选中 logits 做 softmax。
+
+    与先对全部专家做 softmax 再选择相比，该路径避免计算完整 softmax。输入输出示例：
+    输入 ``[M,E]``、``topk=K``，返回形状均为 ``[M,K]`` 的 float32 权重和 int32 ID。
+    """
     assert (
         hidden_states.shape[0] == gating_output.shape[0]
     ), f"Number of tokens mismatch, {hidden_states.shape=} vs {gating_output.shape=}"
@@ -671,10 +807,10 @@ def fused_topk_cpu(
     correction_bias: torch.Tensor = None,
     scoring_func: str = "softmax",
 ):
-    # TODO: add c++ kernel for cpu
-    # The topk_softmax_cpu kernel only handles vanilla softmax scoring with no
-    # correction bias. Fall back to the torch-native impl for the rest
-    # (e.g. MiniMax sets both correction_bias and scoring_func).
+    # TODO：为 CPU 增加覆盖完整功能的 C++ kernel。
+    # 当前 topk_softmax_cpu 只支持不带 correction bias 的普通 softmax 打分；
+    # 其他情况回退到 PyTorch 原生实现，例如 MiniMax 会同时设置 correction_bias
+    # 和特殊 scoring_func。
     if correction_bias is not None or scoring_func != "softmax":
         return fused_topk_torch_native(
             hidden_states,
@@ -695,14 +831,19 @@ def fused_topk_cpu(
 
 
 def apply_topk_weights_cpu(need_apply, topk_weights, inputs):
+    """在 CPU 上提前把路由权重乘入专家输入，并清空后续权重语义。
+
+    输入输出示例：``inputs=[2.,4.]``、``topk_weights=[0.5,0.25]`` 且启用时，
+    返回加权输入 ``[1.,1.]`` 和全 1 权重；禁用时原样返回。
+    """
     if not need_apply:
         return inputs, topk_weights
 
-    # TODO: fuse below processing in fused_experts_cpu kernel
+    # TODO：把下面的加权与权重清理融合进 fused_experts_cpu kernel。
     inputs = inputs * topk_weights.to(inputs.dtype)
     topk_weights = torch.ones_like(
         topk_weights, dtype=torch.float32
-    )  # clear topk_weights as already applied
+    )  # 权重已经乘入 inputs，后续用全 1 避免重复加权。
 
     return inputs, topk_weights
 
@@ -717,6 +858,12 @@ def fused_topk(
     packed_out: Optional[torch.Tensor] = None,
     num_token_non_padded: Optional[torch.Tensor] = None,
 ):
+    """按平台能力调用融合 kernel，完成 softmax/sigmoid 打分与 Top-K 选择。
+
+    输入输出示例：``hidden_states.shape=[M,d]``、``gating_output.shape=[M,E]``、
+    ``topk=K`` 时，返回 ``topk_weights:[M,K]`` 和 ``topk_ids:[M,K]``。
+    correction bias 可改变入选专家，但权重仍来自原始打分函数。
+    """
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     M, _ = hidden_states.shape
@@ -729,7 +876,7 @@ def fused_topk(
     if scoring_func == "softmax":
         if _use_aiter:
 
-            # Use fused_topk instead of topk_softmax to auto dispatch to the correct kernel
+            # 使用 AITER fused_topk 自动分派到适合当前形状和硬件的 kernel。
             topk_weights, topk_ids = aiter_fused_topk(
                 hidden_states,
                 gating_output,
@@ -740,8 +887,8 @@ def fused_topk(
             )
         # ===== TO BE REFACTORED ====
         elif packed_out is not None:
-            # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): one JIT kernel
-            # writes topk_weights/topk_ids AND the FlashInfer packed topk in one launch.
+            # 融合 gating 与 routed pack：一个 JIT kernel 在一次 launch 中同时写出
+            # topk_weights、topk_ids 和 FlashInfer 使用的 packed Top-K。
             from sglang.jit_kernel.trtllm_lora_temp.topk_softmax_pack import (
                 topk_softmax_pack,
             )
@@ -754,7 +901,7 @@ def fused_topk(
                 renormalize,
                 num_token_non_padded=num_token_non_padded,
             )
-        # ===== END TO BE REFACTORED ====
+        # ===== 待重构区域结束 =====
         else:
             topk_softmax(
                 topk_weights,
@@ -787,7 +934,7 @@ def fused_topk(
     return topk_weights, topk_ids
 
 
-# This is used by the Deepseek V2/V3/R1 series models
+# DeepSeek V2/V3/R1 系列模型使用该分组 Top-K 实现。
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def grouped_topk_gpu(
     hidden_states: torch.Tensor,
@@ -800,6 +947,12 @@ def grouped_topk_gpu(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
+    """先选择专家组，再仅从入选组内选择 Top-K 专家。
+
+    每组包含 ``num_experts/num_expert_group`` 个专家，先以组内最大 score 作为组分数，
+    选出 ``topk_group`` 个组，再屏蔽其他组。输入输出示例：8 个专家分 4 组、选 2 组、
+    最终 Top-2 时，输出形状为 ``[num_tokens,2]``，ID 只来自两个入选组。
+    """
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     scores = torch.softmax(gating_output, dim=-1)
@@ -864,6 +1017,11 @@ def grouped_topk_cpu(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
+    """调用 CPU 融合 kernel 执行分组 Top-K。
+
+    输入 ``gating_output=[M,E]``、Top-K 为 K 时，返回 ``[M,K]`` 的权重和专家 ID；
+    当前 CPU kernel 不支持在输出端额外应用 routed scaling factor。
+    """
     assert not apply_routed_scaling_factor_on_output
     return torch.ops.sgl_kernel.grouped_topk_cpu(
         hidden_states,
@@ -874,7 +1032,7 @@ def grouped_topk_cpu(
         topk_group,
         num_fused_shared_experts,
         routed_scaling_factor,
-        # num_token_non_padded must be None since it is not supported in kernel
+        # CPU kernel 尚不支持 num_token_non_padded，因此必须传 None。
         num_token_non_padded=None,
     )
 
@@ -889,21 +1047,23 @@ def kimi_k2_biased_topk_impl(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
-    """
-    Optimized version for num_expert_group=1 case (e.g., Kimi K2 with 384 experts).
-    Simplifies the grouped topk logic by removing unnecessary group masking operations.
-    Note: This function assumes num_fused_shared_experts=0.
+    """针对 ``num_expert_group=1`` 的优化版本，例如 384 专家的 Kimi K2。
+
+    只有一个组时无需构造组 mask，可直接在加 correction bias 后的分数上选 Top-K。
+    本函数假设 ``num_fused_shared_experts=0``。
+
+    输入输出示例：``gating_output.shape=[M,384]``、``topk=8`` 时，返回形状为
+    ``[M,8]`` 的权重和专家 ID；bias 参与选择，原始 sigmoid score 用作权重。
     """
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     scores = gating_output.sigmoid()
     num_token = scores.shape[0]
 
-    # When num_expert_group=1, no need for group masking
-    # Directly compute scores with correction bias
+    # 只有一个专家组时无需构造组 mask，直接加 correction bias 得到选择分数。
     tmp_scores = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
 
-    # Directly select topk experts (no need to sort since num_fused_shared_experts=0)
+    # 直接选择 Top-K；没有融合共享专家时不依赖排序结果。
     _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
     topk_weights = scores.gather(1, topk_ids)
 
@@ -931,6 +1091,12 @@ def biased_topk_impl(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
+    """执行带专家 correction bias 的非分组 Top-K。
+
+    bias 仅用于平衡专家选择，最终权重从未加 bias 的 score 中取得。输入输出示例：
+    ``gating_output=[M,E]``、``correction_bias=[E]``、``topk=K`` 时，返回
+    ``topk_weights/topk_ids=[M,K]``。
+    """
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     if scoring_func == "sigmoid":
@@ -1047,6 +1213,11 @@ def biased_grouped_topk_impl(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
+    """执行带 correction bias 的分组 Top-K 原生实现。
+
+    每个组取分数最高的两个专家之和作为组分数，先选组再选专家；bias 只影响选择，
+    最终权重来自未加 bias 的 sigmoid score。输入 ``[M,E]``、Top-K=K 时返回 ``[M,K]``。
+    """
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
 
     scores = gating_output.sigmoid()
@@ -1108,6 +1279,7 @@ def biased_grouped_topk_impl(
 
 
 def is_power_of_two(n):
+    """判断正整数是否为 2 的幂，例如 1、2、8 返回 True，6 和 0 返回 False。"""
     return n > 0 and math.log2(n).is_integer()
 
 
@@ -1115,9 +1287,14 @@ def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
 ) -> None:
+    """把 padding token 对应的专家 ID 原地设为 -1。
+
+    输入输出示例：``topk_ids.shape=[4,2]``、``num_token_non_padded=3`` 时，前三行
+    保持不变，最后一行变为 ``[-1,-1]``。
+    """
     if num_token_non_padded is None:
         return
-    # TODO: let the kernel support other dtypes
+    # TODO：让 CUDA kernel 支持 int32 以外的 dtype。
     if _is_cuda and topk_ids.dtype == torch.int32:
         mask_topk_ids(topk_ids, num_token_non_padded)
     else:
@@ -1129,6 +1306,10 @@ def _zero_topk_weights_padded_region(
     topk_weights: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
 ):
+    """把 padding token 对应的 Top-K 权重原地清零。
+
+    输入输出示例：``topk_weights.shape=[4,2]``、有效 token 数为 3 时，最后一行置 0。
+    """
     if num_token_non_padded is None:
         return
     indices = torch.arange(0, topk_weights.shape[0], device=topk_weights.device)
@@ -1139,6 +1320,11 @@ def _zero_topk_weights_padded_region(
 def _biased_grouped_topk_postprocess(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
 ):
+    """把逻辑专家 ID 映射为物理 ID，并屏蔽 padding token。
+
+    输入输出示例：逻辑 ID ``[[0,2]]`` 经 EPLB 映射表可能变为 ``[[1,3]]``；若该行
+    属于 padding 区域，则最终变为 ``[[-1,-1]]``。
+    """
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_ids
@@ -1156,20 +1342,24 @@ def biased_grouped_topk_gpu(
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
 ):
+    """按硬件与形状选择带 bias 的分组 Top-K GPU 实现。
 
+    优先级包含 FlashInfer、SGLang fused gate、AITER、MUSA、Kimi K2/JIT 和 PyTorch
+    回退。输入 ``gating_output=[M,E]``、Top-K=K，统一返回 ``[M,K]`` 的权重和 ID。
+    """
     num_tokens = gating_output.shape[0]
     num_experts = gating_output.shape[1]
     experts_per_group = (
         num_experts // num_expert_group if num_expert_group else num_experts
     )
 
-    # topk for routed experts only (shared experts are appended separately below)
+    # 这里只为路由专家计算 Top-K；共享专家会在后面单独追加。
     topk_routed = topk - num_fused_shared_experts
     if (
         _is_cuda
         and fused_topk_deepseek is not None
         and is_power_of_two(num_experts)
-        # flashinfer constraints (applied to routed experts only)
+        # FlashInfer 的约束只应用于路由专家，不包含后续追加的共享专家。
         and topk_routed <= 8
         and topk_group <= num_expert_group
         and topk_group * num_expert_group >= topk_routed
@@ -1179,7 +1369,7 @@ def biased_grouped_topk_gpu(
             else num_experts <= 384
         )
     ):
-        # Pre-allocate output tensors (flashinfer mutates them in-place)
+        # FlashInfer 会原地写结果，因此提前分配输出张量。
         topk_weights = torch.empty(
             (num_tokens, topk_routed), dtype=torch.float32, device=gating_output.device
         )
@@ -1187,12 +1377,12 @@ def biased_grouped_topk_gpu(
             (num_tokens, topk_routed), dtype=torch.int32, device=gating_output.device
         )
 
-        # flashinfer always applies the scaling_factor internally
+        # FlashInfer 总会在 kernel 内部应用 scaling_factor。
         scaling_factor = 1.0
         if routed_scaling_factor is not None and apply_routed_scaling_factor_on_output:
             scaling_factor = routed_scaling_factor
 
-        # flashinfer's fused_topk_deepseek
+        # 调用 FlashInfer 的 DeepSeek 融合 Top-K kernel。
         fused_topk_deepseek(
             gating_output.to(dtype=torch.float32),
             correction_bias,
@@ -1206,9 +1396,9 @@ def biased_grouped_topk_gpu(
         )
 
         if num_fused_shared_experts > 0:
-            # Append shared expert columns: ID = num_experts (first shared slot),
-            # weight = sum(routed) / scaling_factor (matching biased_grouped_topk_impl).
-            # DeepEP fusion will overwrite both in _remap_topk_ids_for_deepep_fusion.
+            # 追加共享专家列：第一个共享专家 ID 为 num_experts；权重等于路由专家
+            # 权重和除以 scaling_factor，与 biased_grouped_topk_impl 保持一致。
+            # DeepEP 融合路径稍后会在 remap 阶段覆盖共享专家 ID 和权重。
             topk_ids = F.pad(topk_ids, (0, num_fused_shared_experts), value=num_experts)
             topk_weights = F.pad(topk_weights, (0, num_fused_shared_experts))
             if routed_scaling_factor is not None:
@@ -1221,7 +1411,8 @@ def biased_grouped_topk_gpu(
 
     elif (
         _is_cuda
-        # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
+        # 当前 moe_fused_gate kernel 要求每组专家数不超过 MAX_VPT=32；
+        # 后续 kernel 支持 MAX_VPT > 32 后可移除此限制。
         and experts_per_group <= 32
         and is_power_of_two(num_experts)
     ):
@@ -1274,7 +1465,7 @@ def biased_grouped_topk_gpu(
             apply_routed_scaling_factor_on_output,
         )
     else:
-        # Use optimized path for Kimi K2 (384 experts with num_expert_group=1)
+        # Kimi K2（384 专家且只有一个专家组）使用专用优化路径。
         num_experts = gating_output.shape[1]
         if _is_cuda and num_experts == 384 and num_expert_group == 1:
             # ===== TO BE REFACTORED ====
@@ -1291,7 +1482,7 @@ def biased_grouped_topk_gpu(
                     kimi_k2_moe_fused_gate as _kimi_k2_moe_fused_gate,
                 )
 
-                # bf16 pass-through: skip the two host-side fp32 upcast kernels.
+                # BF16 直通：避免启动两个由主机侧触发的 FP32 类型提升 kernel。
                 return _kimi_k2_moe_fused_gate(
                     gating_output,
                     correction_bias,
@@ -1300,7 +1491,7 @@ def biased_grouped_topk_gpu(
                     routed_scaling_factor=routed_scaling_factor,
                     apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
                 )
-            # ===== END TO BE REFACTORED ====
+            # ===== 待重构区域结束 =====
             return kimi_k2_moe_fused_gate(
                 gating_output.to(dtype=torch.float32),
                 correction_bias,
@@ -1403,7 +1594,7 @@ def biased_grouped_topk_cpu(
         topk_group,
         num_fused_shared_experts,
         routed_scaling_factor if apply_routed_scaling_factor_on_output else None,
-        # num_token_non_padded must be None since it is not supported in kernel
+        # CPU kernel 尚不支持 num_token_non_padded，因此必须传 None。
         num_token_non_padded=None,
     )
 
@@ -1426,39 +1617,42 @@ def _remap_topk_for_deepep(
     num_physical_routed_experts: int,
     topk_config: TopKConfig,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Remap TopK output to DeepEP interleaved expert layout.
+    """把 Top-K 输出重映射到 DeepEP 的交错专家布局。
 
-    DeepEP dispatch needs each rank's shared expert at a unique ID so tokens
-    route to the correct rank. The layout interleaves shared slots among
-    routed experts: [routed_0..L-1, shared, routed_L..2L-1, shared, ...].
+    DeepEP dispatch 要求每个 rank 的共享专家拥有唯一 ID，才能把 token 路由到正确 rank。
+    布局会在各 rank 的路由专家段后插入共享专家槽位：
+    ``[routed_0..L-1, shared, routed_L..2L-1, shared, ...]``。
 
-    Routed IDs:  e -> e + e // num_local_routed
-    Shared IDs:  ep_rank * num_local_experts + num_local_routed
-    Shared weight: 1 / routed_scaling_factor (compensates post-MoE scaling)
+    映射规则：
+        - 路由专家：``e -> e + e // num_local_routed``；
+        - 共享专家：``ep_rank * num_local_experts + num_local_routed``；
+        - 共享权重：``1 / routed_scaling_factor``，抵消 MoE 后续整体缩放。
+
+    输入输出示例：EP=2、每 rank 2 个路由专家和 1 个共享专家时，原路由 ID
+    ``[0,1,2,3]`` 映射为 ``[0,1,3,4]``，共享槽位 ID 分别为 rank 0 的 2 和 rank 1 的 5。
     """
     if topk_ids.shape[0] == 0:
         return topk_ids, topk_weights
 
     ep_size = get_moe_expert_parallel_world_size()
     ep_rank = get_moe_expert_parallel_rank()
-    # Static EPLB may add redundant physical experts. At this point routed
-    # topk_ids have already been remapped from logical to physical ids, so the
-    # DeepEP interleaved layout must use the physical routed count.
+    # 静态 EPLB 可能增加冗余物理专家。此处路由 topk_ids 已从逻辑 ID 映射为物理 ID，
+    # 因此 DeepEP 交错布局必须使用物理路由专家数量。
     num_local_routed = num_physical_routed_experts // ep_size
     num_local_experts = num_local_routed + num_fused_shared_experts
 
-    # Remap routed IDs: insert gaps for shared expert slots (single fused op)
+    # 重映射路由专家 ID：为每个 rank 的共享专家槽位插入空隙。
     routed = topk_ids[:, :-num_fused_shared_experts]
     topk_ids[:, :-num_fused_shared_experts] = routed + routed // num_local_routed
 
-    # Set shared expert IDs to route to home rank (vectorized)
+    # 向量化设置共享专家 ID，使其路由回当前 EP rank。
     topk_ids[:, -num_fused_shared_experts:] = (
         ep_rank * num_local_experts
         + num_local_routed
         + torch.arange(num_fused_shared_experts, device=topk_ids.device)
     )
 
-    # Override shared weight: 1/routed_scaling_factor so net contribution = 1.0
+    # 覆盖共享专家权重为 1/routed_scaling_factor，使缩放后的净贡献为 1。
     routed_scaling_factor = topk_config.routed_scaling_factor
     if routed_scaling_factor is not None and routed_scaling_factor != 0:
         topk_weights[:, -num_fused_shared_experts:] = 1.0 / routed_scaling_factor
@@ -1475,6 +1669,11 @@ def _post_process_topk_ids(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """统一处理 Top-K ID 的 EPLB、padding、共享专家和 DeepEP 映射。
+
+    返回 ``(最终专家ID, 最终权重, 统计用专家ID)``。输入输出示例：输入均为 ``[M,K]``；
+    padding 行会被屏蔽，EPLB 可把逻辑 ID 映射为物理 ID，DeepEP 可进一步插入共享槽位。
+    """
     num_fused_shared_experts = topk_config.num_fused_shared_experts
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
@@ -1486,10 +1685,8 @@ def _post_process_topk_ids(
         )
     recorder_topk_ids = None
     if _is_cuda:
-        # When shared experts are fused (appended as extra columns in topk_ids),
-        # EPLB dispatch must only remap the routed expert columns.
-        # The shared expert column (value = n_routed_experts) would be out-of-bounds
-        # for the logical-to-physical dispatch table.
+        # 融合共享专家时，它们作为 topk_ids 的额外列追加。EPLB 只能重映射路由专家列；
+        # 共享专家列的值等于 n_routed_experts，若用于逻辑到物理映射表会越界。
         if num_fused_shared_experts > 0 and is_deepep_class_backend():
             shared_cols = topk_ids[:, -num_fused_shared_experts:]
             routed_cols = topk_ids[:, :-num_fused_shared_experts]
@@ -1497,9 +1694,8 @@ def _post_process_topk_ids(
                 routed_cols, expert_location_dispatch_info, num_token_non_padded
             )
             topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
-            # ExpertDistributionRecorder tracks EPLB physical routed experts.
-            # DeepEP dispatch later inserts per-rank shared slots into topk_ids,
-            # so keep the routed physical ids separately for statistics.
+            # ExpertDistributionRecorder 统计 EPLB 的物理路由专家。DeepEP 随后会向
+            # topk_ids 插入每 rank 的共享专家槽位，因此单独保留路由物理 ID 供统计使用。
             recorder_topk_ids = routed_cols
         else:
             topk_ids = _biased_grouped_topk_postprocess(
@@ -1509,10 +1705,8 @@ def _post_process_topk_ids(
         topk_ids = _biased_grouped_topk_postprocess(
             topk_ids, expert_location_dispatch_info, num_token_non_padded
         )
-        # On AMD HIP, the aiter MoE kernels do not handle topk_ids=-1 safely
-        # (negative indices cause illegal memory access). Instead, zero the
-        # routing weights for padded tokens so their MoE output contributes
-        # nothing to the hidden state after the weighted sum.
+        # AMD HIP 的 AITER MoE kernel 不能安全处理 topk_ids=-1，负索引会导致非法访存。
+        # 因此改为把 padding token 的路由权重清零，使其专家输出在加权求和后贡献为 0。
         _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
 
     if recorder_topk_ids is None:
@@ -1526,7 +1720,7 @@ def _post_process_topk_ids(
             else fused_shared_experts_scaling_factor
         )
 
-        # Lazy import to avoid circular-import issues
+        # 延迟导入，避免模块间循环依赖。
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
             fused_append_shared_experts,
         )
@@ -1536,11 +1730,10 @@ def _post_process_topk_ids(
             topk_weights,
             num_fused_shared_experts,
             scale_factor,
-            N,  # base id for shared experts
+            N,  # 共享专家 ID 的起始值。
         )
 
-    # DeepEP: remap to interleaved expert layout where each rank's shared
-    # expert has a unique ID for dispatch routing.
+    # DeepEP：重映射到交错专家布局，使每个 rank 的共享专家具有唯一 dispatch ID。
     if num_fused_shared_experts > 0 and is_deepep_class_backend():
         num_physical_routed_experts = (
             expert_location_dispatch_info.num_physical_experts
@@ -1556,9 +1749,8 @@ def _post_process_topk_ids(
         )
 
     if _is_hip:
-        # Shared-expert append/remap can introduce non-zero weights after the
-        # initial HIP padding mask above. Ensure padded tokens leave this helper
-        # with all expert weights zeroed.
+        # 追加/重映射共享专家可能在前面的 HIP padding mask 之后重新引入非零权重；
+        # 因此函数返回前再次确保 padding token 的所有专家权重均为 0。
         _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
 
     return topk_ids, topk_weights, recorder_topk_ids
@@ -1573,6 +1765,15 @@ def select_experts(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> StandardTopKOutput:
+    """统一的专家选择入口，根据配置和平台选择具体 Top-K 实现并完成后处理。
+
+    主要阶段：输入逻辑/物理专家变换 → grouped/biased/fused/custom Top-K → 可选基准测试
+    路由覆盖 → padding/EPLB/DeepEP 后处理 → 记录专家分布。
+
+    输入输出示例：``hidden_states.shape=[4,d]``、``router_logits.shape=[4,8]``、
+    ``top_k=2`` 时，通常返回 ``StandardTopKOutput``：权重和 ID 均为 ``[4,2]``，
+    router_logits 保持 ``[4,8]``。实验性融合路径可能返回带 packed ID 的兼容子类型。
+    """
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
     topk_group = topk_config.topk_group
@@ -1589,7 +1790,7 @@ def select_experts(
 
     scoring_func = topk_config.scoring_func
 
-    # Set by the fused-gating+pack branch below; None everywhere else.
+    # 仅在后面的 gating+pack 融合分支中设置，其他路径保持 None。
     packed_topk = None
 
     (
@@ -1601,8 +1802,8 @@ def select_experts(
         info=expert_location_dispatch_info,
     )
 
-    # DeepSeek V2/V3/R1 series models use grouped_top_k
-    # remove num_fused_shared_experts from grouped_topk/biased_grouped_topk
+    # DeepSeek V2/V3/R1 系列模型使用 grouped Top-K。
+    # 路由 Top-K 数量需要扣除稍后单独追加的融合共享专家。
     num_routed_topk = top_k - num_fused_shared_experts
     if use_grouped_topk:
         assert topk_group is not None
@@ -1675,7 +1876,7 @@ def select_experts(
             and scoring_func == "softmax"
             and correction_bias is None
         ):
-            # flashinfer_trtllm_routed uses raw-logits topk
+            # flashinfer_trtllm_routed 直接在原始 logits 上执行 Top-K。
             topk_weights, topk_ids = fused_topk_softmax_torch_raw_logits(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -1683,8 +1884,8 @@ def select_experts(
                 renormalize=renormalize,
             )
         else:
-            # Fused gating + routed pack (SGLANG_OPT_LORA_FUSED_TOPK_PACK): only on the plain
-            # CUDA softmax path with no EPLB remap / shared experts / bias / routing overrides.
+            # gating+routed pack 融合仅用于普通 CUDA softmax 路径，并要求没有 EPLB
+            # 重映射、共享专家、correction bias 或自定义路由覆盖。
             _fused_topk_pack = False
             if _SGLANG_EXPERIMENTAL_LORA_OPTI:
                 from sglang.srt.lora.trtllm_lora_temp.environ import lora_envs
@@ -1709,17 +1910,17 @@ def select_experts(
                         device=hidden_states.device,
                     )
 
-            # Qwen3MOE uses fused_topk
+            # Qwen3-MoE 使用 fused_topk。
             _fused_topk_kwargs = {}
             # ===== TO BE REFACTORED ====
-            # Only the experimental fused topk+pack passes packed_out/num_token_non_padded;
-            # the default call keeps the upstream signature (fused_topk_cpu lacks these).
+            # 只有实验性的 Top-K+pack 融合路径传 packed_out/num_token_non_padded；
+            # 默认调用保持上游函数签名，因为 fused_topk_cpu 没有这些参数。
             if packed_topk is not None:
                 _fused_topk_kwargs = dict(
                     packed_out=packed_topk,
                     num_token_non_padded=num_token_non_padded,
                 )
-            # ===== END TO BE REFACTORED ====
+            # ===== 待重构区域结束 =====
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -1751,8 +1952,8 @@ def select_experts(
         )
 
     if simulate_uniform_experts:
-        # Benchmark-only: override gating with random-offset uniform expert assignment
-        # to avoid expert imbalance from dummy/random weights. Do NOT use in production.
+        # 仅用于基准测试：用带随机起点的均匀专家分配覆盖真实路由，避免虚假/随机权重
+        # 导致专家负载倾斜。禁止用于生产环境。
         num_tokens, k = topk_ids.shape
         num_experts = router_logits.shape[1]
         if k > 0:
@@ -1764,8 +1965,8 @@ def select_experts(
             topk_ids = ((offsets + steps * step) % num_experts).to(topk_ids.dtype)
             topk_weights = torch.ones_like(topk_weights) / k
     elif simulate_round_robin_experts:
-        # Benchmark-only: override gating with deterministic expert assignment
-        # to avoid routing noise from dummy/random weights. Do NOT use in production.
+        # 仅用于基准测试：用确定性的轮询专家分配覆盖真实路由，避免虚假/随机权重
+        # 带来的路由噪声。禁止用于生产环境。
         num_tokens, k = topk_ids.shape
         num_experts = router_logits.shape[1]
         topk_ids = _make_round_robin_expert_ids(
@@ -1802,7 +2003,7 @@ def select_experts(
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 
-# Register fake implementations for torch.compile support
+# 注册 fake 实现，使 torch.compile 能在不执行真实 kernel 的情况下推导输出形状。
 if _is_cuda:
 
     @torch.library.register_fake("sgl_kernel::moe_fused_gate")

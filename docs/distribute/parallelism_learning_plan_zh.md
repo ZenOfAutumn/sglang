@@ -254,6 +254,8 @@ $$
 
 **目标**：理解 MoE 如何按 expert 切分、all-to-all 通信、以及负载不均问题。
 
+> 详细的按小时源码路线、手算题和验收项见 `docs/distribute/expert_parallelism_learning_plan_zh.md`。
+
 - **阅读顺序**：
   1. `docs/theory/distributed/EP.md` §1–§5（含 §5 手算一次 EP 路由，务必跟着算）。
   2. `srt/layers/moe/ep_moe/`：EP MoE 层实现。

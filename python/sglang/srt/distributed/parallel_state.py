@@ -38,6 +38,8 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed
+from torch.distributed import Backend, ProcessGroup
+
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.distributed.utils import set_global_tcp_store
@@ -59,7 +61,6 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
-from torch.distributed import Backend, ProcessGroup
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -76,6 +77,13 @@ _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 
 
 def get_torch_distributed_pg_options(group_name=None):
+    """构造 NPU/HCCL 进程组选项，其他设备返回 ``None``。
+
+    输入输出示例：
+        - CUDA 环境：``get_torch_distributed_pg_options("tp") -> None``；
+        - NPU 环境且组名为 ``"moe_ep"``：返回配置了 HCCL 缓冲区大小的 Options；
+        - NPU 环境但组名为 ``"tp"``：返回 ``None``，沿用 PyTorch 默认选项。
+    """
     if not _is_npu:
         return None
 
@@ -157,12 +165,23 @@ _groups: Dict[str, Callable[[], Optional["GroupCoordinator"]]] = {}
 
 
 def _register_group(group: "GroupCoordinator") -> None:
+    """用弱引用注册通信组，供只接受字符串参数的自定义算子反查。
+
+    输入输出示例：
+        输入 ``group.unique_name == "tp:0"`` 后，``_groups["tp:0"]()`` 返回该组；
+        本函数无返回值，组销毁后弱引用会返回 ``None``。
+    """
     _groups[group.unique_name] = weakref.ref(group)
 
 
 @register_custom_op(mutates_args=["tensor"])
 @register_split_op()
 def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
+    """按组名执行原地 all-reduce，供 ``torch.compile`` 可追踪的自定义算子调用。
+
+    输入输出示例（两 rank、SUM）：rank 0 输入 ``[1, 2]``，rank 1 输入 ``[3, 4]``；
+    调用后两个 rank 的原张量都变为 ``[4, 6]``，函数返回 ``None``。
+    """
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
@@ -174,6 +193,11 @@ def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
 def outplace_all_reduce(
     tensor: torch.Tensor, group_name: str, outplace_all_reduce_method: str
 ) -> torch.Tensor:
+    """按组名执行非原地 all-reduce，返回新张量并保留输入张量不变。
+
+    输入输出示例（两 rank、SUM）：rank 0 输入 ``[1]``，rank 1 输入 ``[2]``；
+    两边均返回新张量 ``[3]``，原输入仍分别为 ``[1]`` 和 ``[2]``。
+    """
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
@@ -185,6 +209,11 @@ def outplace_all_reduce(
 def reg_all_gather_into_tensor(
     output: torch.Tensor, input: torch.Tensor, group_name: str
 ) -> None:
+    """把各 rank 的输入沿第 0 维收集到预分配的 ``output``。
+
+    输入输出示例（两 rank）：输入分别为 ``[[1, 2]]``、``[[3, 4]]``，
+    每个 rank 的 ``output`` 最终都为 ``[[1, 2], [3, 4]]``；函数无返回值。
+    """
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
@@ -196,6 +225,11 @@ def reg_all_gather_into_tensor(
 def reg_reduce_scatter_tensor(
     output: torch.Tensor, input: torch.Tensor, group_name: str
 ) -> None:
+    """对输入先逐元素归约，再把第 0 维分片写入各 rank 的 ``output``。
+
+    输入输出示例（两 rank、SUM）：rank 0 输入 ``[1, 2, 3, 4]``，rank 1 输入
+    ``[10, 20, 30, 40]``；rank 0 输出 ``[11, 22]``，rank 1 输出 ``[33, 44]``。
+    """
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
@@ -207,6 +241,12 @@ def reg_reduce_scatter_tensor(
 def reg_all_to_all_single(
     output: torch.Tensor, input: torch.Tensor, group_name: str
 ) -> None:
+    """执行等长 all-to-all，把每个 rank 的输入均分后交换给所有 rank。
+
+    输入输出示例（两 rank）：rank 0 输入 ``[0, 1, 2, 3]``，rank 1 输入
+    ``[10, 11, 12, 13]``；rank 0 输出 ``[0, 1, 10, 11]``，rank 1 输出
+    ``[2, 3, 12, 13]``。
+    """
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
@@ -632,6 +672,9 @@ class GroupCoordinator:
         整体分发优先级（从上到下）：
           CPU shm → HPU/XPU/NPU 专用 → pynccl+symm-mem →
           ca(custom) → qr(quick, ROCm) → pymscclpp → torch symm-mem → pynccl → 原地回退
+
+        输入输出示例（两 rank、SUM）：rank 0 输入 ``tensor([1., 2.])``，rank 1 输入
+        ``tensor([3., 4.])``；两个 rank 都得到 ``tensor([4., 6.])``。
         """
         # 只有 1 张 GPU 时直接返回，无需通信
         if self.world_size == 1:
@@ -718,6 +761,9 @@ class GroupCoordinator:
         """
         面向用户的量化 all-reduce，用法与 all_reduce 类似（仅 NPU 支持）。
         先将数据量化再通信，以降低通信量。
+
+        输入输出示例（两 rank）：rank 0 输入 ``[1., 2.]``、rank 1 输入 ``[3., 4.]``，
+        两边均得到近似 ``[4., 6.]``；具体误差取决于 NPU 通信器的量化格式。
         """
         # 只有 1 张卡时直接返回
         if self.world_size == 1:
@@ -739,6 +785,9 @@ class GroupCoordinator:
         """尝试通过 custom all-reduce 通信器执行融合的 all-reduce + RMSNorm。仅 ROCm/HIP 支持。
 
         返回 None 表示不支持融合路径，调用方应回退到“all-reduce + 单独 RMSNorm”。
+
+        输入输出示例：输入形状均为 ``[num_tokens, hidden_size]`` 时，支持路径返回
+        ``(归一化输出, 更新后的 residual)``；当前设备或通信器不支持时返回 ``None``。
         """
         ca_comm = self.ca_comm
         if ca_comm is None or getattr(ca_comm, "disabled", True):
@@ -855,6 +904,10 @@ class GroupCoordinator:
         让后续的 LayerNorm 等逐 token 算子只在分片上计算。
 
         注：`output` 由调用方预先分配，本方法原地填充。
+
+        输入输出示例（两 rank、SUM）：两个 rank 分别输入 ``[1,2,3,4]`` 和
+        ``[10,20,30,40]``；rank 0 的 ``output`` 为 ``[11,22]``，rank 1 为
+        ``[33,44]``。
         """
         pynccl_comm = self.pynccl_comm
         # 开启对称内存时，即使 pynccl 处于 disabled 也要走 pynccl（才能用到零拷贝快路径）
@@ -878,6 +931,9 @@ class GroupCoordinator:
 
         NPU 直接调用实现；其他平台走自定义算子 `reg_reduce_scatter_tensor`，
         以便 torch.compile 能正确识别“会修改 output”这一副作用。
+
+        输入输出示例（world_size=2）：``input.shape == [8, d]`` 时，每个 rank 需传入
+        ``output.shape == [4, d]``；调用后不同 rank 分别持有归约结果的前、后半段。
         """
         if _is_npu:
             self._reduce_scatter_tensor(output, input)
@@ -885,11 +941,19 @@ class GroupCoordinator:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
-        """all-to-all 的实际执行体：每个 rank 把自己的数据均分后分发给全部 rank。"""
+        """all-to-all 的实际执行体：每个 rank 把自己的数据均分后分发给全部 rank。
+
+        输入输出示例见 ``all_to_all_single``；本方法只负责调用底层进程组。
+        """
         torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
     def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor):
-        """all-to-all 对外入口；单卡时退化为一次拷贝。"""
+        """all-to-all 对外入口；单卡时退化为一次拷贝。
+
+        输入输出示例（两 rank）：rank 0 输入 ``[0,1,2,3]``，rank 1 输入
+        ``[10,11,12,13]``；rank 0 输出 ``[0,1,10,11]``，rank 1 输出
+        ``[2,3,12,13]``。
+        """
         if self.world_size == 1:
             output.copy_(input)
             return
@@ -905,6 +969,9 @@ class GroupCoordinator:
         与 `reduce_scatter_tensor` 的区别：输入是长度为 world_size 的张量列表（每个
         元素对应一个目标 rank 的分片），而不是单个已拼接好的大张量；
         结果（对应本 rank 分片的求和）写入 `output`。
+
+        输入输出示例（两 rank）：rank 0 输入列表 ``[[1,2], [3,4]]``，rank 1 输入
+        ``[[10,20], [30,40]]``；rank 0 输出 ``[11,22]``，rank 1 输出 ``[33,44]``。
         """
         # TODO(ch-wan): 待支持其他后端（目前只有 torch.distributed 路径）
         torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
@@ -929,6 +996,9 @@ class GroupCoordinator:
             本 rank 对应的那一分片的归约结果。
 
         注：变长语义仅 pynccl 支持，torch.distributed 无对应接口，因此无回退路径。
+
+        输入输出示例（两 rank，``sizes=[1, 2]``）：归约后的完整第 0 维长度为 3，
+        rank 0 得到 1 行，rank 1 得到 2 行。
         """
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
@@ -1036,6 +1106,9 @@ class GroupCoordinator:
 
         NPU/XPU 直接调用实现；其他平台走自定义算子 `reg_all_gather_into_tensor`，
         以便 torch.compile 能正确识别“会修改 output”这一副作用。
+
+        输入输出示例（两 rank）：各 rank 输入形状 ``[1, d]``，预分配输出形状
+        ``[2, d]``；调用后每个 rank 的输出都按 rank 顺序包含两份输入。
         """
         if _is_npu or _is_xpu:
             self._all_gather_into_tensor(output, input)
@@ -1051,6 +1124,9 @@ class GroupCoordinator:
         从而消除由同步导致的 CPU 侧 launch-kernel 阻塞问题。
         具体实现上使用 pynccl 提供的接口，去掉 event 的同步逻辑。
         主要用于 context parallel（CP）下的通信-计算重叠。
+
+        输入输出示例（两 rank）：各 rank 输入 ``[1, d]``、输出缓冲区 ``[2, d]``；
+        调用立即把通信排入指定 stream，待该 stream 完成后输出包含两份输入。
         """
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
@@ -1077,6 +1153,9 @@ class GroupCoordinator:
             dim: 在哪个维度上拼接（支持负数，默认最后一维）。
             output_tensor_list: 可选；传入时改为列表形式的原地 all-gather，
                 结果逐个写入列表元素（不做拼接，返回值不是拼接张量）。
+
+        输入输出示例（两 rank，``dim=0``）：rank 0 输入 ``[[1,2]]``，rank 1 输入
+        ``[[3,4]]``；每个 rank 都返回 ``[[1,2], [3,4]]``。
         """
         world_size = self.world_size
         # 只有 1 张 GPU 时跳过通信
@@ -1169,6 +1248,9 @@ class GroupCoordinator:
             与输入一一对应的输出张量列表（即使传入的是单个张量）。
 
         注：变长语义仅 pynccl 支持，无 torch.distributed 回退路径。
+
+        输入输出示例（两 rank，``sizes=[1, 2]``）：rank 0 输入形状 ``[1,d]``，
+        rank 1 输入形状 ``[2,d]``；两边输出列表中的张量形状均为 ``[3,d]``。
         """
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
@@ -1225,6 +1307,9 @@ class GroupCoordinator:
 
         注：假设输入张量在所有 rank 上位于相同类型的设备上。
         注：`dst` 是目标进程的“组内 rank”，不是全局 rank。
+
+        输入输出示例（两 rank，``dst=0, dim=0``）：输入分别为 ``[[1]]``、``[[2]]``；
+        rank 0 返回 ``[[1],[2]]``，rank 1 返回 ``None``。
         """
         world_size = self.world_size
         # 只有 1 张 GPU 时跳过通信
@@ -1256,6 +1341,9 @@ class GroupCoordinator:
     def broadcast(self, input_: torch.Tensor, src: int = 0):
         """广播输入张量（原地写入，非 src 端的内容会被覆盖）。
         注：`src` 是源进程的“组内 rank”。
+
+        输入输出示例（两 rank，``src=0``）：rank 0 输入 ``[1,2]``，rank 1 输入任意
+        占位张量；调用后两个 rank 的张量都为 ``[1,2]``。
         """
         assert src < self.world_size, f"Invalid src rank ({src})"
 
@@ -1271,6 +1359,9 @@ class GroupCoordinator:
     def broadcast_object(self, obj: Optional[Any] = None, src: int = 0):
         """广播任意 Python 对象（通过 pickle 序列化，走 CPU 组）。
         注：`src` 是源进程的“组内 rank”。
+
+        输入输出示例：源 rank 传入 ``{"step": 3}``，其余 rank 传入 ``None``；
+        所有 rank 最终都返回 ``{"step": 3}``。
         """
         assert src < self.world_size, f"Invalid src rank ({src})"
 
@@ -1298,6 +1389,9 @@ class GroupCoordinator:
     ):
         """广播一个对象列表（原地写入 obj_list）。
         注：`src` 是源进程的“组内 rank”。
+
+        输入输出示例：源 rank 传入 ``["prefill", 8]``，其余 rank 传入
+        ``[None, None]``；调用后每个列表都变为 ``["prefill", 8]``。
         """
         assert src < self.world_size, f"Invalid src rank ({src})"
 
@@ -1311,7 +1405,11 @@ class GroupCoordinator:
         return obj_list
 
     def all_gather_object(self, obj: Any) -> List[Any]:
-        """收集组内每个 rank 的对象，返回按组内 rank 排序的列表（走 CPU 组）。"""
+        """收集组内每个 rank 的对象，返回按组内 rank 排序的列表（走 CPU 组）。
+
+        输入输出示例：两个 rank 分别传入 ``{"rank": 0}``、``{"rank": 1}``，
+        两边均返回 ``[{"rank": 0}, {"rank": 1}]``。
+        """
         objs = [None] * self.world_size
         torch.distributed.all_gather_object(objs, obj, group=self.cpu_group)
         return objs
@@ -1332,6 +1430,10 @@ class GroupCoordinator:
 
         注：`dst` 是目标进程的“组内 rank”。
         返回：async_send=True 时返回未完成的 P2PWork 列表，需调用方自行等待。
+
+        输入输出示例：rank 0 调用 ``send_object({"step": 3}, dst=1)``，rank 1 调用
+        ``recv_object(src=0)`` 后返回 ``{"step": 3}``；同步发送时返回空列表，异步发送
+        时返回两个分别对应“长度”和“数据本体”的 ``P2PWork``。
         """
 
         assert dst < self.world_size, f"Invalid dst rank ({dst})"
@@ -1372,8 +1474,11 @@ class GroupCoordinator:
         self,
         src: int,
     ) -> Any:
-        """从源 rank 接收一个 Python 对象（与 send_object 配对使用，走 CPU 组）。"""
-        """注：`src` 是源进程的“组内 rank”。"""
+        """从源 rank 接收一个 Python 对象（与 ``send_object`` 配对，走 CPU 组）。
+
+        ``src`` 是源进程的组内 rank。输入输出示例：发送端传入 ``["a", 1]`` 后，
+        ``recv_object(src=0)`` 返回反序列化后的 ``["a", 1]``。
+        """
 
         assert src < self.world_size, f"Invalid src rank ({src})"
         assert (
@@ -1416,6 +1521,9 @@ class GroupCoordinator:
         思路：先把字典拆成“元数据列表 + 张量列表”，广播元数据让接收端知道每个
         张量的 shape/dtype/device 并预分配，再异步广播各个张量。
         注：`src` 是源进程的“组内 rank”。
+
+        输入输出示例：源 rank 传入 ``{"hidden": tensor([[1,2]]), "step": 3}``，
+        其余 rank 传入 ``None``；所有 rank 最终返回键、非张量值及张量内容都相同的字典。
         """
         # 只有 1 张 GPU 时跳过通信
         if not torch.distributed.is_initialized() or self.world_size == 1:
@@ -1503,6 +1611,10 @@ class GroupCoordinator:
         `all_gather_group` 不为空时启用 send-allgather 优化：发送方只发自己负责的
         那一切片，接收方再在该组内 all-gather 拼回完整张量，以减少跨节点流量。
         注：`dst` 是目标进程的“组内 rank”；默认为环上的下一个 rank。
+
+        输入输出示例：PP 前一阶段调用
+        ``send_tensor_dict({"hidden": tensor([[1,2]])}, dst=1)``，后一阶段调用
+        ``recv_tensor_dict(src=0)`` 后得到相同 shape、dtype 和内容的 ``hidden`` 张量。
         """
         # 只有 1 张 GPU 时跳过通信
         if self.world_size == 1:
@@ -1554,8 +1666,11 @@ class GroupCoordinator:
         src: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
-        """接收一个张量字典（与 send_tensor_dict 配对使用）。
-        注：`src` 是源进程的“组内 rank”；默认为环上的上一个 rank。
+        """接收一个张量字典（与 ``send_tensor_dict`` 配对使用）。
+
+        ``src`` 是源进程的组内 rank；默认为环上的上一个 rank。输入输出示例：发送端
+        发送 ``{"hidden": tensor([[1,2]]), "step": 3}`` 后，本函数返回同结构字典；
+        张量会按元数据在当前设备重新分配，非张量值直接从元数据恢复。
         """
         # 只有 1 张 GPU 时跳过通信
         if not torch.distributed.is_initialized() or self.world_size == 1:
@@ -1611,15 +1726,22 @@ class GroupCoordinator:
         return tensor_dict
 
     def barrier(self):
-        """组内的屏障同步。
-        注：不要在这里用 `device_group`！NCCL 的 `barrier` 很糟糕，因为它内部是一个
-        使用隐式创建的 GPU 张量的广播操作，很容易搞乱当前设备。因此改用 CPU 组。
+        """阻塞当前 rank，直到组内所有 rank 都到达该屏障。
+
+        不使用 ``device_group``：NCCL barrier 内部会广播隐式创建的 GPU 张量，容易
+        扰乱当前设备，因此这里固定使用 CPU 组。输入输出示例：四个 rank 到达时间不同，
+        最先到达的 rank 会等待最后一个 rank 到达，随后四者继续执行；无返回值。
         """
         torch.distributed.barrier(group=self.cpu_group)
 
     def send(self, tensor: torch.Tensor, dst: Optional[int] = None) -> None:
-        """以非阻塞方式向目标 rank 发送一个张量"""
-        """注：`dst` 是目标进程的“组内 rank”；默认为环上的下一个 rank。"""
+        """向目标 rank 发送一个张量。
+
+        ``dst`` 是目标进程的组内 rank；省略时发送给环上的下一个 rank。
+        输入输出示例：组 ``[0,1]`` 的 rank 0 调用 ``send(tensor([1,2]), dst=1)``；
+        rank 1 可用 ``recv(torch.Size([2]), torch.int64, src=0)`` 得到 ``[1,2]``。
+        本函数无返回值；底层 PyNccl 路径可异步排队，torch.distributed 路径为阻塞 send。
+        """
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
 
@@ -1632,8 +1754,12 @@ class GroupCoordinator:
     def recv(
         self, size: torch.Size, dtype: torch.dtype, src: Optional[int] = None
     ) -> torch.Tensor:
-        """从源 rank 接收一个张量（需要调用方提前知道 size 与 dtype）。"""
-        """注：`src` 是源进程的“组内 rank”；默认为环上的上一个 rank。"""
+        """从源 rank 接收一个张量，调用方必须提前知道形状与类型。
+
+        ``src`` 是源进程的组内 rank；省略时从环上的上一个 rank 接收。
+        输入输出示例：rank 0 发送 ``tensor([1.,2.])`` 后，rank 1 调用
+        ``recv(torch.Size([2]), torch.float32, src=0)``，返回 ``tensor([1.,2.])``。
+        """
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
 
@@ -1674,6 +1800,11 @@ def get_world_group() -> GroupCoordinator:
 def init_world_group(
     ranks: List[int], local_rank: int, backend: str, recovered_rank: bool = False
 ) -> GroupCoordinator:
+    """创建覆盖全部进程的 WORLD 组协调器。
+
+    输入输出示例：输入 ``ranks=[0,1,2,3], local_rank=1, backend="nccl"``，
+    当前全局 rank 1 返回 ``world_size=4``、``rank_in_group=1`` 的协调器。
+    """
     return GroupCoordinator(
         group_ranks=[ranks],
         local_rank=local_rank,
@@ -1702,6 +1833,11 @@ def init_model_parallel_group(
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     recovered_rank: bool = False,
 ) -> GroupCoordinator:
+    """创建某一并行维度的组协调器，并按平台与全局开关选择通信优化。
+
+    输入输出示例：``group_ranks=[[0,1],[2,3]]`` 且当前 rank 为 2 时，返回仅持有
+    ``ranks=[2,3]``、``rank_in_group=0`` 的协调器；所有进程仍须以相同顺序创建全部子组。
+    """
     if use_custom_allreduce is None:
         use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
     if use_mscclpp_allreduce is None:
@@ -1733,18 +1869,28 @@ _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
 
-# duplicate GroupCoordinator for prefill in PD-Multiplexing
+# 为 PD-Multiplexing 的 prefill 阶段复制一份独立的 GroupCoordinator。
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
 
 _ENABLE_PDMUX_P_TP: bool = False
 
 
 def set_pdmux_status(enable_prefill_multiplexing: bool):
+    """切换是否让 ``get_tp_group`` 返回 PD-Multiplexing 的 prefill TP 组。
+
+    输入输出示例：传入 ``True`` 后，``get_tp_group()`` 返回
+    ``_PDMUX_PREFILL_TP_GROUP``；传入 ``False`` 后恢复返回普通 ``_TP``。无返回值。
+    """
     global _ENABLE_PDMUX_P_TP
     _ENABLE_PDMUX_P_TP = enable_prefill_multiplexing
 
 
 def get_tp_group() -> GroupCoordinator:
+    """返回当前生效的张量并行（TP）组。
+
+    输出示例：普通模式返回 ``_TP``；PD-Multiplexing prefill 模式返回其专用 TP 组。
+    未初始化时抛出断言错误。
+    """
     if _ENABLE_PDMUX_P_TP:
         assert (
             _PDMUX_PREFILL_TP_GROUP is not None
@@ -1755,6 +1901,7 @@ def get_tp_group() -> GroupCoordinator:
 
 
 def get_attn_tp_group() -> GroupCoordinator:
+    """返回注意力张量并行（Attention TP）组；未初始化时抛出断言错误。"""
     assert (
         _ATTN_TP is not None
     ), "attention tensor model parallel group is not initialized"
@@ -1762,6 +1909,7 @@ def get_attn_tp_group() -> GroupCoordinator:
 
 
 def get_attn_cp_group() -> GroupCoordinator:
+    """返回注意力上下文并行（Attention CP）组；未初始化时抛出断言错误。"""
     assert (
         _ATTN_CP is not None
     ), "attention context model parallel group is not initialized"
@@ -1774,39 +1922,47 @@ _MOE_TP: Optional[GroupCoordinator] = None
 
 
 def get_moe_dp_group() -> GroupCoordinator:
+    """返回 MoE 数据并行组；例如 MoE DP=2 时其 ``world_size`` 为 2。"""
     assert _MOE_DP is not None, "moe data parallel group is not initialized"
     return _MOE_DP
 
 
 def get_moe_ep_group() -> GroupCoordinator:
+    """返回 MoE 专家并行组；例如 MoE EP=8 时其 ``world_size`` 为 8。"""
     assert _MOE_EP is not None, "expert model parallel group is not initialized"
     return _MOE_EP
 
 
 def get_moe_tp_group() -> GroupCoordinator:
+    """返回 MoE 张量并行组；例如 MoE TP=2 时其 ``world_size`` 为 2。"""
     assert _MOE_TP is not None, "expert model parallel group is not initialized"
     return _MOE_TP
 
 
-# kept for backward compatibility
+# 为保持向后兼容而保留旧函数名。
 get_tensor_model_parallel_group = get_tp_group
 
 _PP: Optional[GroupCoordinator] = None
 
 
 def get_pp_group() -> GroupCoordinator:
+    """返回流水线并行（PP）组；例如 PP=4 时其 ``world_size`` 为 4。"""
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
 
 
-# kept for backward compatibility
+# 为保持向后兼容而保留旧函数名。
 get_pipeline_model_parallel_group = get_pp_group
 
 
 def get_mooncake_transfer_engine():
-    """
-    Return the shared MooncakeTransferEngine if initialized in device_communicators,
-    else None. Used by disaggregation mooncake backend and mem_cache mooncake_store.
+    """返回设备通信器中已初始化的共享 ``MooncakeTransferEngine``。
+
+    若尚未初始化则返回 ``None``。该实例由解耦式 Mooncake 后端和
+    ``mem_cache/mooncake_store`` 共同使用。
+
+    输入输出示例：初始化 Mooncake 通信器后返回共享引擎对象；未启用 Mooncake 时
+    返回 ``None``。
     """
     from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
         get_mooncake_transfer_engine as _get_engine,
@@ -1817,18 +1973,15 @@ def get_mooncake_transfer_engine():
 
 @contextmanager
 def graph_capture(stream: Optional[torch.cuda.Stream] = None):
-    """
-    `graph_capture` is a context manager which should surround the code that
-    is capturing the CUDA graph. Its main purpose is to ensure that the
-    some operations will be run after the graph is captured, before the graph
-    is replayed. It returns a `GraphCaptureContext` object which contains the
-    necessary data for the graph capture. Currently, it only contains the
-    stream that the graph capture is running on. This stream is set to the
-    current CUDA stream when the context manager is entered and reset to the
-    default stream when the context manager is exited. This is to ensure that
-    the graph capture is running on a separate stream from the default stream,
-    in order to explicitly distinguish the kernels to capture
-    from other kernels possibly launched on background in the default stream.
+    """为 CUDA Graph 捕获统一切换各模型并行通信组的上下文管理器。
+
+    进入上下文时，TP、PP、MoE EP/TP 通信器会切换到支持图捕获的状态，并在独立
+    stream 上执行待捕获 kernel，避免混入默认 stream 后台启动的其他 kernel。退出后
+    恢复通信器状态。返回的 ``GraphCaptureContext`` 当前只保存捕获所用 stream。
+
+    输入输出示例：
+        ``with graph_capture() as ctx: model(x)``；代码块内 ``ctx.stream`` 是捕获流，
+        退出代码块后通信器恢复普通执行状态。
     """
     with (
         get_tp_group().graph_capture(stream=stream) as context,
@@ -1865,22 +2018,29 @@ def set_torch_symm_mem_all_reduce(enable: bool):
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
 
 
-# TODO: refactor in-tree platforms to get rid of this wrapper
+# TODO：重构仓库内的平台实现，最终移除这个包装函数。
 def get_default_distributed_backend(device: str) -> str:
-    # We deliberately go through ``platforms.current_platform`` (rather than
-    # ``from ... import current_platform``) so each call resolves through the
-    # platforms package's lazy ``__getattr__`` and picks up runtime overrides
-    # of ``_current_platform`` (e.g. in tests).
+    """返回设备类型对应的默认 PyTorch 分布式后端。
+
+    输入输出示例：``"cuda" -> "nccl"``、``"cpu" -> "gloo"``；实际当前平台的
+    返回值由平台实现决定。
+    """
+    # 这里刻意通过 ``platforms.current_platform`` 动态访问，而不是直接导入对象。
+    # 这样每次调用都会经过 platforms 包的惰性 ``__getattr__``，从而感知运行时对
+    # ``_current_platform`` 的覆盖。
     if device == platforms.current_platform.device_type:
         return platforms.current_platform.get_torch_distributed_backend_str()
     return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
 
 def _create_global_tcp_store(rank: int, world_size: int) -> None:
-    """Create a global TCPStore for coordination across ranks.
+    """创建供所有 rank 协调使用的全局 ``TCPStore``。
 
-    This function creates a TCPStore that all ranks can use for coordination
-    (e.g., for NIXL buffer setup).
+    该 Store 用于 NIXL 缓冲区初始化等不适合走 device collective 的控制面协作。
+    rank 0 作为服务端，其余 rank 连接同一 ``MASTER_ADDR:port``。
+
+    输入输出示例：输入 ``rank=0, world_size=8`` 时创建服务端并注册到全局状态；
+    输入 ``rank=1, world_size=8`` 时连接该服务端。本函数无显式返回值。
     """
     from torch.distributed import TCPStore
 
@@ -1894,8 +2054,8 @@ def _create_global_tcp_store(rank: int, world_size: int) -> None:
 
     base_store_port = envs.SGLANG_TCP_STORE_PORT.get()
 
-    # Rank 0 gets its local IP and broadcasts it to all ranks
-    # Use broadcast_object_list which works with any backend (handles CPU/GPU automatically)
+    # 环境变量未提供主节点地址时，由 rank 0 获取本机 IP 并广播给所有 rank。
+    # ``broadcast_object_list`` 可适配任意后端，并自动处理 CPU/GPU 对象通信。
     if not master_ip:
         if rank == 0:
             master_ip = get_local_ip_auto()
@@ -1941,6 +2101,22 @@ def init_distributed_environment(
     moe_a2a_backend: Optional[str] = None,
     recovered_rank: bool = False,
 ):
+    """初始化 PyTorch 分布式环境以及 SGLang 的 WORLD 组封装。
+
+    参数：
+        world_size: 全局进程数；每个进程必须传入相同值。
+        rank: 当前进程的全局 rank，范围为 ``[0, world_size)``。
+        distributed_init_method: rendezvous 地址，通常为 ``env://`` 或 ``tcp://...``。
+        local_rank: 当前进程在节点内的设备编号；``-1`` 时从环境或全局 rank 推导。
+        backend: device 进程组后端，如 ``nccl``、``gloo``、``mooncake``。
+        timeout: 进程组操作超时秒数。
+        moe_a2a_backend: MoE all-to-all 后端；为 ``nixl`` 时额外创建 TCPStore。
+        recovered_rank: 当前 rank 是否由弹性恢复流程重新加入。
+
+    输入输出示例：四卡单机的每个进程分别调用
+    ``init_distributed_environment(4, rank, "env://", rank, "nccl")``；调用结束后
+    ``get_world_group().ranks == [0,1,2,3]``，函数无显式返回值。
+    """
     logger.debug(
         "world_size=%d rank=%d local_rank=%d " "distributed_init_method=%s backend=%s",
         world_size,
@@ -1976,13 +2152,13 @@ def init_distributed_environment(
         if backend == "mooncake":
             from mooncake.ep import MooncakeBackendOptions
 
-            # Setting "cuda" as device here is safe, as it is guarded under the mooncake case
+            # 此分支仅在 Mooncake 后端下执行，因此这里固定使用 ``cuda`` 是安全的。
             active_ranks = torch.ones(world_size, dtype=torch.int32, device="cuda")
             pg_options = MooncakeBackendOptions(active_ranks, recovered_rank)
         else:
             pg_options = get_torch_distributed_pg_options()
 
-        # this backend is used for WORLD
+        # 这里的 backend 用于创建包含全部 rank 的 WORLD 进程组。
         torch.distributed.init_process_group(
             backend=backend,
             init_method=distributed_init_method,
@@ -1992,16 +2168,14 @@ def init_distributed_environment(
             pg_options=pg_options,
         )
 
-        # Create a global TCPStore for coordination (used by NIXL)
+        # NIXL 需要额外的全局 TCPStore 完成各 rank 间的控制面协调。
         if moe_a2a_backend == "nixl":
             _create_global_tcp_store(rank, world_size)
 
-    # set the local rank
-    # local_rank is not available in torch ProcessGroup,
-    # see https://github.com/pytorch/pytorch/issues/122816
+    # 设置节点内 local rank。PyTorch ProcessGroup 本身不提供 local_rank，
+    # 参见 https://github.com/pytorch/pytorch/issues/122816。
     if local_rank == -1:
-        # local rank not set, this usually happens in single-node
-        # setting, where we can use rank as local rank
+        # 未显式设置 local rank 通常意味着单节点部署，此时可用全局 rank 作为 local rank。
         if distributed_init_method == "env://":
             local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         else:
@@ -2415,8 +2589,13 @@ def ensure_model_parallel_initialized(
     pipeline_model_parallel_size: int,
     backend: Optional[str] = None,
 ) -> None:
-    """便捷函数：若模型并行组尚未初始化则初始化它们；若已初始化，则校验
-    张量并行与流水线并行的规模是否与预期一致。
+    """确保模型并行组已按期望规模初始化。
+
+    尚未初始化时调用 ``initialize_model_parallel``；已初始化时校验 TP 与 PP 规模，
+    不匹配则抛出断言错误。
+
+    输入输出示例：在 ``world_size=8`` 下传入 ``TP=2, EP=1, PP=4``，首次调用创建
+    对应进程组，后续相同参数调用仅校验状态；函数无返回值。
     """
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
     if not model_parallel_is_initialized():
@@ -2494,7 +2673,7 @@ def get_tensor_model_parallel_rank():
     return get_tp_group().rank_in_group
 
 
-# ATTN_TP
+# 注意力张量并行（Attention TP）查询接口。
 def get_attn_tensor_model_parallel_world_size():
     """返回注意力张量并行组（Attention TP）的进程数。"""
     return get_attn_tp_group().world_size
@@ -2505,7 +2684,7 @@ def get_attn_tensor_model_parallel_rank():
     return get_attn_tp_group().rank_in_group
 
 
-# ATTN_CP
+# 注意力上下文并行（Attention CP）查询接口。
 def get_attn_context_model_parallel_world_size():
     """返回注意力上下文并行组（Attention CP）的进程数。"""
     return get_attn_cp_group().world_size
@@ -2526,7 +2705,7 @@ def get_pipeline_model_parallel_rank():
     return get_pp_group().rank_in_group
 
 
-# MOE_DP
+# MoE 数据并行（MoE DP）查询接口。
 def get_moe_data_parallel_world_size():
     """返回 MoE 数据并行组（MoE DP）的进程数。"""
     return get_moe_dp_group().world_size
@@ -2537,7 +2716,7 @@ def get_moe_data_parallel_rank():
     return get_moe_dp_group().rank_in_group
 
 
-# MOE_EP
+# MoE 专家并行（MoE EP）查询接口。
 def get_moe_expert_parallel_world_size():
     """返回 MoE 专家并行组（MoE EP）的进程数。"""
     return get_moe_ep_group().world_size
@@ -2548,7 +2727,7 @@ def get_moe_expert_parallel_rank():
     return get_moe_ep_group().rank_in_group
 
 
-# MOE_TP
+# MoE 张量并行（MoE TP）查询接口。
 def get_moe_tensor_parallel_world_size():
     """返回 MoE 张量并行组（MoE TP）的进程数。"""
     return get_moe_tp_group().world_size
@@ -2560,7 +2739,11 @@ def get_moe_tensor_parallel_rank():
 
 
 def destroy_model_parallel():
-    """把各模型并行组置为 None 并销毁它们。"""
+    """销毁所有模型并行组并清空全局引用。
+
+    输入输出示例：初始化 TP/PP/EP 后调用本函数，随后 ``model_parallel_is_initialized()``
+    返回 ``False``；函数无返回值。共享/别名进程组会避免重复销毁。
+    """
     global _TP
     if _TP:
         _TP.destroy()
@@ -2604,6 +2787,11 @@ def destroy_model_parallel():
 
 
 def destroy_distributed_environment():
+    """销毁 WORLD 组和 PyTorch 默认进程组，并重置模型并行超时配置。
+
+    输入输出示例：调用后 ``torch.distributed.is_initialized()`` 为 ``False``，
+    ``_WORLD`` 为 ``None``；重复调用也是安全的。
+    """
     global _WORLD, _MODEL_PARALLEL_GROUP_TIMEOUT
     if _WORLD:
         _WORLD.destroy()
@@ -2614,6 +2802,11 @@ def destroy_distributed_environment():
 
 
 def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
+    """清理分布式环境、可选关闭 Ray，并回收主机与设备缓存。
+
+    输入输出示例：``cleanup_dist_env_and_memory(shutdown_ray=True)`` 会依次销毁模型并行
+    与 WORLD 组、关闭 Ray、执行 Python GC，并清理当前硬件后端的设备缓存。无返回值。
+    """
     destroy_model_parallel()
     destroy_distributed_environment()
     with contextlib.suppress(AssertionError):
@@ -2647,6 +2840,10 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
 
     返回：长度为 world_size 的 List[bool]，第 i 位为 True 表示组内 rank i 与
     source_rank 在同一节点。
+
+    输入输出示例：四个 rank 中 0、1 位于节点 A，2、3 位于节点 B，调用
+    ``in_the_same_node_as(pg, source_rank=0)`` 后所有 rank 均返回
+    ``[True, True, False, False]``。
     """
     assert (
         torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL
@@ -2699,7 +2896,7 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
 
     torch.distributed.barrier(group=pg)
 
-    # clean up the shared memory segment
+    # 所有 rank 完成探测后，由源 rank 删除共享内存段。
     with contextlib.suppress(OSError):
         if rank == source_rank and shm:
             shm.unlink()
@@ -2714,6 +2911,12 @@ vllm_get_world_group = None
 
 
 def monkey_patch_vllm_parallel_state(reverse: bool = False):
+    """让 vLLM 的并行组查询函数临时复用 SGLang 的实现，或恢复原实现。
+
+    输入输出示例：传入 ``False`` 后，``vllm.get_tp_group`` 指向本模块的
+    ``get_tp_group``；传入 ``True`` 后恢复首次 patch 前保存的 vLLM 函数。若未安装
+    vLLM 则直接返回。本函数无显式返回值。
+    """
     try:
         import vllm.distributed.parallel_state as vllm_parallel_state
     except ImportError:

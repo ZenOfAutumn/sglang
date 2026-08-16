@@ -1,7 +1,9 @@
 # 并行方式总览：背景、问题、优缺点与适用范围
 
-> 本文横向对比大模型训练 / 推理中六种主流并行方式——数据并行（DP）、张量并行（TP）、
-> 流水线并行（PP）、序列并行（SP）、上下文并行（CP）、专家并行（EP）——分别说明它们
+> 本文横向对比大模型训练 / 推理中六种主流并行方式——数据并行（Data Parallelism, DP）、
+> 张量并行（Tensor Parallelism, TP）、流水线并行（Pipeline Parallelism, PP）、
+> 序列并行（Sequence Parallelism, SP）、上下文并行（Context Parallelism, CP）、
+> 专家并行（Expert Parallelism, EP）——分别说明它们
 > **出现的历史背景**、**要解决的核心问题**、**优缺点**、**适用范围**与**所受限制**，
 > 并给出选型建议与组合方式。每种并行的完整数学原理与 SGLang 实现，见同目录下的专文
 > （`DP.md` / `TP.md` / `PP.md` / `SP.md` / `CP.md` / `EP.md`）。
@@ -10,12 +12,12 @@
 
 1. [一张图看懂：并行是在切什么](#1-一张图看懂并行是在切什么)
 2. [为什么会出现这么多种并行](#2-为什么会出现这么多种并行)
-3. [数据并行（DP）](#3-数据并行dp)
-4. [张量并行（TP）](#4-张量并行tp)
-5. [流水线并行（PP）](#5-流水线并行pp)
-6. [序列并行（SP）](#6-序列并行sp)
-7. [上下文并行（CP）](#7-上下文并行cp)
-8. [专家并行（EP）](#8-专家并行ep)
+3. [数据并行（Data Parallelism, DP）](#3-数据并行data-parallelism-dp)
+4. [张量并行（Tensor Parallelism, TP）](#4-张量并行tensor-parallelism-tp)
+5. [流水线并行（Pipeline Parallelism, PP）](#5-流水线并行pipeline-parallelism-pp)
+6. [序列并行（Sequence Parallelism, SP）](#6-序列并行sequence-parallelism-sp)
+7. [上下文并行（Context Parallelism, CP）](#7-上下文并行context-parallelism-cp)
+8. [专家并行（Expert Parallelism, EP）](#8-专家并行expert-parallelism-ep)
 9. [横向对比速查表](#9-横向对比速查表)
 10. [并行如何组合：3D / 4D 并行](#10-并行如何组合3d--4d-并行)
 11. [选型决策路径](#11-选型决策路径)
@@ -38,12 +40,12 @@
 
 | 并行方式 | 切的维度 | 一句话概括 |
 |---|---|---|
-| **DP** | 批维度 | 复制整个模型，喂不同的数据 |
-| **TP** | 权重维度（层内张量） | 把一层的大矩阵拆成几块并行算 |
-| **PP** | 层维度（深度） | 不同层放到不同卡，像流水线串起来 |
-| **SP** | 序列维度（针对非矩阵乘算子） | 把 LayerNorm / Dropout 等按序列切，配合 TP 省激活显存 |
-| **CP** | 序列维度（针对 attention） | 把超长序列按 token 切，解决长上下文 |
-| **EP** | 专家维度（仅 MoE） | 不同 expert 放到不同卡 |
+| **Data Parallelism（DP）** | 批维度 | 复制整个模型，喂不同的数据 |
+| **Tensor Parallelism（TP）** | 权重维度（层内张量） | 把一层的大矩阵拆成几块并行算 |
+| **Pipeline Parallelism（PP）** | 层维度（深度） | 不同层放到不同卡，像流水线串起来 |
+| **Sequence Parallelism（SP）** | 序列维度（针对非矩阵乘算子） | 把 LayerNorm / Dropout 等按序列切，配合 TP 省激活显存 |
+| **Context Parallelism（CP）** | 序列维度（针对 attention） | 把超长序列按 token 切，解决长上下文 |
+| **Expert Parallelism（EP）** | 专家维度（仅 MoE） | 不同 expert 放到不同卡 |
 
 > 关键直觉：这些维度**彼此正交**，所以并行方式可以**任意组合**——
 > 一个真实的大规模部署往往是 `DP × TP × PP × EP` 的乘积（见 [§10](#10-并行如何组合3d--4d-并行)）。
@@ -76,7 +78,7 @@ MoE 专家总量爆炸     → EP：把专家分散到不同卡          （GSha
 
 ---
 
-## 3. 数据并行（DP）
+## 3. 数据并行（Data Parallelism, DP）
 
 > 详见 `DP.md`。
 
@@ -101,7 +103,7 @@ MoE 专家总量爆炸     → EP：把专家分散到不同卡          （GSha
 
 ---
 
-## 4. 张量并行（TP）
+## 4. 张量并行（Tensor Parallelism, TP）
 
 > 详见 `TP.md`。
 
@@ -127,7 +129,7 @@ MoE 专家总量爆炸     → EP：把专家分散到不同卡          （GSha
 
 ---
 
-## 5. 流水线并行（PP）
+## 5. 流水线并行（Pipeline Parallelism, PP）
 
 > 详见 `PP.md`。
 
@@ -152,7 +154,7 @@ MoE 专家总量爆炸     → EP：把专家分散到不同卡          （GSha
 
 ---
 
-## 6. 序列并行（SP）
+## 6. 序列并行（Sequence Parallelism, SP）
 
 > 详见 `SP.md`。
 
@@ -179,7 +181,7 @@ MoE 专家总量爆炸     → EP：把专家分散到不同卡          （GSha
 
 ---
 
-## 7. 上下文并行（CP）
+## 7. 上下文并行（Context Parallelism, CP）
 
 > 详见 `CP.md`。
 
@@ -205,7 +207,7 @@ Attention 的显存与算力随序列长度 $s$ 呈 $O(s^2)$（或 KV cache 呈 
 
 ---
 
-## 8. 专家并行（EP）
+## 8. 专家并行（Expert Parallelism, EP）
 
 > 详见 `EP.md`。
 
@@ -234,7 +236,7 @@ token 经 router 选出 top-k 后，通过 **all-to-all** 路由（dispatch）�
 
 ## 9. 横向对比速查表
 
-| 维度 | DP | TP | PP | SP | CP | EP |
+| 维度 | Data Parallelism（DP） | Tensor Parallelism（TP） | Pipeline Parallelism（PP） | Sequence Parallelism（SP） | Context Parallelism（CP） | Expert Parallelism（EP） |
 |---|---|---|---|---|---|---|
 | **切什么** | 批（复制模型） | 层内张量（权重） | 层（深度） | 序列（非矩阵乘算子） | 序列（attention） | 专家（MoE） |
 | **主要解决** | 吞吐不足 | 单层装不下/算不动 | 整模型跨机装不下 | 激活显存冗余 | 超长序列爆炸 | MoE 专家权重爆炸 |

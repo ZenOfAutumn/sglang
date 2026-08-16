@@ -1,3 +1,21 @@
+# ============================================================================
+# DeepEP Token Dispatcher（DeepEP 令牌分发器）
+# ----------------------------------------------------------------------------
+# 本模块封装 DeepEP（DeepSeek Expert Parallelism 通信库）在 MoE 专家并行中的
+# 「dispatch（分发）」与「combine（聚合）」两个核心 all-to-all 通信步骤：
+#   - dispatch：按 top-k 路由结果，把每个 token 的 hidden_states 发送到其所选
+#     专家所在的 rank（GPU/NPU）上；
+#   - combine：专家计算完成后，把结果按原路收回并按 top-k 权重加权聚合，还原到
+#     每个 token 原本所在的 rank。
+#
+# 提供两种运行模式：
+#   - Normal（普通模式）：面向 prefill（长序列、大 batch），吞吐优先；
+#   - Low-Latency（低时延模式，简称 LL）：面向 decode（逐 token 生成），时延优先，
+#     使用 RDMA 直达并支持计算/通信重叠（overlap）。
+#
+# 每个通信步骤都拆成 a/b 两个子阶段（如 dispatch_a / dispatch_b），以便把
+# 「发起通信」与「等待通信完成」分离，从而与其它计算重叠，隐藏通信开销。
+# ============================================================================
 from __future__ import annotations
 
 import logging
@@ -69,22 +87,39 @@ logger = logging.getLogger(__name__)
 
 
 def _deepep_precompile_tp_barrier() -> None:
-    # DeepEP's all-to-all operation has a much shorter timeout compared to torch.distributed,
-    # so if different ranks compile at different speeds, it may quickly trigger a timeout.
-    # To avoid this, we use torch.distributed's barrier during the compile stage.
-    # We apply this barrier only in the compile stage to prevent extra all-reduce overhead at runtime.
+    # DeepEP 的 all-to-all 操作相比 torch.distributed 的超时时间要短得多，
+    # 因此如果不同 rank 的编译速度不一致，很容易触发超时。
+    # 为避免这一问题，我们在编译阶段改用 torch.distributed 的 barrier 做同步。
+    # 该 barrier 只在编译阶段生效，以免在运行时引入额外的 all-reduce 开销。
     if envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get():
         get_tp_group().barrier()
 
 
 class DeepEPPDispatchHooks(DispatcherBaseHooks):
+    """DeepEP 分发 hook 容器。
+
+    在 dispatch_a 与 dispatch_b 之间被调用，用于依次执行所有已注册的 hook 函数，
+    常用于插入观测、调试或与其它模块的协同逻辑。
+    """
+
     def __call__(self, dispatcher: BaseDispatcher):
+        """依次调用所有已注册的 hook，参数为当前 dispatcher 实例。"""
         for hook_fun in self.hook_dict.values():
             hook_fun(dispatcher)
 
 
 class DeepEPNormalDispatchOutput(NamedTuple):
-    """DeepEP normal dispatch output."""
+    """DeepEP 普通模式（Normal）分发输出。
+
+    字段说明：
+        hidden_states: 本 rank 收到的、发往本地专家的所有 token 特征，
+            形状约为 [num_recv_tokens, hidden_size]。
+        hidden_states_scale: 量化缩放因子（仅 fp8/nvfp4 等量化路径存在，否则为 None）。
+        topk_ids: 收到的 token 对应的 top-k 专家 id，形状 [num_recv_tokens, topk]。
+        topk_weights: 收到的 token 对应的 top-k 路由权重，形状 [num_recv_tokens, topk]。
+        num_recv_tokens_per_expert: 每个本地专家收到的 token 数量列表，
+            如 [12, 8, 0, 30] 表示 4 个本地专家各自收到的 token 数。
+    """
 
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
@@ -98,7 +133,20 @@ class DeepEPNormalDispatchOutput(NamedTuple):
 
 
 class DeepEPLLDispatchOutput(NamedTuple):
-    """DeepEP low latency dispatch output."""
+    """DeepEP 低时延模式（Low-Latency）分发输出。
+
+    低时延模式为每个专家预留固定容量的缓冲区，token 按专家分块摆放，
+    并用 masked_m 记录每个专家实际有效的 token 数。
+
+    字段说明：
+        hidden_states: 收到的 token 特征，按专家分块，
+            形状约为 [num_local_experts, max_tokens_per_expert, hidden_size]。
+        hidden_states_scale: 量化缩放因子（无量化时为 None）。
+        topk_ids: top-k 专家 id，形状 [num_tokens, topk]。
+        topk_weights: top-k 路由权重，形状 [num_tokens, topk]。
+        masked_m: 每个本地专家实际有效 token 数量的掩码计数，形状 [num_local_experts]。
+        expected_m: 每个专家「期望」处理的平均 token 数（用于 GEMM 分组的对齐估计）。
+    """
 
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
@@ -117,7 +165,13 @@ assert isinstance(DeepEPLLDispatchOutput, DispatchOutput)
 
 
 class DeepEPNormalCombineInput(NamedTuple):
-    """DeepEP normal combine input."""
+    """DeepEP 普通模式（Normal）聚合输入。
+
+    字段说明：
+        hidden_states: 专家计算后的 token 特征（待收回并加权聚合）。
+        topk_ids: 每个 token 的 top-k 专家 id。
+        topk_weights: 每个 token 的 top-k 路由权重（用于聚合时加权求和）。
+    """
 
     hidden_states: torch.Tensor
     topk_ids: torch.Tensor
@@ -129,7 +183,13 @@ class DeepEPNormalCombineInput(NamedTuple):
 
 
 class DeepEPLLCombineInput(NamedTuple):
-    """DeepEP low latency combine input."""
+    """DeepEP 低时延模式（Low-Latency）聚合输入。
+
+    字段说明：
+        hidden_states: 专家计算后的 token 特征（按专家分块）。
+        topk_ids: 每个 token 的 top-k 专家 id。
+        topk_weights: 每个 token 的 top-k 路由权重。
+    """
 
     hidden_states: torch.Tensor
     topk_ids: torch.Tensor
@@ -145,11 +205,31 @@ assert isinstance(DeepEPLLCombineInput, CombineInput)
 
 
 class DeepEPDispatchMode(IntEnum):
+    """DeepEP 分发模式枚举。
+
+    NORMAL: 普通模式，吞吐优先，用于 prefill。
+    LOW_LATENCY: 低时延模式，时延优先，用于 decode。
+    """
+
     NORMAL = auto()
     LOW_LATENCY = auto()
 
 
 class DeepEPBuffer:
+    """DeepEP 通信缓冲区的全局管理器（单例）。
+
+    DeepEP 需要预先分配 NVLink（机内）与 RDMA（跨机）通信缓冲区。
+    由于缓冲区创建开销大、且全局共享，这里用类属性缓存单例，首次
+    调用 get_deepep_buffer 时创建，后续直接复用。
+
+    类属性：
+        _buffer: 已创建的 DeepEP Buffer 实例（None 表示尚未创建）。
+        _dispatch_mode: 当前分发模式（Normal / Low-Latency）。
+        _hidden_size: 隐藏层维度。
+        _num_max_dispatch_tokens_per_rank: 低时延模式下每 rank 最大分发 token 数。
+        _num_experts: 专家总数。
+    """
+
     _buffer = None
     _dispatch_mode: Optional[DeepEPDispatchMode] = None
     _hidden_size: Optional[int] = None
@@ -166,6 +246,32 @@ class DeepEPBuffer:
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
     ):
+        """获取（首次则创建）全局共享的 DeepEP 通信缓冲区。
+
+        会根据模式估算所需的 NVLink / RDMA 缓冲区字节数，并推算每 rank 的
+        QP（queue pair）数量，最后创建 Buffer 实例。
+
+        参数：
+            group: 专家并行的进程组（决定参与 all-to-all 的 rank 集合）。
+            hidden_size: 隐藏层维度，如 7168。
+            param_bytes: 单个元素的字节数，如 bf16 为 2。
+            deepep_mode: 运行模式（NORMAL / LOW_LATENCY / AUTO）。
+            num_max_dispatch_tokens_per_rank: 低时延模式下每 rank 最大分发 token 数（需 > 0）。
+            num_experts: 专家总数（低时延模式下需能被 group.size() 整除）。
+
+        返回：
+            DeepEP Buffer 实例（全局单例，后续调用直接复用）。
+
+        示例：
+            >>> buf = DeepEPBuffer.get_deepep_buffer(
+            ...     group, hidden_size=7168, param_bytes=2,
+            ...     deepep_mode=DeepEPMode.LOW_LATENCY,
+            ...     num_max_dispatch_tokens_per_rank=128, num_experts=256,
+            ... )
+            >>> isinstance(buf, Buffer)
+            True
+        """
+        # 已创建则直接返回缓存单例，避免重复分配大块缓冲区
         if cls._buffer is not None:
             return cls._buffer
 
@@ -203,16 +309,16 @@ class DeepEPBuffer:
                 num_rdma_bytes,
             )
 
-        # We should calculate num_qps_per_rank consistently with DeepEP's test script logic:
+        # 我们应与 DeepEP 测试脚本的逻辑保持一致来计算 num_qps_per_rank（每 rank 的 QP 数）：
         if deepep_mode == DeepEPMode.NORMAL:
-            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
+            # 参考：https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
             num_qps_per_rank = DeepEPConfig.get_instance().num_sms
         elif deepep_mode == DeepEPMode.LOW_LATENCY:
-            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_low_latency.py#L176
+            # 参考：https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_low_latency.py#L176
             num_qps_per_rank = num_experts // group.size()
         elif deepep_mode == DeepEPMode.AUTO:
-            # low-latency and normal mode all need run
-            # refer: https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
+            # AUTO 模式下低时延与普通模式都需运行，因此取两者所需 QP 数的最大值
+            # 参考：https://github.com/deepseek-ai/DeepEP/blob/main/tests/test_internode.py#L235
             num_qps_per_rank = max(
                 DeepEPConfig.get_instance().num_sms, num_experts // group.size()
             )
@@ -237,18 +343,17 @@ class DeepEPBuffer:
         buffer_kwargs = dict(
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
-            # TODO can be false when unneeded
+            # TODO 在不需要时可设为 False
             allow_mnnvl=True,
         )
-        # Use CU_MEM_HANDLE_TYPE_FABRIC on hardware that advertises MNNVL fabric
-        # support, so cross-pod GB200/GB300 EP groups use
-        # cuMemImportFromShareableHandle instead of the intra-node-only
-        # cudaIpcOpenMemHandle. The DeepEP build we ship is keyed on the CUDA major
-        # version:
-        #   cu13x -> hybrid-ep, which gates fabric behind a use_fabric kwarg, so we
-        #            pass it when the device advertises fabric support.
-        #   cu12x -> fzyzcjy/DeepEP, which has no use_fabric kwarg but already
-        #            auto-enables fabric in C++ when supported, so we skip it:
+        # 在声明支持 MNNVL fabric 的硬件上使用 CU_MEM_HANDLE_TYPE_FABRIC，
+        # 使跨 pod 的 GB200/GB300 EP 组使用 cuMemImportFromShareableHandle，
+        # 而不是仅限机内的 cudaIpcOpenMemHandle。
+        # 我们发布的 DeepEP 构建按 CUDA 主版本区分：
+        #   cu13x -> hybrid-ep，它用 use_fabric 参数控制 fabric，因此当设备声明支持
+        #            fabric 时我们传入该参数。
+        #   cu12x -> fzyzcjy/DeepEP，无 use_fabric 参数，但在 C++ 层已在支持时自动
+        #            启用 fabric，因此我们跳过：
         #            https://github.com/fzyzcjy/DeepEP/blob/814e508537c6ffc775d59f6f1b9ba43f3a65968c/csrc/deep_ep.cpp#L52
         is_cu12 = get_cuda_version()[0] == 12
         if not is_cu12 and is_flashinfer_available():
@@ -262,6 +367,11 @@ class DeepEPBuffer:
 
     @classmethod
     def clean_buffer(cls):
+        """清理低时延缓冲区（仅在低时延模式下生效）。
+
+        低时延模式的缓冲区会累积状态，切换模式前需要清理。
+        非低时延模式直接返回。
+        """
         if not cls._buffer.low_latency_mode:
             return
         cls._buffer.clean_low_latency_buffer(
@@ -272,16 +382,26 @@ class DeepEPBuffer:
 
     @classmethod
     def set_dispatch_mode_as_normal(cls):
+        """将当前分发模式设为普通模式。"""
         cls._dispatch_mode = DeepEPDispatchMode.NORMAL
 
     @classmethod
     def set_dispatch_mode_as_low_latency(cls):
+        """将当前分发模式设为低时延模式。
+
+        若从普通模式切换而来，需先清理缓冲区以释放/重置状态。
+        """
         if cls._dispatch_mode == DeepEPDispatchMode.NORMAL:
             cls.clean_buffer()
         cls._dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
 
     @classmethod
     def set_dispatch_mode(cls, mode: DeepEPMode):
+        """根据传入的 DeepEPMode 设置当前分发模式。
+
+        参数：
+            mode: DeepEPMode，需为低时延或普通模式，否则抛出异常。
+        """
         if mode.is_low_latency():
             cls.set_dispatch_mode_as_low_latency()
         elif mode.is_normal():
@@ -291,6 +411,17 @@ class DeepEPBuffer:
 
 
 class DeepEPConfig(BaseDispatcherConfig):
+    """DeepEP 分发器配置（单例）。
+
+    从环境/命令行给出的 JSON 配置中解析普通模式下 dispatch / combine 的
+    通信配置（如 SM 数量）。若未提供配置，则使用 DeepEP 默认值。
+
+    属性：
+        normal_dispatch_config: 普通模式 dispatch 配置（None 表示用默认）。
+        normal_combine_config: 普通模式 combine 配置（None 表示用默认）。
+        num_sms: 用于 DeepEP 通信的 SM（流多处理器）数量。
+    """
+
     _instance = None
 
     def __init__(self):
@@ -314,12 +445,28 @@ class DeepEPConfig(BaseDispatcherConfig):
 
     @classmethod
     def get_instance(cls):
+        """获取全局单例配置（首次调用时创建）。"""
         if cls._instance is None:
             cls._instance = DeepEPConfig()
         return cls._instance
 
 
 class _DeepEPDispatcherImplBase:
+    """DeepEP 分发器实现的抽象基类。
+
+    定义了 dispatch/combine 的 a/b 子阶段接口，以及量化 dtype、重叠参数
+    等公共状态。普通模式与低时延模式分别由子类实现。
+
+    主要属性：
+        group: 专家并行进程组。
+        router_topk: 每个 token 选择的专家个数（top-k）。
+        num_experts / num_local_experts: 专家总数 / 本 rank 上的专家数。
+        hidden_size: 隐藏层维度。
+        deepep_mode: 运行模式。
+        num_max_dispatch_tokens_per_rank: 每 rank 最大分发 token 数（低时延相关）。
+        handle: DeepEP 内部句柄，在 dispatch 中生成并在 combine 中回传（用于路由还原）。
+    """
+
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -347,12 +494,12 @@ class _DeepEPDispatcherImplBase:
         self.deepep_mode = deepep_mode
 
         self.params_bytes = 2
-        # A large value will lead to large memory occupation, thus users should change it accordingly
+        # 过大的取值会导致内存占用激增，因此用户应根据实际情况相应调整
         self.num_max_dispatch_tokens_per_rank = (
             envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
         )
-        # DeepEP internode_ll dispatch uses FINISHED_SUM_TAG=1024
-        # and the logic requires num-tokens-sent-from-one-rank-to-another-rank less than it
+        # DeepEP 的 internode_ll dispatch 使用 FINISHED_SUM_TAG=1024，
+        # 其逻辑要求「从一个 rank 发往另一个 rank 的 token 数」小于该值
         assert self.num_max_dispatch_tokens_per_rank <= 1024
 
         self.handle = None
@@ -369,9 +516,11 @@ class _DeepEPDispatcherImplBase:
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
+        """dispatch 第一阶段：预处理并发起分发通信（子类实现）。"""
         raise NotImplementedError
 
     def dispatch_b(self, *args, **kwargs):
+        """dispatch 第二阶段：等待通信完成并整理输出（子类实现）。"""
         raise NotImplementedError
 
     def combine_a(
@@ -380,22 +529,27 @@ class _DeepEPDispatcherImplBase:
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+        """combine 第一阶段：发起聚合通信（子类实现）。"""
         raise NotImplementedError
 
     def combine_b(self, *args, **kwargs):
+        """combine 第二阶段：等待聚合通信完成并返回结果（子类实现）。"""
         raise NotImplementedError
 
     def _get_buffer(self):
+        """获取当前模式对应的 DeepEP 缓冲区（子类实现）。"""
         raise NotImplementedError
 
     def set_quant_config(self, quant_config: dict) -> None:
+        """设置量化配置，并据此重新推导分发输出的 dtype。"""
         self.quant_config = quant_config
         self.set_deepep_dispatcher_dtype()
 
     def set_deepep_dispatcher_dtype(self) -> None:
+        """根据量化配置与硬件确定分发输出 dtype，并设置 use_fp8/use_nvfp4 标志。"""
         self.deepep_output_dtype = get_deepep_output_dtype(self)
 
-        # Configuration mapping for each dtype
+        # 每种 dtype 对应的配置映射
         config_map = {
             DeepEPOutputDtype.BF16: {
                 "use_fp8": False,
@@ -405,9 +559,8 @@ class _DeepEPDispatcherImplBase:
                 "use_fp8": True,
                 "use_nvfp4": False,
             },
-            # Needed for Ascend A2/A3 NPU case,
-            # despite the use_fp8 flag,
-            # quantization will be performed in int8
+            # 针对昇腾 Ascend A2/A3 NPU 场景：
+            # 尽管置了 use_fp8 标志，实际量化会以 int8 执行
             DeepEPOutputDtype.INT8: {
                 "use_fp8": True,
                 "use_nvfp4": False,
@@ -431,7 +584,11 @@ class _DeepEPDispatcherImplBase:
             self._update_int8_quant_env()
 
     def _validate_and_adjust_dtype(self) -> None:
-        """Validate dtype against hardware and adjust if necessary."""
+        """校验分发输出 dtype 与硬件是否兼容，必要时自动调整。
+
+        - 昇腾 NPU：fp8 回退为 int8；nvfp4 不支持（报错）。
+        - GPU：int8 回退为 fp8；nvfp4 受支持无需调整。
+        """
         if _is_npu:
             if self.deepep_output_dtype == DeepEPOutputDtype.FP8:
                 logger.warning_once(
@@ -453,21 +610,28 @@ class _DeepEPDispatcherImplBase:
             # NVFP4 is supported on GPU, no adjustment needed
 
     def _update_int8_quant_env(self) -> None:
-        """TODO adapt different quantization schemes for base model and draft model on NPU"""
+        """TODO 在 NPU 上为 base 模型与 draft 模型适配不同的量化方案"""
         pass
 
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
     ) -> None:
+        """设置计算/通信重叠（overlap）参数，供低时延 combine 使用。"""
         self.overlap_args = combine_overlap_args
         self.meta_overlap_args = meta_overlap_args
 
     def clear_overlap_args(self) -> None:
+        """清除重叠参数。"""
         self.overlap_args = None
         self.meta_overlap_args = None
 
 
 class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
+    """DeepEP 普通模式（Normal）分发器实现，面向 prefill 场景。
+
+    特点：支持异步完成（async_finish），可用 CUDA event 把通信与计算重叠。
+    """
+
     def __init__(self, async_finish: bool, **kwargs):
         super().__init__(**kwargs)
 
@@ -480,10 +644,27 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
+        """dispatch 第一阶段：（可选）fp8 量化并捕获 CUDA event，为分发做准备。
+
+        参数：
+            hidden_states: 本 rank 的 token 特征，形状 [num_tokens, hidden_size]。
+            topk_output: 路由输出，包含 topk_ids 与 topk_weights。
+
+        返回：
+            (hidden_states, topk_ids, topk_weights, previous_event) 元组，
+            作为 dispatch_b 的输入。previous_event 在异步模式下为捕获的 CUDA event，
+            否则为 None。
+
+        示例：
+            >>> # hidden_states: [4, 7168]，topk=8
+            >>> hs, ids, w, ev = impl.dispatch_a(hidden_states, topk_output)
+            >>> ids.dtype
+            torch.int64
+        """
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
-            # TODO hard code 128 block quant,use fp8 communication
+            # TODO 硬编码 128 分块量化，使用 fp8 通信
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,
                 128,
@@ -495,6 +676,22 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return hidden_states, topk_ids, topk_weights, previous_event
 
     def dispatch_b(self, hidden_states, topk_ids, topk_weights, previous_event):
+        """dispatch 第二阶段：执行实际 all-to-all 分发，等待完成并打包输出。
+
+        参数：
+            hidden_states, topk_ids, topk_weights, previous_event: 均来自 dispatch_a 的输出。
+
+        返回：
+            DeepEPNormalDispatchOutput，包含本 rank 收到的 token 特征、（可选）量化缩放因子、
+            top-k id/权重，以及每个本地专家收到的 token 数量。
+
+        示例：
+            >>> out = impl.dispatch_b(hs, ids, w, ev)
+            >>> out.format
+            <DispatchOutputFormat.DEEPEP_NORMAL: ...>
+            >>> out.num_recv_tokens_per_expert  # 如 4 个本地专家各自收到的 token 数
+            [12, 8, 0, 30]
+        """
         (
             hidden_states,
             topk_ids,
@@ -524,7 +721,19 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
         previous_event,
     ):
+        """普通模式 dispatch 的核心实现：计算布局 -> 执行 all-to-all -> 记录专家分布。
+
+        参数：
+            x: token 特征（或 (特征, 量化缩放因子) 元组）。
+            topk_ids / topk_weights: top-k 专家 id 与路由权重。
+            previous_event: 前置 CUDA event（异步模式下用于依赖排序）。
+
+        返回：
+            (recv_x, recv_topk_ids, recv_topk_weights, num_recv_tokens_per_expert, event)。
+        """
         buffer = self._get_buffer()
+        # 先计算分发布局：统计发往每个 rank / RDMA rank / 专家的 token 数，
+        # 以及每个 token 是否属于某 rank，供后续 all-to-all 使用
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -538,9 +747,8 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=previous_event is not None,
         )
-        # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
-        # However, doing this would incur an unknown synchronization error, but keeping
-        # `handle` as a member variable works.
+        # FIXME：`handle` 本应随 token 一起从 dispatch 传递到 combine。
+        # 但这样做会引发一个未知的同步错误；把 `handle` 作为成员变量保存则可正常工作。
 
         _deepep_precompile_tp_barrier()
         (
@@ -585,16 +793,34 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+        """combine 第一阶段：准备待聚合的专家输出并捕获 CUDA event。
 
+        参数：
+            hidden_states: 专家计算后的 token 特征。
+            topk_ids / topk_weights: top-k 专家 id 与路由权重（普通模式下此处未直接使用，
+                权重加权在 DeepEP 内部依据 handle 完成）。
+
+        返回：
+            (output, previous_event)，作为 combine_b 的输入。
+        """
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
             output = hidden_states
         else:
-            raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
+            raise NotImplementedError()  # 曾支持 triton runner，但目前暂时禁用
 
         previous_event = Buffer.capture() if self.async_finish else None
         return output, previous_event
 
     def combine_b(self, output, previous_event):
+        """combine 第二阶段：执行 all-to-all 聚合，等待完成并清理句柄。
+
+        参数：
+            output, previous_event: 来自 combine_a 的输出。
+
+        返回：
+            combined hidden_states，形状还原为 [num_tokens, hidden_size]（每个 token 回到
+            其原本所在 rank，并完成 top-k 加权聚合）。
+        """
         hidden_states, event = self._combine_core(output, previous_event)
         event.current_stream_wait() if self.async_finish else ()
         self.handle = None
@@ -602,6 +828,15 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return hidden_states
 
     def _combine_core(self, x: torch.Tensor, previous_event):
+        """普通模式 combine 的核心实现：基于 dispatch 时保存的 handle 执行 all-to-all 回传。
+
+        参数：
+            x: 待聚合的专家输出。
+            previous_event: 前置 CUDA event。
+
+        返回：
+            (combined_x, event)，combined_x 为聚合后的 token 特征。
+        """
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
         combined_x, _, event = buffer.combine(
@@ -615,6 +850,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         return combined_x, event
 
     def _get_buffer(self):
+        """将缓冲区置为普通模式并返回。"""
         DeepEPBuffer.set_dispatch_mode_as_normal()
 
         return DeepEPBuffer.get_deepep_buffer(
@@ -628,11 +864,20 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
 
 class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
+    """DeepEP 低时延模式（Low-Latency）分发器实现，面向 decode 场景。
+
+    特点：
+        - 每个专家预留固定容量缓冲区，token 按专家分块摆放；
+        - 支持 return_recv_hook：返回一个 hook，由调用方适时触发以等待接收，
+          便于与计算重叠；
+        - 支持 combine 阶段的计算/通信重叠（overlap）。
+    """
+
     def __init__(self, return_recv_hook: bool, **kwargs):
         super().__init__(**kwargs)
 
         """
-        num_max_dispatch_tokens_per_rank: the actual batch size in the decoding engine should be less than 256
+        num_max_dispatch_tokens_per_rank：解码引擎中的实际 batch size 应小于 256
         https://github.com/deepseek-ai/DeepEP?tab=readme-ov-file#example-use-in-inference-decoding
         """
         self.return_recv_hook = return_recv_hook
@@ -644,6 +889,22 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
+        """dispatch 第一阶段（低时延）：发起 low_latency_dispatch 并估算每专家期望 token 数。
+
+        参数：
+            hidden_states: 本 rank 的 token 特征，形状 [num_tokens, hidden_size]。
+            topk_output: 路由输出，包含 topk_ids 与 topk_weights。
+
+        返回：
+            (hidden_states, topk_ids, topk_weights, masked_m, expected_m, event, hook) 元组，
+            作为 dispatch_b 的输入。其中 expected_m 为每专家期望处理的平均 token 数，
+            计算公式为 (num_tokens * group_size * topk + num_experts) // num_experts。
+
+        示例：
+            >>> # num_tokens=1（decode），hidden_size=7168，topk=8
+            >>> res = impl.dispatch_a(hidden_states, topk_output)
+            >>> hs, ids, w, masked_m, expected_m, ev, hook = res
+        """
         buffer = self._get_buffer()
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
@@ -675,6 +936,22 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         event,
         hook,
     ):
+        """dispatch 第二阶段（低时延）：等待接收完成并打包为 DeepEPLLDispatchOutput。
+
+        若启用 return_recv_hook 则调用 hook() 等待接收；否则在当前流等待 event。
+
+        参数：
+            均来自 dispatch_a 的输出。
+
+        返回：
+            DeepEPLLDispatchOutput，包含按专家分块的 token 特征、（可选）量化缩放因子、
+            top-k id/权重、masked_m 与 expected_m。
+
+        示例：
+            >>> out = impl.dispatch_b(hs, ids, w, masked_m, expected_m, ev, hook)
+            >>> out.format
+            <DispatchOutputFormat.DEEPEP_LL: ...>
+        """
         hook() if self.return_recv_hook else event.current_stream_wait()
 
         get_global_expert_distribution_recorder().on_deepep_dispatch_low_latency(
@@ -701,11 +978,20 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
     ):
+        """低时延 dispatch 的核心实现：调用 buffer.low_latency_dispatch 发起 RDMA 直达分发。
+
+        参数：
+            hidden_states: token 特征。
+            topk_ids: top-k 专家 id。
+
+        返回：
+            (packed_recv_hidden, packed_recv_count, event, hook)：
+            分别为按专家打包的接收特征、每专家接收计数、CUDA event 与接收 hook。
+        """
         input_global_scale = self.quant_config.get("input_global_scale", None)
 
-        # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP
-        # to return int32-packed UE8M0 scales that don't feed the flashinfer
-        # cutedsl kernel.
+        # round_scale / use_ue8m0 是 FP8-DeepGEMM 专用选项；它们会使 DeepEP 返回
+        # int32 打包的 UE8M0 缩放因子，而这种格式无法馈送给 flashinfer 的 cutedsl kernel。
         fp8_deepgemm_scale_opts = (
             dict(
                 round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -745,6 +1031,15 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+        """combine 第一阶段（低时延）：发起 low_latency_combine。
+
+        参数：
+            hidden_states: 专家计算后的 token 特征（按专家分块）。
+            topk_ids / topk_weights: top-k 专家 id 与路由权重（用于加权聚合）。
+
+        返回：
+            (hidden_states, event, hook)，作为 combine_b 的输入。
+        """
         hidden_states, event, hook = self._combine_core(
             hidden_states,
             topk_ids,
@@ -753,6 +1048,16 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return hidden_states, event, hook
 
     def combine_b(self, hidden_states, event, hook):
+        """combine 第二阶段（低时延）：等待聚合完成，处理可选的重叠流同步。
+
+        若设置了 overlap，会在重叠流与当前流之间做双向等待，确保顺序正确。
+
+        参数：
+            hidden_states, event, hook: 来自 combine_a 的输出。
+
+        返回：
+            聚合后的 hidden_states。
+        """
         overlap_args = self.overlap_args
         if overlap_args is not None:
             overlap_args.stream.wait_stream(self.device_module.current_stream())
@@ -770,6 +1075,17 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ):
+        """低时延 combine 的核心实现：在（可选的）重叠流上调用 low_latency_combine。
+
+        会根据是否 Blackwell 架构组装不同的 overlap 参数（信号量、阈值、block_m 等）。
+
+        参数：
+            hidden_states: 专家输出特征。
+            topk_ids / topk_weights: top-k 专家 id 与路由权重。
+
+        返回：
+            (combined_hidden_states, event, hook)。
+        """
         buffer = self._get_buffer()
         overlap_args = self.overlap_args
         meta_overlap_args = self.meta_overlap_args
@@ -813,6 +1129,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         return combined_hidden_states, event, hook
 
     def _get_buffer(self):
+        """将缓冲区置为低时延模式并返回。"""
         DeepEPBuffer.set_dispatch_mode_as_low_latency()
         return DeepEPBuffer.get_deepep_buffer(
             self.group,
@@ -833,6 +1150,32 @@ class _Stage(Enum):
 
 
 class DeepEPDispatcher(BaseDispatcher):
+    """DeepEP 分发器对外统一入口。
+
+    根据运行模式（普通/低时延/AUTO）在内部持有对应的实现（_DeepEPDispatcherImplNormal
+    / _DeepEPDispatcherImplLowLatency），并对外暴露 dispatch / combine（及其 a/b 子阶段）。
+    AUTO 模式会在运行时按当前是 prefill 还是 decode 自动选择具体实现。
+
+    典型用法：
+        >>> dispatcher = DeepEPDispatcher(group, router_topk=8, num_experts=256,
+        ...     num_local_experts=8, hidden_size=7168, params_dtype=torch.bfloat16)
+        >>> dispatch_out = dispatcher.dispatch(hidden_states, topk_output)
+        >>> # ... 专家计算得到 expert_out ...
+        >>> combine_in = DeepEPNormalCombineInput(expert_out, topk_ids, topk_weights)
+        >>> result = dispatcher.combine(combine_in)  # 形状还原为 [num_tokens, hidden_size]
+
+    参数：
+        group: 专家并行进程组。
+        router_topk: 每个 token 选择的专家个数（top-k）。
+        permute_fusion: 是否启用置换融合优化。
+        num_experts / num_local_experts: 专家总数 / 本 rank 上的专家数。
+        hidden_size: 隐藏层维度。
+        params_dtype: 参数 dtype（如 torch.bfloat16）。
+        deepep_mode: 运行模式，默认 AUTO（运行时自动选择普通/低时延）。
+        async_finish: 普通模式是否异步完成（用于通信/计算重叠）。
+        return_recv_hook: 低时延模式是否返回接收 hook（用于通信/计算重叠）。
+    """
+
     def __init__(
         self,
         group: torch.distributed.ProcessGroup,
@@ -875,9 +1218,8 @@ class DeepEPDispatcher(BaseDispatcher):
         self._stage = _Stage.INITIAL
         self._deepep_dispatch_hooks = DeepEPPDispatchHooks()
 
-        # DeepEP/Mooncake/Nixl mark invalid topk slots with -1; the AITER
-        # pre_permute reroutes them to a sink slot at index num_local_experts,
-        # which is masked off here.
+        # DeepEP/Mooncake/Nixl 会用 -1 标记无效的 topk 槽位；AITER 的 pre_permute
+        # 会把它们重定向到索引 num_local_experts 处的「汇点」槽位，并在这里被掩码屏蔽。
         self.expert_mask_gpu = None
         if _use_aiter and num_local_experts is not None:
             expert_mask = torch.zeros(
@@ -893,6 +1235,16 @@ class DeepEPDispatcher(BaseDispatcher):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ) -> DispatchOutput:
+        """同步执行完整分发（dispatch_a -> 触发 hook -> dispatch_b）。
+
+        参数：
+            hidden_states: 本 rank 的 token 特征，形状 [num_tokens, hidden_size]。
+            topk_output: 路由输出（包含 topk_ids 与 topk_weights）。
+
+        返回：
+            DispatchOutput（普通模式为 DeepEPNormalDispatchOutput，低时延为
+            DeepEPLLDispatchOutput）。
+        """
         self.dispatch_a(hidden_states, topk_output)
         if self._deepep_dispatch_hooks is not None:
             self._deepep_dispatch_hooks(self)
@@ -904,6 +1256,7 @@ class DeepEPDispatcher(BaseDispatcher):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
     ):
+        """分发第一阶段：推进状态机并调用具体实现的 dispatch_a，保存中间状态。"""
         self._update_stage(_Stage.INITIAL, _Stage.AFTER_DISPATCH_A)
         inner_state = self._get_impl().dispatch_a(
             hidden_states=hidden_states,
@@ -912,6 +1265,7 @@ class DeepEPDispatcher(BaseDispatcher):
         self._dispatch_intermediate_state = inner_state
 
     def dispatch_b(self):
+        """分发第二阶段：取回中间状态并调用具体实现的 dispatch_b，返回 DispatchOutput。"""
         self._update_stage(_Stage.AFTER_DISPATCH_A, _Stage.AFTER_DISPATCH_B)
         inner_state = self._dispatch_intermediate_state
         del self._dispatch_intermediate_state
@@ -921,6 +1275,15 @@ class DeepEPDispatcher(BaseDispatcher):
         self,
         combine_input: CombineInput,
     ) -> torch.Tensor:
+        """同步执行完整聚合（combine_a -> combine_b）。
+
+        参数：
+            combine_input: CombineInput（普通模式为 DeepEPNormalCombineInput，低时延为
+                DeepEPLLCombineInput），包含专家输出特征、topk_ids 与 topk_weights。
+
+        返回：
+            聚合后的 hidden_states，形状 [num_tokens, hidden_size]。
+        """
         self.combine_a(combine_input)
         ret = self.combine_b()
         return ret
@@ -929,6 +1292,7 @@ class DeepEPDispatcher(BaseDispatcher):
         self,
         combine_input: CombineInput,
     ):
+        """聚合第一阶段：拆包输入、推进状态机并调用具体实现的 combine_a。"""
         hidden_states, topk_ids, topk_weights = combine_input
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl().combine_a(
@@ -939,12 +1303,18 @@ class DeepEPDispatcher(BaseDispatcher):
         self._combine_intermediate_state = inner_state
 
     def combine_b(self):
+        """聚合第二阶段：取回中间状态并调用具体实现的 combine_b，返回聚合结果。"""
         self._update_stage(_Stage.AFTER_COMBINE_A, _Stage.INITIAL)
         inner_state = self._combine_intermediate_state
         del self._combine_intermediate_state
         return self._get_impl().combine_b(*inner_state)
 
     def _get_impl(self) -> _DeepEPDispatcherImplBase:
+        """解析当前应使用的具体实现（普通/低时延）。
+
+        AUTO 模式下根据当前是否为 prefill（is_extend_in_batch）来自动选择：
+        prefill 选普通模式，decode 选低时延模式。
+        """
         is_extend_in_batch = get_is_extend_in_batch()
         resolved_deepep_mode = self.deepep_mode.resolve(is_extend_in_batch)
         if resolved_deepep_mode == DeepEPMode.NORMAL:
@@ -955,10 +1325,15 @@ class DeepEPDispatcher(BaseDispatcher):
             raise ValueError(f"Invalid deepep_mode: {self.deepep_mode}")
 
     def _update_stage(self, old_stage, new_stage):
+        """推进阶段状态机：断言当前处于 old_stage，然后切换到 new_stage。
+
+        用于防止 a/b 子阶段被错误顺序或重复调用。
+        """
         assert self._stage == old_stage
         self._stage = new_stage
 
     def set_quant_config(self, quant_config: dict):
+        """为已启用的（低时延/普通）子分发器同步设置量化配置。"""
         super().set_quant_config(quant_config)
         if self.deepep_mode.enable_low_latency():
             self._low_latency_dispatcher.set_quant_config(quant_config)
@@ -968,6 +1343,7 @@ class DeepEPDispatcher(BaseDispatcher):
     def set_overlap_args(
         self, combine_overlap_args: CombineOverlapArgs, meta_overlap_args: dict
     ):
+        """为已启用的子分发器同步设置计算/通信重叠参数。"""
         super().set_overlap_args(combine_overlap_args, meta_overlap_args)
         if self.deepep_mode.enable_low_latency():
             self._low_latency_dispatcher.set_overlap_args(
@@ -979,6 +1355,7 @@ class DeepEPDispatcher(BaseDispatcher):
             )
 
     def clear_overlap_args(self):
+        """清除已启用子分发器的重叠参数。"""
         super().clear_overlap_args()
         if self.deepep_mode.enable_low_latency():
             self._low_latency_dispatcher.clear_overlap_args()
@@ -986,4 +1363,5 @@ class DeepEPDispatcher(BaseDispatcher):
             self._normal_dispatcher.clear_overlap_args()
 
     def register_deepep_dispatch_hook(self, hook):
+        """注册分发 hook（在 dispatch_a 与 dispatch_b 之间被触发）。"""
         return self._deepep_dispatch_hooks.register_hook(hook)
