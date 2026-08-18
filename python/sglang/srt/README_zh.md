@@ -97,7 +97,7 @@
   - [`anthropic/`](entrypoints/anthropic/README_zh.md)
   - [`ollama/`](entrypoints/ollama/README_zh.md)
   - [`openai/`](entrypoints/openai/README_zh.md)
-- [`eplb/`](eplb/README_zh.md)
+- [`eplb/`](eplb/eplb_learning_guide_zh.md)
   - [`eplb_algorithms/`](eplb/eplb_algorithms/README_zh.md)
   - [`eplb_simulator/`](eplb/eplb_simulator/README_zh.md)
 - [`function_call/`](function_call/README_zh.md)

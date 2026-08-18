@@ -134,28 +134,54 @@ class _ExpertDistributionRecorderNoop(ExpertDistributionRecorder):
 
 
 class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
+    """专家分布记录器的真实（非空）实现，负责在运行时采集各专家的负载分布。
+
+    整体机制：
+    - 通过三个 hook（on_select_experts / on_deepep_dispatch_normal /
+      on_deepep_dispatch_low_latency）在 MoE 路由、DeepEP 分发等关键路径上埋点采集。
+    - 每次 forward pass 内由 _SinglePassGatherer 收集当次数据，结束后汇总到 _Accumulator。
+    - 通过 with_forward_pass / with_current_layer 等上下文管理器维护当前所处的
+      forward_pass_id / 层 id / 调试名，供 hook 定位数据归属。
+    - 支持 start/stop 控制记录开关，以及 dump 导出（并重置）。
+    """
+
     def __init__(
         self,
         server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ):
+        """初始化真实记录器。
+
+        输入：
+        - server_args: 服务端参数（含记录器模式、是否导出指标等）。
+        - expert_location_metadata: 专家位置元数据（提供层数、物理/逻辑专家数等）。
+        - rank: 当前分布式 rank。
+        构造后：创建汇总器 _accumulator 与各采集器 _single_pass_gatherers；
+        若开启了 enable_expert_distribution_metrics 则自动开始记录。
+        """
         self._server_args = server_args
         self._expert_location_metadata = expert_location_metadata
 
+        # 是否正在记录（开关）
         self._recording = False
+        # 是否整体禁用（用于 disable_this_region 临时屏蔽）
         self._disable_all = False
-        self._current_forward_pass_id = Withable()
-        self._current_layer_idx = Withable()
-        self._current_debug_name = Withable()
+        # 下面三个 Withable 用于以上下文方式保存“当前”状态，供 hook 定位数据归属
+        self._current_forward_pass_id = Withable()  # 当前 forward pass id
+        self._current_layer_idx = Withable()  # 当前层 id
+        self._current_debug_name = Withable()  # 当前调试名（用于选择采集器）
+        # 汇总器：跨多个 forward pass 累积/聚合各次采集结果
         self._accumulator = _Accumulator.init_new(
             server_args, expert_location_metadata, rank
         )
+        # 单次采集器：每个 key 对应一种采集器，负责单次 forward pass 内的数据收集
         self._single_pass_gatherers = {
             k: _SinglePassGatherer.init_new(server_args, expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
         }
 
+        # 若开启了专家分布指标导出，则在初始化时就自动开始记录
         if server_args.enable_expert_distribution_metrics:
             logger.info(
                 "ExpertDistributionRecorder auto start record since enable_expert_distribution_metrics"
@@ -163,13 +189,29 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             self.start_record()
 
     def with_current_layer(self, layer_idx):
+        """上下文管理器：在进入某层计算时记录当前层 id，退出时自动恢复。
+
+        示例：
+            with recorder.with_current_layer(3):
+                ...  # 此区域内 hook 采集的数据会归属到第 3 层
+        """
         return self._current_layer_idx.with_value(layer_idx)
 
     def with_debug_name(self, debug_name):
+        """上下文管理器：设置当前调试名，用于选择对应的单次采集器。"""
         return self._current_debug_name.with_value(debug_name)
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
+        """上下文管理器：包住一次完整的 forward pass，自动处理开始/结束钩子。
+
+        进入时记录 forward_pass_id 并重置各采集器；退出时把本次采集数据汇总进累加器。
+
+        示例：
+            with recorder.with_forward_pass(42, forward_batch) as outputs:
+                ...  # 运行模型 forward；hook 采集的数据归属到 pass 42
+            # 退出后 outputs 中可能含本次 pass 产生的 metrics
+        """
         outputs = {}
         with self._current_forward_pass_id.with_value(forward_pass_id):
             self._on_forward_pass_start(forward_batch)
@@ -180,7 +222,13 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     @contextmanager
     def disable_this_region(self):
-        """Context manager to temporarily disable recording."""
+        """上下文管理器：临时禁用记录（区域内的 hook 全部不采集）。
+
+        退出时恢复之前的启用状态（支持嵌套）。
+        示例：
+            with recorder.disable_this_region():
+                ...  # 例如预热/捕获图等不希望计入统计的区域
+        """
         previous_disable_all = self._disable_all
         self._disable_all = True
         try:
@@ -189,6 +237,10 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             self._disable_all = previous_disable_all
 
     def _on_forward_pass_start(self, forward_batch: ForwardBatch):
+        """forward pass 开始回调：重置各单次采集器并通知其本次 forward 开始。
+
+        未处于记录状态（_recording=False）时直接返回，不做任何采集。
+        """
         if not self._recording:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
@@ -196,6 +248,10 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             gatherer.on_forward_pass_start(forward_batch)
 
     def _on_forward_pass_end(self, forward_pass_id: int, outputs: Dict[str, Any]):
+        """forward pass 结束回调：从各采集器 collect 本次数据并 append 到累加器。
+
+        outputs 用于回传本次 pass 可能产生的指标（如均衡度）。
+        """
         if not self._recording:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
@@ -205,6 +261,11 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             )
 
     def on_select_experts(self, topk_ids: torch.Tensor):
+        """采集钩子：在 topk 专家选择处埋点，记录每个 token 选中的专家 id。
+
+        输入：topk_ids，形状 (num_tokens, top_k)，元素为选中的（物理）专家 id。
+        示例：topk_ids=[[0,3],[0,1]] 表示 token0 选中专家 0/3，token1 选中 0/1。
+        """
         self._on_hook("on_select_experts", topk_ids=topk_ids)
 
     def on_deepep_dispatch_normal(
@@ -214,6 +275,13 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
     ):
+        """采集钩子：DeepEP normal（高吞吐）分发路径上埋点。
+
+        输入：
+        - local_physical_count_of_layer: 本层各本地物理专家的 token 计数。
+        - num_tokens_per_rank / num_tokens_per_rdma_rank / num_tokens_per_expert:
+          DeepEP 分发产生的各维度 token 数量统计。
+        """
         self._on_hook(
             "on_deepep_dispatch_normal",
             local_physical_count_of_layer=local_physical_count_of_layer,
@@ -225,12 +293,22 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def on_deepep_dispatch_low_latency(
         self, local_physical_count_of_layer: torch.Tensor
     ):
+        """采集钩子：DeepEP low-latency（低延迟）分发路径上埋点。
+
+        输入：local_physical_count_of_layer，本层各本地物理专家的 token 计数张量。
+        """
         self._on_hook(
             "on_deepep_dispatch_low_latency",
             local_physical_count_of_layer=local_physical_count_of_layer,
         )
 
     def _on_hook(self, hook_name: str, **kwargs):
+        """钩子统一分发入口：根据当前调试名选到对应采集器，并调用其同名方法。
+
+        会自动带上当前层 id（layer_idx）。以下两种情况直接跳过（不采集）：
+        - 整体被禁用（_disable_all=True）；
+        - 既不在记录状态、当前 stream 也未在做 CUDA graph 捕获时。
+        """
         if self._disable_all:
             return
         if not (
@@ -245,7 +323,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         getattr(gatherer, hook_name)(layer_idx=self._current_layer_idx.value, **kwargs)
 
     def _reset(self):
-        """Reset the expert distribution recorder."""
+        """重置专家分布记录器：清空各采集器与累加器的状态。"""
         logger.info("Resetting ExpertDistributionRecorder...")
         assert (
             self._current_layer_idx.value is None
@@ -255,7 +333,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._accumulator.reset()
 
     def start_record(self):
-        """Start recording the expert distribution."""
+        """开始记录专家分布（会先重置状态）。"""
         if self._recording:
             logger.warning(
                 "SGLang server is already recording expert ids. Did you forget to dump the expert ids recorded so far by sending requests to the `/stop_expert_distribution_record` and `/dump_expert_distribution_record` endpoints?"
@@ -264,7 +342,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._recording = True
 
     def stop_record(self):
-        """Stop recording the expert distribution."""
+        """停止记录专家分布。"""
         if not self._recording:
             logger.warning(
                 "SGLang server has not been recording expert ids. Did you forget to start recording by sending request to the `/start_expert_distribution_record` endpoint?"
@@ -272,7 +350,11 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._recording = False
 
     def dump_record(self, output_mode: _OutputMode = "file"):
-        """Dump the expert distribution record and reset the recorder after dumping."""
+        """导出专家分布记录，并在导出后重置记录器。
+
+        输入：output_mode，"file" 写入文件，"object" 直接返回结果 dict。
+        返回：由累加器 dump 出的结果（object 模式下为含 logical_count 等字段的 dict）。
+        """
         output = self._accumulator.dump(output_mode=output_mode)
         self._reset()
         return output
@@ -300,12 +382,55 @@ def set_global_expert_distribution_recorder(value):
 
 
 class _SinglePassGatherer(ABC):
+    """单次 forward pass 的专家负载收集器（抽象基类）。
+
+    定位
+    ----
+    在 EPLB 的负载采集链路中，``ExpertDistributionRecorder``（记录器）负责跨多次
+    forward pass 的累积与 dump，而本类只负责"一次 forward pass 之内"的负载收集：
+    模型前向过程中通过若干 hook（``on_select_experts`` / ``on_deepep_dispatch_*``）
+    把各层、各专家被路由到的 token 计数喂进来，本次 forward 结束后由记录器调用
+    ``collect()`` 取走结果，再调用 ``reset()`` 复位以复用同一实例。
+
+    为什么要有多个子类
+    ------------------
+    不同的 MoE 后端 / 采集精度，其"负载信息从哪个 hook、以什么形态到来"各不相同，
+    因此派生出多个子类（见 ``init_new`` 的分派）：
+
+    - ``_DetailSinglePassGatherer``：per-token 逐 token 记录 topk_ids，信息最细（可离线复盘）。
+    - ``_SelectExpertsSinglePassGatherer``：在 topk 选择处统计（全局物理专家计数）。
+    - ``_DeepepNormalSinglePassGatherer``：DeepEP normal 模式，从 dispatch 处拿近似统计（CPU 累加）。
+    - ``_DeepepLowLatencySinglePassGatherer``：DeepEP low-latency 模式（GPU 上按本地物理专家累加）。
+
+    统一输出
+    --------
+    所有子类的 ``collect()`` 都会返回含 ``global_physical_count``
+    （形状 ``[num_layers, num_physical_experts]``，各物理专家被路由到的 token 数）的 dict，
+    使上层记录器无需关心具体后端差异。
+    """
+
     @staticmethod
     def init_new(
         server_args: ServerArgs,
         expert_location_metadata: ExpertLocationMetadata,
         rank: int,
     ) -> _SinglePassGatherer:
+        """工厂方法：根据 server_args 的后端/采集模式创建对应的收集器子类实例。
+
+        分派优先级（自上而下）：
+          1. ``expert_distribution_recorder_mode == "per_token"`` → 逐 token 详细收集器；
+          2. ``moe_a2a_backend == "mori"`` → low-latency 收集器；
+          3. ``expert_distribution_recorder_mode == "stat_approx"`` 且 DeepEP normal → normal 收集器；
+          4. 启用了 a2a 后端时，按 ``deepep_mode`` 选 normal / low_latency 收集器；
+          5. 兜底：``_SelectExpertsSinglePassGatherer``（在 topk 选择处统计）。
+
+        输入输出示例
+        ------------
+        >>> # 默认配置（moe_a2a_backend="none"，非 per_token）：
+        >>> gatherer = _SinglePassGatherer.init_new(server_args, meta, rank=0)
+        >>> type(gatherer).__name__
+        '_SelectExpertsSinglePassGatherer'
+        """
         if server_args.expert_distribution_recorder_mode == "per_token":
             return _DetailSinglePassGatherer(
                 server_args, expert_location_metadata, rank
@@ -335,13 +460,34 @@ class _SinglePassGatherer(ABC):
         return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
 
     def __init__(self, expert_location_metadata: ExpertLocationMetadata, rank: int):
+        """保存专家位置元数据与当前 rank。
+
+        参数
+        ----
+        expert_location_metadata: 专家位置元数据，提供 num_layers / num_physical_experts /
+            num_local_physical_experts 等维度信息，供各子类分配缓冲区与换算索引。
+        rank: 当前进程的 EP rank，用于把"本地物理专家计数"映射到"全局物理专家计数"中的偏移。
+        """
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
 
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
+        """forward pass 开始时的 hook（默认空实现）。
+
+        仅需要逐 token 元信息的子类（``_DetailSinglePassGatherer``）会重写它以记录
+        input_ids / positions 等；其余子类无需该信息。
+        """
         pass
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        """topk 专家选择处的 hook（默认空实现）。
+
+        参数
+        ----
+        layer_idx: 当前 MoE 层的下标。
+        topk_ids: 该层每个 token 选中的 topk 专家 id，形状约为 ``[num_tokens, top_k]``；
+            其中 ``-1`` 表示无效/填充位。
+        """
         pass
 
     def on_deepep_dispatch_normal(
@@ -352,22 +498,48 @@ class _SinglePassGatherer(ABC):
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
     ):
+        """DeepEP normal 模式 dispatch 处的 hook（默认空实现）。
+
+        参数
+        ----
+        layer_idx: 当前层下标。
+        local_physical_count_of_layer: 本层各"本地物理专家"收到的 token 计数列表。
+        num_tokens_per_rank / num_tokens_per_rdma_rank / num_tokens_per_expert:
+            dispatch 过程中的分发统计（分别按 rank / RDMA rank / 专家维度），
+            仅详细收集器会保存，用于离线分析。
+        """
         pass
 
     def on_deepep_dispatch_low_latency(
         self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
     ):
+        """DeepEP low-latency 模式 dispatch 处的 hook（默认空实现）。
+
+        参数
+        ----
+        layer_idx: 当前层下标。
+        local_physical_count_of_layer: 本层各本地物理专家收到的 token 计数（张量）。
+        """
         pass
 
     def reset(self):
+        """复位内部缓冲区，以便同一实例用于下一次 forward pass。子类必须实现。"""
         raise NotImplementedError
 
     def collect(self) -> Dict:
+        """汇总并返回本次 forward pass 的采集结果（含 ``global_physical_count``）。子类必须实现。"""
         raise NotImplementedError
 
 
 class _DetailSinglePassGatherer(_SinglePassGatherer):
-    # DeepSeek V3 has this value; should generalize later
+    """逐 token 详细收集器（per_token 模式）。
+
+    除了统计各物理专家的 token 数，还会完整保留每个 token 的 topk_ids、
+    输入元信息（input_ids/positions 等）以及 dispatch 统计，信息最细，
+    主要用于离线分析/复盘（数据量较大，不适合高频在线重平衡）。
+    """
+
+    # DeepSeek V3 的 topk 取值为 8；后续应该做成可配置/通用的
     _TOP_K_NUM = 8
 
     def __init__(
@@ -389,12 +561,17 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
             device=server_args.device,
         )
         self._misc_objects: List[Dict[str, Any]] = []
+        # 详细收集器暂不支持 TBO（two-batch-overlap，双 batch 重叠）
         assert (
             not server_args.enable_two_batch_overlap
         ), "DetailSinglePassGatherer does not support TBO yet"
-        # TODO assert shared experts fusion is disabled, o/w data is wrong
+        # TODO 需断言共享专家融合（shared experts fusion）已关闭，否则数据会出错
 
     def on_forward_pass_start(self, forward_batch: ForwardBatch):
+        """记录本次 forward 的输入元信息（input_ids / positions / 序列长 / forward 模式）。
+
+        断言 ``self._metadata is None`` 确保一次 forward 只记录一次（未被 reset 前不重入）。
+        """
         assert self._metadata is None
         self._metadata = dict(
             # TODO pr-chain
@@ -406,6 +583,15 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         )
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        """把该层每个 token 的 topk_ids 原样写入预分配的缓冲区对应位置。
+
+        输入输出示例
+        ------------
+        >>> # layer_idx=0, topk_ids 形状 [3 个 token, top_k=2]
+        >>> topk_ids = torch.tensor([[1, 5], [2, 5], [1, 3]])
+        >>> gatherer.on_select_experts(0, topk_ids)
+        >>> # 之后 self._topk_ids_of_layer[0, :3, :2] == topk_ids
+        """
         self._topk_ids_of_layer[layer_idx, : topk_ids.shape[0], : topk_ids.shape[1]] = (
             topk_ids
         )
@@ -418,6 +604,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
     ):
+        """把本层 dispatch 的各维度统计（转到 CPU list）追加到 ``_misc_objects`` 中保存。"""
         self._misc_objects.append(
             dict(
                 layer_id=layer_idx,
@@ -432,11 +619,23 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         )
 
     def reset(self):
+        """复位：topk 缓冲区填 -1（无效位）、清空 misc 列表、元信息置 None。"""
         self._topk_ids_of_layer[...] = -1
         self._misc_objects.clear()
         self._metadata = None
 
     def collect(self) -> Dict:
+        """汇总本次 forward 的详细结果。
+
+        会把逐 token 的 topk_ids 聚合成各物理专家的计数 ``global_physical_count``，
+        并连同输入元信息、逐 token topk_ids、dispatch 统计一并返回。
+
+        返回 dict 包含：
+          - input_ids / positions / extend_seq_lens / forward_mode（来自元信息）
+          - topk_ids_of_layer: ``[num_layers, num_tokens, top_k]`` 逐 token 的选专家结果
+          - misc_objects: 各层 dispatch 统计
+          - global_physical_count: ``[num_layers, num_physical_experts]`` 各物理专家 token 数
+        """
         num_tokens = len(self._metadata["input_ids"])
 
         global_physical_count = _convert_per_token_to_global_physical_count(
@@ -455,11 +654,29 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
 
 
 class _LayerBasedCpuSinglePassGatherer(_SinglePassGatherer):
+    """基于层的 CPU 收集器（抽象中间类）。
+
+    用一个 ``{layer_idx: List[int]}`` 字典在 CPU 上累加各层的逐专家计数；
+    同一层多次写入时按位相加（适用于 DeepEP normal 等以 Python list 形式上报的场景）。
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # {层下标: 该层各专家的累加计数列表}
         self._objects_of_layer = {}
 
     def _on_layer_data(self, layer_idx: int, objects: List[int]):
+        """向指定层写入/累加一组计数。
+
+        若该层已有数据则逐位相加（``_list_sum``），否则直接写入。
+
+        输入输出示例
+        ------------
+        >>> g._on_layer_data(0, [1, 2, 3])   # 首次写入
+        >>> g._on_layer_data(0, [4, 0, 1])   # 逐位相加
+        >>> g._objects_of_layer[0]
+        [5, 2, 4]
+        """
         assert 0 <= layer_idx < self._expert_location_metadata.num_layers
         if layer_idx in self._objects_of_layer:
             self._objects_of_layer[layer_idx] = _list_sum(
@@ -469,9 +686,18 @@ class _LayerBasedCpuSinglePassGatherer(_SinglePassGatherer):
             self._objects_of_layer[layer_idx] = objects
 
     def reset(self):
+        """复位：清空逐层计数字典。"""
         self._objects_of_layer.clear()
 
     def _collect_objects(self, pad_len: int) -> torch.Tensor:
+        """把逐层计数字典汇总成 ``[num_layers, pad_len]`` 的张量；缺失的层用全 0 补齐。
+
+        输入输出示例
+        ------------
+        >>> # 共 3 层，仅第 1 层有数据 [2, 5]，pad_len=2
+        >>> g._collect_objects(pad_len=2)
+        tensor([[0, 0], [2, 5], [0, 0]])
+        """
         data = [
             self._objects_of_layer.get(layer_index) or ([0] * pad_len)
             for layer_index in range(self._expert_location_metadata.num_layers)
@@ -480,10 +706,25 @@ class _LayerBasedCpuSinglePassGatherer(_SinglePassGatherer):
 
 
 def _list_sum(a: List, b: List) -> List:
+    """两个等长列表逐位相加（长度不一致会因 strict=True 报错）。
+
+    >>> _list_sum([1, 2, 3], [4, 0, 1])
+    [5, 2, 4]
+    """
     return [x + y for x, y in zip(a, b, strict=True)]
 
 
 class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
+    """基于层的 GPU 收集器（抽象中间类）。
+
+    用一个预分配的 GPU 张量 ``_data`` 直接在设备上累加计数，避免频繁的 CPU 交互。
+
+    ``enable_global_physical_experts`` 控制 ``_data`` 的列宽：
+      - True：直接按全局物理专家数 ``num_physical_experts`` 开辟（collect 时无需换算）；
+      - False：按本地物理专家数 ``num_local_physical_experts`` 开辟，collect 时再根据 rank
+        映射到全局计数。
+    """
+
     def __init__(self, *args, enable_global_physical_experts: bool, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -504,13 +745,18 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
         )
 
     def reset(self):
+        """复位：把 GPU 计数张量清零。"""
         self._data[...] = 0
 
     def collect(self) -> Dict:
+        """返回 ``{"global_physical_count": [num_layers, num_physical_experts]}``。
+
+        若本来就是全局计数则直接返回；否则把本地计数按 rank 映射到全局位置。
+        """
         if self._enable_global_physical_experts:
             global_physical_count = self._data
         else:
-            # Can optimize if bottleneck
+            # 若成为瓶颈可以优化
             global_physical_count = _convert_local_to_global_physical_count(
                 self._data,
                 rank=self._rank,
@@ -522,11 +768,27 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
 
 
 class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
+    """在 topk 选择处统计的收集器（默认兜底实现）。
+
+    直接根据每层选中的 topk_ids 累加各全局物理专家的计数（``enable_global_physical_experts=True``），
+        适用于未启用专门 a2a 后端的常规场景。
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, enable_global_physical_experts=True)
 
-    # can optimize (e.g. fuse / compile)
+    # 可优化（例如算子融合 / 编译）
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        """把本层 topk_ids 展平，排除 -1 无效位后，用 scatter_add 累加到各专家计数。
+
+        输入输出示例
+        ------------
+        >>> # num_physical_experts=6, layer_idx=0
+        >>> topk_ids = torch.tensor([[1, 5], [1, 3], [-1, 5]])  # 含一个无效位 -1
+        >>> g.on_select_experts(0, topk_ids)
+        >>> # 专家1 被选 2 次、专家5 选 2 次、专家3 选 1 次，-1 不计
+        >>> # => self._data[0] == tensor([0, 2, 0, 1, 0, 2])
+        """
         topk_ids = topk_ids.flatten()
         mask = topk_ids != -1
         self._data[layer_idx, :].scatter_add_(
@@ -535,6 +797,12 @@ class _SelectExpertsSinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
 
 
 class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
+    """DeepEP normal 模式收集器。
+
+    从 DeepEP normal dispatch 处拿到的是本地物理专家计数（Python list），在 CPU 上逐层累加；
+    注意这是近似统计，小 batch 时精度有限（见构造时的提示日志）。
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if torch.distributed.get_rank() == 0:
@@ -551,10 +819,12 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
         num_tokens_per_rdma_rank,
         num_tokens_per_expert,
     ):
+        """把本层的本地物理专家计数（list）累加到对应层。"""
         assert isinstance(local_physical_count_of_layer, list)
         self._on_layer_data(layer_idx, local_physical_count_of_layer)
 
     def collect(self) -> Dict:
+        """汇总逐层本地计数并按 rank 映射为全局计数，返回 ``{"global_physical_count": ...}``。"""
         local_physical_count = super()._collect_objects(
             pad_len=self._expert_location_metadata.num_local_physical_experts
         )
@@ -568,13 +838,20 @@ class _DeepepNormalSinglePassGatherer(_LayerBasedCpuSinglePassGatherer):
 
 
 class _DeepepLowLatencySinglePassGatherer(_LayerBasedGpuSinglePassGatherer):
+    """DeepEP low-latency 模式收集器。
+
+    在 GPU 上按"本地物理专家"累加（``enable_global_physical_experts=False``），
+    collect 时再根据 rank 映射到全局计数。
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs, enable_global_physical_experts=False)
 
     def on_deepep_dispatch_low_latency(
         self, layer_idx: int, local_physical_count_of_layer: torch.Tensor
     ):
-        # Most naive implementation, can optimize later
+        """把本层本地物理专家计数（张量）直接累加到 GPU 缓冲区对应行。"""
+        # 最朴素的实现，后续可优化
         self._data[layer_idx, :] += local_physical_count_of_layer
 
 
@@ -914,13 +1191,30 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             raise NotImplementedError
 
     def _get_global_average_utilization_rate(self):
+        """计算「窗口内平均均衡度」并广播给所有 rank。
+
+        这里的 utilization rate 并非 GPU 硬件利用率，而是各 GPU 之间专家负载的
+        均衡程度（balancedness）：越接近 1 表示越均衡，越小表示越不均衡（存在热点 GPU）。
+        单次值由 compute_utilization_rate 计算（avg/max），逐次 append 到滑动窗口 _history。
+
+        行为：
+        - 若未启用记录，或阈值 eplb_min_rebalancing_utilization_threshold == 1.0（默认），
+          直接返回 None，表示不启用“已均衡则跳过重平衡”的判断（即每次都重平衡）。
+        - 否则取最大窗口（window_sizes[-1]，即最近 1000 次 forward）内的均值；
+          只有 rank 0 持有真实值，再通过 broadcast 同步给其他 rank。
+
+        返回：float（均衡度，0~1）或 None。
+        """
+        # 未启用，或阈值为 1.0（不做跳过判断）时直接返回 None
         if not self._enable or math.isclose(
             self._server_args.eplb_min_rebalancing_utilization_threshold, 1.0
         ):
             return None
 
         if self._rank == 0:
+            # _history.mean() 返回各窗口大小对应的均值；window_sizes = [10, 100, 1000]
             utilization_mean_rates = self._history.mean()
+            # 取最大窗口（最近 1000 次 forward pass）的平均均衡度
             window_index = self.window_sizes[-1]
             average_utilization_rate_over_window = (
                 utilization_mean_rates[window_index]
@@ -1052,7 +1346,22 @@ def compute_gpu_physical_count(
 def compute_utilization_rate(
     gpu_physical_count_of_batch: torch.Tensor,  # (..., num_layer, num_gpu)
 ):
-    """output: utilization_rate (..., num_layer)"""
+    """计算每层的“均衡度”（balancedness），输出形状 (..., num_layer)。
+
+    本质是“平均负载 / 峰值负载”：对每一层，先把物理专家计数按 GPU 聚合成每张卡的
+    token 处理量，再取所有 GPU 的均值与最大值之比：
+
+        utilization_rate = (avg_gpu_physical_count + eps) / (max_gpu_physical_count + eps)
+
+    含义：
+    - 值 = 1.0：完全均衡，每张卡负载相同。
+    - 值越小：越不均衡，存在热点 GPU（最忙的卡远高于平均），成为瓶颈。
+    - eps=1e-5 用于避免除零。
+
+    示例：
+        某层 4 张卡负载 = [100, 100, 100, 100] -> 100/100 = 1.0（完全均衡）
+        某层 4 张卡负载 = [400, 0, 0, 0]     -> 100/400 = 0.25（严重不均衡）
+    """
     gpu_physical_count_of_batch = gpu_physical_count_of_batch.float()
     max_gpu_physical_count = einops.reduce(
         gpu_physical_count_of_batch,
