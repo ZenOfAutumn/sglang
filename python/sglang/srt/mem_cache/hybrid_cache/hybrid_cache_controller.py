@@ -5,20 +5,21 @@ import logging
 import os
 import threading
 import time
-from queue import Queue
+from dataclasses import replace
+from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 
-from sglang.srt.managers.cache_controller import CacheOperation as BaseCacheOperation
 from sglang.srt.managers.cache_controller import (
-    HiCacheAck,
+    CacheOperation,
 )
 from sglang.srt.managers.cache_controller import (
     HiCacheController as BaseHiCacheController,
 )
 from sglang.srt.managers.cache_controller import (
     LayerDoneCounter,
+    PrefetchAck,
 )
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
@@ -29,93 +30,16 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    count_pool_hits,
 )
-from sglang.srt.mem_cache.memory_pool_host import PoolEntry
-from sglang.srt.utils import get_device_module
+from sglang.srt.mem_cache.l2_transfer import L2Transfer
+from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 logger = logging.getLogger(__name__)
-device_module = get_device_module()
-
-# 本模块是「混合模型」（如线性注意力 / Mamba：KV pool + 额外状态 pool）场景下的
-# HiCache 控制器实现。相比通用的 HiCacheController，它在 device/host/storage 三级
-# 搬运的基础上，额外支持「多 pool 协同搬运」：KV 主池之外还挂接若干 extra pool
-# （如 Mamba 状态、SWA 索引等），并通过 PoolTransfer 统一描述与调度这些附加搬运。
-
-
-class CacheOperation(BaseCacheOperation):
-    """一次 device<->host 搬运操作（在通用 CacheOperation 基础上扩展 pool_transfers）。
-
-    pool_transfers：除 KV 主池外，本次操作还需要一并搬运的「附加池」列表。混合模型里
-    一个逻辑节点的完整状态可能分散在多个池中，需要一起搬运才能保持一致。
-    """
-
-    def __init__(
-        self,
-        host_indices: torch.Tensor,
-        device_indices: torch.Tensor,
-        node_id: int,
-        priority: Optional[int] = None,
-        pool_transfers: Optional[list[PoolTransfer]] = None,
-    ):
-        super().__init__(host_indices, device_indices, node_id, priority)
-        self.pool_transfers = pool_transfers
-
-    @staticmethod
-    def merge_pool_transfers(
-        ops: List[CacheOperation],
-    ) -> Optional[list[PoolTransfer]]:
-        # 把多个操作里「同名同来源」的 PoolTransfer 合并成一个（各自的索引拼接起来），
-        # 以便批量执行一次搬运，减少调度开销。
-        # 分组键为 (池名, 索引来源池)：只有这两者都相同的 transfer 才能安全拼接。
-        grouped: dict[tuple[PoolName, Optional[PoolName]], list[PoolTransfer]] = {}
-        for op in ops:
-            for t in op.pool_transfers or []:
-                grouped.setdefault((t.name, t.indices_from_pool), []).append(t)
-        if not grouped:
-            return None
-
-        def cat_or_none(tensors):
-            # 拼接一组张量；若全为 None 则返回 None（该字段本次无内容）。
-            parts = [x for x in tensors if x is not None]
-            return torch.cat(parts) if parts else None
-
-        return [
-            PoolTransfer(
-                name=ts[0].name,
-                host_indices=cat_or_none(t.host_indices for t in ts),
-                device_indices=cat_or_none(t.device_indices for t in ts),
-                keys=[k for t in ts if t.keys for k in t.keys] or None,
-                hit_policy=ts[0].hit_policy,
-                indices_from_pool=ts[0].indices_from_pool,
-            )
-            for ts in grouped.values()
-        ]
-
-    @staticmethod
-    def merge_ops(ops: List[CacheOperation]) -> CacheOperation:
-        # 把队列里的多个搬运操作合并成一个大操作，一次性提交给 device 流执行。
-        if len(ops) == 1:
-            return ops[0]
-        # KV 主池的 host/device 索引直接首尾拼接。
-        host_indices = torch.cat([op.host_indices for op in ops])
-        device_indices = torch.cat([op.device_indices for op in ops])
-        node_ids = []
-        # 合并后的优先级取各操作中的最小值（数值越小优先级越高）。
-        priority = min(op.priority for op in ops)
-        for op in ops:
-            node_ids.extend(op.node_ids)
-        merged = CacheOperation(
-            host_indices,
-            device_indices,
-            -1,
-            priority,
-            pool_transfers=CacheOperation.merge_pool_transfers(ops),
-        )
-        merged.node_ids = node_ids
-        return merged
 
 
 class StorageOperation(BaseStorageOperation):
@@ -149,7 +73,6 @@ class PrefetchOperation(StorageOperation):
     def __init__(
         self,
         request_id: str,
-        host_indices: torch.Tensor,
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
@@ -158,9 +81,10 @@ class PrefetchOperation(StorageOperation):
         self.request_id = request_id
         self._lock = threading.Lock()
         self._terminated_flag = False
+        self.storage_hit_count = 0
         self.start_time = time.monotonic()
         super().__init__(
-            host_indices,
+            None,
             token_ids,
             last_hash,
             prefix_keys=prefix_keys,
@@ -169,22 +93,14 @@ class PrefetchOperation(StorageOperation):
         # 若没有附加池搬运，则附加池部分一开始就视为已完成。
         self.pool_transfers_done = not bool(pool_transfers)
 
-    def increment(self, num_tokens: int):
-        # 累加已完成的 token 数；若已被标记终止则拒绝累加并返回 False。
-        with self._lock:
-            if self._terminated_flag:
-                return False
-            self.completed_tokens += num_tokens
-            return True
-
     def mark_terminate(self):
         # 标记该预取为「终止」，使其在下一次进度检查时尽快收尾。
         with self._lock:
             self._terminated_flag = True
 
     def is_terminated(self) -> bool:
-        # 查询该预取是否已被标记终止。
-        return self._terminated_flag
+        with self._lock:
+            return self._terminated_flag
 
 
 class HybridCacheController(BaseHiCacheController):
@@ -213,6 +129,7 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         transfer_layer_num: Optional[int] = None,
         enable_storage_metrics: bool = False,
+        host_memory_mode: str = "cache",
     ):
         # 先缓存一份启动时的 storage_backend，稍后手动 attach（下方父类先传 None，避免在
         # 额外池尚未就绪时就启动 storage 线程）。
@@ -236,6 +153,7 @@ class HybridCacheController(BaseHiCacheController):
             model_name=model_name,
             storage_backend_extra_config=storage_backend_extra_config,
             enable_storage_metrics=enable_storage_metrics,
+            host_memory_mode=host_memory_mode,
         )
         # 覆盖 layer_num：混合模型需要搬运「所有层」（例如线性模型的 KV + Mamba），
         # 而不只是 full_kv_pool 报告的全注意力层。因此重建逐层完成计数器。
@@ -243,7 +161,7 @@ class HybridCacheController(BaseHiCacheController):
             self.layer_num = transfer_layer_num
             self.layer_done_counter = LayerDoneCounter(self.layer_num)
 
-        # 若启动时已指定后端，现在（额外池已就绪）才真正 attach，并把各 host 池注册给后端。
+        self.storage_host_pool = mem_pool_host.anchor_entry.host_pool
         if startup_storage_backend is not None:
             self.attach_storage_backend(
                 storage_backend=startup_storage_backend,
@@ -277,6 +195,15 @@ class HybridCacheController(BaseHiCacheController):
         # 再把每个 host 池（含 KV 主池与各额外池）注册到后端，使后端能直接向这些
         # host 内存做零拷贝/DMA 搬运。
         for entry in host_pools or []:
+            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+
+    def register_host_pool_entry(self, entry: PoolEntry) -> None:
+        if not isinstance(self.mem_pool_host, HostPoolGroup):
+            raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
+        self.mem_pool_host.add_entry(entry)
+        if not entry.is_primary_index_anchor:
+            self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
+        if self.enable_storage and self.storage_backend is not None:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     @staticmethod
@@ -434,12 +361,10 @@ class HybridCacheController(BaseHiCacheController):
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
-        # 为 extra pool 自动分配 host 索引（已有的保留）；失败时回滚、释放已分配的 host 空间。
-        pool_transfers = self._resolve_pool_transfers_allocation(
+        pool_transfers = self.mem_pool_host.resolve_host_transfers(
             extra_pools,
-            alloc_host=True,
-            kv_device_indices=device_indices,
-            kv_host_indices=host_indices,
+            primary_device_indices=device_indices,
+            primary_host_indices=host_indices,
         )
         if pool_transfers is None and extra_pools:
             self.mem_pool_host.free(host_indices)
@@ -458,47 +383,165 @@ class HybridCacheController(BaseHiCacheController):
         self.start_writing()
         return host_indices
 
-    def start_writing(self) -> None:
-        # 把写队列里的操作合并为一，在专用写流上一次性把所有层的 KV（及额外池）从 device 备份到 host。
-        if not self.write_queue:
-            return
-        op = CacheOperation.merge_ops(self.write_queue)
-        # 把索引搬到执行设备上，并得到归一化后的额外池搬运描述。
-        host_indices, device_indices, resolved_pool_transfers = (
-            self.move_hybrid_indices(op)
+    def _move_op_indices(
+        self, op: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
+        return self.move_hybrid_indices(op)
+
+    def _move_write_operation(
+        self, op: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[list[PoolTransfer]]]:
+        host_group = self.mem_pool_host
+        if self.io_backend != "kernel" or host_group.layout != "page_first":
+            return self.move_hybrid_indices(op)
+        if not getattr(host_group, "supports_per_pool_backup_indices", False):
+            if not getattr(host_group, "can_use_write_back_jit", False):
+                return self.move_hybrid_indices(op)
+            return op.host_indices, op.device_indices, op.pool_transfers
+
+        def move_for_pool(host_pool, host_indices, device_indices):
+            if getattr(host_pool, "can_use_write_back_jit", False):
+                if host_indices.is_cuda:
+                    host_indices = host_indices.cpu()
+                return host_indices, device_indices
+            return self.move_indices(host_indices, device_indices)
+
+        host_indices, device_indices = move_for_pool(
+            host_group.anchor_entry.host_pool,
+            op.host_indices,
+            op.device_indices,
         )
-        self.write_queue.clear()
-        # start/finish 事件用于跟踪本次异步搬运的开始与完成。
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
-        start_event.record()
-        with device_module.stream(self.write_stream):
-            start_event.wait(self.write_stream)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device,
-                host_indices,
-                device_indices,
-                self.io_backend,
-                pool_transfers=resolved_pool_transfers,
+        pool_transfers = []
+        for transfer in op.pool_transfers or []:
+            entry = host_group.entry_map[transfer.name]
+            transfer_host_indices, transfer_device_indices = move_for_pool(
+                entry.host_pool,
+                transfer.host_indices,
+                transfer.device_indices,
             )
-            # 若启用了投机解码的 draft 模型，同样备份其 draft KV。
-            if self.has_draft and host_indices.numel() > 0:
-                self.mem_pool_host_draft.backup_from_device_all_layer(
-                    self.mem_pool_device_draft,
-                    host_indices,
-                    device_indices,
-                    self.io_backend,
+            pool_transfers.append(
+                replace(
+                    transfer,
+                    host_indices=transfer_host_indices,
+                    device_indices=transfer_device_indices,
                 )
-            finish_event.record()
-            # 在写流上登记所有参与搬运的张量，避免它们在异步搬运完成前被提前回收。
-            self._record_transfer_indices_on_stream(
-                self.write_stream,
-                host_indices,
-                device_indices,
-                resolved_pool_transfers,
             )
-        # 登记写完成 ack，由上层 writing_check 收割。
-        self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+        return host_indices, device_indices, pool_transfers or None
+
+    def _l2_transfers(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[list[PoolTransfer]] = None,
+    ) -> list[L2Transfer]:
+        anchor = self.mem_pool_host.anchor_entry
+        transfers = []
+        if host_indices.numel() > 0:
+            transfers.append(
+                L2Transfer(
+                    host_pool=anchor.host_pool,
+                    device_pool=anchor.device_pool,
+                    host_indices=host_indices,
+                    device_indices=device_indices,
+                    layer_mapper=anchor.layer_mapper,
+                )
+            )
+        for pool_transfer in pool_transfers or []:
+            if (
+                pool_transfer.host_indices is None
+                or pool_transfer.device_indices is None
+            ):
+                raise ValueError(f"Unresolved L2 transfer for {pool_transfer.name}.")
+            entry = self.mem_pool_host.entry_map[pool_transfer.name]
+            transfers.append(
+                L2Transfer(
+                    host_pool=entry.host_pool,
+                    device_pool=entry.device_pool,
+                    host_indices=pool_transfer.host_indices,
+                    device_indices=pool_transfer.device_indices,
+                    layer_mapper=entry.layer_mapper,
+                )
+            )
+        return transfers
+
+    def _l2_load_transfers(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[list[PoolTransfer]] = None,
+    ) -> list[L2Transfer]:
+        transfers = self._l2_transfers(host_indices, device_indices, pool_transfers)
+        transfers_by_entry = {
+            (id(t.host_pool), id(t.device_pool)): t for t in transfers
+        }
+        for entry in self.mem_pool_host.entry_map.values():
+            target_transfer = transfers_by_entry.get(
+                (id(entry.host_pool), id(entry.device_pool))
+            )
+            if target_transfer is None or target_transfer.layer_mapper is None:
+                continue
+            for depth, draft_device_pool in enumerate(entry.packed_draft_device_pools):
+                draft_host_layer = target_transfer.layer_mapper(self.layer_num + depth)
+                if draft_host_layer is None:
+                    continue
+
+                def draft_layer_mapper(
+                    layer_id: int,
+                    *,
+                    expected_layer_id: int = depth,
+                    host_layer_id: int = draft_host_layer,
+                ) -> Optional[int]:
+                    if layer_id == expected_layer_id:
+                        return host_layer_id
+                    return None
+
+                transfers.append(
+                    L2Transfer(
+                        host_pool=target_transfer.host_pool,
+                        device_pool=draft_device_pool,
+                        host_indices=target_transfer.host_indices,
+                        device_indices=target_transfer.device_indices,
+                        layer_mapper=draft_layer_mapper,
+                        is_draft=True,
+                    )
+                )
+        return transfers
+
+    def _num_tokens_by_pool(self, op: CacheOperation) -> dict[str, int]:
+        """Per-pool token counts for a merged transfer op (anchor + extra
+        pools), shared by D->H write and H->D load acks; sidecar transfers
+        reusing another pool's indices are excluded."""
+        counts = {self.mem_pool_host.anchor_entry.name.value: len(op.device_indices)}
+        for transfer in op.pool_transfers or []:
+            if transfer.indices_from_pool is not None or transfer.host_indices is None:
+                continue
+            name = transfer.name.value
+            counts[name] = counts.get(name, 0) + len(transfer.host_indices)
+        return counts
+
+    def _transfer_num_bytes(self, op: CacheOperation) -> int:
+        """Total bytes moved by a merged transfer op across all pools.
+
+        Sidecar transfers riding another pool's indices are included here but
+        excluded from the per-pool token counts.
+        """
+        kv_tokens = len(op.device_indices)
+        num_bytes = kv_tokens * self.mem_pool_host.anchor_entry.host_pool.size_per_token
+        # Slot counts of the pools sidecars can ride on.
+        source_len = {self.mem_pool_host.anchor_entry.name: kv_tokens}
+        for t in op.pool_transfers or []:
+            if t.indices_from_pool is None and t.host_indices is not None:
+                source_len[t.name] = len(t.host_indices)
+        for t in op.pool_transfers or []:
+            entry = self.mem_pool_host.entry_map.get(t.name)
+            if entry is None:
+                continue
+            if t.indices_from_pool is not None:
+                num_slots = source_len.get(t.indices_from_pool, 0)
+            else:
+                num_slots = len(t.host_indices) if t.host_indices is not None else 0
+            num_bytes += num_slots * entry.host_pool.size_per_token
+        return num_bytes
 
     def load(
         self,
@@ -524,10 +567,8 @@ class HybridCacheController(BaseHiCacheController):
             if device_indices is None:
                 return None
 
-        # 为 extra pool 自动分配 device 索引（已有的保留）；失败时回滚并释放已分配的 KV device 空间。
-        pool_transfers = self._resolve_pool_transfers_allocation(
+        pool_transfers = self._resolve_device_transfers(
             extra_pools,
-            alloc_host=False,
             kv_device_indices=device_indices,
             kv_host_indices=host_indices,
         )
@@ -548,84 +589,9 @@ class HybridCacheController(BaseHiCacheController):
         )
         return device_indices
 
-    def start_loading(self) -> int:
-        # 把回载队列合并为一，在专用回载流上「逐层」把 KV（及额外池）从 host 回载到 device。
-        # 逐层完成时通过 layer_done_counter 通知消费方，使计算可与回载流水线重叠。
-        if not self.load_queue:
-            return -1
-        # 登记一个 producer，拿到它的逐层事件组，供下游按 consumer index 追踪完成情况。
-        producer_id = self.layer_done_counter.update_producer()
-        op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices, resolved_pool_transfers = (
-            self.move_hybrid_indices(op)
-        )
-        self.load_queue.clear()
-        producer_event = self.layer_done_counter.events[producer_id]
-        producer_event.start_event.record()
-        with device_module.stream(self.load_stream):
-            producer_event.start_event.wait(self.load_stream)
-            for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
-                    host_indices,
-                    device_indices,
-                    i,
-                    self.io_backend,
-                    pool_transfers=resolved_pool_transfers,
-                )
-                # draft 模型（如果有）同样逐层回载，但层数可能少于主模型，需越界保护。
-                if (
-                    self.has_draft
-                    and host_indices.numel() > 0
-                    and i < self.mem_pool_host_draft.layer_num
-                ):
-                    self.mem_pool_host_draft.load_to_device_per_layer(
-                        self.mem_pool_device_draft,
-                        host_indices,
-                        device_indices,
-                        i,
-                        self.io_backend,
-                    )
-                # 标记第 i 层回载完成，唤醒等待该层的消费方。
-                producer_event.complete(i)
-            self._record_transfer_indices_on_stream(
-                self.load_stream,
-                host_indices,
-                device_indices,
-                resolved_pool_transfers,
-            )
-        self.ack_load_queue.append(
-            HiCacheAck(
-                producer_event.start_event,
-                producer_event.finish_event,
-                op.node_ids,
-            )
-        )
-        return producer_id
-
-    def _record_transfer_indices_on_stream(
-        self,
-        stream: torch.Stream,
-        host_indices: torch.Tensor,
-        device_indices: torch.Tensor,
-        pool_transfers: Optional[list[PoolTransfer]] = None,
-    ) -> None:
-        # 对参与搬运的 CUDA 张量调用 record_stream，告诉分配器「该张量仍被本流使用」，
-        # 避免在异步搬运尚未完成时内存被提前复用（造成数据损坏）。
-        if host_indices.is_cuda:
-            host_indices.record_stream(stream)
-        if device_indices.is_cuda:
-            device_indices.record_stream(stream)
-        for transfer in pool_transfers or []:
-            if transfer.host_indices is not None and transfer.host_indices.is_cuda:
-                transfer.host_indices.record_stream(stream)
-            if transfer.device_indices is not None and transfer.device_indices.is_cuda:
-                transfer.device_indices.record_stream(stream)
-
     def prefetch(
         self,
         request_id: str,
-        host_indices: torch.Tensor,
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
@@ -634,7 +600,6 @@ class HybridCacheController(BaseHiCacheController):
         # 创建一个预取操作并入预取队列，交由 storage 线程异步从 L3 拉取到 host。
         operation = PrefetchOperation(
             request_id,
-            host_indices,
             new_input_tokens,
             last_hash,
             prefix_keys=prefix_keys,
@@ -663,15 +628,10 @@ class HybridCacheController(BaseHiCacheController):
         return operation.id
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
-        # 向 L3 storage 查询：本次 token 序列有多长的前缀已存在于后端（用于决定预取长度）。
-        # 逐页链式计算哈希：每页的哈希依赖上一页的哈希（last_hash），形成前缀链。
-        last_hash = operation.last_hash
-        hash_value = []
-        for start in range(0, len(operation.token_ids), self.page_size):
-            last_hash = self.get_hash_str(
-                operation.token_ids[start : start + self.page_size], last_hash
-            )
-            hash_value.append(last_hash)
+        hash_value = self.get_hash_str(
+            operation.token_ids, operation.last_hash, page_size=self.page_size
+        )
+        operation.all_hash_values = hash_value
 
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
@@ -725,35 +685,137 @@ class HybridCacheController(BaseHiCacheController):
                 )
         return host_indices, device_indices, resolved_pool_transfers
 
-    def _page_transfer(self, operation):
-        # 先搬 KV 主池 —— 它决定了实际完成的页数。
-        super()._page_transfer(operation)
+    def _page_transfer(self, operation: PrefetchOperation) -> bool:
+        # KV pools and KV-derived pools first — determines actual completed page count
+        kv_completed_pages = super()._page_transfer(operation)
 
-        # 额外池只在 KV 完全完成后才搬。若 KV 提前终止（IO 失败、超时、TP 不一致），
-        # 则完全跳过额外 IO，以避免数据错位。
-        kv_completed_pages = operation.completed_tokens // self.page_size
-        if operation.pool_transfers and kv_completed_pages == len(operation.hash_value):
+        # Read non-KV derived sidecar pool, e.g. SWA, Mamba.
+        self._page_transfer_sidecar(operation, kv_completed_pages)
+
+    def _page_transfer_sidecar(
+        self, operation: PrefetchOperation, kv_completed_pages: int
+    ) -> None:
+        if operation.pool_transfers is None:
+            return
+
+        # Extra pools only after KV fully completes. If KV terminated early
+        # (IO failure, timeout, TP mismatch), skip extra IO entirely to avoid
+        # data misalignment.
+        pool_hits: dict[str, int] = {}
+        if not operation.is_terminated() and kv_completed_pages == len(
+            operation.hash_value
+        ):
+            # KV-derived sidecar pools are handled in CacheController._page_transfer_kv_batch.
+            # Only handle non-KV-derived sidecar pools here.
+            transfers_nonkv = [
+                transfer
+                for transfer in operation.pool_transfers
+                if transfer.indices_from_pool != PoolName.KV
+            ]
             self._sync_trailing_keys(
-                operation.pool_transfers, operation.hash_value, kv_completed_pages
+                transfers_nonkv, operation.hash_value, kv_completed_pages
             )
-            self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_get_v2(operation.pool_transfers)
-            operation.pool_storage_result.update_extra_pool_hit_pages(results)
-        operation.pool_transfers_done = True
+            self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
+            results = self.storage_backend.batch_get_v2(transfers_nonkv)
+            pool_hits = count_pool_hits(results)
+        # Emit PrefetchAck to prefetch_sync_queue, even the operation has been canceled by the
+        # scheduler thread.  The prefetch sync thread expects the same number of PrefetchAck objects
+        # to perform all_reduce.
+        self.prefetch_sync_queue.put(
+            PrefetchAck(
+                rid=operation.request_id,
+                operation=operation,
+                pool_hits=pool_hits,
+            )
+        )
+        return
 
     def _page_backup(self, operation):
-        # 先备份额外池（解析派生搬运后批量写入）。
-        if operation.pool_transfers:
-            self._resolve_sidecar_derived_pool_transfers(operation)
-            results = self.storage_backend.batch_set_v2(operation.pool_transfers)
-            operation.pool_storage_result.update_extra_pool_hit_pages(results)
+        # MLA KV is replicated across TP ranks and should still be written only
+        # by TP0. Rank-sharded sidecars still need every TP rank.
+        backup_transfers = [
+            transfer
+            for transfer in operation.pool_transfers or []
+            if self.should_backup(transfer)
+        ]
 
-        # 再备份 KV 主池。
-        super()._page_backup(operation)
+        if backup_transfers:
+            self._resolve_sidecar_kv_derived_pool_transfers(operation)
+            self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
+            results = self.storage_backend.batch_set_v2(backup_transfers)
+            pool_hits = count_pool_hits(results)
+            operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
-    def _resolve_sidecar_derived_pool_transfers(self, operation):
-        # 解析「派生型」额外池：它们不拥有自己的索引/键，而是从另一个源池（KV 或另一个
-        # 额外池）借用 host_indices 与 keys。在真正读写 storage 前，把这些字段从源池填好。
+        if not self.backup_skip:
+            super()._page_backup(operation)
+        else:
+            sidecar_ok = bool(backup_transfers)
+            if sidecar_ok:
+                for transfer in backup_transfers:
+                    result = results.get(transfer.name)
+                    if result is None:
+                        result = results.get(transfer.name.value)
+                    expected = len(transfer.keys or [])
+                    if expected == 0 and transfer.host_indices is not None:
+                        expected = int(transfer.host_indices.numel())
+                    if (
+                        not isinstance(result, (list, tuple))
+                        or len(result) != expected
+                        or not all(bool(ok) for ok in result)
+                    ):
+                        sidecar_ok = False
+                        break
+            operation.completed_tokens = (
+                len(operation.hash_value) * self.page_size if sidecar_ok else 0
+            )
+
+    def should_backup(self, transfer: PoolTransfer) -> bool:
+        if not self.backup_skip:
+            return True
+
+        # Kimi-K3 Mamba/KDA state is TP-sharded even when the primary MLA KV
+        # pool is replicated.
+        if transfer.name == PoolName.MAMBA:
+            return True
+
+        # Mooncake gives MHA draft and draft-SWA objects rank-specific keys.
+        # MLA/DeepSeek-V4 draft pools remain TP0-only.
+        if self.storage_backend_type == "mooncake" and transfer.name in (
+            PoolName.DRAFT,
+            PoolName.DRAFT_SWA,
+        ):
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            return entry is not None and isinstance(
+                entry.host_pool, MHATokenToKVPoolHost
+            )
+
+        return False
+
+    def backup_thread_func(self):
+        """Back up rank-sharded sidecars on every TP rank.
+
+        The base implementation skips the entire operation on non-zero MLA TP
+        ranks. That optimization is valid for replicated MLA KV, but not for
+        hybrid rank-sharded pools such as Kimi-K3 Mamba state.
+        """
+        while not self.storage_stop_event.is_set():
+            try:
+                operation = self.backup_queue.get(block=True, timeout=1)
+                if operation is None:
+                    continue
+                self._page_backup(operation)
+                self.ack_backup_queue.put(operation)
+            except Empty:
+                continue
+
+    def _resolve_sidecar_kv_derived_pool_transfers(self, operation):
+        for transfer in operation.pool_transfers:
+            if transfer.indices_from_pool == PoolName.KV:
+                transfer.host_indices = operation.host_indices
+                if transfer.keys is None:
+                    transfer.keys = operation.hash_value
+
+    def _resolve_sidecar_nonkv_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:
             if transfer.indices_from_pool is None:
                 continue
@@ -777,10 +839,7 @@ class HybridCacheController(BaseHiCacheController):
                 if transfer.keys is None:
                     transfer.keys = source.keys
             else:
-                # 源是 KV 主池：直接用本次操作的 KV host 索引与页哈希作为索引/键。
-                transfer.host_indices = operation.host_indices
-                if transfer.keys is None:
-                    transfer.keys = operation.hash_value
+                pass
 
     def _sync_trailing_keys(
         self,
@@ -800,22 +859,38 @@ class HybridCacheController(BaseHiCacheController):
                 continue
             trailing_n = len(transfer.keys) if transfer.keys else 1
             transfer.keys = all_hashes[max(0, kv_hit_pages - trailing_n) : kv_hit_pages]
+            if transfer.host_indices is None:
+                continue
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            pool_page_size = (
+                entry.host_pool.page_size if entry is not None else self.page_size
+            )
+            needed = len(transfer.keys) * pool_page_size
+            if transfer.host_indices.numel() > needed:
+                # The hit undershot the pre-allocated window buffer. Backends
+                # fetch keys zipped against the buffer head, so shrink the
+                # transfer to match and release the tail now — otherwise the
+                # length mismatch makes batch_get_v2 fetch nothing and the
+                # whole window is silently lost downstream.
+                self.append_host_mem_release(
+                    extra_pools=[
+                        PoolTransfer(
+                            name=transfer.name,
+                            host_indices=transfer.host_indices[needed:],
+                        )
+                    ]
+                )
+                transfer.host_indices = transfer.host_indices[:needed]
 
-    def _resolve_pool_transfers_allocation(
+    def _resolve_device_transfers(
         self,
         extra_pools: Optional[list[PoolTransfer]],
-        alloc_host: bool,
         kv_device_indices: Optional[torch.Tensor] = None,
         kv_host_indices: Optional[torch.Tensor] = None,
     ) -> Optional[list[PoolTransfer]]:
-        """为那些索引为 None 的 PoolTransfer 自动分配 host 或 device 索引。
-
-        采用「全部成功或全部回滚」的原子语义：只要任一额外池分配失败，就把本次已成功
-        分配的全部释放并返回 None，避免部分分配造成泄漏与不一致。
-        """
+        """Allocate unresolved side-pool device indices atomically."""
         if not extra_pools:
             return None
-        # 记录 (池, 释放函数, 已分配索引)，供失败时原子回滚。
         newly_allocated: list[tuple[PoolTransfer, Callable, torch.Tensor]] = []
         # 派生型搬运（索引来自其他池）延后处理，等源池分配好再借用。
         derived_transfers: list[PoolTransfer] = []
@@ -824,10 +899,7 @@ class HybridCacheController(BaseHiCacheController):
             # 回滚：把已成功分配的都释放，并清空对应字段。
             for prev_pool, prev_free_fn, prev_indices in newly_allocated:
                 prev_free_fn(prev_indices)
-                if alloc_host:
-                    prev_pool.host_indices = None
-                else:
-                    prev_pool.device_indices = None
+                prev_pool.device_indices = None
 
         for pool in extra_pools:
             if pool.indices_from_pool is not None:
@@ -837,24 +909,15 @@ class HybridCacheController(BaseHiCacheController):
             entry = self.mem_pool_host.entry_map.get(pool.name)
             if entry is None:
                 continue
-            if alloc_host:
-                # 分配 host 索引：仅当尚未分配 host 且已有 device 索引（以其长度为准）时才做。
-                if pool.host_indices is not None or pool.device_indices is None:
-                    continue
-                alloc_fn = entry.host_pool.alloc
-                free_fn = entry.host_pool.free
-                evict_fn = entry.host_evict_fn
-                size = len(pool.device_indices)
-            else:
-                # 分配 device 索引：仅当尚未分配 device 且已有 host 索引时才做。
-                if pool.device_indices is not None or pool.host_indices is None:
-                    continue
-                # 对于 device_pool 是「原始 KV 池（layout）」而非分配器的池（如 SWA），
-                # 用 device_alloc_fn / device_free_fn 覆盖 entry.device_pool 的默认方法。
-                alloc_fn = entry.device_alloc_fn or entry.device_pool.alloc
-                free_fn = entry.device_free_fn or entry.device_pool.free
-                evict_fn = entry.device_evict_fn
-                size = len(pool.host_indices)
+            if pool.device_indices is not None or pool.host_indices is None:
+                continue
+            # device_alloc_fn / device_free_fn override entry.device_pool's
+            # methods for pools whose device_pool is a raw KV pool (layout)
+            # rather than an allocator (e.g. SWA).
+            alloc_fn = entry.device_alloc_fn or entry.device_pool.alloc
+            free_fn = entry.device_free_fn or entry.device_pool.free
+            evict_fn = entry.device_evict_fn
+            size = len(pool.host_indices)
             indices = alloc_fn(size)
             if indices is None and evict_fn:
                 # 分配失败且有淘汰函数：先淘汰出空间再重试一次。
@@ -864,10 +927,7 @@ class HybridCacheController(BaseHiCacheController):
                 # 原子回滚：释放本次已成功分配的一切。
                 rollback_allocated()
                 return None
-            if alloc_host:
-                pool.host_indices = indices
-            else:
-                pool.device_indices = indices
+            pool.device_indices = indices
             newly_allocated.append((pool, free_fn, indices))
 
         # 为延后的派生型池从其源池赋予索引。
@@ -894,3 +954,23 @@ class HybridCacheController(BaseHiCacheController):
             pool.host_indices = source.host_indices
             pool.device_indices = source.device_indices
         return extra_pools
+
+    def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:
+        # Handle KV-derived pool.
+        super()._reduce_prefetch_ack(ack)
+
+        # Handle other sidecar pools, e.g. SWA, Mamba.
+        if ack.pool_hits is not None:
+            # "for ... in PoolName" ensures the same order across all ranks.
+            # On prefetch failure, pool_hits may be empty dict.
+            packed = torch.tensor(
+                [ack.pool_hits.get(pool.value, 0) for pool in PoolName],
+                dtype=torch.int,
+            )
+            self._all_reduce(
+                packed,
+                torch.distributed.ReduceOp.MIN,
+                self.prefetch_completion_sync_groups,
+            )
+            for i, pool in enumerate(PoolName):
+                ack.pool_hits[pool.value] = packed[i].item()

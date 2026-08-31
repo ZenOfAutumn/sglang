@@ -11,7 +11,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import time
 from dataclasses import dataclass
 from typing import (
@@ -21,12 +20,16 @@ from typing import (
     Optional,
 )
 
+import msgspec
 import zmq
 
 from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
+    is_kv_publisher_rank,
+    select_kv_publisher_dp_rank,
 )
+from sglang.srt.managers.io_struct import hook_custom_types, sock_send
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -38,18 +41,18 @@ if TYPE_CHECKING:
 class SchedulerStats: ...  # type: ignore[no-redef]
 
 
-@dataclasses.dataclass
-class KvMetrics:
-    """中译：一次上报的 KV cache 运行指标快照。各字段含义见下方逐行注释。"""
+class KvMetrics(msgspec.Struct, tag=True, kw_only=True, array_like=True):
+    request_active_slots: int = 0
+    request_total_slots: int = 0
+    kv_active_blocks: int = 0
+    kv_total_blocks: int = 0
+    num_requests_waiting: int = 0
+    gpu_cache_usage_perc: float = 0.0
+    gpu_prefix_cache_hit_rate: float = 0.0
+    data_parallel_rank: int = 0
 
-    request_active_slots: int = 0  # 当前正在运行的请求数（占用的槽位）
-    request_total_slots: int = 0  # 可容纳的最大并发请求数（总槽位）
-    kv_active_blocks: int = 0  # 当前已使用的 KV block 数
-    kv_total_blocks: int = 0  # KV cache 的总 block 数
-    num_requests_waiting: int = 0  # 等待队列中的请求数
-    gpu_cache_usage_perc: float = 0.0  # KV cache（token）使用率
-    gpu_prefix_cache_hit_rate: float = 0.0  # 前缀缓存命中率
-    data_parallel_rank: int = 0  # 数据并行 rank（标识来源分片）
+
+hook_custom_types(KvMetrics)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -78,14 +81,15 @@ class SchedulerKvEventsPublisher:
 
     def init_kv_events(self, kv_events_config: Optional[str]):
         # 中译：仅在配置非空、且 attn_tp_rank 与 attn_cp_rank 均为 0 时启用，避免多 rank 重复上报。
-        self.enable_kv_cache_events = bool(
-            kv_events_config and self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0
-        )
+        self.enable_kv_cache_events = is_kv_publisher_rank(kv_events_config, self.ps)
 
         if self.enable_kv_cache_events:
             # 中译：按配置与 attn_dp_rank 创建对应的事件发布器（如 ZMQ/其他后端）。
             self.kv_event_publisher = EventPublisherFactory.create(
-                kv_events_config, self.ps.attn_dp_rank
+                kv_events_config,
+                select_kv_publisher_dp_rank(
+                    self.ps.attn_dp_size, self.ps.attn_dp_rank, self.ps.dp_rank
+                ),
             )
 
     def emit_kv_metrics(self):
@@ -111,7 +115,7 @@ class SchedulerKvEventsPublisher:
 
         # 中译：socket 未关闭时才推送，避免在关停过程中向已关闭的 socket 发送。
         if not self.send_metrics_from_scheduler.closed:
-            self.send_metrics_from_scheduler.send_pyobj(kv_metrics)
+            sock_send(self.send_metrics_from_scheduler, kv_metrics)
 
     def publish_kv_events(self):
         """中译：把前缀缓存树累积的 KV cache 事件取出并批量发布。"""

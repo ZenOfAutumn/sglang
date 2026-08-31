@@ -23,7 +23,7 @@
 import logging
 from contextlib import contextmanager
 from enum import Enum, auto
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 from sglang.srt.managers.io_struct import BlockReqInput, BlockReqType
 from sglang.srt.utils.poll_based_barrier import PollBasedBarrier
@@ -73,10 +73,10 @@ class SchedulerInputBlocker:
     def _handle_recv_req(self, recv_req):
         # 中译：处理单个请求。BlockReqInput 是控制信号（BLOCK/UNBLOCK），其余为普通业务请求。
         if isinstance(recv_req, BlockReqInput):
-            if recv_req.type == BlockReqType.BLOCK:
+            if recv_req.req_type == BlockReqType.BLOCK:
                 self._execute_block_req()
                 return []
-            elif recv_req.type == BlockReqType.UNBLOCK:
+            elif recv_req.req_type == BlockReqType.UNBLOCK:
                 self._execute_unblock_req()
                 return []
             else:
@@ -127,11 +127,10 @@ class _State(Enum):
 
 
 @contextmanager
-def input_blocker_guard_region(send_to_scheduler):
     # 中译：上下文管理器——进入时向调度器发送 BLOCK 请求，退出时（无论是否异常）发送 UNBLOCK，
-    #       用于把一段「需要全局静止」的临界区（如权重更新）包裹起来。
-    send_to_scheduler.send_pyobj(BlockReqInput(BlockReqType.BLOCK))
+def input_blocker_guard_region(dispatch_to_scheduler: Callable[[BlockReqInput], None]):
+    dispatch_to_scheduler(BlockReqInput(req_type=BlockReqType.BLOCK))
     try:
         yield
     finally:
-        send_to_scheduler.send_pyobj(BlockReqInput(BlockReqType.UNBLOCK))
+        dispatch_to_scheduler(BlockReqInput(req_type=BlockReqType.UNBLOCK))

@@ -30,9 +30,8 @@ import triton.language as tl
 
 from sglang.srt.distributed import (
     GroupCoordinator,
-    get_attn_context_model_parallel_rank,
-    get_attn_context_model_parallel_world_size,
     get_attn_cp_group,
+    get_attn_cp_overlap_group,
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
@@ -47,7 +46,18 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import (
+    derive_attention_widths,
+    get_device,
+    get_exec,
+    get_flags,
+    get_forward,
+    get_parallel,
+    get_resources,
+    get_stream,
+)
+from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -66,19 +76,35 @@ if TYPE_CHECKING:
 _ATTN_DP_RANK: Optional[int] = None
 # attention 数据并行组的大小（未开启 DP attention 时为 1）
 _ATTN_DP_SIZE: Optional[int] = None
-# "local" 系列用于 moe_dense_tp_size 场景：dense 层可能使用比全局 TP 更小的
-# TP 度，于是在每个 dense-TP 子组内部又形成了一套局部的 DP 划分。
-_LOCAL_ATTN_DP_SIZE: Optional[int] = None
-_LOCAL_ATTN_DP_RANK: Optional[int] = None
-# 是否开启了 DP attention
-_ENABLE_DP_ATTENTION_FLAG: bool = False
-# 针对混合 SSM（Hybrid-Mamba）模型的开关：允许在存在空闲 rank（token 数为 0）时
-# 仍然走 MAX_LEN 模式，以便通过"伪造行"的方式让空闲 rank 参与计算。
-_DP_MAX_LEN_WITH_IDLE = False
+
+
+def world_dp_gather_enabled() -> bool:
+    """Whether DP gathers should use expanded WORLD after joiner admission."""
+    dp = get_flags().dp
+    return dp.use_world_group_for_gather and not dp.joiner_skip_all_gather
+
+
+def enable_joiner_all_gather():
+    get_flags().dp.joiner_skip_all_gather = False
+
+
+def update_dp_attention_post_scale(new_dp_size: int, new_dp_rank: int):
+    global _ATTN_DP_SIZE, _ATTN_DP_RANK
+    _ATTN_DP_SIZE = new_dp_size
+    _ATTN_DP_RANK = new_dp_rank
+    get_parallel().stamp_derived_widths(attn_dp_size=new_dp_size)
+    get_flags().dp.use_world_group_for_gather = True
+    logger.debug(
+        "[Elastic EP] dp_attention switched to WORLD: dp_size=%d dp_rank=%d",
+        new_dp_size,
+        new_dp_rank,
+    )
+
 
 _is_hip = is_hip()
 # ROCm 7.0.0 alpha 上 RCCL 的临时规避开关
 _USE_ROCM700A_WA = _is_hip and get_bool_env_var("SGLANG_USE_ROCM700A")
+_is_cpu = is_cpu()
 
 
 class DpPaddingMode(IntEnum):
@@ -114,15 +140,27 @@ class DpPaddingMode(IntEnum):
         """
         dp_size = get_attention_dp_size()
 
-        # 当 batch 中含有 extend 请求且 dp_size > 1 时，各 rank 的 token 数差异
-        # 通常很大（prefill 长度不一），此时用 SUM_LEN 可避免按最大长度 padding
-        # 带来的巨大冗余开销。
-        # 而 dp_size == 1 时 max_len == sum_len，优先选 MAX_LEN 以便启用
-        # symmetric memory 优化（DSA CP 等特性需要）。
+        # (trangdough) pplx-kernels a2a is a symmetric collective: every EP rank
+        # must dispatch the same number of tokens or the device-side handshake
+        # deadlocks (idle DP ranks with 0 tokens never signal their peers).
+        # Force MAX_LEN so all ranks are padded to equal token counts.
+        from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+        moe_a2a_backend = get_moe_a2a_backend()
+        if moe_a2a_backend.is_pplx():
+            return DpPaddingMode.MAX_LEN
+
+        if moe_a2a_backend.is_deepep_v2() and envs.SGLANG_DEEPEP_V2_FORCE_MAX_LEN.get():
+            return DpPaddingMode.MAX_LEN
+
+        # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
+        # overhead from uneven token distribution.
+        # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
+        # to enable symmetric memory optimization (needed for DSA CP, etc.).
         if is_extend_in_batch and dp_size > 1:
-            # 混合 SSM 模型需要通过 MAX_LEN 的"伪造行"机制让空闲 rank 也有输入；
-            # 其他模型仍走主线的 SUM_LEN。
-            if _DP_MAX_LEN_WITH_IDLE and min(global_num_tokens) == 0:
+            # Hybrid-SSM models materialize idle ranks via the MAX_LEN
+            # fabricated-row conversion; other models keep mainline SUM_LEN.
+            if get_flags().dp.max_len_with_idle and min(global_num_tokens) == 0:
                 return DpPaddingMode.MAX_LEN
             return DpPaddingMode.SUM_LEN
 
@@ -152,36 +190,35 @@ class DpPaddingMode(IntEnum):
 
 
 class _DpGatheredBufferWrapper:
-    """DP gather 缓冲区的元信息容器（全部为类变量，进程级单例）。
+    """Facade for the DP gathered-buffer state: allocation metadata lives on
+    ``flags.dp`` (set once at initialize_dp_attention). The per-forward
+    sizing quartet stays as class attributes: the values are read inside
+    torch.compile-traced model code, and attribute-source ints get dynamo's
+    automatic-dynamic treatment, while contextvars are untraceable and dict
+    slots value-guard into the recompile limit (one recompile per distinct
+    size)."""
 
-    这里只保存"如何创建 buffer"所需的元信息（hidden_size / dtype / device /
-    长度等），buffer 本身在每次调用 getter 时按需 `torch.empty` 分配，
-    以便复用 PyTorch 的 caching allocator 或 symmetric memory 池。
-    """
-
-    # 模型 hidden size，即 buffer 的第二维
-    _hidden_size: int
-    # buffer 的数据类型
-    _dtype: torch.dtype
-    # buffer 所在设备
-    _device: torch.device
-    # 全局 buffer 的行数（gather 之后的总 token 数）
-    _global_dp_buffer_len: int
-    # 本 rank 的 buffer 行数（本地 token 数，可能已为 cuda graph padding）
-    _local_dp_buffer_len: int
-    # 是否采用"按最大长度 padding"（即 MAX_LEN 模式），决定能否用 symmetric memory
-    _dp_max_padding: bool
-    # 各 DP rank 的 token 数（CPU 侧列表）
-    _global_num_tokens: Optional[List[int]]
-    # 本次 batch 是否包含 extend 请求
-    _is_extend_in_batch: bool
+    # Real defaults (not bare annotations): the sizing quartet is overwritten
+    # per-forward by set_dp_buffer_len, but callers that run before the first
+    # forward — notably the load-time mhc_pre prewarm, which has no ForwardBatch
+    # yet — read _dp_max_padding via is_allocation_symmetric(). A bare
+    # annotation creates no class attribute, so those reads raised
+    # AttributeError. Defaulting _dp_max_padding to False (non-symmetric) is
+    # safe for prewarm: it only JIT-compiles kernels and never enters a real
+    # all-reduce, so the symmetric pool is not needed there.
+    _global_dp_buffer_len: int = 0
+    _local_dp_buffer_len: int = 0
+    _dp_max_padding: bool = False
+    _global_num_tokens: Optional[List[int]] = None
+    _global_num_tokens_gpu: Optional[torch.Tensor] = None
 
     @classmethod
     def set_metadata(cls, hidden_size: int, dtype: torch.dtype, device: torch.device):
-        """设置 buffer 的静态元信息，仅在初始化时调用一次。"""
-        cls._hidden_size = hidden_size
-        cls._dtype = dtype
-        cls._device = device
+
+        dp = get_flags().dp
+        dp.buffer_hidden_size = hidden_size
+        dp.buffer_dtype = dtype
+        dp.buffer_device = device
 
     @classmethod
     def set_dp_buffer_len(
@@ -190,36 +227,36 @@ class _DpGatheredBufferWrapper:
         local_dp_buffer_len: int,
         dp_max_padding: bool,
         global_num_tokens: Optional[List[int]] = None,
+        global_num_tokens_gpu: Optional[torch.Tensor] = None,
     ):
         """设置本次 forward 的 buffer 长度信息，每个 batch 前调用一次。"""
         cls._global_dp_buffer_len = global_dp_buffer_len
         cls._local_dp_buffer_len = local_dp_buffer_len
         cls._dp_max_padding = dp_max_padding
         cls._global_num_tokens = global_num_tokens
+        cls._global_num_tokens_gpu = global_num_tokens_gpu
 
     @classmethod
     def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
-        """分配用于存放"全局所有 token"的 buffer，形状为 (global_len, hidden_size)。
 
-        只有在 MAX_LEN 模式（各 rank 长度一致）下才能使用 symmetric memory，
-        因为对称内存要求所有 rank 分配完全相同的大小。
-        """
+        dp = get_flags().dp
         with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
-                (cls._global_dp_buffer_len, cls._hidden_size),
-                dtype=cls._dtype,
-                device=cls._device,
+                (cls._global_dp_buffer_len, dp.buffer_hidden_size),
+                dtype=dp.buffer_dtype,
+                device=dp.buffer_device,
             )
         return buffer
 
     @classmethod
     def get_local_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
-        """分配用于存放"本 rank token"的 buffer，形状为 (local_len, hidden_size)。"""
+
+        dp = get_flags().dp
         with use_symmetric_memory(group, disabled=not cls._dp_max_padding):
             buffer = torch.empty(
-                (cls._local_dp_buffer_len, cls._hidden_size),
-                dtype=cls._dtype,
-                device=cls._device,
+                (cls._local_dp_buffer_len, dp.buffer_hidden_size),
+                dtype=dp.buffer_dtype,
+                device=dp.buffer_device,
             )
         return buffer
 
@@ -232,28 +269,31 @@ class _DpGatheredBufferWrapper:
         return cls._local_dp_buffer_len
 
     @classmethod
+    def set_local_dp_buffer_len(cls, local_dp_buffer_len: int) -> None:
+        cls._local_dp_buffer_len = local_dp_buffer_len
+
+    @classmethod
     def get_dp_global_num_tokens(cls) -> List[int]:
         return cls._global_num_tokens
 
     @classmethod
+    def get_dp_global_num_tokens_gpu(cls) -> Optional[torch.Tensor]:
+        return cls._global_num_tokens_gpu
+
+    @classmethod
     def get_dp_hidden_size(cls) -> int:
-        return cls._hidden_size
+
+        return get_flags().dp.buffer_hidden_size
 
     @classmethod
     def get_dp_dtype(cls) -> torch.dtype:
-        return cls._dtype
+
+        return get_flags().dp.buffer_dtype
 
     @classmethod
     def get_dp_device(cls) -> torch.device:
-        return cls._device
 
-    @classmethod
-    def set_is_extend_in_batch(cls, is_extend_in_batch: bool):
-        cls._is_extend_in_batch = is_extend_in_batch
-
-    @classmethod
-    def get_is_extend_in_batch(cls) -> bool:
-        return cls._is_extend_in_batch
+        return get_flags().dp.buffer_device
 
     @classmethod
     def is_dp_max_padding(cls) -> bool:
@@ -271,10 +311,15 @@ def set_dp_buffer_len(
     local_dp_buffer_len: int,
     dp_max_padding: bool,
     global_num_tokens: Optional[List[int]] = None,
+    global_num_tokens_gpu: Optional[torch.Tensor] = None,
 ):
     """设置本次 forward 的 DP buffer 长度信息。"""
     _DpGatheredBufferWrapper.set_dp_buffer_len(
-        global_dp_buffer_len, local_dp_buffer_len, dp_max_padding, global_num_tokens
+        global_dp_buffer_len,
+        local_dp_buffer_len,
+        dp_max_padding,
+        global_num_tokens,
+        global_num_tokens_gpu,
     )
 
 
@@ -298,6 +343,10 @@ def get_local_dp_buffer_len() -> int:
     return _DpGatheredBufferWrapper.get_local_dp_buffer_len()
 
 
+def set_local_dp_buffer_len(local_dp_buffer_len: int) -> None:
+    _DpGatheredBufferWrapper.set_local_dp_buffer_len(local_dp_buffer_len)
+
+
 def get_dp_global_num_tokens() -> List[int]:
     """返回各 DP rank 的 token 数列表（CPU 侧）。"""
     return _DpGatheredBufferWrapper.get_dp_global_num_tokens()
@@ -319,13 +368,16 @@ def get_dp_device() -> torch.device:
 
 
 def set_is_extend_in_batch(is_extend_in_batch: bool):
-    """记录本次 batch 是否包含 extend（prefill）请求。"""
-    _DpGatheredBufferWrapper.set_is_extend_in_batch(is_extend_in_batch)
+    # Sticky within the thread: every ForwardBatch construction writes it,
+    # graph runners force False around capture; readers are the EP
+    # dispatchers on the same (single) forward thread.
+
+    get_forward().set("is_extend_in_batch", is_extend_in_batch)
 
 
 def get_is_extend_in_batch() -> bool:
-    """查询本次 batch 是否包含 extend（prefill）请求。"""
-    return _DpGatheredBufferWrapper.get_is_extend_in_batch()
+
+    return get_forward().is_extend_in_batch
 
 
 def is_dp_max_padding() -> bool:
@@ -336,25 +388,17 @@ def is_dp_max_padding() -> bool:
 def compute_dp_attention_world_info(
     enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size: int = 1
 ):
-    """由全局 TP rank 反推 attention 侧的 (tp, dp) 坐标。
+    """This rank's place in the attention topology, plus the widths it sits in.
 
-    全局 ``tp_size`` 个 rank 被划分为三个维度：DP × CP × TP，满足
-    ``tp_size = attn_dp_size * attn_cp_size * attn_tp_size``。
-
-    Args:
-        enable_dp_attention: 是否开启 DP attention。
-        tp_rank: 当前进程的全局 TP rank。
-        tp_size: 全局 TP world size。
-        dp_size: DP attention 的并行度。
-        attn_cp_size: attention 的 context parallel 并行度。
-
-    Returns:
-        (attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size) 四元组。
+    The widths come from `derive_attention_widths`; what this adds is the two
+    ranks, which are per-process and so are not part of the stamped set.
     """
-    # 未开启 DP attention 时退化为 dp_size == 1，即纯 TP
-    attn_dp_size = dp_size if enable_dp_attention else 1
-    # 剩下的 rank 分给 attention 内部的 TP
-    attn_tp_size = tp_size // attn_dp_size // attn_cp_size
+    attn_dp_size, attn_tp_size = derive_attention_widths(
+        tp_size=tp_size,
+        attn_cp_size=attn_cp_size,
+        dp_size=dp_size,
+        enable_dp_attention=enable_dp_attention,
+    )
     attn_tp_rank = tp_rank % attn_tp_size
 
     if not enable_dp_attention:
@@ -368,92 +412,45 @@ def compute_dp_attention_world_info(
     return attn_tp_rank, attn_tp_size, attn_dp_rank, attn_dp_size
 
 
-def compute_dp_attention_local_info(
-    enable_dp_attention, tp_rank, tp_size, dp_size, moe_dense_tp_size
-):
-    """计算 dense 层子组内部的"局部" attention (tp, dp) 坐标。
-
-    当通过 ``moe_dense_tp_size`` 为 MoE 模型中的 dense（共享专家 / 稠密 FFN）层
-    指定了一个更小的 TP 度时，全局 rank 会被切成若干个 ``moe_dense_tp_size``
-    大小的子组；在每个子组内部又形成一套独立的 DP/TP 划分。本函数返回的就是
-    这套"局部"坐标。未开启 DP attention 时直接退化为全局 TP 坐标。
-
-    Returns:
-        (local_attn_tp_rank, local_attn_tp_size, local_attn_dp_rank) 三元组。
-    """
-    if not enable_dp_attention:
-        return tp_rank, tp_size, 0
-
-    # 子组大小；未指定 moe_dense_tp_size 时就是全局 TP
-    local_tp_size = moe_dense_tp_size if moe_dense_tp_size else tp_size
-    # 当前 rank 在子组内的偏移
-    local_tp_rank = tp_rank % local_tp_size
-    # 子组内部的 DP 度 = 全局 DP 度 / 子组个数
-    local_dp_size = max(1, dp_size // (tp_size // local_tp_size))
-
-    # 在子组内部再按 (dp, tp) 二维展开
-    local_attn_tp_size = local_tp_size // local_dp_size
-    local_attn_dp_rank = local_tp_rank // local_attn_tp_size
-    local_attn_tp_rank = local_tp_rank % local_attn_tp_size
-
-    return local_attn_tp_rank, local_attn_tp_size, local_attn_dp_rank
-
-
 def initialize_dp_attention(
     server_args: ServerArgs,
     model_config: ModelConfig,
 ):
     """初始化 DP attention 的全局状态，需在分布式进程组建立之后调用一次。"""
     global _ATTN_DP_RANK, _ATTN_DP_SIZE
-    global _LOCAL_ATTN_DP_SIZE, _LOCAL_ATTN_DP_RANK, _ENABLE_DP_ATTENTION_FLAG
-    global _DP_MAX_LEN_WITH_IDLE
-    # 混合 SSM（Mamba/Attention 混合）模型的 HF config 中含有
-    # `hybrid_override_pattern` 字段，以此识别并启用带空闲 rank 的 MAX_LEN 路径
-    _DP_MAX_LEN_WITH_IDLE = (
+    dp = get_flags().dp
+    dp.max_len_with_idle = (
         getattr(model_config.hf_config, "hybrid_override_pattern", None) is not None
     )
-    enable_dp_attention = server_args.enable_dp_attention
-    dp_size = server_args.dp_size
-    moe_dense_tp_size = server_args.moe_dense_tp_size
-    attn_cp_size = server_args.attn_cp_size
+    enable_dp_attention = get_parallel().enable_dp_attention
+    dp_size = get_parallel().dp_size
+    attn_cp_size = get_parallel().attn_cp_size
 
-    _ENABLE_DP_ATTENTION_FLAG = enable_dp_attention
+    dp.enabled = enable_dp_attention
 
     tp_rank = get_tensor_model_parallel_rank()
     tp_size = get_tensor_model_parallel_world_size()
 
-    # 计算全局 DP rank
-    _, _, _ATTN_DP_RANK, _ = compute_dp_attention_world_info(
+    _, _, _ATTN_DP_RANK, _ATTN_DP_SIZE = compute_dp_attention_world_info(
         enable_dp_attention, tp_rank, tp_size, dp_size, attn_cp_size
     )
-    # 计算 dense 子组内的局部 DP rank
-    _, _, _LOCAL_ATTN_DP_RANK = compute_dp_attention_local_info(
-        enable_dp_attention, tp_rank, tp_size, dp_size, moe_dense_tp_size
-    )
+    get_parallel().stamp_derived_widths(attn_dp_size=_ATTN_DP_SIZE)
 
-    if enable_dp_attention:
-        _ATTN_DP_SIZE = dp_size
-        if moe_dense_tp_size is None:
-            # 未单独指定 dense TP 度时，局部与全局一致
-            _LOCAL_ATTN_DP_SIZE = _ATTN_DP_SIZE
-        else:
-            # 否则局部 DP 度 = 全局 DP 度 / dense 子组个数
-            _LOCAL_ATTN_DP_SIZE = max(1, dp_size // (tp_size // moe_dense_tp_size))
-    else:
-        _ATTN_DP_SIZE = 1
-        _LOCAL_ATTN_DP_SIZE = 1
+    if get_exec().moe.elastic_ep_backend is not None and get_parallel().max_ep_size:
+        _ATTN_DP_RANK = tp_rank + get_parallel().ep_join_rank_offset
+        if server_args.is_ep_scale_joiner:
+            dp.joiner_skip_all_gather = True
 
     # 记录 gather buffer 的静态元信息
     _DpGatheredBufferWrapper.set_metadata(
         hidden_size=model_config.hidden_size,
         dtype=model_config.dtype,
-        device=torch.device(server_args.device),
+        device=torch.device(get_device().device),
     )
 
 
 def is_dp_attention_enabled() -> bool:
-    """是否开启了 DP attention。"""
-    return _ENABLE_DP_ATTENTION_FLAG
+    return get_flags().dp.enabled
 
 
 def is_allocation_symmetric() -> bool:
@@ -462,36 +459,6 @@ def is_allocation_symmetric() -> bool:
     未开启 DP attention 时天然对称；开启后只有 MAX_LEN 模式各 rank 长度一致。
     """
     return not is_dp_attention_enabled() or is_dp_max_padding()
-
-
-def get_attention_tp_group() -> GroupCoordinator:
-    """返回 attention 内部的 TP 通信组。"""
-    return get_attn_tp_group()
-
-
-def get_attention_tp_rank() -> int:
-    """返回当前进程在 attention TP 组中的 rank。"""
-    return get_attn_tensor_model_parallel_rank()
-
-
-def get_attention_tp_size() -> int:
-    """返回 attention TP 组的大小。"""
-    return get_attn_tensor_model_parallel_world_size()
-
-
-def get_attention_cp_group() -> GroupCoordinator:
-    """返回 attention 的 context parallel（序列切分）通信组。"""
-    return get_attn_cp_group()
-
-
-def get_attention_cp_rank() -> int:
-    """返回当前进程在 attention CP 组中的 rank。"""
-    return get_attn_context_model_parallel_rank()
-
-
-def get_attention_cp_size() -> int:
-    """返回 attention CP 组的大小。"""
-    return get_attn_context_model_parallel_world_size()
 
 
 def get_attention_dp_rank() -> int:
@@ -506,27 +473,16 @@ def get_attention_dp_size() -> int:
     return _ATTN_DP_SIZE
 
 
-def get_local_attention_dp_rank() -> int:
-    """返回 dense 子组内部的局部 attention DP rank。"""
-    assert _LOCAL_ATTN_DP_RANK is not None, "dp attention not initialized!"
-    return _LOCAL_ATTN_DP_RANK
-
-
-def get_local_attention_dp_size() -> int:
-    """返回 dense 子组内部的局部 attention DP 组大小。"""
-    assert _LOCAL_ATTN_DP_SIZE is not None, "dp attention not initialized!"
-    return _LOCAL_ATTN_DP_SIZE
-
-
 @contextmanager
 def disable_dp_size():
-    """临时把 DP size 置为 1，退出上下文后自动还原。
+    """Run without DP attention until this scope ends.
 
-    该方法用于投机采样（speculative decoding）的 draft worker：draft 模型可能
-    使用与 target 模型不同的并行度，运行 draft 模型期间需要屏蔽 DP 划分。
+    This is for draft workers of speculative decoding, which run the draft model
+    at a different width from the target model's workers.
 
-    Args:
-        tp_group (GroupCoordinator): tp 组协调器
+    The scope replaces both the module global that ``get_attention_dp_size()``
+    reads and the derived width the runtime context answers with, so the two
+    spellings of the name cannot disagree inside it.
     """
     global _ATTN_DP_SIZE
     assert _ATTN_DP_SIZE is not None, "dp attention not initialized!"
@@ -534,7 +490,8 @@ def disable_dp_size():
     old_dp_size = _ATTN_DP_SIZE
     _ATTN_DP_SIZE = 1
     try:
-        yield
+        with get_parallel().override(attn_dp_size=1):
+            yield
     finally:
         # 无论上下文内是否抛异常，都要还原全局状态
         _ATTN_DP_SIZE = old_dp_size
@@ -598,74 +555,41 @@ def get_dp_local_slice_cpu(
     return local_start_pos, local_num_tokens
 
 
-@triton.jit
-def memcpy_triton_kernel(
-    dst_ptr,
-    src_ptr,
-    offset_ptr,
-    sz_ptr,
-    offset_src: tl.constexpr,
-    chunk_size,  # 对 offset 和 sz 的放大倍数（即每行的元素个数）
-    BLOCK_SIZE: tl.constexpr,
-):
-    """带偏移的显存拷贝 kernel。
+from sglang.kernels.ops.memory.memcpy_triton import memcpy_triton
 
-    之所以不用 `torch.Tensor.copy_` / 切片赋值，是因为这里的 ``offset`` 和 ``sz``
-    都是**GPU 张量**（而非 Python int）。用切片会强制 D2H 同步，且无法被 CUDA Graph
-    捕获；用自定义 kernel 则可以在 device 端直接读取这两个标量。
 
-    Args:
-        offset_ptr: 指向偏移量标量的指针（单位：行）。
-        sz_ptr: 指向拷贝行数标量的指针（单位：行）。
-        offset_src: 编译期常量。True 表示偏移作用在 src 上（scatter：从全局取本地），
-            False 表示偏移作用在 dst 上（gather：把本地写入全局）。
-    """
-    pid = tl.program_id(axis=0).to(tl.int64)
-    # 行偏移 / 行数 → 元素偏移 / 元素数；转 int64 防止大张量溢出
-    offset = tl.load(offset_ptr).to(tl.int64) * chunk_size
-    sz = tl.load(sz_ptr).to(tl.int64) * chunk_size
+# TODO: write c++ kernel for cpu
+def memcpy_cpu(dst, src, dim, offset, sz, offset_src):
+    assert dim == 0, "Only dim=0 supported"
+    assert src.shape[1:] == dst.shape[1:], "src and dst must have same trailing shape"
 
-    start_index = pid * BLOCK_SIZE
-    offs = tl.arange(0, BLOCK_SIZE)
-    # 尾块可能不足 BLOCK_SIZE，用 mask 屏蔽越界元素
-    mask = start_index + offs < sz
+    total_rows_dst, total_rows_src = dst.shape[0], src.shape[0]
+    dst_start, src_start = 0, 0
 
     if offset_src:
-        # scatter 方向：src[offset : offset+sz] -> dst[0 : sz]
-        data = tl.load(src_ptr + offset + start_index + offs, mask=mask)
-        tl.store(dst_ptr + start_index + offs, data, mask=mask)
+        # src[offset:] → dst[0:]
+        src_start = offset
+        dst_start = 0
     else:
-        # gather 方向：src[0 : sz] -> dst[offset : offset+sz]
-        data = tl.load(src_ptr + start_index + offs, mask=mask)
-        tl.store(dst_ptr + offset + start_index + offs, data, mask=mask)
+        # src[0:] → dst[offset:]
+        src_start = 0
+        dst_start = offset
+
+    dst_end = min(dst_start + sz, total_rows_dst)
+    src_end = min(src_start + sz, total_rows_src)
+    actual_sz = min(dst_end - dst_start, src_end - src_start)
+
+    if actual_sz <= 0:
+        return
+
+    dst[dst_start : dst_start + actual_sz].copy_(src[src_start : src_start + actual_sz])
 
 
-def prod(x):
-    """求可迭代对象所有元素的乘积（空序列返回 1）。"""
-    return functools.reduce(lambda a, b: a * b, x, 1)
+memcpy_func = memcpy_cpu if _is_cpu else memcpy_triton
 
 
-def memcpy_triton(dst, src, dim, offset, sz, offset_src):
-    """`memcpy_triton_kernel` 的 Python 封装，负责计算 grid 并做形状校验。
-
-    Args:
-        dst: 目标张量。
-        src: 源张量。
-        dim: 偏移所在的维度，目前只支持 0（第 0 维为 token 维）。
-        offset: GPU 标量张量，行偏移。
-        sz: GPU 标量张量，拷贝的行数。
-        offset_src: 偏移是否作用在 src 上，参见 kernel 说明。
-    """
-    # 实际拷贝量不会超过两者中较小的元素数，以此上界估算 grid
-    max_size = min(src.numel(), dst.numel())
-    assert dim == 0, "dim != 0 unsupported"
-    # 除第 0 维外形状必须一致，这样每行的元素个数才相同
-    assert src.shape[1:] == dst.shape[1:], "src and dst must have same shape"
-    chunk_size = prod(src.shape[1:])
-    BLOCK_SIZE = 8192
-    grid = (triton.cdiv(max_size, BLOCK_SIZE),)
-
-    memcpy_triton_kernel[grid](dst, src, offset, sz, offset_src, chunk_size, BLOCK_SIZE)
+def memcpy(dst, src, dim, offset, sz, offset_src):
+    memcpy_func(dst, src, dim, offset, sz, offset_src)
 
 
 def _dp_gather_via_all_reduce(
@@ -721,30 +645,34 @@ def _dp_gather_via_all_reduce(
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()
 
-    # is_partial=False 时只让 attn TP rank 0 写入，避免副本被重复累加
-    if local_tokens.shape[0] > 0 and (is_partial or get_attention_tp_rank() == 0):
+    if local_tokens.shape[0] > 0 and (
+        is_partial or get_attn_tensor_model_parallel_rank() == 0
+    ):
         assert (
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
 
-        # 把 local_tokens 写入 global_tokens[local_start_pos : +local_num_tokens]
-        memcpy_triton(
-            global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
+        memcpy(global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False)
+
+    # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
+    if world_dp_gather_enabled():
+        torch.distributed.all_reduce(
+            global_tokens,
+            op=torch.distributed.ReduceOp.SUM,
+            group=torch.distributed.group.WORLD,
         )
-
-    # input_ids 是 int32 类型。单机场景下需要使用 inplace_all_reduce，
-    # 因为自定义 all-reduce（custom all reduce）走的是原地路径。
-    NUM_GPUS_PER_NODE = 8
-    if (
-        not local_tokens.dtype.is_floating_point
-        and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
-    ):
-        from sglang.srt.distributed.parallel_state import inplace_all_reduce
-
-        inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
-
     else:
-        global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
+        NUM_GPUS_PER_NODE = 8
+        if (
+            not local_tokens.dtype.is_floating_point
+            and get_tensor_model_parallel_world_size() <= NUM_GPUS_PER_NODE
+        ):
+            from sglang.srt.distributed.parallel_state import inplace_all_reduce
+
+            inplace_all_reduce(global_tokens, group_name=get_tp_group().unique_name)
+
+        else:
+            global_tokens[:] = tensor_model_parallel_all_reduce(global_tokens)
 
 
 def _dp_gather_via_all_gather(
@@ -753,72 +681,253 @@ def _dp_gather_via_all_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    """MAX_LEN 模式的 gather 实现：直接用 all_gather 汇聚等长的分片。
+    use_world = world_dp_gather_enabled()
 
-    当 attn TP > 1 时不能直接 all_gather（同一 DP 组内的多个 TP rank 会重复贡献），
-    因此先在 attn TP 组内做 reduce_scatter 把数据规约并切成不重叠的小片，
-    再在全局 TP 组上 all_gather —— 总通信量与直接 all_gather 相当，且结果正确。
-
-    与 SUM_LEN 的关键区别：MAX_LEN 要求**各 rank 的 local_tokens 等长**
-    （调用方已 pad 到 ``max(global_num_tokens)``），因此可以直接用 all_gather，
-    无需偏移量；代价是 padding 行会占用带宽。
-
-    示例 1 —— ``attn_tp_size == 1`` 的快路径（``tp_size=2``、``attn_dp_size=2``）:
-
-    每个 rank 的数据本身就是一份独立分片，直接 all_gather 沿第 0 维拼接即可。
-
-    ::
-
-        输入 local_tokens（已 pad 到等长 2）:
-            rank0: [a0, a1]
-            rank1: [b0, b1]
-
-        all_gather_into_tensor 后（两个 rank 结果相同，按 rank 序拼接）:
-            global_tokens: [a0, a1, b0, b1]
-
-    示例 2 —— ``attn_tp_size == 2`` 的通用路径（``tp_size=4``、``attn_dp_size=2``）:
-
-    rank0/1 同属 DP 组 0，rank2/3 同属 DP 组 1。此时若直接 all_gather，同组两卡
-    会各贡献一份，全局张量长度会翻倍且内容重复。故先在组内 reduce_scatter：
-    把长度 2 的 local_tokens 规约后切成 2 段，每卡只留 1 段（互不重叠），
-    再 all_gather 这些小段，正好拼回长度 4 的全局张量。
-
-    ::
-
-        输入 local_tokens（is_partial=True，组内两卡各持部分和）:
-            rank0: [a0', a1']        rank2: [b0', b1']
-            rank1: [a0", a1"]        rank3: [b0", b1"]
-            （满足 a0'+a0" = a0，a1'+a1" = a1，b 同理）
-
-        组内 reduce_scatter_tensor 后，每卡持有 1 段完整结果:
-            rank0: [a0]              rank2: [b0]
-            rank1: [a1]              rank3: [b1]
-
-        全局 all_gather_into_tensor 后（4 个 rank 结果相同）:
-            global_tokens: [a0, a1, b0, b1]
-
-    ``is_partial=False`` 时组内两卡持有的是**完整副本**而非部分和，
-    直接 reduce_scatter 求和会得到 2 倍值；因此先把 ``attn_tp_rank != 0``
-    的 local_tokens 清零，使求和结果仍等于 rank 0 的原值。
-    """
-    if get_attention_tp_size() == 1:
-        # attn TP = 1：每个 rank 的数据本身就是一份独立分片，直接 all_gather
-        get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
+    if get_attn_tensor_model_parallel_world_size() == 1:
+        if use_world:
+            torch.distributed.all_gather_into_tensor(
+                global_tokens,
+                local_tokens,
+                group=torch.distributed.group.WORLD,
+            )
+        else:
+            get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
         return
 
     if not is_partial:
-        # 非部分和场景下各 TP rank 是完整副本，只保留 rank 0 的值，
-        # 其余置零，这样后续 reduce_scatter（求和）不会把副本重复累加
-        if get_attention_tp_rank() != 0:
+        if get_attn_tensor_model_parallel_rank() != 0:
             local_tokens.fill_(0)
-    # 取出本 TP rank 在 reduce_scatter 后应负责的那一片
-    scattered_local_tokens = local_tokens.tensor_split(get_attention_tp_size())[
-        get_attention_tp_rank()
-    ]
-    # 在 attn TP 组内规约并切分：每个 rank 拿到互不重叠的一小段完整结果
-    get_attention_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
-    # 全局 TP 组上把所有小段拼接成完整的全局张量
-    get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
+    scattered_local_tokens = local_tokens.tensor_split(
+        get_attn_tensor_model_parallel_world_size()
+    )[get_attn_tensor_model_parallel_rank()]
+    get_attn_tp_group().reduce_scatter_tensor(scattered_local_tokens, local_tokens)
+    if use_world:
+        torch.distributed.all_gather_into_tensor(
+            global_tokens,
+            scattered_local_tokens,
+            group=torch.distributed.group.WORLD,
+        )
+    else:
+        get_tp_group().all_gather_into_tensor(global_tokens, scattered_local_tokens)
+
+
+# Variable-length DP-MoE gather (reference https://github.com/ROCm/ATOM/pull/930): instead of padding every
+# rank to max_len (all_gather) or all-reducing a sum_len zero-buffer (all_reduce),
+# gather exactly sum(per-rank tokens) via all_gatherv. Env-gated; only the simple
+# tp_size==dp_size (attn_tp_size==1) case is supported for now (e.g. tp8dp8).
+_USE_DP_GATHERV = get_bool_env_var("SGLANG_DP_USE_GATHERV")
+
+_DP_GATHER_FP8_GROUP = 128
+# Grow-only gathered fp8 payload / scales buffers, keyed by device.
+_dp_gather_fp8_bufs: dict = {}
+
+
+@functools.lru_cache(maxsize=1)
+def _use_dp_gather_fp8() -> bool:
+    return envs.SGLANG_ENABLE_DP_GATHER_FP8.get()
+
+
+def _get_dp_gather_fp8_bufs(rows: int, hidden: int, device: torch.device):
+    key = str(device)
+    bufs = _dp_gather_fp8_bufs.get(key)
+    if bufs is None or bufs[0].shape[0] < rows:
+        bufs = (
+            torch.empty((rows, hidden), dtype=torch.uint8, device=device),
+            torch.empty(
+                (rows, hidden // _DP_GATHER_FP8_GROUP),
+                dtype=torch.float32,
+                device=device,
+            ),
+        )
+        _dp_gather_fp8_bufs[key] = bufs
+    return bufs[0][:rows], bufs[1][:rows]
+
+
+@triton.jit
+def _dequant_per_token_group_fp8_kernel(
+    q_ptr,
+    s_ptr,
+    out_ptr,
+    HIDDEN: tl.constexpr,
+    NGROUPS: tl.constexpr,
+    GROUP: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    # HIDDEN may not be a multiple of BLOCK (e.g. DeepSeek 7168 vs BLOCK
+    # 2048): the tail iteration must be masked or it reads/writes up to
+    # BLOCK-1 elements past the row (cross-row corruption + OOB on the last
+    # row).  HIDDEN is constexpr, so the mask folds away when it divides.
+    for start in tl.static_range(0, HIDDEN, BLOCK):
+        offs = start + tl.arange(0, BLOCK)
+        mask = offs < HIDDEN
+        qv = tl.load(q_ptr + row * HIDDEN + offs, mask=mask, other=0.0).to(tl.float32)
+        sv = tl.load(s_ptr + row * NGROUPS + offs // GROUP, mask=mask, other=0.0)
+        tl.store(out_ptr + row * HIDDEN + offs, (qv * sv).to(tl.bfloat16), mask=mask)
+
+
+@triton.jit
+def _mask_dp_pad_topk_ids_kernel(
+    topk_ids_ptr,
+    counts_ptr,
+    max_len,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    rank = row // max_len
+    pos = row % max_len
+    valid = pos < tl.load(counts_ptr + rank)
+    if valid == 0:
+        offs = tl.arange(0, BLOCK)
+        tl.store(topk_ids_ptr + row * TOPK + offs, -1, mask=offs < TOPK)
+
+
+def mask_dp_pad_moe_topk_ids(topk_ids: torch.Tensor) -> None:
+    """Set MAX_LEN pad rows' (post-translation, local) topk_ids to -1 in place.
+
+    Under dp-attention MAX_LEN padding the gathered MoE buffer is
+    [dp_size * max_len, hidden] with rank r's real rows at
+    [r*max_len, r*max_len + global_num_tokens[r]); the pad rows carry stale
+    hidden values, run the router, and get dispatched into experts whose
+    outputs are then discarded by the post-reorder scatter — pure wasted
+    compute, and a masked-grouped-GEMM workspace blow-up when they collide
+    on the same top-k.  -1 is the drop sentinel both the triton fused_moe
+    (filter_expert) and the DeepGEMM EP preprocess honor; it must be applied
+    AFTER the local_expert_mapping gather (a pre-translation -1 aliases to
+    the mapping table's last entry).  Capture-safe: per-batch state is read
+    only from the replay-updated global_num_tokens_gpu tensor.
+    """
+    counts = _DpGatheredBufferWrapper.get_dp_global_num_tokens_gpu()
+    if counts is None:
+        return
+    max_len = _DpGatheredBufferWrapper.get_local_dp_buffer_len()
+    rows, topk = topk_ids.shape
+    if max_len <= 0 or rows != counts.shape[0] * max_len:
+        # Layout mismatch (e.g. non-DP or logits-path caller): do nothing.
+        return
+    _mask_dp_pad_topk_ids_kernel[(rows,)](
+        topk_ids,
+        counts,
+        max_len,
+        TOPK=topk,
+        BLOCK=triton.next_power_of_2(topk),
+    )
+
+
+def _dp_gather_via_all_gatherv_fp8(
+    global_tokens: torch.Tensor,
+    local_real: torch.Tensor,
+    sizes: List[int],
+):
+    """fp8 wire format for the variable-length DP gather: quantize the local
+    rows per-token-group (the SAME group-128 quantization the MoE expert GEMMs
+    apply to their input downstream), gather payload (as uint8 — NCCL has no
+    fp8 dtype; the gatherv leg is broadcast-only so a byte view is safe) and
+    scales in two output-buffered gatherv calls, then dequantize into the
+    bf16 global buffer.  Zero pad rows quantize to (q=0, s=eps) and so
+    dequantize back to exact zeros — the MoE-tail invariant is preserved.
+    The combine leg (reduce_scatterv) stays bf16: NCCL SUM cannot run on fp8."""
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
+    rows = global_tokens.shape[0]
+    hidden = global_tokens.shape[-1]
+    q, s = sglang_per_token_group_quant_fp8(
+        local_real.contiguous(), _DP_GATHER_FP8_GROUP
+    )
+    gq, gs = _get_dp_gather_fp8_bufs(rows, hidden, global_tokens.device)
+    tp_group = get_tp_group()
+    tp_group.all_gatherv(q.view(torch.uint8), sizes=sizes, output=gq)
+    tp_group.all_gatherv(s, sizes=sizes, output=gs)
+    _dequant_per_token_group_fp8_kernel[(rows,)](
+        gq.view(torch.float8_e4m3fn),
+        gs,
+        global_tokens,
+        HIDDEN=hidden,
+        NGROUPS=hidden // _DP_GATHER_FP8_GROUP,
+        GROUP=_DP_GATHER_FP8_GROUP,
+        BLOCK=2048,
+    )
+
+
+def is_dp_gatherv_active() -> bool:
+    """Variable-length DP-MoE gather/scatter (all_gatherv + reduce_scatterv) is
+    enabled and applicable to the CURRENT forward. Requires:
+      - env SGLANG_DP_USE_GATHERV (default off),
+      - supported layout (attn_tp_size==1, tp_size==dp_size),
+      - SUM_LEN padding mode. The gatherv pair (all_gatherv + reduce_scatterv) is
+        only valid under SUM_LEN; under MAX_LEN the buffer is equal-padded and the
+        gather/combine use all_gather / (aiter) reduce_scatter instead. Reading the
+        per-forward padding via _DpGatheredBufferWrapper.is_dp_max_padding() (set by
+        set_dp_buffer_len) keeps callers that lack a ForwardBatch (e.g.
+        dp_reduce_scatter_tensor) consistent."""
+    return (
+        _USE_DP_GATHERV
+        and not world_dp_gather_enabled()
+        and get_attn_tensor_model_parallel_world_size() == 1
+        and get_tensor_model_parallel_world_size() == get_attention_dp_size()
+        and not _DpGatheredBufferWrapper.is_dp_max_padding()
+    )
+
+
+def _dp_gatherv_sizes(forward_batch) -> Optional[List[int]]:
+    """Per-rank CPU token counts for the buffer being gathered. The MoE gather
+    passes a ForwardBatch (global_num_tokens_cpu); the logits gather passes a
+    LogitsMetadata (global_num_tokens_for_logprob_cpu). Return the sizes that
+    match the LOCAL tensor for this context, or None to fall back."""
+    sizes = getattr(forward_batch, "global_num_tokens_for_logprob_cpu", None)
+    if sizes is None:
+        sizes = getattr(forward_batch, "global_num_tokens_cpu", None)
+    if sizes is None:
+        return None
+    try:
+        return [int(x) for x in sizes]
+    except (TypeError, ValueError):
+        return None
+
+
+def _dp_gather_via_all_gatherv(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    forward_batch: ForwardBatch,
+    is_partial: bool,
+    sizes: List[int],
+):
+    # attn_tp_size == 1: each DP rank contributes exactly `sizes[rank]` rows.
+    # CRITICAL: the MoE downstream runs on the WHOLE `global_tokens` buffer
+    # (M = global_tokens.shape[0]), so the gather MUST fill every row. We pad
+    # each rank's local tensor up to sizes[rank] with zeros (matching the
+    # buffer's reserved per-rank slot) so sum(sizes) == buffer rows and there
+    # is no uninitialized tail for the MoE to read.
+    rank = get_attention_dp_rank()
+    local_rows = sizes[rank]
+    if local_tokens.shape[0] == local_rows:
+        local_real = local_tokens
+    elif local_tokens.shape[0] > local_rows:
+        local_real = local_tokens[:local_rows]
+    else:
+        local_real = local_tokens.new_zeros((local_rows, *local_tokens.shape[1:]))
+        local_real[: local_tokens.shape[0]].copy_(local_tokens)
+    # sum(sizes) == global_tokens.shape[0] is guaranteed by the caller (else it
+    # falls back to all_reduce). Pass global_tokens as the NCCL output buffer so
+    # the gather writes directly into it -- avoids the previous extra full-buffer
+    # torch.cat + copy_ (two ~sum(sizes)*hidden DtoD copies, ~700us/layer at c512).
+    # NOTE: the fp8 branch condition must be identical on EVERY DP rank (all
+    # ranks must issue the same NCCL op sequence) — env/dtype/hidden are
+    # rank-uniform; never gate on per-rank state like forward_mode (ranks can
+    # be extend/idle-mixed within one global forward).  Prefill-only is
+    # already structural: the gatherv path runs only under SUM_LEN padding,
+    # which decode-only steps and CUDA-graph capture never select.
+    if (
+        _use_dp_gather_fp8()
+        and global_tokens.dtype == torch.bfloat16
+        and global_tokens.shape[-1] % _DP_GATHER_FP8_GROUP == 0
+    ):
+        _dp_gather_via_all_gatherv_fp8(global_tokens, local_real, sizes)
+        return
+    get_tp_group().all_gatherv(local_real, sizes=sizes, output=global_tokens)
 
 
 def _dp_gather(
@@ -827,8 +936,33 @@ def _dp_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    """gather 的统一入口，按 padding 模式分派到具体实现。"""
-    if forward_batch.dp_padding_mode.is_max_len():
+    if (
+        is_dp_gatherv_active()
+        and forward_batch.dp_padding_mode is not None
+        and not forward_batch.dp_padding_mode.is_max_len()
+    ):
+        # The gatherv per-rank sizes MUST sum to the pre-allocated global buffer
+        # (the MoE runs on the whole buffer, so any unfilled tail = garbage).
+        # The buffer was sized from the ceil_align'd global_num_tokens stored via
+        # set_dp_buffer_len (forward_batch_info), so the authoritative sizes are
+        # get_dp_global_num_tokens() — the SAME source the reduce_scatterv combine
+        # uses (symmetric). _dp_gatherv_sizes() reads the raw (un-aligned, and for
+        # the MoE-gather context the logprob-token) counts, which do NOT match the
+        # buffer for prefill steps -> would force an all_reduce fallback.
+        # Prefer the buffer-aligned sizes; fall back to the per-batch sizes only
+        # if they happen to match (e.g. the logits gather path).
+        _gatherv_sizes = get_dp_global_num_tokens()
+        if _gatherv_sizes is None or sum(_gatherv_sizes) != global_tokens.shape[0]:
+            _gatherv_sizes = _dp_gatherv_sizes(forward_batch)
+        if _gatherv_sizes is not None and sum(_gatherv_sizes) == global_tokens.shape[0]:
+            _dp_gather_via_all_gatherv(
+                global_tokens, local_tokens, forward_batch, is_partial, _gatherv_sizes
+            )
+            return
+    if (
+        forward_batch.dp_padding_mode is not None
+        and forward_batch.dp_padding_mode.is_max_len()
+    ):
         _dp_gather_via_all_gather(
             global_tokens, local_tokens, forward_batch, is_partial
         )
@@ -885,19 +1019,18 @@ def dp_scatter(
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between local_tokens and global_tokens not allowed"
 
-        # 把 global_tokens[local_start_pos : +local_num_tokens] 拷贝到 local_tokens
-        memcpy_triton(
-            local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True
-        )
+        memcpy(local_tokens, global_tokens, 0, local_start_pos, local_num_tokens, True)
 
 
 def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
-    """在 DP 维度上做 reduce-scatter：规约全局张量并把结果切回各 DP rank。
-
-    当 tp_size == dp_size（即 attn TP 为 1）时，一次 reduce_scatter 即可。
-    否则需要两步：先在全局 TP 组上 reduce_scatter 得到更细的分片，
-    再在 attn TP 组内 all_gather 还原成每个 DP rank 完整的那一段。
-    """
+    if is_dp_gatherv_active():
+        # Variable-length combine matching all_gatherv dispatch: scatter the
+        # global (sum_len) tensor back to per-rank token counts. Fall through to
+        # the default reduce-scatter path if per-rank sizes are unavailable.
+        sizes = get_dp_global_num_tokens()
+        if sizes is not None:
+            get_tp_group().reduce_scatterv(input, output=output, sizes=sizes)
+            return
     if get_tensor_model_parallel_world_size() == get_attention_dp_size():
         get_tp_group().reduce_scatter_tensor(output, input)
     else:
@@ -907,33 +1040,135 @@ def dp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
         )[get_tensor_model_parallel_rank()]
         # 第一步：全局规约并细分
         get_tp_group().reduce_scatter_tensor(scattered_local_tokens, input)
-        # 第二步：在 attn TP 组内拼回本 DP rank 的完整分片
-        get_attention_tp_group().all_gather_into_tensor(output, scattered_local_tokens)
+        get_attn_tp_group().all_gather_into_tensor(output, scattered_local_tokens)
+
+
+# ---------------------------------------------------------------------------
+# Two-batch-overlap (non-EP / DP TP-MoE) async gather + combine.
+#
+# The DP TP-MoE path (deepseek_v4) gathers local hidden -> a global buffer
+# before the experts and reduce-scatters back after. For TBO we run those two
+# collectives on a single shared comm stream (mirroring the mori dispatcher's
+# _comm_stream) and return a CUDA event, so the op engine can yield and let the
+# OTHER ubatch's attn+MoE compute run on the compute stream while this ubatch's
+# gather/combine proceeds on the comm stream. Both ubatches share ONE comm
+# stream -> their collectives serialize in-order (no concurrent-collective
+# deadlock on the RCCL communicator), each overlapping the other's compute.
+# ---------------------------------------------------------------------------
+def get_dp_tbo_comm_stream() -> torch.cuda.Stream:
+
+    return get_stream("dp_tbo_comm")
+
+
+# Persistent reusable CUDA events for non-EP DP TBO, keyed by (kind, subbatch).
+# CRITICAL: do NOT create a fresh event per gather/combine -- that is ~244 new
+# torch.cuda.Event per forward (61 layers x 2 ubatches x 2), and the HSA signal
+# pool is exhausted after a few hundred forwards -> HSA_STATUS_ERROR_OUT_OF_RESOURCES
+# ("...create internal OS-specific events"). Reuse one event per (kind, subbatch)
+# and just re-record it (mirrors the mori CommStreamPool event reuse).
+def _tbo_event(key) -> torch.cuda.Event:
+
+    pool = get_resources().tbo_event_pool
+    ev = pool.get(key)
+    if ev is None:
+        ev = torch.cuda.Event()
+        pool[key] = ev
+    return ev
+
+
+def dp_gather_partial_async(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    forward_batch: ForwardBatch,
+    event_key=("gather", 0),
+) -> torch.cuda.Event:
+    """Launch `dp_gather_partial` (all_gatherv) on the shared DP TBO comm stream;
+    re-record + return a PERSISTENT event (keyed by `event_key`) that fires when
+    the gather completes. Caller yields, then `compute_stream.wait_event(ev)`
+    before reading `global_tokens`."""
+    comm = get_dp_tbo_comm_stream()
+    compute = torch.cuda.current_stream()
+    # Keep buffers alive across streams (caching allocator).
+    local_tokens.record_stream(comm)
+    global_tokens.record_stream(comm)
+    ev = _tbo_event(event_key)
+    with torch.cuda.stream(comm):
+        comm.wait_stream(compute)  # inputs were produced on the compute stream
+        dp_gather_partial(global_tokens, local_tokens, forward_batch)
+        ev.record(comm)
+    return ev
+
+
+# Persistent grow-only buffers for non-EP DP TBO, keyed by (kind, tbo_subbatch).
+# Reused across ALL layers (and forwards) so the caching allocator does not churn
+# a fresh per-layer `torch.empty` for the 8x DP-gather / combine buffers. That
+# churn (different sizes per forward x 2 ubatches x 61 layers, kept alive by the
+# comm-stream record_stream) ballooned `reserved` to ~270GB and tripped
+# HSA_STATUS_ERROR_OUT_OF_RESOURCES at large prefill chunks, even though the live
+# (allocated) working set was only ~10GB.
+_TBO_PERSIST_BUF: dict = {}
+
+
+def get_tbo_persistent_buffer(
+    key, rows: int, hidden: int, dtype: torch.dtype, device
+) -> torch.Tensor:
+    """Return a [rows, hidden] view of a grow-only persistent buffer for `key`.
+    Reallocates only when the request exceeds the cached capacity / changes
+    dtype|hidden. Caller must treat the returned view as scratch (overwritten)."""
+    buf = _TBO_PERSIST_BUF.get(key)
+    cap = 0 if buf is None else buf.shape[0]
+    if buf is None or rows > cap or buf.shape[1] != hidden or buf.dtype != dtype:
+        new_rows = max(rows, cap)
+        buf = torch.empty((new_rows, hidden), dtype=dtype, device=device)
+        _TBO_PERSIST_BUF[key] = buf
+    return buf[:rows]
+
+
+def dp_reduce_scatterv_async(
+    output_local: torch.Tensor,
+    global_tokens: torch.Tensor,
+    sizes: List[int],
+    event_key=("combine", 0),
+) -> torch.cuda.Event:
+    """Launch the variable-length reduce_scatterv (combine) on the shared DP TBO
+    comm stream; re-record + return a PERSISTENT event (keyed by `event_key`).
+    Matches the gatherv (SUM_LEN) path."""
+    comm = get_dp_tbo_comm_stream()
+    compute = torch.cuda.current_stream()
+    ev = _tbo_event(event_key)
+    with torch.cuda.stream(comm):
+        comm.wait_stream(compute)
+        get_tp_group().reduce_scatterv(global_tokens, output=output_local, sizes=sizes)
+        ev.record(comm)
+    return ev
 
 
 def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
-    """在 attention TP 组内执行 reduce-scatter。"""
-    return get_attention_tp_group().reduce_scatter_tensor(output, input)
+    return get_attn_tp_group().reduce_scatter_tensor(output, input)
 
 
 def attn_cp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
-    """在 attention CP（context parallel）组内执行 reduce-scatter。"""
-    return get_attention_cp_group().reduce_scatter_tensor(output, input)
+    return get_attn_cp_group().reduce_scatter_tensor(output, input)
 
 
 def attn_tp_all_reduce(input: torch.Tensor):
-    """在 attention TP 组内执行 all-reduce。"""
-    return get_attention_tp_group().all_reduce(input)
+    return get_attn_tp_group().all_reduce(input)
 
 
 def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
-    """在 attention TP 组内执行 all-gather，结果写入预分配的 output 张量。"""
-    return get_attention_tp_group().all_gather_into_tensor(output, input)
+    return get_attn_tp_group().all_gather_into_tensor(output, input)
 
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
-    """在 attention CP 组内执行 all-gather，结果写入预分配的 output 张量。"""
-    return get_attention_cp_group().all_gather_into_tensor(output, input)
+    return get_attn_cp_group().all_gather_into_tensor(output, input)
+
+
+def attn_cp_overlap_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
+    return get_attn_cp_overlap_group().all_gather_into_tensor(output, input)
+
+
+def attn_cp_overlap_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
+    return get_attn_cp_overlap_group().reduce_scatter_tensor(output, input)
 
 
 def get_moe_cp_group() -> GroupCoordinator:
@@ -952,15 +1187,12 @@ def get_moe_cp_size() -> int:
 
 
 def is_enable_moe_cp_allgather() -> bool:
-    """当 moe_dp_size < attn_cp_size 时返回 True，此时进入 MoE 前需跨 CP rank 做 all-gather。
+    """True when moe_dp_size < attn_cp_size, requiring allgather across CP ranks before MoE.
 
-    原因：attention 阶段序列被 CP 切分到多个 rank，而 MoE 的 DP 度更小，
-    因此必须先把被 CP 切散的 token 汇总回来，MoE 才能看到完整序列。
+    In that configuration ``initialize_model_parallel`` aliases ``_MOE_DP`` to
+    ``_ATTN_CP``, so the two groups report equal widths.
     """
-    from sglang.srt.server_args import get_global_server_args
-
-    sa = get_global_server_args()
-    return sa.attn_cp_size > sa.moe_dp_size
+    return get_parallel().attn_cp_size > get_parallel().moe_dp_size
 
 
 def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
@@ -969,5 +1201,4 @@ def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):
-    """在 attention TP 组内执行 all-gather，结果以张量列表形式返回（每个 rank 一个）。"""
-    return get_attention_tp_group().all_gather(input, output_tensor_list=output_list)
+    return get_attn_tp_group().all_gather(input, output_tensor_list=output_list)

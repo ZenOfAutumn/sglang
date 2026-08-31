@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.storage.hf3fs.hf3fs_client import Hf3fsClient
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
@@ -586,7 +586,7 @@ class HiCacheHF3FS(HiCacheStorage):
         MHA 非 MLA 的零拷贝模式下，每页拆成 k/v 两个 key，故用 factor=2 换算回页数。
         """
         factor = 1
-        if self.is_zero_copy and not self.is_mla_model:
+        if self.mha_zero_copy:
             keys = self._get_mha_zero_copy_keys(keys)
             factor = 2
 
@@ -647,6 +647,7 @@ class HiCacheHF3FS(HiCacheStorage):
             "page_first",
             "page_first_direct",
         ]
+        self.mha_zero_copy = self.is_zero_copy and not self.is_mla_model
 
         logger.info(f"{self.is_zero_copy=}, layout={self.mem_pool_host.layout}")
 
@@ -736,7 +737,7 @@ class HiCacheHF3FS(HiCacheStorage):
             ]
         )
 
-        if self.is_zero_copy and not self.is_mla_model:
+        if self.mha_zero_copy:
             keys = self._get_mha_zero_copy_keys(keys)
             values = self._get_mha_zero_copy_values(values)
 
@@ -1022,7 +1023,7 @@ class HiCacheHF3FS(HiCacheStorage):
             for i in range(page_num)
         ]
 
-        if self.is_zero_copy and not self.is_mla_model:
+        if self.mha_zero_copy:
             keys = self._get_mha_zero_copy_keys(keys)
             values = self._get_mha_zero_copy_values(values)
 

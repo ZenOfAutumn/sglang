@@ -42,28 +42,38 @@ import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
-from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
+from sglang.kernels.ops.speculative.cache_locs import (
+    assign_extend_cache_locs_func as assign_extend_cache_locs_func,
+)
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.runtime_context import (
+    get_device,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
+    GrammarTree,
+    build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
-    generate_token_bitmask,
     move_accept_tokens_to_target_kvcache,
     prepare_mamba_track_for_verify,
     record_stream_for_v2_verify,
 )
-from sglang.srt.speculative.triton_ops.cache_locs import (
-    assign_extend_cache_locs_func as assign_extend_cache_locs_func,
-)
+from sglang.srt.utils import is_cpu
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
+
+_is_cpu = is_cpu()
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +83,34 @@ logger = logging.getLogger(__name__)
 #   QLEN_MASK: 只存树内 [draft_token_num, draft_token_num] 部分，历史全可见由后端隐式处理
 # 见下方 _prepare_for_speculative_decoding 中的性能说明（QLEN 约快 8%）。
 USE_FULL_MASK = True
+
+
+def _derive_tree_links(
+    mask: np.ndarray, bs: int, draft_token_num: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Host-side (retrive_next_token, retrive_next_sibling), matching what
+    reconstruct_indices_from_tree_mask produces on device.
+
+    ``mask[b, i, j]`` marks node j as an ancestor of node i, so i's immediate parent
+    is the largest such j < i, and both links follow from the parents alone.
+    """
+    tree = mask.reshape(bs, draft_token_num, draft_token_num)
+    node_order = np.arange(draft_token_num)
+    ancestors = tree & (node_order < node_order[:, None])
+    parents = np.where(ancestors.any(-1), (ancestors * node_order).argmax(-1), -1)
+
+    next_token = np.full((bs, draft_token_num), -1, dtype=np.int64)
+    next_sibling = np.full((bs, draft_token_num), -1, dtype=np.int64)
+    for b in range(bs):
+        # Descending scan, so every k > i is already recorded when i is reached.
+        earliest_child_of = {}
+        for i in reversed(range(draft_token_num)):
+            next_token[b, i] = earliest_child_of.get(i, -1)
+            parent = int(parents[b, i])
+            if parent >= 0:
+                next_sibling[b, i] = earliest_child_of.get(parent, -1)
+                earliest_child_of[parent] = i
+    return torch.from_numpy(next_token), torch.from_numpy(next_sibling)
 
 
 class NGRAMWorker(BaseSpecWorker):
@@ -99,61 +137,55 @@ class NGRAMWorker(BaseSpecWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        super().__init__()
+
         self.server_args = server_args
-        self.enable_overlap = not server_args.disable_overlap_schedule
+        self.enable_overlap = not get_schedule().disable_overlap_schedule
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.tp_rank = tp_rank
-        self.page_size = server_args.page_size
-        self.draft_token_num: int = server_args.speculative_num_draft_tokens
-        self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
+        self.tp_rank = ps.tp_rank
+        self.page_size = get_schedule().page_size
+        self.draft_token_num: int = get_spec().speculative_num_draft_tokens
+        self.max_trie_depth: int = get_spec().speculative_ngram_max_trie_depth
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
+        self.topk = get_spec().speculative_eagle_topk
+        self.speculative_num_steps = get_spec().speculative_num_steps
         # req_to_token_pool / token_to_kv_pool_allocator are set in
         # alloc_memory_pool(), after the target pools are allocated.
-        self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
+        self.device = get_device().device
 
         self.adaptive_controller = None
         # 中译：上一轮 decode batch 的 rid 集合；用于清理已离开 batch 的请求在
         # 语料库中的匹配状态（见 forward_batch_generation）。
         # 为什么要自己记：req.finished() 在 overlap 模式下滞后一轮，不可靠。
         self._prev_decode_rids: set = set()
+        self.grammar_tree_host: Optional[tuple] = None
 
         self.ngram_corpus = NgramCorpus(
-            min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
-            max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
-            match_type=server_args.speculative_ngram_match_type,
-            capacity=server_args.speculative_ngram_capacity,
-            max_trie_depth=server_args.speculative_ngram_max_trie_depth,
-            draft_token_num=server_args.speculative_num_draft_tokens,
-            external_sam_budget=server_args.speculative_ngram_external_sam_budget,
-            external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
+            min_bfs_breadth=get_spec().speculative_ngram_min_bfs_breadth,
+            max_bfs_breadth=get_spec().speculative_ngram_max_bfs_breadth,
+            match_type=get_spec().speculative_ngram_match_type,
+            capacity=get_spec().speculative_ngram_capacity,
+            max_trie_depth=get_spec().speculative_ngram_max_trie_depth,
+            draft_token_num=get_spec().speculative_num_draft_tokens,
+            external_sam_budget=get_spec().speculative_ngram_external_sam_budget,
+            external_corpus_max_tokens=get_spec().speculative_ngram_external_corpus_max_tokens,
         )
-        # 启动期预热：把 --speculative-ngram-external-corpus-path 指定的语料
-        # 同步灌进 SAM。这里用同步加载（不像运行时 HTTP 加载那样开后台线程），
-        # 因为服务还没开始接请求，阻塞在这里是安全的；
-        # 而且语料没装好就服务，头几个请求的命中率会很难看。
-        if server_args.speculative_ngram_external_corpus_path is not None:
+        if get_spec().speculative_ngram_external_corpus_path is not None:
             from sglang.srt.speculative.cpp_ngram.external_corpus import (
                 iter_external_corpus_chunks,
             )
 
-            # 用语料文件路径本身作为 corpus_id，天然唯一
-            corpus_path = server_args.speculative_ngram_external_corpus_path
+            corpus_path = get_spec().speculative_ngram_external_corpus_path
             chunks = list(
                 iter_external_corpus_chunks(
                     corpus_path,
                     target_worker.tokenizer,
-                    server_args.speculative_ngram_external_corpus_max_tokens,
+                    get_spec().speculative_ngram_external_corpus_max_tokens,
                 )
             )
             loaded = self.add_external_corpus(corpus_path, chunks)
@@ -163,10 +195,6 @@ class NGRAMWorker(BaseSpecWorker):
                 corpus_path,
                 loaded,
             )
-
-    @property
-    def target_worker(self) -> TpModelWorker:
-        return self._target_worker
 
     @property
     def draft_worker(self) -> Optional[EagleDraftWorkerBase]:
@@ -362,39 +390,47 @@ class NGRAMWorker(BaseSpecWorker):
         bs = len(batch.reqs)
         stride = self.draft_token_num
 
-        # 上一轮验证的接受结果。overlap 模式下这些还没写进 req.output_ids，
-        # 需要在下面手动"拼接"回历史，否则匹配用的上下文会缺尾巴。
-        prev_token_ids, prev_accept_lens = (
-            batch.spec_info.accept_tokens,
-            batch.spec_info.accept_lens,
-        )
-        # trie 匹配在 CPU 上做，先把张量搬下来（一次 D2H，几十字节，开销可忽略）
-        if not prev_token_ids.is_cpu:
-            prev_token_ids = prev_token_ids.cpu()
-            prev_accept_lens = prev_accept_lens.cpu()
         # 中译：worker 级别的暂存区——在草稿准备阶段写入，
-        # 在同一次 forward 调用内、verify 之后由 _update_ngram_corpus 消费。
-        # 存成 Python list 而非张量，因为后续都是纯 CPU 的切片操作。
-        self.prev_token_ids = prev_token_ids.tolist()
-        self.prev_accept_lens = prev_accept_lens.tolist()
+        # 中译：overlap 模式的结果处理滞后一轮，所以上一轮被接受的 token 还没进入
+        # Overlap mode processes results one iteration behind, so the last
+        # round's accepted tokens are not yet in req.output_ids and must be
+        # spliced in from spec_info. Sync mode and grammar batches process
+        # results before the next draft prep, so output_ids is already
+        # complete and splicing would duplicate the tail.
+        use_prev_tokens = self.enable_overlap and not batch.grammar_needs_sync()
 
-        # 等待上一轮 batch_put 的异步插入落盘，否则可能匹配不到刚生成的 token
+        # Accept-independent prep, hoisted above the blocking .cpu() below.
+        req_ids = [req.rid for req in batch.reqs]
+        # Only the last max_trie_depth tokens can match; the ids are
+        # array.array, so list() the tails for list concat below.
+        input_tails = [
+            list(req.origin_input_ids[-self.max_trie_depth :]) for req in batch.reqs
+        ]
+        output_tails = [
+            list(req.output_ids[-self.max_trie_depth :]) for req in batch.reqs
+        base_lens = [
+            len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs
+        if use_prev_tokens:
+            prev_token_ids, prev_accept_lens = (
+                batch.spec_info.accept_tokens,
+                batch.spec_info.accept_lens,
+            )
+            if not prev_token_ids.is_cpu:
+                prev_token_ids = prev_token_ids.cpu()
+                prev_accept_lens = prev_accept_lens.cpu()
+            # Worker-level staging: written here at draft prep, consumed by
+            # _update_ngram_corpus after verify within the same forward call.
+            self.prev_token_ids = prev_token_ids.tolist()
+            self.prev_accept_lens = prev_accept_lens.tolist()
+            assert bs == len(self.prev_accept_lens)
+        else:
+            # _update_ngram_corpus still reads the staging; fill it empty.
+            self.prev_token_ids = []
+            self.prev_accept_lens = [0] * bs
         self.ngram_corpus.synchronize()
-        req_ids = []
         batch_tokens = []
         total_lens = []
-        assert len(batch.reqs) == len(self.prev_accept_lens)
-        # 中译：overlap 模式的结果处理滞后一轮，所以上一轮被接受的 token 还没进入
-        # req.output_ids，必须从 spec_info 里拼接回来。而同步模式和带 grammar 的
-        # batch 会在下一次草稿准备之前就处理完结果，此时 output_ids 已经是完整的，
-        # 再拼接就会把尾部重复一遍。
-        use_prev_tokens = self.enable_overlap and not batch.has_grammar
-        i = 0
-        for req in batch.reqs:
-            # 从拍平的 accept_tokens 里切出第 i 个请求真正被接受的那几个。
-            # 例：stride=16、prev_accept_lens=[3, 1] 时，
-            #     i=0 取 prev_token_ids[0:3]，i=1 取 prev_token_ids[16:17]
-            #     —— 注意起点是 i*stride 而非累加，因为存储是按 stride 定长分段的。
+        for i in range(bs):
             prev_tokens = (
                 self.prev_token_ids[i * stride : i * stride + self.prev_accept_lens[i]]
                 if use_prev_tokens
@@ -404,20 +440,12 @@ class NGRAMWorker(BaseSpecWorker):
             # 逻辑序列 = prompt ⊕ 已输出 ⊕ 上一轮新接受的，取最后 18 个。
             # 先对 output_ids 做 [-18:] 是为了避免把长输出整个复制一遍。
             check_token = self._efficient_concat_last_n(
-                list(req.origin_input_ids),
-                list(req.output_ids[-self.max_trie_depth :]) + prev_tokens,
+                input_tails[i],
+                output_tails[i] + prev_tokens,
                 self.max_trie_depth,
             )
-            req_ids.append(req.rid)
             batch_tokens.append(check_token)
-            i += 1
-            # total_lens 传的是**逻辑总长度**（不是 check_token 的长度）——
-            # C++ 侧靠它判断增量匹配状态是否连续：若本次总长 = 上次总长 + 增量，
-            # 就能接着上次的 trie 节点往下走，否则从头重新匹配。
-            total_lens.append(
-                len(req.origin_input_ids) + len(req.output_ids) + len(prev_tokens)
-            )
-        # 进入 C++ trie 做批量匹配 + BFS 展开，这是整个草稿阶段唯一的重活
+            total_lens.append(base_lens[i] + len(prev_tokens))
         req_drafts, mask = self.ngram_corpus.batch_get(
             req_ids, batch_tokens, total_lens
         )
@@ -458,18 +486,26 @@ class NGRAMWorker(BaseSpecWorker):
         tree_mask = self.tree_mask_batch[bs]
         draft_tokens = self.draft_tokens_batch[bs]
 
-        # CPU 侧匹配出草稿树，再异步搬上 GPU（non_blocking + 预分配 = 可与后续重叠）
+        # Pre-sync: only needs seq_lens_cpu, so build before the blocking
+        # accept sync inside _prepare_draft_tokens.
+        ones_masks = None
+        if USE_FULL_MASK and not _is_cpu:
+            ones_masks = [
+                torch.ones(
+                    (self.draft_token_num, batch.seq_lens_cpu[i]), device=self.device
+                )
+                for i in range(bs)
+            ]
+
         req_drafts, mask = self._prepare_draft_tokens(batch)
         tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
         draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
 
         # 中译：利用 tree_mask 生成 positions 和若干索引。
-        # 这个 kernel 把 0/1 矩阵反解成「左孩子右兄弟」表示（见 ngram_info.py 头注释）：
-        #   positions            ← 每个节点的绝对位置 = seq_len + 该节点在树中的深度
-        #   retrieve_index       ← 节点的全局下标
-        #   retrieve_next_token  ← 第一个子节点下标，无子为 -1
-        #   retrieve_next_sibling← 下一个兄弟下标，无兄弟为 -1
-        # 带 # mutable 标注的四个参数是**输出**参数，被 kernel 原地写入。
+        # Staged for the grammar bitmask, derived after the verify launch below.
+        self.grammar_tree_host = (mask, req_drafts) if batch.has_grammar else None
+
+        # generate positions and some indices using tree_mask
         reconstruct_indices_from_tree_mask(
             tree_mask,
             batch.seq_lens,
@@ -482,32 +518,17 @@ class NGRAMWorker(BaseSpecWorker):
         )
 
         # 中译（NOTE）：QLEN_MASK 比 FULL_MASK 更快，但需要在 flashinfer 侧做相应改动。
-        # 实测约有 8% 的性能提升（效果大致与 batch size 成正比）。
-        #
-        # FULL_MASK 的做法：为每个请求拼出 [draft_token_num, seq_len + draft_token_num]
-        # 的完整可见性矩阵——左半段全 1（历史 KV 对所有草稿 token 可见），
-        # 右半段是树内 mask（只能看见自己的祖先链）。
-        #
-        # 示例（draft_token_num=4, seq_len=100）：
-        #   req_mask 左半 = ones(4, 100)
-        #   req_mask 右半 = mask[i]，即 4x4 的树内可见性
-        #   拼接后 shape (4, 104)，flatten 成 416 个 bool
-        #   bs=2、另一请求 seq_len=50 → 216 个，总计 632
-        #   （与 ngram_info.generate_attn_arg_prefill 的 mask_numel 推导一致）
-        if USE_FULL_MASK:
+        # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
+        # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
+        if USE_FULL_MASK and not _is_cpu:
             tree_mask = []
             mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
             # 中译（TODO by siyuan）：这里的 for 循环在大 batch size 下会带来显著开销，
             # 可以改写成一个 kernel。
             for i in range(bs):
-                seq_len = batch.seq_lens_cpu[i]
-                # 历史部分全可见：每个草稿 token 都能 attend 到全部已有 KV
-                req_mask = torch.ones(
-                    (self.draft_token_num, seq_len), device=self.device
-                )
                 req_mask = torch.cat(
                     (
-                        req_mask,
+                        ones_masks[i],
                         torch.from_numpy(mask[i]).to(
                             device=self.device, non_blocking=True
                         ),
@@ -572,8 +593,9 @@ class NGRAMWorker(BaseSpecWorker):
         batch_tokens = []
         i, stride = 0, self.draft_token_num
         # 中译：与 _prepare_draft_tokens 中相同的拼接条件——只有 overlap 模式下
-        # 才存在「已接受但尚未进入 req.output_ids」的 token。
-        use_prev_tokens = self.enable_overlap and not batch.has_grammar
+        # Same splice condition as _prepare_draft_tokens: only overlap mode
+        # has accepted tokens missing from req.output_ids.
+        use_prev_tokens = self.enable_overlap and not batch.grammar_needs_sync()
         for req in batch.reqs:
             # 中译（FIXME）：要不要把 'extend'（即 prompt 部分）也插进缓存，
             # 经过测试差别不大，所以目前不插入。
@@ -588,7 +610,7 @@ class NGRAMWorker(BaseSpecWorker):
                 else []
             )
             put_ids = self._efficient_concat_last_n(
-                list(req.origin_input_ids),
+                list(req.origin_input_ids[-self.max_trie_depth :]),
                 list(req.output_ids[-self.max_trie_depth :]) + prev_tokens,
                 self.max_trie_depth,
             )
@@ -597,7 +619,7 @@ class NGRAMWorker(BaseSpecWorker):
         self.ngram_corpus.batch_put(batch_tokens)
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None
+        self, batch: ScheduleBatch, on_publish=None, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
         """一轮完整的 NGRAM 投机解码：匹配 → 验证 → 接受 → 写回。
 
@@ -637,18 +659,8 @@ class NGRAMWorker(BaseSpecWorker):
 
         if batch.forward_mode.is_target_verify():
             # 中译：如有需要，先在 CPU 上准备 grammar 数据。
-            # 提前搬到 CPU 是为了让下面的 bitmask 生成能与 GPU 前向并行进行。
-            if batch.has_grammar:
-                retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
-                retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
-                draft_tokens_cpu = verify_input.draft_token.view(
-                    verify_input.retrieve_next_token.shape
-                ).cpu()
-
-            # 步骤 2：目标模型一次前向验证整棵草稿树。
-            # 这是唯一一次模型调用——NGRAM 的全部收益就来自「一次前向验证 N 个候选」。
             batch_result = self.target_worker.forward_batch_generation(
-                batch, is_verify=True
+                batch, pp_proxy_tensors=pp_proxy_tensors, is_verify=True
             )
 
             logits_output, can_run_cuda_graph = (
@@ -657,27 +669,27 @@ class NGRAMWorker(BaseSpecWorker):
             )
 
             verify_input: NgramVerifyInput = batch.spec_info
-            vocab_mask = None
+            grammar_mask = None
             if batch.has_grammar:
                 # 中译：为结构化输出生成 logit mask。
-                # 让 bitmask 生成这些 CPU 操作与前向计算重叠进行。
-                # 树形验证下每个候选节点的语法状态都不同，所以要逐节点算 mask。
-                vocab_mask = generate_token_bitmask(
-                    batch.reqs,
-                    verify_input,
-                    retrieve_next_token_cpu,
-                    retrieve_next_sibling_cpu,
-                    draft_tokens_cpu,
-                    batch.sampling_info.vocab_size,
-                )
-
-                if vocab_mask is not None:
-                    assert verify_input.grammar is not None
-                    vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
                     # 中译（NOTE by sk）：否则这个 vocab mask 会是上一个 extend 阶段
-                    # 遗留下来的那个，被套用后会产出错误结果。
-                    # 所以这里必须显式清空 sampling_info 上的旧 mask。
-                    batch.sampling_info.vocab_mask = None
+                # From the host tree rather than the device output: no readback to
+                # wait on, and deriving here keeps it under the verify forward.
+                mask, req_drafts = self.grammar_tree_host
+                retrieve_next_token_cpu, retrieve_next_sibling_cpu = _derive_tree_links(
+                    mask, bs, self.draft_token_num
+                )
+                grammar_mask = build_grammar_vocab_mask(
+                    reqs=batch.reqs,
+                    tree=GrammarTree.from_host(
+                        retrieve_next_token_cpu,
+                        retrieve_next_sibling_cpu,
+                        torch.from_numpy(req_drafts).to(torch.int64).view(bs, -1),
+                    ),
+                    sampling_info=batch.sampling_info,
+                    device=verify_input.retrieve_next_token.device,
+                    # Host corpus lookup, so NGRAM stays synchronous: nothing pending.
+                    barrier=None,
 
             # 中译：采样。
             # 先做 NaN/Inf 探针——投机解码下数值异常很难排查，
@@ -692,14 +704,7 @@ class NGRAMWorker(BaseSpecWorker):
                 predict,
                 accept_lens,
                 accept_index,
-            # 步骤 3：沿树路径贪心接受。直接复用 EAGLE 的实现——
-            # 草稿来源不同，但「验证一棵树」这件事是完全一样的。
-            # 返回：
-            #   predict      各节点的目标模型预测，shape [bs, draft_token_num]
-            #   accept_lens  各请求接受长度（含 bonus），如 tensor([3, 1])
-            #   accept_index 被接受节点的下标，shape [bs, draft_token_num]
-            ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
-            # 例：seq_lens=[100, 50] ⊕ accept_lens=[3, 1] → [103, 51]
+            ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
             new_seq_lens = batch.seq_lens + accept_lens
             # 按实际接受长度提交 Mamba 状态，丢弃猜错分支上的状态演进
             commit_mamba_states_after_verify(
@@ -727,15 +732,11 @@ class NGRAMWorker(BaseSpecWorker):
             )
             if batch.return_logprob:
                 # 中译：最后一个参数是 accept_index 的行宽减 1。NGRAM 的
-                # accept_index 形状是 (bs, draft_token_num)——它的树深度不像
-                # EAGLE 的 (bs, spec_steps + 1) 那样受 spec_steps 约束。
-                # 例：draft_token_num=16 → 传 15
-                compute_spec_v2_logprobs(
+                compute_spec_logprobs(
                     batch,
                     logits_output,
                     predict,
-                    accept_index,
-                    self.draft_token_num - 1,
+                    accept_index=accept_index,
                 )
 
             if on_publish is not None:
@@ -760,9 +761,9 @@ class NGRAMWorker(BaseSpecWorker):
             batch.forward_mode = ForwardMode.DECODE
 
         else:
-            # 非 decode（即 extend/prefill）：不投机，走普通前向。
-            # prefill 本身已经是计算密集的，投机拿不到收益。
-            batch_result = self.target_worker.forward_batch_generation(batch)
+            batch_result = self.target_worker.forward_batch_generation(
+                batch, pp_proxy_tensors=pp_proxy_tensors
+            )
             logits_output, predict, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,

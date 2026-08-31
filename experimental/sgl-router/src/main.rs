@@ -104,18 +104,43 @@ async fn main() -> Result<()> {
 
     // 创建 worker 注册表，后续由发现（discovery）与管理器（manager）任务动态维护。
     let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
+    let prefix_index = cfg
+        .model
+        .cache_aware
+        .as_ref()
+        .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
+        .map(|indexer| {
+            let config = sgl_kv_indexer::PrefixIndexConfig {
+                endpoint: indexer.url.clone(),
+                query_deadline: std::time::Duration::from_millis(indexer.query_timeout_ms),
+                max_inflight: indexer.query_max_inflight,
+            };
+            sgl_kv_indexer::GrpcPrefixIndex::new(config)
+                .map(Arc::new)
+                .context("configure KV Indexer client")
+        })
+        .transpose()?;
 
-    // 提前构建 KV 事件索引，以便 cache-aware-zmq 策略能共享其 `HashTree`
-    // 句柄与 `BlockSizeOracle`。即使没有任何模型使用 `cache_aware_zmq`，
-    // 该索引仍会被构建（开销极低），只是不会添加任何订阅者。
+    // Build the KV-event index up front so the cache-aware-zmq policy can
+    // share its `HashTree` handle + `BlockSizeOracle`. An external Indexer makes
+    // the local tree irrelevant to routing, so only discover hash metadata rather
+    // than duplicating every KV event.
     let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
-    let kv_index = sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .expect("default http client builds"),
-        Arc::clone(&block_size_oracle),
-    );
+    let kv_event_http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .expect("default http client builds");
+    let kv_index = if prefix_index.is_some() {
+        sgl_router::policies::kv_events::KvEventIndex::new_metadata_only_with_http_and_oracle(
+            kv_event_http,
+            Arc::clone(&block_size_oracle),
+        )
+    } else {
+        sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
+            kv_event_http,
+            Arc::clone(&block_size_oracle),
+        )
+    };
     let policies = Arc::new(
         sgl_router::policies::factory::build_registry(
             &cfg,
@@ -171,19 +196,17 @@ async fn main() -> Result<()> {
         .context("build proxy client")?,
     );
 
-    // 组装应用上下文 AppContext，汇集所有共享组件（配置、分词器、代理、
-    // worker 注册表、策略与活跃负载），供后续请求处理使用。
-    let ctx = Arc::new(
-        sgl_router::server::app_context::AppContext::with_active_load(
-            cfg.clone(),
-            tokenizers,
-            proxy,
-            registry,
-            policies,
-            active_load,
-        ),
+    let mut app_ctx = sgl_router::server::app_context::AppContext::with_active_load(
+        cfg.clone(),
+        tokenizers,
+        proxy,
+        registry,
+        policies,
+        active_load,
     );
-    // 标记服务就绪，使健康检查（readiness）接口开始返回“就绪”。
+    app_ctx.prefix_index = prefix_index;
+    app_ctx.block_size_oracle = block_size_oracle;
+    let ctx = Arc::new(app_ctx);
     ctx.mark_ready();
 
     // 基于上下文构建 axum 路由（注册所有 HTTP 端点）。

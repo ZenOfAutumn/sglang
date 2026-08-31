@@ -70,35 +70,10 @@ def import_processors(package_name: str, overwrite: bool = False):
                     PROCESSOR_MAPPING[arch] = cls
 
 
-def get_mm_processor(
-    hf_config,
-    server_args: ServerArgs,
-    processor,
-    transport_mode,
-    model_config=None,
-    **kwargs,
-) -> BaseMultimodalProcessor:
-    """中译：多模态处理器工厂——根据模型配置选出并实例化合适的处理器。
-
-    作用：
-        依据 hf_config.architectures（模型架构名）在 PROCESSOR_MAPPING 中查表，
-        并结合是否走 Transformers 后端，返回一个具体的 BaseMultimodalProcessor 实例。
-
-    关键参数：
-        hf_config: HuggingFace 模型配置，其中 architectures 列出模型架构名，用于查表。
-        server_args: 服务启动参数；其 model_impl 决定使用的实现后端（auto/transformers 等）。
-        processor: 底层的 HF 处理器/分词器对象，传入具体处理器构造。
-        transport_mode: 多模态数据的传输方式（如进程间如何传递张量）。
-        model_config: 可选；当 model_impl 为 "auto" 时用它解析最终实现类型。
-        **kwargs: 透传给处理器构造函数的其他参数。
-
-    返回值：
-        匹配到的多模态处理器实例。
-
-    异常：
-        若没有任何已注册架构匹配且未启用 Transformers 后端，抛出 ValueError。
-    """
     # 中译：解析使用的模型实现后端；显式为 "transformers" 时直接走 Transformers 后端。
+def get_mm_processor_cls(hf_config, server_args: ServerArgs, model_config=None):
+    """The class :func:`get_mm_processor` would instantiate, or ``None`` when the
+    architecture has no registered processor."""
     model_impl = str(getattr(server_args, "model_impl", "auto")).lower()
     uses_transformers_backend = model_impl == "transformers"
     # 中译："auto" 时进一步解析模型最终实现类型，判断是否落到 Transformers 后端。
@@ -117,9 +92,7 @@ def get_mm_processor(
         if not uses_transformers_backend or getattr(
             processor_cls, "supports_transformers_backend", False
         ):
-            return processor_cls(
-                hf_config, server_args, processor, transport_mode, **kwargs
-            )
+            return processor_cls
 
     # 中译：未命中专用处理器但走 Transformers 后端时，回退到通用的 Transformers 自动处理器。
     if uses_transformers_backend:
@@ -127,12 +100,23 @@ def get_mm_processor(
             TransformersAutoMultimodalProcessor,
         )
 
-        return TransformersAutoMultimodalProcessor(
-            hf_config, server_args, processor, transport_mode, **kwargs
-        )
+        return TransformersAutoMultimodalProcessor
 
     # 中译：既无专用处理器也不走 Transformers 后端——无法处理该架构，报错并列出已注册架构。
-    raise ValueError(
-        f"No processor registered for architecture: {hf_config.architectures}.\n"
-        f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"
-    )
+    return None
+
+def get_mm_processor(
+    hf_config,
+    server_args: ServerArgs,
+    processor,
+    transport_mode,
+    model_config=None,
+    **kwargs,
+) -> BaseMultimodalProcessor:
+    processor_cls = get_mm_processor_cls(hf_config, server_args, model_config)
+    if processor_cls is None:
+        raise ValueError(
+            f"No processor registered for architecture: {hf_config.architectures}.\n"
+            f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"
+        )
+    return processor_cls(hf_config, server_args, processor, transport_mode, **kwargs)

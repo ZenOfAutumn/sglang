@@ -110,5 +110,6 @@ class FrozenKVMTPVerifyInput(EagleVerifyInput):
     """
 
     def __post_init__(self):
-        """初始化后设置输入类型为 FROZEN_KV_MTP_VERIFY。"""
-        SpecInput.__init__(self, SpecInputType.FROZEN_KV_MTP_VERIFY)
+        # Run EagleVerifyInput's width auto-fill, then correct the type tag.
+        super().__post_init__()
+        self.spec_input_type = SpecInputType.FROZEN_KV_MTP_VERIFY

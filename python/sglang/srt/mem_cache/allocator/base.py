@@ -63,11 +63,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         # 由各子类在 clear() 中初始化为具体张量。
         self.free_pages = None
         self.release_pages = None
-        # 是否「不在批量释放分组中」。为 True 时 free 立即生效；
-        # 在 free_group_begin/free_group_end 之间为 False，释放会先攒进 free_group。
-        self.is_not_in_free_group = True
-        # 批量释放期间暂存待释放下标的列表，结束时一次性合并释放。
-        self.free_group = []
+        # None: free right away. A list: hold frees until free_group_end().
+        self.free_group: list[torch.Tensor] | None = None
 
     @property
     def size_full(self):
@@ -87,25 +84,18 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         # 返回底层物理 KV 存储对象。
         return self._kvcache
 
-    def restore_state(self, state):
-        # 从 backup_state 保存的快照恢复空闲账本（用于回滚等场景）。
-        self.free_pages, self.release_pages = state
-
-    def backup_state(self):
-        # 备份当前空闲账本，便于之后 restore_state 回滚。
-        return (self.free_pages, self.release_pages)
-
     def free_group_begin(self):
-        # 开启「批量释放」模式：此后的 free 不立即生效，而是先攒进 free_group，
-        # 待 free_group_end 时一次性合并释放，减少多次 torch.cat 的开销。
-        self.is_not_in_free_group = False
         self.free_group = []
 
     def free_group_end(self):
-        # 结束「批量释放」模式：把期间攒下的所有待释放下标拼接后一次性 free。
-        self.is_not_in_free_group = True
-        if self.free_group:
-            self.free(torch.cat(self.free_group))
+        pending, self.free_group = self.free_group, None
+        if pending:
+            self.free(torch.cat(pending))
+
+    @staticmethod
+    def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:
+        """Take ownership before a caller can mutate a deferred tensor view."""
+        return free_index.clone()
 
     def merge_and_sort_free(self):
         # 把延迟释放的 release_pages 合并回 free_pages 并排序。
@@ -117,6 +107,16 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             self.release_pages = torch.empty(
                 (0,), dtype=self.release_pages.dtype, device=self.device
             )
+
+    def translate_kv_indices_for_transfer(
+        self, kv_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Token ids as the PD-disaggregation transfer engine addresses them.
+
+        Identity here: a static pool's token ids index its registered buffers
+        directly. Virtual-id pools must override.
+        """
+        return kv_indices
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         # 把指定下标的 KV 拷贝到 CPU（用于卸载/换出）。
@@ -136,6 +136,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         # 解码分配（每步追加少量 token）：仅分页分配器支持。
         raise NotImplementedError("alloc_decode is only for paged allocator")
 
+    def resize(self, config) -> None:
+        self.size = config.max_total_num_tokens
+        if self.page_size > 1:
+            self.num_pages = config.max_total_num_tokens // self.page_size
+        self.clear()
+
     @abc.abstractmethod
     def clear(self):
         # 重置分配器：把所有槽位重新标记为空闲（子类必须实现）。
@@ -150,3 +156,35 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def free(self, free_index: torch.Tensor):
         # 归还 free_index 指向的 KV 槽位下标（子类必须实现）。
         raise NotImplementedError()
+
+    def free_full(self, free_index: torch.Tensor):
+        """Free slots whose SWA peers the caller already released.
+
+        A hybrid SWA allocator pairs each full-attention slot with an SWA slot
+        that can die first; this releases the full side alone. A single pool has
+        no peer, so it is a plain free()."""
+        self.free(free_index)
+
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int):
+        """Free ``kv_row[start_pos : start_pos + n]`` of one request (or a
+        page-aligned copy); subclasses may use ``start_pos`` to skip the
+        data-dependent dedup. Default: plain free()."""
+        self.free(free_index)
+
+    def free_segments(self, segments):
+        """Free disjoint ascending ``(free_index, start_pos)`` segments of one
+        request's kv row; a boundary page shared by consecutive segments is
+        emitted once (the later segment's head is trimmed)."""
+        ps = self.page_size
+        prev_end = None
+        for free_index, start_pos in segments:
+            n = free_index.numel()
+            if n == 0:
+                continue
+            seg_end = start_pos + n
+            if prev_end is not None and start_pos // ps == (prev_end - 1) // ps:
+                boundary = (start_pos // ps + 1) * ps
+                free_index = free_index[boundary - start_pos :]
+                start_pos = boundary
+            prev_end = seg_end
+            self.free_segment(free_index, start_pos=start_pos)

@@ -63,17 +63,15 @@ import mmap
 import os
 import struct
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import msgspec
 import msgspec.msgpack
 import msgspec.structs
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.utils.network import is_zmq_endpoint_ipv6
-
-if TYPE_CHECKING:
-    from sglang.srt.managers.io_struct import GetLoadsReqOutput
 
 logger = logging.getLogger(__name__)
 
@@ -82,23 +80,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # 中译：PD 分离模式字符串与整数编码的双向映射。快照里用 int 存储更紧凑，
-#       读出时再反查回字符串。
-DISAGG_MODE_TO_INT = {"null": 0, "prefill": 1, "decode": 2}
-INT_TO_DISAGG_MODE = {v: k for k, v in DISAGG_MODE_TO_INT.items()}
 
-
-def _native(v):
-    """Coerce numpy scalars to Python int/float for msgpack encoding.
-
-    中译：把 numpy 标量（如 np.int64/np.float32）转换为 Python 原生 int/float，
-          以便 msgpack 能正确编码。numpy 标量带 .item() 方法，调用它即可取出原生值。
-    """
-    if hasattr(v, "item"):
-        return v.item()
-    return v
-
-
-def should_use_zmq(server_args) -> bool:
+def should_use_zmq() -> bool:
     """Whether to use zmq PUSH/PULL instead of shared memory for load snapshots.
 
     Shared memory (mmap) only works within a single node.  When schedulers
@@ -113,14 +96,14 @@ def should_use_zmq(server_args) -> bool:
           开启 zmq 模式（主要用于测试）。
     """
     return (
-        server_args.enable_dp_attention and server_args.nnodes > 1
+        get_parallel().enable_dp_attention and get_parallel().nnodes > 1
     ) or envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.get()
 
 
 _LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens"})
 
 
-def _tokenizer_load_snapshot_owner_caller(server_args) -> str:
+def _tokenizer_load_snapshot_owner_caller() -> str:
     """The caller that plays the tokenizer-side zmq owner role.
 
     In multi-tokenizer mode (``tokenizer_worker_num > 1``) there are N
@@ -134,12 +117,12 @@ def _tokenizer_load_snapshot_owner_caller(server_args) -> str:
           因此改由唯一的 MultiTokenizerRouter 进程持有 socket（轮询 zmq -> 写 SHM），
           每个 worker 只读 SHM。单 tokenizer 模式下则由 TokenizerManager 充当。
     """
-    if server_args.tokenizer_worker_num > 1:
+    if get_serving().tokenizer_worker_num > 1:
         return "MultiTokenizerRouter"
     return "TokenizerManager"
 
 
-def zmq_reader_owner(server_args, caller: str) -> bool:
+def zmq_reader_owner(caller: str) -> bool:
     """Decide which process owns the zmq PULL socket.
 
     Exactly one of ``"DataParallelController"``, ``"TokenizerManager"``, or
@@ -157,32 +140,25 @@ def zmq_reader_owner(server_args, caller: str) -> bool:
         load data -> tokenizer-side owner owns it (polls on /v1/loads calls).
 
     The tokenizer-side owner is the ``"MultiTokenizerRouter"`` caller in
-    multi-tokenizer mode, otherwise the ``"TokenizerManager"`` caller.
-
-    中译：决定由哪个进程持有（bind）zmq PULL socket。
-          zmq 模式激活时，DataParallelController / TokenizerManager /
-          MultiTokenizerRouter 三者中必须且只能有一个返回 True；owner 负责
-          轮询 zmq 并写入 SHM，其余进程只读 SHM。规则：
-          - node_rank 非 0：该节点没有 TokenizerManager，DataParallelController
-            只负责拉起 Scheduler 并等待，因此无人持有 -> 返回 False。
-          - dp_size == 1：没有 DataParallelController -> 由 tokenizer 侧 owner 持有。
-          - dp_size > 1 且为「负载感知」调度方法：DataParallelController 在每次分发时
-            都会通过 refresh_load_budget() 轮询 -> 由它持有。
-          - dp_size > 1 且为轮询/其他方法：DataParallelController 从不读负载数据
-            -> 由 tokenizer 侧 owner 持有（在 /v1/loads 调用时轮询）。
-          其中 tokenizer 侧 owner 在多 tokenizer 模式下是 MultiTokenizerRouter，
-          否则是 TokenizerManager。
+    multi-tokenizer mode, otherwise the ``"TokenizerManager"`` caller. Which of
+    the two it is only matters to a tokenizer-side caller, and asking costs the
+    DP controller a `serving` read its role is not audited for -- so the
+    controller answers from the parallel leaves alone.
     """
-    if not should_use_zmq(server_args):
+    if not should_use_zmq():
         return False
-    if server_args.node_rank != 0:
+    if get_parallel().node_rank != 0:
         return False
-    tokenizer_owner = _tokenizer_load_snapshot_owner_caller(server_args)
-    if server_args.dp_size == 1:
-        return caller == tokenizer_owner
-    if server_args.load_balance_method.lower() in _LOAD_AWARE_METHODS:
-        return caller == "DataParallelController"
-    return caller == tokenizer_owner
+    if caller == "DataParallelController":
+        return (
+            get_parallel().dp_size > 1
+            and get_parallel().load_balance_method.lower() in _LOAD_AWARE_METHODS
+        )
+    if get_parallel().dp_size > 1 and (
+        get_parallel().load_balance_method.lower() in _LOAD_AWARE_METHODS
+    ):
+        return False
+    return caller == _tokenizer_load_snapshot_owner_caller()
 
 
 # ---------------------------------------------------------------------------
@@ -190,126 +166,33 @@ def zmq_reader_owner(server_args, caller: str) -> bool:
 # ---------------------------------------------------------------------------
 
 # 中译：核心指标字段名清单。这些是「扁平」字段，直接从 GetLoadsReqOutput 同名属性拷贝。
-CORE_METRIC_FIELDS = (
-    "timestamp",
-    "dp_rank",
-    "num_running_reqs",
-    "num_waiting_reqs",
-    "num_waiting_uncached_tokens",
-    "num_used_tokens",
-    "num_total_tokens",
-    "max_total_num_tokens",
-    "max_running_requests",
-    "token_usage",
-    "gen_throughput",
-    "cache_hit_rate",
-    "utilization",
-)
 # 中译：可选「分节（section）」字段表。每个元组为
-#       (include 键, GetLoadsReqOutput 上的子对象属性名, 快照里的 has_xxx 存在标志,
-#        ((子对象属性名, 快照扁平字段名), ...))。
-#       由于 LoadSnapshot 是扁平结构，这里把嵌套子对象（memory/spec/lora/disagg/queues）
-#       拍平成带前缀的字段；has_xxx 标志位记录该分节当时是否存在。
-SECTION_FIELDS = (
-    (
-        "memory",
-        "memory",
-        "has_memory",
-        (
-            ("weight_gb", "memory_weight_gb"),
-            ("kv_cache_gb", "memory_kv_cache_gb"),
-            ("graph_gb", "memory_graph_gb"),
-            ("token_capacity", "memory_token_capacity"),
-        ),
-    ),
-    (
-        "spec",
-        "speculative",
-        "has_speculative",
-        (
-            ("accept_length", "speculative_accept_length"),
-            ("accept_rate", "speculative_accept_rate"),
-        ),
-    ),
-    (
-        "lora",
-        "lora",
-        "has_lora",
-        (
-            ("slots_used", "lora_slots_used"),
-            ("slots_total", "lora_slots_total"),
-            ("utilization", "lora_utilization"),
-        ),
-    ),
-    (
-        "disagg",
-        "disaggregation",
-        "has_disaggregation",
-        (
-            ("mode", "disagg_mode"),
-            ("prefill_bootstrap_queue_reqs", "prefill_bootstrap_queue_reqs"),
-            ("prefill_inflight_queue_reqs", "prefill_inflight_queue_reqs"),
-            ("decode_prealloc_queue_reqs", "decode_prealloc_queue_reqs"),
-            ("decode_transfer_queue_reqs", "decode_transfer_queue_reqs"),
-            ("decode_retracted_queue_reqs", "decode_retracted_queue_reqs"),
-            ("kv_transfer_speed_gb_s", "kv_transfer_speed_gb_s"),
-            ("kv_transfer_latency_ms", "kv_transfer_latency_ms"),
-        ),
-    ),
-    (
-        "queues",
-        "queues",
-        "has_queues",
-        (
-            ("waiting", "queue_waiting"),
-            ("grammar", "queue_grammar"),
-            ("paused", "queue_paused"),
-            ("retracted", "queue_retracted"),
-        ),
-    ),
-)
+
+class MemoryMetrics(msgspec.Struct, array_like=True):
+    """Memory breakdown metrics."""
+    weight_gb: float
+    kv_cache_gb: float
+    graph_gb: float
+    token_capacity: int
+class SpeculativeMetrics(msgspec.Struct, array_like=True):
+    """Speculative decoding metrics."""
+
+    accept_length: float
+    accept_rate: float
 
 
-class LoadSnapshot(msgspec.Struct, omit_defaults=True):
-    """单个 dp_rank 的负载快照（可序列化的扁平结构）。
+class LoRAMetrics(msgspec.Struct, array_like=True):
+    """LoRA adapter pool metrics."""
 
-    中译：用 msgspec.Struct 定义，omit_defaults=True 表示编码时省略默认值字段以减小体积。
-          字段分为「核心指标」与若干可选分节（memory/speculative/lora/disaggregation/queues），
-          每个分节用 has_xxx 标志位表示当时是否采集到。该对象会被 msgpack 编码后写入
-          SHM 槽位或经 zmq 传输。
-    """
+    slots_used: int
+    slots_total: int
+    utilization: float
 
-    timestamp: float = 0.0
-    dp_rank: int = 0
-    num_running_reqs: int = 0
-    num_waiting_reqs: int = 0
-    num_waiting_uncached_tokens: int = 0
-    num_used_tokens: int = 0
-    num_total_tokens: int = 0
-    max_total_num_tokens: int = 0
-    max_running_requests: int = 0
-    token_usage: float = 0.0
-    gen_throughput: float = 0.0
-    cache_hit_rate: float = 0.0
-    utilization: float = 0.0
 
-    has_memory: int = 0
-    memory_weight_gb: float = 0.0
-    memory_kv_cache_gb: float = 0.0
-    memory_graph_gb: float = 0.0
-    memory_token_capacity: int = 0
+class DisaggregationMetrics(msgspec.Struct, array_like=True):
+    """PD disaggregation metrics."""
 
-    has_speculative: int = 0
-    speculative_accept_length: float = 0.0
-    speculative_accept_rate: float = 0.0
-
-    has_lora: int = 0
-    lora_slots_used: int = 0
-    lora_slots_total: int = 0
-    lora_utilization: float = 0.0
-
-    has_disaggregation: int = 0
-    disagg_mode: int = 0
+    mode: str  # "prefill", "decode", or "null"
     prefill_bootstrap_queue_reqs: int = 0
     prefill_inflight_queue_reqs: int = 0
     decode_prealloc_queue_reqs: int = 0
@@ -318,45 +201,55 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
 
-    has_queues: int = 0
-    queue_waiting: int = 0
-    queue_grammar: int = 0
-    queue_paused: int = 0
-    queue_retracted: int = 0
 
-    @classmethod
-    def from_get_loads_output(cls, output: GetLoadsReqOutput) -> LoadSnapshot:
-        """从 Scheduler 产出的 GetLoadsReqOutput 构造一个扁平的 LoadSnapshot。
-
-        中译：先逐个拷贝核心指标字段（dp_rank 做空值兜底，其余经 _native 归一化）；
-              再遍历分节表，把每个嵌套子对象拍平成带前缀的字段，并写入 has_xxx 标志位；
-              disagg_mode 字符串转为整数编码。
-        参数 output：调度器汇报的原始负载对象（含可选子对象）。
-        返回：填好字段的 LoadSnapshot 实例。
-        """
-        snapshot: dict = {}
-        for name in CORE_METRIC_FIELDS:
-            value = getattr(output, name)
-            if name == "dp_rank":
-                snapshot[name] = int(value) if value is not None else 0
-            else:
-                snapshot[name] = _native(value)
-
-        for _, section_name, present_attr, attrs in SECTION_FIELDS:
             # 中译：取出子对象（如 output.memory）；不存在则 has_xxx=0 并跳过该分节。
-            section = getattr(output, section_name, None)
-            snapshot[present_attr] = int(section is not None)
-            if section is None:
-                continue
-            for section_attr, snapshot_attr in attrs:
-                value = getattr(section, section_attr)
-                if snapshot_attr == "disagg_mode":
-                    value = DISAGG_MODE_TO_INT.get(value, 0)
-                else:
-                    value = _native(value)
-                snapshot[snapshot_attr] = value
+class QueueMetrics(msgspec.Struct, array_like=True):
+    """Detailed queue info breakdown."""
 
-        return cls(**snapshot)
+    waiting: int
+    grammar: int
+    paused: int
+    retracted: int
+    prealloc_ready: int
+
+
+# LoadSnapshot's nested sub-struct fields; every other struct field is a flat
+# scalar returned under "core".
+_SECTION_FIELDS = frozenset(
+    {"memory", "speculative", "lora", "disaggregation", "queues"}
+)
+
+
+class LoadSnapshot(msgspec.Struct, omit_defaults=True):
+    """Per-DP-rank load metrics: the SHM/zmq wire format and the /v1/loads source."""
+
+    timestamp: float = 0.0
+    dp_rank: int = 0
+    num_running_reqs: int = 0
+    num_waiting_reqs: int = 0
+    num_waiting_uncached_tokens: int = 0
+    num_used_tokens: int = 0
+    num_total_tokens: int = 0
+    # num_total_tokens minus tokens still awaiting a KV transfer (equal to it
+    # outside disaggregated decode).
+    num_active_tokens: int = 0
+    max_total_num_tokens: int = 0
+    max_running_requests: int = 0
+    token_usage: float = 0.0
+    gen_throughput: float = 0.0
+    cache_hit_rate: float = 0.0
+    utilization: float = 0.0
+    # cumulative counters
+    total_prefill_uncached_tokens: int = 0
+    total_prefill_busy_us: int = 0
+    # Decode step-time moment sums
+    decode_moments: Optional[list[float]] = None
+
+    memory: Optional[MemoryMetrics] = None
+    speculative: Optional[SpeculativeMetrics] = None
+    lora: Optional[LoRAMetrics] = None
+    disaggregation: Optional[DisaggregationMetrics] = None
+    queues: Optional[QueueMetrics] = None
 
     # 中译：to_dict 的 include 参数允许的合法分节名集合。
     VALID_SECTIONS = frozenset(
@@ -364,29 +257,7 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     )
 
     def to_dict(self, include: Optional[set[str]] = None) -> dict:
-        """把快照转回带嵌套结构的 dict（供 /v1/loads 等接口返回）。
-
-        中译：核心指标始终包含；include 控制返回哪些可选分节。
-              - include 为 None 或含 "all"：返回全部存在的分节。
-              - include == {"core"}：只返回核心指标。
-              - 其他：校验 include 是否都在 VALID_SECTIONS 内（否则报错），
-                按需挑选分节。仅当 has_xxx 为真的分节才会出现在结果里。
-              disagg_mode 整数会被反查回字符串。
-        """
-        load = {
-            "dp_rank": self.dp_rank,
-            "num_running_reqs": self.num_running_reqs,
-            "num_waiting_reqs": self.num_waiting_reqs,
-            "num_waiting_uncached_tokens": self.num_waiting_uncached_tokens,
-            "num_used_tokens": self.num_used_tokens,
-            "num_total_tokens": self.num_total_tokens,
-            "max_total_num_tokens": self.max_total_num_tokens,
-            "max_running_requests": self.max_running_requests,
-            "token_usage": self.token_usage,
-            "gen_throughput": self.gen_throughput,
-            "cache_hit_rate": self.cache_hit_rate,
-            "utilization": self.utilization,
-        }
+        load = {key: getattr(self, key) for key in _CORE_KEYS}
 
         if include is None or "all" in include:
             include_all = True
@@ -401,28 +272,36 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
                 return load
             include_all = False
 
-        for include_key, section_name, present_attr, attrs in SECTION_FIELDS:
             # 中译：该分节当时未采集到（has_xxx 为 0）则跳过。
-            if not getattr(self, present_attr):
-                continue
             # 中译：非「全选」模式下，未被 include 请求的分节也跳过。
-            if not include_all and include_key not in include:
-                continue
-
             # 中译：把扁平字段重新组装回嵌套子 dict。
-            section = {}
-            for section_attr, snapshot_attr in attrs:
-                value = getattr(self, snapshot_attr)
-                if snapshot_attr == "disagg_mode":
-                    value = INT_TO_DISAGG_MODE.get(value, "null")
-                section[section_attr] = value
-            load[section_name] = section
+        for field, include_name, section in (
+            ("memory", "memory", self.memory),
+            ("speculative", "spec", self.speculative),
+            ("lora", "lora", self.lora),
+            ("disaggregation", "disagg", self.disaggregation),
+            ("queues", "queues", self.queues),
+        ):
+            if section is None or (not include_all and include_name not in include):
+                continue
+            load[field] = msgspec.structs.asdict(section)
 
         return load
 
 
 # 中译：全局共享的 msgpack 编/解码器（编码任意对象、解码为 LoadSnapshot）。
-snapshot_encoder = msgspec.msgpack.Encoder()
+# Flat scalar fields returned under "core": every struct field but the sections.
+_CORE_KEYS = tuple(
+    f for f in LoadSnapshot.__struct_fields__ if f not in _SECTION_FIELDS
+)
+
+def _enc_hook(obj):
+    """Coerce numpy scalars to native Python; msgpack has no numpy types."""
+    to_item = getattr(obj, "item", None)
+    if to_item is not None:
+        return to_item()
+    raise NotImplementedError(f"cannot encode {type(obj).__name__} in load snapshot")
+snapshot_encoder = msgspec.msgpack.Encoder(enc_hook=_enc_hook)
 snapshot_decoder = msgspec.msgpack.Decoder(LoadSnapshot)
 
 
@@ -917,19 +796,13 @@ def _zmq_addr_for(port_args) -> str:
 
 
 def create_load_snapshot_writer(
-    server_args,
     port_args,
     dp_size: int,
     dp_rank: int,
     publish_interval: int = 1,
 ):
-    """Return a SHM or ZMQ writer based on server configuration.
-
-    中译：工厂函数——根据服务配置返回 SHM 写者或 ZMQ 写者。
-          should_use_zmq 为真时用 ZmqLoadSnapshotWriter（地址来自 _zmq_addr_for），
-          否则用 ShmLoadSnapshotWriter（路径来自 shm_path_for(instance_id)）。
-    """
-    if should_use_zmq(server_args):
+    """Return a SHM or ZMQ writer based on server configuration."""
+    if should_use_zmq():
         return ZmqLoadSnapshotWriter(
             _zmq_addr_for(port_args), dp_size, dp_rank, publish_interval
         )
@@ -938,7 +811,7 @@ def create_load_snapshot_writer(
     )
 
 
-def create_load_snapshot_reader(server_args, port_args, caller: str):
+def create_load_snapshot_reader(port_args, caller: str):
     """Create a load snapshot reader.
 
     Args:
@@ -952,8 +825,8 @@ def create_load_snapshot_reader(server_args, port_args, caller: str):
           否则返回纯 ShmLoadSnapshotReader（仅读 SHM）。
           caller 取值见上，用于决定 zmq 模式下由谁来 bind PULL socket。
     """
-    dp_size = server_args.dp_size
-    if zmq_reader_owner(server_args, caller):
+    dp_size = get_parallel().dp_size
+    if zmq_reader_owner(caller):
         return ZmqShmLoadSnapshotReader(
             _zmq_addr_for(port_args), shm_path_for(port_args.instance_id), dp_size
         )

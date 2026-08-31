@@ -15,45 +15,59 @@ Multi-modality utils
 
 import copy
 import hashlib
+import os
 import pickle
+import sys
 from abc import abstractmethod
 from collections import defaultdict
 from multiprocessing import shared_memory
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from torch import nn
 
+from sglang.kernels.ops.memory.gpu_tensor_hash import gpu_tensor_hash
 from sglang.srt.environ import envs
-from sglang.srt.layers.multimodal import gpu_tensor_hash
+from sglang.srt.managers.io_struct import (
+    BaseBatchReq,
+    TokenizedEmbeddingReqInput,
+    TokenizedGenerateReqInput,
+)
+
+# Preserve the existing initialization import for downstream callers.
+from sglang.srt.managers.mm_schedule import (
+    DataEmbeddingFunc,
+    get_embedding_and_mask,
+)
+from sglang.srt.managers.mm_schedule import (
+    init_mm_embedding_cache as init_mm_embedding_cache,
+)
 from sglang.srt.managers.schedule_batch import (
     CudaIpcTensorTransportProxy,
     Modality,
-    MultimodalDataItem,
     MultimodalInputs,
 )
-from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.multimodal.evs import EVSEmbeddingResult
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import flatten_nested_list, is_npu, print_warning_once
+from sglang.srt.multimodal.transport import (
+    TensorTransportMode,
+    determine_tensor_transport_mode,
+)
+from sglang.srt.runtime_context import (
+    get_disagg,
+    get_server_args,
+    get_serving,
+)
+from sglang.srt.utils import flatten_nested_list, print_warning_once
+from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 from sglang.utils import logger
-
-_is_npu = is_npu()
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
 # propagation that can cause some log messages (like 'server is fired up') to not appear
 # in the console when multimodal support is enabled.
 
-# TODO(mick): nccl
-# cuda_ipc: for intranode tensor sharing
 # 中译：张量跨进程传输模式。cuda_ipc 用于「节点内」GPU 张量共享（零拷贝）；
-#       auto / default 走常规序列化路径。
-TensorTransportMode = Literal["cuda_ipc", "auto", "default"]
-
-
 # 中译：预分配的 GPU 特征缓冲区与当前写入偏移。复用一块大缓冲区避免反复申请显存。
 _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
@@ -79,8 +93,8 @@ def init_feature_buffer(device):
             num_elements, dtype=torch.float32, device=device
         )
         logger.info(f"Preallocated {size_mb}MB GPU buffer")
-    except RuntimeError as e:
         # 中译：显存不足等导致分配失败时，退回 None（后续逻辑会回退到普通分配）。
+    except RuntimeError:
         _GPU_FEATURE_BUFFER = None
 
 
@@ -189,7 +203,7 @@ class TransportProxyTensor(torch.Tensor):
                     "storage_offset": self.storage_offset(),
                 }
                 state["tensor_data"] = None
-            except Exception as e:
+            except Exception:
                 # Failed to get CUDA IPC handle (possibly tp). Falling back to default transport.
                 state["metadata"]["transport_mode"] = "default"
                 state["tensor_data"] = self.as_subclass(torch.Tensor)
@@ -432,501 +446,50 @@ class MultiModalityDataPaddingPatternMultimodalTokens(MultiModalityDataPaddingPa
 
 
 # 中译：进程级的多模态 embedding 静态缓存（按多模态项哈希复用编码结果，避免重复 ViT 前向）。
-embedding_cache: Optional[MultiModalStaticCache] = None
-
-
-def init_mm_embedding_cache(max_size: int = 0):
     # 中译：初始化全局多模态 embedding 缓存，max_size 为缓存容量上限（0 表示按实现默认）。
-    global embedding_cache
-    embedding_cache = MultiModalStaticCache(max_size)
-
-
-def get_embedding_chunk(
-    embedding: torch.Tensor,
-    extend_prefix_len: int,
-    extend_seq_len: int,
-    items_offset: List[Tuple[int, int]],
-) -> Tuple[torch.Tensor, int, int]:
-    """
-    Extract a chunk of embeddings based on the specified prefix length, sequence length, and offset ranges.
-
-    Args:
-        embedding: The full embedding tensor to extract a chunk from
-        extend_prefix_len: The starting position (prefix length) for extraction
-        extend_seq_len: The number of tokens to extract
-        items_offset: List of [start, end] offset ranges for multimodal items in the input sequence
-
-    Returns:
-        A tuple containing:
-        - The extracted embedding chunk as a tensor
-        - The start index used for extraction
-        - The end index used for extraction
-
-    Note:
-        If there's no overlap between the requested range and the offset ranges,
-        an empty tensor is returned with zeros for start and end indices.
-
-    中译：根据给定的前缀长度、序列长度与各多模态项的偏移区间，从完整 embedding 中切出
-          本次「分块预填充」所需的那一段。
-          背景：分块预填充时一个请求被拆成多个 batch 处理，每个 chunk 只覆盖 token 序列的
-          一段区间 [extend_prefix_len, extend_prefix_len + extend_seq_len)，而 embedding 是
-          按多模态项顺序连续排布的，需要把 token 区间映射到 embedding 行区间。
-          返回：(切出的 embedding 片段, 起始行下标, 结束行下标)。若无重叠则返回空张量与 0。
-    """
-    start_index, end_index = 0, 0
     # 中译：本次 chunk 覆盖的 token 区间（闭区间）：[extend_start_index, extend_end_index]。
-    extend_start_index = extend_prefix_len
-    extend_end_index = extend_prefix_len + extend_seq_len - 1
-
     # 中译：累加各多模态项落在 chunk 起点之前 / 内部的 token 数，换算出 embedding 行的起止下标。
-    for start, end in items_offset:
-        if extend_start_index >= start and extend_start_index <= end:
-            start_index += extend_start_index - start
-        elif extend_start_index > end:
-            start_index += end - start + 1
-
-        if extend_end_index >= start and extend_end_index <= end:
-            end_index += extend_end_index - start + 1
-        elif extend_end_index > end:
-            end_index += end - start + 1
-    # some models' embedding is 3-dim, reshape it to 2-dim
     # 中译：部分模型的 embedding 是三维，统一 reshape 成二维 (tokens, hidden) 再切片。
-    embedding = embedding.reshape(-1, embedding.shape[-1])
-    embedding_chunk = embedding[start_index:end_index]
-    return embedding_chunk, start_index, end_index
-
-
-def _get_precomputed_embedding(
-    items: List[MultimodalDataItem],
-    items_size: List[int],
-    prefix_length: List[int],
-    extend_length: List[int],
-    items_offset_list: List[List[Tuple[int, int]]],
-) -> Optional[torch.Tensor]:
-    """
-    If all items have precomputed_embeddings, return their concatenation.
-    If some but not all have precomputed_embeddings, raise NotImplementedError.
-    If none have precomputed_embeddings, return None.
-
-    中译：尝试走「预计算 embedding」快路径。
-          某些请求的多模态特征已在别处编码好（precomputed_embeddings），无需再跑 ViT。
-          - 全部数据项都有预计算 embedding：拼接后按 chunk 切出并返回；
-          - 部分有部分没有：抛 NotImplementedError（暂不支持混合）；
-          - 都没有：返回 None，交由后续的分块编码路径处理。
-    """
-    precomputed_embeddings = []
-    max_iterations = min(len(items_size) - 1, len(prefix_length))
-
-    for i in range(max_iterations):
-        if items_size[i] == items_size[i + 1]:
-            continue
-
-        items_per_req = items[items_size[i] : items_size[i + 1]]
-        extend_len = extend_length[i] if i < len(extend_length) else 0
-        items_offset = items_offset_list[i]
-
-        if any(item.precomputed_embeddings is None for item in items_per_req):
-            chunk = None
-        else:
-            req_embeddings = torch.concat(
-                [item.precomputed_embeddings for item in items_per_req]
-            )
-            chunk, _, _ = get_embedding_chunk(
-                embedding=req_embeddings,
-                extend_prefix_len=prefix_length[i],
-                extend_seq_len=extend_len,
-                items_offset=items_offset,
-            )
-
-        if chunk is None and len(items_per_req) > 1:
-            return None
-        precomputed_embeddings.append(chunk)
-
-    if any(feature is not None for feature in precomputed_embeddings):
         # 中译：要么全部有预计算 embedding，要么全部没有；混合情形（部分预计算）暂不支持。
-        if not all(feature is not None for feature in precomputed_embeddings):
-            raise NotImplementedError(
-                "MM inputs where only some items are precomputed."
-            )
-
-        # Normalize device across chunks before concat.
         # 中译：拼接前先统一各片段所在设备（优先选 CUDA），避免 concat 跨设备报错。
-        target_device = next(
-            (t.device for t in precomputed_embeddings if t.is_cuda),
-            precomputed_embeddings[0].device,
-        )
-        precomputed_embeddings = [
-            t if t.device == target_device else t.to(target_device, non_blocking=True)
-            for t in precomputed_embeddings
-        ]
-        result = torch.concat(precomputed_embeddings)
-        # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
-        result = result.reshape(-1, result.shape[-1])
-        return result
-    return None
-
-
 # 中译：多模态特征编码函数的类型别名——输入数据项列表，输出 embedding 张量或 EVS 结果。
-DataEmbeddingFunc = Callable[
-    [List[MultimodalDataItem]], torch.Tensor | EVSEmbeddingResult
-]
-
-
-def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> bool:
-    """qwen-vl visual forward already moves batched features to the target device.
-
-    instead of performing multiple H2D for each mm feature from all mm_items (followed by concatenation on device),
-    for some models which internally performs H2D on concated mm feature, these small H2D calls could be replaced with a single big H2D
-
-    中译：判断是否可以跳过「编码前把特征搬到目标设备」这一步。
-          某些模型（如 Qwen3-VL 系列）的视觉前向内部会自行把整批特征一次性 H2D 到目标设备，
-          这样就无需为每个 mm_item 单独做小批 H2D（多次小拷贝 + 设备上拼接），
-          可用一次大 H2D 替代，减少拷贝次数。仅对特定模型的 get_image/video_feature 返回 True。
-    """
-    owner = getattr(data_embedding_func, "__self__", None)
-    if owner is None:
-        return False
-    if getattr(data_embedding_func, "__name__", None) not in (
-        "get_image_feature",
-        "get_video_feature",
-    ):
-        return False
-    return owner.__class__.__name__ in {
-        "Qwen3VLForConditionalGeneration",
-        "Qwen3VLMoeForConditionalGeneration",
-        "Qwen3_5ForConditionalGeneration",
-        "Qwen3_5MoeForConditionalGeneration",
-    }
-
-
-def _move_items_to_device(
-    items: List[MultimodalDataItem], device: torch.device
-) -> None:
-    """Move item features to the target device (in-place, non-blocking).
-
-    中译：把各数据项的特征张量「就地、非阻塞」搬到目标设备（仅当尚未在该设备时）。
-    """
-    for item in items:
-        if isinstance(item.feature, torch.Tensor) and item.feature.device != device:
-            item.feature = item.feature.to(device, non_blocking=True)
-
-
-def _get_chunked_embedding_full(
-    data_embedding_func: DataEmbeddingFunc,
-    embedding_items_per_req: List[MultimodalDataItem],
-    items_offset: List[Tuple[int, int]],
-    extend_prefix_len: int,
-    extend_seq_len: int,
-    input_ids: torch.Tensor,
-    device: torch.device,
-) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
-    """
-    Fallback: encode all items at once, cache combined result, extract chunk.
-    Used for non-bundled items or EVS results.
-
-    中译：回退路径——把一个请求的全部数据项「一次性」编码，缓存合并结果，再切出当前 chunk。
-          用于「未按图切分（non-bundled）」的项或 EVS（按帧裁剪）结果。
-          相比按图编码，此路径可能会编码到不属于当前 chunk 的项，但实现简单、通用。
-    """
-    item_hashes = [item.hash for item in embedding_items_per_req]
-    embedding_items_hash = MultiModalStaticCache.combine_hashes(item_hashes)
-    embedding_per_req = embedding_cache.get(item_hashes)
-
-    if embedding_per_req is None:
         # 中译：缓存未命中——必要时把特征搬到设备，调用编码函数，并写回缓存。
-        if not _can_skip_pre_embed_feature_move(data_embedding_func):
-            _move_items_to_device(embedding_items_per_req, device)
-        embedding = data_embedding_func(embedding_items_per_req)
-        embedding_per_req = (
-            EmbeddingResult(embedding=embedding)
-            if isinstance(embedding, torch.Tensor)
-            else embedding
-        )
-        embedding_cache.set(embedding_items_hash, embedding_per_req)
-
-    if isinstance(embedding_per_req, EVSEmbeddingResult):
         # 中译：EVS（高效视频采样）会裁剪掉部分帧，需相应地重排占位符并更新 input_ids 与偏移。
-        item = embedding_items_per_req[0]
-        input_ids, items_offset = (
-            embedding_per_req.redistribute_pruned_frames_placeholders(
-                input_ids,
-                items_offset,
-                item=item,
-                extend_prefix_len=extend_prefix_len,
-                extend_seq_len=extend_seq_len,
-            )
-        )
-
-    embedding_per_req_chunk, _, _ = get_embedding_chunk(
-        embedding=embedding_per_req.embedding,
-        extend_prefix_len=extend_prefix_len,
-        extend_seq_len=extend_seq_len,
-        items_offset=items_offset,
-    )
-    return embedding_per_req_chunk, input_ids
-
-
-def _get_chunked_embedding_by_item(
-    data_embedding_func: DataEmbeddingFunc,
-    embedding_items_per_req: List[MultimodalDataItem],
-    items_offset: List[Tuple[int, int]],
-    extend_prefix_len: int,
-    extend_seq_len: int,
-    device: torch.device,
-) -> Optional[torch.Tensor]:
-    """
-    Per-image chunk-aware encoding: only encode images overlapping with the
-    current chunk, cache each image individually.
-    Items must already be split per-image (each item has exactly one offset).
-
-    中译：「按图、感知 chunk」的编码路径。只编码与当前 chunk 有重叠的图像，并按单图各自缓存。
-          要求数据项已按单图切分（每项恰好一个 offset）。相比一次性全编码，能避免对不在
-          当前 chunk 的图像做无用的 ViT 前向，且缓存粒度更细、命中率更高。
-    """
-    chunk_start = extend_prefix_len
-    chunk_end = extend_prefix_len + extend_seq_len  # exclusive
     # 中译：chunk_end 为开区间右端（不含）。
-
-    if extend_seq_len <= 0:
-        return None
-
-    # 1. Find items overlapping with current chunk
-    # offsets are (start, end) inclusive on both ends
     # 中译：第一步——找出与当前 chunk 有重叠的数据项（offset 为左右都闭的区间）。
-    overlapping = []
-    for idx, (item, offset) in enumerate(zip(embedding_items_per_req, items_offset)):
-        start, end = offset
-        if end >= chunk_start and start < chunk_end:
-            overlapping.append((idx, item, start, end))
-
-    if not overlapping:
-        return None
-
-    # 2. Check per-image cache for each overlapping item
     # 中译：第二步——逐个查单图缓存，命中的直接取，未命中的收集起来稍后批量编码。
-    cached_embeddings = {}  # idx -> tensor
-    miss_items = []  # (idx, item, start, end)
-    for idx, item, start, end in overlapping:
-        cached = embedding_cache.get_single(item.hash)
-        if cached is not None:
-            cached_embeddings[idx] = cached.embedding
-        else:
-            miss_items.append((idx, item, start, end))
-
-    # 3. Batch encode all cache-miss items in one ViT call
     # 中译：第三步——把所有未命中的项合并为一次 ViT 调用（批量编码更高效），
-    #       再按每项的 token 数把输出切回各项，并写入单图缓存。
-    if miss_items:
-        miss_item_list = [item for _, item, _, _ in miss_items]
-        _move_items_to_device(miss_item_list, device)
-        all_miss_embedding = data_embedding_func(miss_item_list)
-        all_miss_embedding = all_miss_embedding.reshape(
-            -1, all_miss_embedding.shape[-1]
-        )
-
-        # Split output by per-item token count
         # 中译：按每项 token 数（end - start + 1）切分批量编码输出。
-        token_counts = [end - start + 1 for _, _, start, end in miss_items]
-        split_embeddings = torch.split(all_miss_embedding, token_counts, dim=0)
-
-        for (idx, item, _, _), emb in zip(miss_items, split_embeddings):
-            cached_embeddings[idx] = emb
-            emb_result = EmbeddingResult(embedding=emb)
-            embedding_cache.set(item.hash, emb_result)
-
-    # 4. Assemble chunk: for each overlapping item, extract the overlap slice
     # 中译：第四步——对每个重叠项，仅取它与当前 chunk 相交的那一段，按顺序拼成 chunk embedding。
-    chunk_slices = []
-    for idx, _, start, end in overlapping:
-        emb = cached_embeddings[idx]  # shape: (end - start + 1, hidden)
         # 中译：计算重叠区间（闭区间），再转为相对该项的本地下标做切片。
-        overlap_start = max(start, chunk_start)
-        overlap_end = min(end, chunk_end - 1)  # inclusive
-        local_start = overlap_start - start
-        local_end = overlap_end - start + 1  # exclusive for slicing
-        chunk_slices.append(emb[local_start:local_end])
-
-    return torch.cat(chunk_slices, dim=0)
-
-
-def _get_chunked_prefill_embedding(
-    data_embedding_func: DataEmbeddingFunc,
-    embedding_items: List[MultimodalDataItem],
-    items_size: List[int],
-    prefix_length: List[int],
-    extend_length: List[int],
-    items_offset_list: List[List[Tuple[int, int]]],
-    input_ids: torch.Tensor,
-) -> tuple[torch.Tensor | None, torch.Tensor]:
-    """
-    Chunked prefill embedding: encode per-request items and extract the chunk.
-    Items are already split per-image at processor stage.
-
-    中译：分块预填充的 embedding 入口。逐请求编码其多模态项并切出当前 chunk 的 embedding。
-          数据项在预处理阶段已按单图切分。内部按是否「每项单 offset」选择按图路径或合并路径，
-          最后把各请求的 chunk embedding 拼接成一整段返回（同时返回可能被 EVS 改写的 input_ids）。
-    """
-    embedding_list = []
-    device = input_ids.device
-    # FIXME(Xinyuan): temporary workaround for eagle3
     # 中译：FIXME——针对 eagle3（投机解码）的临时处理，取两者较小值以防越界。
-    max_iterations = min(len(items_size) - 1, len(prefix_length))
-
-    for i in range(max_iterations):
-        if items_size[i] == items_size[i + 1]:
             # 中译：该请求没有本模态的数据项，跳过。
-            continue
-        embedding_items_per_req = embedding_items[items_size[i] : items_size[i + 1]]
-        items_offset = items_offset_list[i]
-        assert items_offset is not None, items_offset
-
-        extend_prefix_len = prefix_length[i]
-        extend_seq_len = extend_length[i] if i < len(extend_length) else 0
-
-        # Skip if all items already prefilled
         # 中译：若该请求的所有数据项都落在已预填充的前缀里（不在本 chunk），整体跳过。
-        if all(offset_end < prefix_length[i] for _, offset_end in items_offset):
-            continue
-
-        # Use per-image path when all items have exactly one offset (already
-        # split per-image) — this avoids encoding images not in this chunk.
-        # Fall back to combined path for non-split items or EVS.
         # 中译：所有项都恰好只有一个 offset（已按单图切分）时走「按图路径」，避免编码 chunk 外的图；
-        #       否则（未切分或 EVS）走「合并路径」。
-        is_per_image = all(len(item.offsets) == 1 for item in embedding_items_per_req)
-
-        if is_per_image:
-            chunk_embedding = _get_chunked_embedding_by_item(
-                data_embedding_func,
-                embedding_items_per_req,
-                items_offset,
-                extend_prefix_len,
-                extend_seq_len,
-                device,
-            )
-            if chunk_embedding is not None:
-                embedding_list.append(chunk_embedding)
-        else:
-            chunk_embedding, input_ids = _get_chunked_embedding_full(
-                data_embedding_func,
-                embedding_items_per_req,
-                items_offset,
-                extend_prefix_len,
-                extend_seq_len,
-                input_ids,
-                device,
-            )
-            if chunk_embedding is not None:
-                embedding_list.append(chunk_embedding)
-
-    if len(embedding_list) == 0:
-        return None, input_ids
-    return torch.concat(embedding_list, dim=0), input_ids
-
-
-def _get_multimodal_mask(
-    input_ids: torch.Tensor, placeholder_tensor: torch.Tensor
-) -> torch.Tensor:
     # 中译：生成多模态占位符掩码——input_ids 中等于任一 pad_value 的位置为 True，
-    #       末尾扩一维 (N, 1) 以便后续 masked_scatter_ 按 hidden 维广播。
-    return torch.isin(input_ids, placeholder_tensor).unsqueeze(-1)
-
-
-def _adjust_embedding_length(
-    embedding: torch.Tensor,
-    mask: torch.Tensor,
-    logger,
-) -> torch.Tensor:
     # 中译：校正 embedding 行数，使其与 input_ids 中占位符 token 的数量一致。
-    #       多了：多为分块预填充导致，从尾部截取所需数量（折中方案，并提示可调大 chunked_prefill_size）；
-    #       少了：属于内部错误，直接抛异常。
-    num_mm_tokens_in_embedding = embedding.shape[0]
-    num_mm_tokens_in_input_ids = mask.sum().item()
-    if num_mm_tokens_in_input_ids != num_mm_tokens_in_embedding:
-        logger.warning(
-            f"Number of tokens in multimodal embedding does not match those in the input text. "
-            f"Got {num_mm_tokens_in_input_ids} tokens in the text but {num_mm_tokens_in_embedding} "
-            f"tokens from multimodal embeddings."
-        )
-        if num_mm_tokens_in_input_ids < num_mm_tokens_in_embedding:
-            chunked_prefill_size = get_global_server_args().chunked_prefill_size
-            if chunked_prefill_size != -1:
-                logger.warning(
-                    "You may want to avoid this issue by raising `chunked_prefill_size`, or disabling chunked prefill"
-                )
-            # extract from the end: this is a compromise
-            if embedding.dim() == 2:
-                embedding = embedding[-num_mm_tokens_in_input_ids:, :]
-            else:
-                num_multimodal = num_mm_tokens_in_input_ids // embedding.shape[0]
-                embedding = embedding[-num_multimodal:, :]
-        else:
-            raise RuntimeError(
-                f"Insufficient multimodal embedding length: {num_mm_tokens_in_input_ids=} vs {num_mm_tokens_in_embedding=}. This is an internal error"
-            )
-    return embedding
-
-
-def get_embedding_and_mask(
-    data_embedding_func: DataEmbeddingFunc,
-    embedding_items: List[MultimodalDataItem],
-    placeholder_tensor: torch.Tensor,
-    input_ids: torch.Tensor,
-    items_size: List[int],
-    prefix_length: List[int],
-    extend_length: List[int],
-    items_offset_list: List[List[Tuple[int, int]]],
-) -> Tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
-    """
-    Generate multimodal embeddings and create a mask for identifying their positions in the input sequence.
-
-    Args:
-        data_embedding_func: Function that generates embeddings for multimodal items
-        embedding_items: List of multimodal items to embed
-        placeholder_tensor: Tensor containing token IDs that serve as placeholders for multimodal content
-        input_ids: The input token IDs tensor
-        items_size: Cumulative sizes of multimodal items per request
-        prefix_length: Prefix lengths for each request
-        extend_length: Sequence lengths for each request
-        items_offset_list: List of offset ranges for multimodal items in each request
-
-    Returns:
-        A tuple containing:
-        - The generated embeddings tensor
-        - A boolean mask tensor indicating where these embeddings should be placed
-        - If EVS is used, the pruned input ids tensor; otherwise, the original input ids tensor
-
-    中译：生成多模态 embedding，并构造一个掩码标识它们在输入序列中的位置。
-          流程：先尝试预计算 embedding 快路径，没有则走分块编码路径；再据占位符生成掩码；
-          最后校正 embedding 长度与掩码一致。
-          返回 (embedding, 掩码, input_ids)；EVS 场景下 input_ids 可能被裁剪改写。
-    """
-    # 1. Get embedding
     # 中译：第一步——取 embedding。优先用预计算结果，否则走分块预填充编码。
-    embedding = _get_precomputed_embedding(
-        embedding_items, items_size, prefix_length, extend_length, items_offset_list
-    )
-    if embedding is None:
-        embedding, input_ids = _get_chunked_prefill_embedding(
-            data_embedding_func,
-            embedding_items,
-            items_size,
-            prefix_length,
-            extend_length,
-            items_offset_list,
-            input_ids,
-        )
-        if embedding is None:
-            return None, None, input_ids
-    # 2. Get mask
     # 中译：第二步——生成占位符掩码。NPU 上需先同步当前流，确保前面的异步算子完成。
-    if _is_npu:
-        torch.npu.current_stream().synchronize()
-    special_multimodal_mask = _get_multimodal_mask(input_ids, placeholder_tensor)
-    # 3. Adjust embedding length if needed
     # 中译：第三步——必要时校正 embedding 行数与掩码中占位符数量一致。
-    embedding = _adjust_embedding_length(embedding, special_multimodal_mask, logger)
-    return embedding, special_multimodal_mask, input_ids
+# masked_scatter_ materializes the expanded [num_tokens, hidden] bool mask plus
+# an int64 prefix-sum over it (~9 B per num_tokens x hidden element); the
+# cumsum-derived row indices keep the transients O(num_tokens) and sync-free.
+def _scatter_mm_embedding(
+    dest: torch.Tensor, mask: torch.Tensor, src: torch.Tensor
+) -> None:
+    # mask: [num_tokens, 1] bool; src: [num_mm_tokens, width] in sequence order.
+    src = src.to(dest.device, dest.dtype)
+    num_src_rows = src.size(0)
+    flat_mask = mask.view(-1)
+    ranks = torch.cumsum(flat_mask, dim=0) - 1
+    # False rows collapse into the discard slot num_src_rows; a mask/src
+    # row-count mismatch device-asserts in scatter_/index_copy_ (poison init).
+    ranks = ranks.masked_fill(~flat_mask, num_src_rows)
+    rows = torch.full(
+        (num_src_rows + 1,), dest.size(0), dtype=torch.long, device=dest.device
+    )
+    rows.scatter_(0, ranks, torch.arange(flat_mask.numel(), device=dest.device))
+    dest.index_copy_(0, rows[:num_src_rows], src)
 
 
 def embed_mm_inputs(
@@ -1068,20 +631,17 @@ def embed_mm_inputs(
         other_info["input_deepstack_embeds"] = input_deepstack_embeds
 
     # 4. scatter embeddings into input embedding
-    # masked_scatter_ avoids the cudaStreamSynchronize that torch.where triggers.
     # 中译：第四步——把各模态 embedding 散布（scatter）到文本 embedding 的占位符位置。
-    #       用 masked_scatter_ 而非 torch.where，可避免后者触发的 cudaStreamSynchronize（更快）。
-    def _scatter(dest, mask, src):
-        dest.masked_scatter_(mask.expand_as(dest), src.to(dest.device, dest.dtype))
-
     for i, modality, embedding, mask in zip(
         range(len(embeddings)), modalities, embeddings, masks
     ):
         if embedding is None or mask is None:
             continue
-        _scatter(input_embeds, mask, embedding)
+        _scatter_mm_embedding(dest=input_embeds, mask=mask, src=embedding)
         if use_deepstack.get(modality, None):
-            _scatter(input_deepstack_embeds, mask, deepstack_embeddings[i])
+            _scatter_mm_embedding(
+                dest=input_deepstack_embeds, mask=mask, src=deepstack_embeddings[i]
+            )
 
     return input_embeds, other_info
 
@@ -1252,34 +812,28 @@ def general_mm_embed_routine(
                 for i, seq_len in enumerate(forward_batch.extend_seq_lens_cpu)
                 if forward_batch.mm_inputs[i] is not None
             ]
-            server_args = get_global_server_args()
-            if server_args and server_args.enable_adaptive_dispatch_to_encoder:
-                # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
                 # 中译：开启自适应分派到编码器时，按预计算与否拆分 batch，保证下游只处理同质 batch。
-                input_embeds, other_info = _embed_mm_inputs_with_split(
-                    mm_inputs_list=mm_inputs_list,
-                    extend_prefix_lens=extend_prefix_lens,
-                    extend_seq_lens=extend_seq_lens,
-                    input_ids=input_ids,
-                    forward_batch=forward_batch,
-                    input_embedding=embed_tokens,
-                    multimodal_model=multimodal_model,
-                    data_embedding_func_mapping=data_embedding_funcs,
-                    placeholder_tokens=placeholder_tokens,
-                    use_deepstack=use_deepstack,
-                )
-            else:
-                input_embeds, other_info = embed_mm_inputs(
-                    mm_inputs_list=mm_inputs_list,
-                    extend_prefix_lens=extend_prefix_lens,
-                    extend_seq_lens=extend_seq_lens,
-                    input_ids=input_ids,
-                    input_embedding=embed_tokens,
-                    multimodal_model=multimodal_model,
-                    data_embedding_func_mapping=data_embedding_funcs,
-                    placeholder_tokens=placeholder_tokens,
-                    use_deepstack=use_deepstack,
-                )
+            server_args = get_server_args()
+            # Makes VLM profiles directly attributable: this range includes
+            # encoder/ViT execution and multimodal feature placement, while
+            # the language model range below excludes both.
+            with torch.profiler.record_function("sglang.vlm.mm_embedding"):
+                if server_args and get_disagg().enable_adaptive_dispatch_to_encoder:
+                    # Split by precomputed vs non-precomputed so get_embedding_and_mask only sees uniform batches
+                    input_embeds, other_info = _embed_mm_inputs_with_split(
+                        mm_inputs_list=mm_inputs_list,
+                        extend_prefix_lens=extend_prefix_lens,
+                        extend_seq_lens=extend_seq_lens,
+                        input_ids=input_ids,
+                        forward_batch=forward_batch,
+                        input_embedding=embed_tokens,
+                        multimodal_model=multimodal_model,
+                        data_embedding_func_mapping=data_embedding_funcs,
+                        placeholder_tokens=placeholder_tokens,
+                        use_deepstack=use_deepstack,
+                    )
+                else:
+                    input_embeds, other_info = embed_mm_inputs(
 
             # add for qwen3_vl deepstack
             # 中译：Qwen3-VL 等 deepstack 模型——把 deepstack embedding 透传给语言模型前向。
@@ -1304,13 +858,14 @@ def general_mm_embed_routine(
                             feature = getattr(mm_item, "feature", None)
                             if isinstance(feature, torch.Tensor) and feature.is_cuda:
                                 mm_item.feature = feature.to("cpu", non_blocking=True)
-                            if get_global_server_args().language_only:
+                            if get_disagg().language_only:
                                 precomputed_embeddings = getattr(
                                     mm_item, "precomputed_embeddings", None
                                 )
                                 if (
                                     isinstance(precomputed_embeddings, torch.Tensor)
                                     and precomputed_embeddings.is_cuda
+                                    and not mm_item.keep_device_embedding
                                 ):
                                     mm_item.precomputed_embeddings = (
                                         precomputed_embeddings.to(
@@ -1331,12 +886,13 @@ def general_mm_embed_routine(
         # 中译：流水线并行的非首 rank 不构造 embedding（由前序 rank 经 hidden states 传入）。
         input_embeds = None
 
-    hidden_states = language_model(
-        input_ids=None,
-        forward_batch=forward_batch,
-        input_embeds=input_embeds,
-        **kwargs,
-    )
+    with torch.profiler.record_function("sglang.vlm.language_model_prefill"):
+        hidden_states = language_model(
+            input_ids=None,
+            forward_batch=forward_batch,
+            input_embeds=input_embeds,
+            **kwargs,
+        )
     return hidden_states
 
 
@@ -1436,7 +992,7 @@ def tensor_hash(tensor_list) -> int:
         # CPU path: hash each tensor incrementally without concat
         hasher = hashlib.sha256()
         for t in tensors:
-            t = t.detach().contiguous()
+            t = t.detach().cpu().contiguous()
             hasher.update(memoryview(t.reshape(-1).view(torch.uint8).numpy()))
         hash_bytes = hasher.digest()[:8]
         return int.from_bytes(hash_bytes, byteorder="big", signed=False)
@@ -1444,7 +1000,7 @@ def tensor_hash(tensor_list) -> int:
     # Single tensor
     if tensor.is_cuda:
         return gpu_tensor_hash(tensor.cuda())
-    tensor = tensor.detach().contiguous()
+    tensor = tensor.detach().cpu().contiguous()
     hasher = hashlib.sha256()
     hasher.update(memoryview(tensor.reshape(-1).view(torch.uint8).numpy()))
     hash_bytes = hasher.digest()[:8]
@@ -1456,8 +1012,12 @@ def hash_feature(f):
     #       列表（含 ShmPointer / 张量 / 普通值）、np.ndarray、torch.Tensor、
     #       CUDA IPC 代理、共享内存指针（优先用预计算哈希），其余退回 data_hash。
     if isinstance(f, list):
-        if len(f) > 0 and isinstance(f[0], ShmPointerMMData):
-            return tensor_hash([x.tensor for x in f])
+        # A list may mix ShmPointerMMData and plain tensors, since wrapping
+        # falls back to inline transport per element when shm allocation fails.
+        if len(f) > 0 and any(isinstance(x, ShmPointerMMData) for x in f):
+            return tensor_hash(
+                [x.tensor if isinstance(x, ShmPointerMMData) else x for x in f]
+            )
         if len(f) > 0 and isinstance(f[0], torch.Tensor):
             return tensor_hash(f)
         return data_hash(tuple(flatten_nested_list(f)))
@@ -1541,6 +1101,22 @@ def _get_length(value):
     return None
 
 
+def _is_rank2_grid(value):
+    """True if `value` is a rank-2 grid ([N, dims]) suitable for per-row prod.
+
+    Tensors/arrays must have ndim == 2; nested lists/tuples must have each row
+    be a sequence. Anything flat (1-D / scalars) is rejected so callers fall
+    back to a simple split instead of mis-collapsing it with prod(dim=-1).
+    """
+    if isinstance(value, (torch.Tensor, np.ndarray)):
+        return value.ndim == 2
+    if isinstance(value, (list, tuple)):
+        return len(value) > 0 and all(
+            isinstance(row, (list, tuple, torch.Tensor, np.ndarray)) for row in value
+        )
+    return False
+
+
 def _slice_value(value, start, end):
     # 中译：对张量/ndarray/list/tuple 等做 [start:end] 切片的通用辅助；切片失败则原样返回。
     if isinstance(value, torch.Tensor):
@@ -1580,6 +1156,84 @@ def _slice_model_data(
     return sliced
 
 
+def _compute_patch_slices(model_specific_data: dict, num_items: int) -> tuple:
+    """Compute per-item patch slice boundaries from 'num_patches' metadata.
+
+    Returns (patch_slices, total_num_patches) where patch_slices is a list of
+    (start, end) tuples for each item, or (None, None) if not applicable.
+    This function can be replaced or extended by model-specific plugins that
+    need custom patch-level splitting logic.
+    """
+    num_patches = model_specific_data.get("num_patches")
+    if _get_length(num_patches) != num_items:
+        return None, None
+
+    if isinstance(num_patches, torch.Tensor):
+        patch_counts = [int(x) for x in num_patches.flatten().cpu().tolist()]
+    elif isinstance(num_patches, np.ndarray):
+        patch_counts = [int(x) for x in num_patches.reshape(-1).tolist()]
+    else:
+        patch_counts = [
+            int(x.item()) if isinstance(x, torch.Tensor) else int(x)
+            for x in num_patches
+        ]
+
+    if not all(count >= 0 for count in patch_counts):
+        return None, None
+
+    patch_slices = []
+    patch_start = 0
+    for count in patch_counts:
+        patch_end = patch_start + count
+        patch_slices.append((patch_start, patch_end))
+        patch_start = patch_end
+    return patch_slices, patch_start
+
+
+# Keys whose dim-0 aligns with total patch count rather than num_items.
+_PATCH_ALIGNED_KEYS = frozenset(("patch_pixel_values", "patch_newline_mask"))
+
+
+def _split_model_data_for_item(
+    model_specific_data: dict,
+    index: int,
+    num_items: int,
+    patch_slices,
+    total_num_patches,
+) -> dict:
+    """Split model_specific_data for a single item during simple-split expansion.
+
+    This function encapsulates the per-item splitting logic for model-specific
+    data fields. It handles three categories:
+      1. Patch-aligned fields (dim-0 == total_num_patches): sliced by patch boundaries.
+      2. Item-aligned fields (dim-0 == num_items): sliced by item index.
+      3. Shared/scalar fields: copied as-is.
+
+    To support additional models, extend `_PATCH_ALIGNED_KEYS` or override this
+    function with a model-specific variant.
+    """
+    new_data = {}
+    for k, v in model_specific_data.items():
+        if (
+            k in _PATCH_ALIGNED_KEYS
+            and patch_slices is not None
+            and _get_length(v) == total_num_patches
+        ):
+            patch_start, patch_end = patch_slices[index]
+            new_data[k] = _slice_value(v, patch_start, patch_end)
+        elif isinstance(v, (list, tuple)) and len(v) == num_items:
+            new_data[k] = [v[index]]
+        elif (
+            isinstance(v, (torch.Tensor, np.ndarray))
+            and len(v.shape) > 0
+            and v.shape[0] == num_items
+        ):
+            new_data[k] = v[index : index + 1]
+        else:
+            new_data[k] = v
+    return new_data
+
+
 def _try_simple_split(item, num_items, expanded_mm_items):
     """Try to split a bundled item by matching feature dim-0 to offset count.
     Returns True if split succeeded, False otherwise.
@@ -1603,6 +1257,10 @@ def _try_simple_split(item, num_items, expanded_mm_items):
         # 中译：特征第 0 维与 offset 数量不一致，无法简单拆分。
         return False
 
+    patch_slices, total_num_patches = _compute_patch_slices(
+        item.model_specific_data, num_items
+    )
+
     for i in range(num_items):
         # 中译：浅拷贝原项，逐项取第 i 行特征/预计算 embedding、第 i 个 offset，清空哈希待重算。
         new_item = copy.copy(item)
@@ -1617,19 +1275,9 @@ def _try_simple_split(item, num_items, expanded_mm_items):
             else:
                 new_item.precomputed_embeddings = item.precomputed_embeddings[i : i + 1]
         new_item.offsets = [item.offsets[i]]
-        new_data = {}
-        for k, v in item.model_specific_data.items():
-            if isinstance(v, (list, tuple)) and len(v) == num_items:
-                new_data[k] = [v[i]]
-            elif (
-                isinstance(v, (torch.Tensor, np.ndarray))
-                and len(v.shape) > 0
-                and v.shape[0] == num_items
-            ):
-                new_data[k] = v[i : i + 1]
-            else:
-                new_data[k] = v
-        new_item.model_specific_data = new_data
+        new_item.model_specific_data = _split_model_data_for_item(
+            item.model_specific_data, i, num_items, patch_slices, total_num_patches
+        )
         new_item.hash = None
         expanded_mm_items.append(new_item)
     return True
@@ -1648,7 +1296,15 @@ def get_new_expanded_mm_items(original_mm_items):
             num_items = len(item.offsets)
 
             if item.is_image():
+                # MoonViT-style models (e.g. LocateAnything) carry per-image
+                # grids under `image_grid_hws` ([h, w]) rather than
+                # `image_grid_thw` ([t, h, w]); both encode dim-0 patch counts
+                # via prod over the last axis, so accept either key. (Use an
+                # explicit None check, not `a or b`: the value is a multi-element
+                # tensor whose truthiness is ambiguous.)
                 image_grid_thw = item.model_specific_data.get("image_grid_thw")
+                if image_grid_thw is None:
+                    image_grid_thw = item.model_specific_data.get("image_grid_hws")
                 grid_len = _get_length(image_grid_thw)
                 if image_grid_thw is None or grid_len != num_items:
                     # No grid info — fall back to simple split by feature dim-0
@@ -1658,6 +1314,17 @@ def get_new_expanded_mm_items(original_mm_items):
                     continue
 
                 # 中译：每张图的 patch 数 = grid_thw 各维之积（T*H*W），据此算特征切分下标。
+                # The grid must be rank-2 ([N, dims]) so `prod` over the last
+                # axis yields one patch count per image. A flat 1-D grid (e.g.
+                # `tensor([h, w])` with num_items==2) would pass the length check
+                # above but `prod(dim=-1)` collapses it to a scalar and mis-splits.
+                # The HF processor always emits rank-2, so this only guards the
+                # degenerate case — fall back to simple split rather than corrupt
+                # the slice boundaries.
+                if not _is_rank2_grid(image_grid_thw):
+                    if not _try_simple_split(item, num_items, expanded_mm_items):
+                        expanded_mm_items.append(item)
+                    continue
                 if isinstance(image_grid_thw, torch.Tensor):
                     patches_per_item = (
                         torch.prod(image_grid_thw, dim=-1).long().tolist()
@@ -1823,9 +1490,17 @@ class ShmPointerMMData:
         self.dtype = tensor.dtype
         self.precomputed_hash = precomputed_hash
         nbytes = tensor.numel() * tensor.element_size()
-        shm = shared_memory.SharedMemory(create=True, size=nbytes)
+        shm = shared_memory.SharedMemory(
+            create=True, size=nbytes, name=make_shm_name("mm")
+        )
         try:
             # 中译：以 uint8 视图把张量原始字节整块拷入共享内存缓冲区。
+            if sys.platform == "linux":
+                # SharedMemory only ftruncates the segment, so tmpfs pages are
+                # allocated lazily at write time; if /dev/shm fills up mid-copy
+                # the process is killed with SIGBUS. Reserving the pages up
+                # front turns exhaustion into a catchable OSError (ENOSPC).
+                os.posix_fallocate(shm._fd, 0, nbytes)
             dst = torch.frombuffer(shm.buf, dtype=torch.uint8)
             dst.copy_(tensor.view(torch.uint8).reshape(-1))
         except BaseException:
@@ -1888,14 +1563,23 @@ def _get_is_default_transport():
     #       default 模式下走常规序列化，无需 SHM 包装；非 default 才需要 wrap/unwrap。
     global _is_default_tensor_transport
     if _is_default_tensor_transport is None:
-        from sglang.srt.managers.tokenizer_manager import (
-            _determine_tensor_transport_mode,
-        )
-
-        _is_default_tensor_transport = (
-            _determine_tensor_transport_mode(get_global_server_args()) == "default"
-        )
+        _is_default_tensor_transport = determine_tensor_transport_mode() == "default"
     return _is_default_tensor_transport
+
+
+def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
+    """Wrap a tensor in ShmPointerMMData, falling back to inline (pickled)
+    transport when shared memory cannot be allocated, e.g. /dev/shm is full
+    under a burst of multimodal requests."""
+    try:
+        return ShmPointerMMData(tensor, precomputed_hash=precomputed_hash)
+    except OSError as e:
+        print_warning_once(
+            f"Failed to allocate shared memory for multimodal feature transport "
+            f"({e}); falling back to inline transport. "
+            f"Consider increasing /dev/shm size."
+        )
+        return tensor
 
 
 def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
@@ -1910,10 +1594,10 @@ def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
           故不适用逐元素哈希。非 CPU 张量或其他类型原样返回。
     """
     if isinstance(value, torch.Tensor) and value.is_cpu:
-        return ShmPointerMMData(value, precomputed_hash=precomputed_hash)
+        return _wrap_shm_or_inline(value, precomputed_hash=precomputed_hash)
     elif isinstance(value, (list, tuple)):
         wrapped = [
-            (ShmPointerMMData(t) if isinstance(t, torch.Tensor) and t.is_cpu else t)
+            (_wrap_shm_or_inline(t) if isinstance(t, torch.Tensor) and t.is_cpu else t)
             for t in value
         ]
         return type(value)(wrapped) if isinstance(value, tuple) else wrapped
@@ -1927,20 +1611,17 @@ def wrap_shm_features(obj):
     中译：扫描对象内的多模态张量（feature / precomputed_embeddings），用共享内存指针包装它们，
           以便跨进程高效传输。default 传输模式或跳过分词器初始化时直接原样返回。
     """
-    if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
+    if _get_is_default_transport() or get_serving().skip_tokenizer_init:
         return obj
 
-    if hasattr(obj, "mm_inputs") and obj.mm_inputs:
+    if obj.mm_inputs:
         for item in obj.mm_inputs.mm_items:
-            item_hash = getattr(item, "hash", None)
-            if hasattr(item, "feature") and item.feature is not None:
+            item_hash = item.hash
+            if item.feature is not None:
                 item.feature = _wrap_tensor_or_list(
                     item.feature, precomputed_hash=item_hash
                 )
-            if (
-                hasattr(item, "precomputed_embeddings")
-                and item.precomputed_embeddings is not None
-            ):
+            if item.precomputed_embeddings is not None:
                 item.precomputed_embeddings = _wrap_tensor_or_list(
                     item.precomputed_embeddings, precomputed_hash=item_hash
                 )
@@ -1965,14 +1646,17 @@ def has_shm_features(recv_reqs):
     中译：判断请求列表中是否有任一请求携带共享内存包装的特征（支持嵌套的 batch 请求）。
     """
     for req in recv_reqs:
-        if hasattr(req, "batch"):
+        if isinstance(req, BaseBatchReq):
             if has_shm_features(req.batch):
                 return True
-        elif hasattr(req, "mm_inputs") and req.mm_inputs:
+        elif (
+            isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
+            and req.mm_inputs
+        ):
             for item in req.mm_inputs.mm_items:
                 if _feature_has_shm(item.feature):
                     return True
-                if _feature_has_shm(getattr(item, "precomputed_embeddings", None)):
+                if _feature_has_shm(item.precomputed_embeddings):
                     return True
     return False
 
@@ -2001,23 +1685,23 @@ def unwrap_shm_features(obj):
     中译：把对象内被共享内存包装的多模态特征还原为标准张量（wrap_shm_features 的逆操作）。
           同时支持单请求与 batch 请求。default 传输或跳过分词器初始化时原样返回。
     """
-    if _get_is_default_transport() or get_global_server_args().skip_tokenizer_init:
+    if _get_is_default_transport() or get_serving().skip_tokenizer_init:
         return obj
     # Handle batch requests
     # 中译：batch 请求——对其中每个子请求递归还原。
-    if hasattr(obj, "batch"):
+    if isinstance(obj, BaseBatchReq):
         for sub_obj in obj.batch:
             unwrap_shm_features(sub_obj)
         return obj
     # Handle single requests
-    if hasattr(obj, "mm_inputs") and obj.mm_inputs:
+    if (
+        isinstance(obj, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput))
+        and obj.mm_inputs
+    ):
         for item in obj.mm_inputs.mm_items:
-            if hasattr(item, "feature") and item.feature is not None:
+            if item.feature is not None:
                 item.feature = _unwrap_tensor_or_list(item.feature)
-            if (
-                hasattr(item, "precomputed_embeddings")
-                and item.precomputed_embeddings is not None
-            ):
+            if item.precomputed_embeddings is not None:
                 item.precomputed_embeddings = _unwrap_tensor_or_list(
                     item.precomputed_embeddings
                 )

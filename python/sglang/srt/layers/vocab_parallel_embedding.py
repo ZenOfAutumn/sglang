@@ -9,10 +9,11 @@ from typing import List, Optional, Sequence, Tuple
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+from sglang.kernels.ops.embeddings.vocab_parallel_embedding import (
+    vocab_parallel_embedding as fused_vocab_parallel_embedding,
+)
 from sglang.srt.distributed import (
     divide,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
@@ -24,8 +25,6 @@ from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_allocation_symmetric,
     is_dp_attention_enabled,
 )
@@ -36,6 +35,7 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_compiler_backend,
@@ -338,6 +338,10 @@ class VocabParallelEmbedding(torch.nn.Module):
             加载时不需再 narrow。
     """  # noqa: E501
 
+    # Attached by quant methods for a quantized ParallelLMHead; see
+    # LinearBase.scheme.
+    scheme = None
+
     def __init__(
         self,
         num_embeddings: int,
@@ -359,14 +363,11 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.use_attn_tp_group = use_attn_tp_group
         if self.enable_tp:
             if use_attn_tp_group:
-                # DP attention 场景：只在 attention 的 TP 子组内切分。
-                # 此时各 DP 副本各自持有完整词表的一份切分，
-                # 归约也只在子组内进行。
-                tp_rank = get_attention_tp_rank()
-                self.tp_size = get_attention_tp_size()
+                tp_rank = get_parallel().attn_tp_rank
+                self.tp_size = get_parallel().attn_tp_size
             else:
-                tp_rank = get_tensor_model_parallel_rank()
-                self.tp_size = get_tensor_model_parallel_world_size()
+                tp_rank = get_parallel().tp_rank
+                self.tp_size = get_parallel().tp_size
         else:
             # 副本化模式：等价于 tp_size=1，各卡持有完整词表。
             # 此时不存在「子组」概念，所以 use_attn_tp_group 必须为 False。
@@ -428,15 +429,10 @@ class VocabParallelEmbedding(torch.nn.Module):
         if quant_method is None:
             quant_method = UnquantizedEmbeddingMethod()
 
-        # 如果本层确实是 embedding 层，那么量化方法必须实现 embedding 操作；
-        # 如果是其他类型（比如子类 ParallelLMHead，它只用权重做 matmul、
-        # 从不调 embedding），则不要求这一点。
-        #
-        # 注意：这里写的是 type(self.__class__)，结果是元类（通常为 type），
-        # 永远不等于 VocabParallelEmbedding，因此 is_embedding_layer 恒为 False，
-        # 下面的校验实际上从不生效。这是从 vLLM 原封不动继承过来的已知缺陷，
-        # 此处保留原样以便与上游保持一致（正确写法应为 type(self)）。
-        is_embedding_layer = type(self.__class__) is VocabParallelEmbedding
+        # If we are making an embedding layer, then our quantization linear
+        # method must implement the embedding operation. If we are another
+        # layer type like ParallelLMHead, this is not important.
+        is_embedding_layer = type(self) is VocabParallelEmbedding
         quant_method_implements_embedding = method_has_implemented_embedding(
             type(quant_method)
         )
@@ -646,6 +642,12 @@ class VocabParallelEmbedding(torch.nn.Module):
         # 参数没有 output_dim，说明它不需切分，应该完整复制到每张卡上
         # （例如 act_order GPTQ 的 g_idx，它是一个全局置换表）。
         if output_dim is None:
+            if (
+                loaded_weight.ndim == 0
+                and param.data.ndim == 1
+                and param.data.numel() == 1
+            ):
+                loaded_weight = loaded_weight.reshape(1)
             assert param.data.shape == loaded_weight.shape
             param.data.copy_(loaded_weight)
             return
@@ -687,6 +689,64 @@ class VocabParallelEmbedding(torch.nn.Module):
         # 但 tp_size == 1 时不走 mask 分支，残留的 NaN/Inf 会污染输出。
         param[loaded_weight.shape[0] :].data.fill_(0)
 
+    def _use_triton_embedding(self, input_: torch.Tensor) -> bool:
+        """Whether the fused Triton kernel can replace the mask+gather+fill unit."""
+        if _is_npu:
+            return False
+        if self.tp_size == 1:
+            return False
+        if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
+            return False
+        if not input_.is_cuda or not input_.is_contiguous():
+            return False
+        if input_.dtype not in (torch.int32, torch.int64):
+            return False
+        return (
+            self.weight.is_cuda
+            and self.weight.ndim == 2
+            and self.weight.stride(1) == 1
+            and self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        )
+
+    def _embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
+        """Embed against the local vocab shard; out-of-shard rows are zero
+        (identity when tp_size == 1).
+
+        The output must be allocated inside the symmetric-memory context so
+        the caller's all-reduce can use it; the mask temporaries and the
+        in-place fill deliberately stay outside the pool.
+        """
+        symm_alloc = use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        )
+        if self.tp_size == 1:
+            with symm_alloc:
+                return self.quant_method.embedding(self, input_.long())
+        if self._use_triton_embedding(input_):
+            with symm_alloc:
+                return fused_vocab_parallel_embedding(
+                    input_,
+                    self.weight,
+                    self.shard_indices.org_vocab_start_index,
+                    self.shard_indices.org_vocab_end_index,
+                    self.shard_indices.num_org_vocab_padding,
+                    self.shard_indices.added_vocab_start_index,
+                    self.shard_indices.added_vocab_end_index,
+                )
+        # Map out-of-shard ids to index 0, gather, then zero those rows.
+        masked_input, input_mask = get_masked_input_and_mask(
+            input_,
+            self.shard_indices.org_vocab_start_index,
+            self.shard_indices.org_vocab_end_index,
+            self.shard_indices.num_org_vocab_padding,
+            self.shard_indices.added_vocab_start_index,
+            self.shard_indices.added_vocab_end_index,
+        )
+        with symm_alloc:
+            output_parallel = self.quant_method.embedding(self, masked_input.long())
+        output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+        return output_parallel
+
     def forward(self, input_):
         """查表得到 token embedding。
 
@@ -705,40 +765,13 @@ class VocabParallelEmbedding(torch.nn.Module):
         maybe_detect_oob(
             input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
         )
-        if self.tp_size > 1:
-            # 构造掩码，并把全局 id 重映射为本 rank 局部行号。
-            masked_input, input_mask = get_masked_input_and_mask(
-                input_,
-                self.shard_indices.org_vocab_start_index,
-                self.shard_indices.org_vocab_end_index,
-                self.shard_indices.num_org_vocab_padding,
-                self.shard_indices.added_vocab_start_index,
-                self.shard_indices.added_vocab_end_index,
-            )
-        else:
-            # 单卡（或副本化）：持有完整词表，id 无需任何平移。
-            masked_input = input_
-
-        # 查表取 embedding。
-        # 包在 use_symmetric_memory 里：对称内存允许后续的 NCCL 集合通信
-        # 直接在这块显存上做，避开一次拷贝；不满足条件时自动禁用。
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            output_parallel = self.quant_method.embedding(self, masked_input.long())
-
-        if self.tp_size > 1:
-            # 把不属于本 rank 的位置置零（它们刚才取到的是第 0 行的垃圾值）。
-            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
-            # input_scattered 模式下，下游会自行做 all-gather 把分散的激活汇总，
-            # 此处再归约一次就重复了，所以跳过。
-            if not get_attn_tp_context().input_scattered:
-                if self.use_attn_tp_group:
-                    # DP attention：仅在 attention 的 TP 子组内归约。
-                    output_parallel = attn_tp_all_reduce(output_parallel)
-                else:
-                    # 在全部模型并行 GPU 上做归约。
-                    output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+        output_parallel = self._embed_local_shard(input_)
+        if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
+            if self.use_attn_tp_group:
+                output_parallel = attn_tp_all_reduce(output_parallel)
+            else:
+                # Reduce across all the model parallel GPUs.
+                output_parallel = tensor_model_parallel_all_reduce(output_parallel)
         return output_parallel
 
     def extra_repr(self) -> str:
@@ -797,6 +830,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        enable_tp: bool = True,
         use_attn_tp_group: bool = False,
         use_presharded_weights: bool = False,
     ):
@@ -808,6 +842,7 @@ class ParallelLMHead(VocabParallelEmbedding):
             padding_size=padding_size,
             quant_config=quant_config,
             prefix=prefix,
+            enable_tp=enable_tp,
             use_attn_tp_group=use_attn_tp_group,
             use_presharded_weights=use_presharded_weights,
         )

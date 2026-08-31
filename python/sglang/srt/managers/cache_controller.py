@@ -27,11 +27,13 @@ limitations under the License.
       （prefetch_thread / backup_thread）来异步执行这些 IO。
 """
 
+
 import logging
 import threading
 import time
-from queue import Empty, Full, Queue
-from typing import TYPE_CHECKING, List, NamedTuple, Optional
+from dataclasses import dataclass
+from queue import Empty, Queue
+from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 import torch
 
@@ -41,25 +43,20 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
+    count_pool_hits,
 )
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-    from sglang.srt.mem_cache.memory_pool_host import HostKVCache
+    from sglang.srt.mem_cache.pool_host import HostKVCache
 
-from sglang.srt.distributed import (
-    get_pipeline_model_parallel_rank,
-    get_pipeline_model_parallel_world_size,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
-    get_attention_tp_rank,
-    get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -160,11 +157,13 @@ class CacheOperation:
         device_indices: torch.Tensor,
         node_id: int,
         priority: Optional[int] = None,
+        pool_transfers: Optional[List[PoolTransfer]] = None,
     ):
         self.host_indices = host_indices
         self.device_indices = device_indices
         self.node_ids = [node_id]
         self.data = None
+        self.pool_transfers = pool_transfers
 
         self.id = CacheOperation.counter
         CacheOperation.counter += 1
@@ -173,20 +172,53 @@ class CacheOperation:
         self.priority = priority if priority is not None else self.id
 
     @staticmethod
+    def _merge_pool_transfers(
+        ops: List[CacheOperation],
+    ) -> Optional[List[PoolTransfer]]:
+        grouped: dict[tuple[PoolName, Optional[PoolName]], List[PoolTransfer]] = {}
+        for op in ops:
+            for transfer in op.pool_transfers or []:
+                grouped.setdefault(
+                    (transfer.name, transfer.indices_from_pool), []
+                ).append(transfer)
+        if not grouped:
+            return None
+
+        def cat_or_none(tensors):
+            parts = [tensor for tensor in tensors if tensor is not None]
+            return torch.cat(parts) if parts else None
+
+        return [
+            PoolTransfer(
+                name=transfers[0].name,
+                host_indices=cat_or_none(t.host_indices for t in transfers),
+                device_indices=cat_or_none(t.device_indices for t in transfers),
+                keys=[key for t in transfers if t.keys for key in t.keys] or None,
+                hit_policy=transfers[0].hit_policy,
+                indices_from_pool=transfers[0].indices_from_pool,
+            )
+            for transfers in grouped.values()
+        ]
+
+    @staticmethod
     def merge_ops(ops: List[CacheOperation]) -> CacheOperation:
         # 中译：把多个操作合并为一个：拼接各自的 host/device 索引，合并 node_ids，
-        #       取最小 priority 作为合并后的优先级。单个时直接返回，避免无谓拷贝。
-        assert len(ops) > 0
+        assert ops
         if len(ops) == 1:
             return ops[0]
-
         host_indices = torch.cat([op.host_indices for op in ops])
         device_indices = torch.cat([op.device_indices for op in ops])
         node_ids = []
         priority = min(op.priority for op in ops)
         for op in ops:
             node_ids.extend(op.node_ids)
-        merged_op = CacheOperation(host_indices, device_indices, -1, priority)
+        merged_op = CacheOperation(
+            host_indices,
+            device_indices,
+            -1,
+            priority,
+            pool_transfers=CacheOperation._merge_pool_transfers(ops),
+        )
         merged_op.node_ids = node_ids
         return merged_op
 
@@ -205,54 +237,40 @@ class HiCacheAck(NamedTuple):
     start_event: device_module.Event
     finish_event: device_module.Event
     node_ids: List[int]
+    num_tokens: int = 0
+    timing_enabled: bool = False
+    # Tokens transferred per host pool (PoolName value -> count).
+    num_tokens_by_pool: Optional[dict[str, int]] = None
+    # Total bytes moved by the op across all pools, including draft piggyback
+    # and sidecar transfers that the per-pool token counts exclude.
+    num_bytes: int = 0
 
 
-class TransferBuffer:
-    """
-    Overlapping buffer preparation and transfer operations to improve throughput.
-
-    中译：传输缓冲区。用一个有界队列把「缓冲准备」与「实际传输」解耦并重叠起来，
-          以提升吞吐。put/get 受 stop_event 控制，便于停止时及时退出而不死等。
-    """
-
-    def __init__(self, stop_event, buffer_count: int = 3) -> None:
-        self.stop_event = stop_event
-        self.buffers = Queue(maxsize=buffer_count)
-
-    def full(self) -> bool:
         # 中译：缓冲队列是否已满。
-        return self.buffers.full()
-
-    def empty(self) -> bool:
         # 中译：缓冲队列是否为空。
-        return self.buffers.empty()
-
-    def put(self, item, block=True, timeout=1) -> None:
         # 中译：放入一个待传输项。队列满时循环重试（带超时），但只要 stop_event 置位就退出；
-        #       非阻塞模式下满则直接放弃。
-        while not self.stop_event.is_set():
-            try:
-                self.buffers.put(item, block=block, timeout=timeout)
-                break
-            except Full:
-                if not block:
-                    break
-                continue
-            except Exception as e:
-                logger.error(e)
-
-    def get(self, block=True, timeout=1) -> Optional[CacheOperation]:
         # 中译：取出一个待传输项；超时为空则返回 None（供调用方轮询）。
-        try:
-            return self.buffers.get(block=block, timeout=timeout)
-        except Empty:
-            return None
-        except Exception as e:
-            logger.error(e)
-
-    def clear(self):
         # 中译：清空缓冲队列（reset 时使用）。
-        self.buffers.queue.clear()
+@dataclass
+class PrefetchAck:
+    """ACK for prefetch operation.
+
+    A sequence of PrefetchAck is sent to the scheduler thread via ack_prefetch_queue,
+    indicating progress or completion of the prefetch operation.
+    For example, a prefetch operation may results into the following sequence of PrefetchAck:
+    1. PrefetchAck(completed_tokens = 128)
+    2. PrefetchAck(completed_tokens = 256)
+    3. PrefetchAck(pool_hits={INDEXER: 256})
+    4. PrefetchAck(completed_req = True)
+    The last PrefetchAck always specifies completed_req = True.
+    """
+    rid: str
+    operation: PrefetchOperation
+    # Number of hits in KV pool.
+    completed_tokens: Optional[int] = None
+    # Number of hits in extra pools.
+    pool_hits: Optional[dict[str, int]] = None
+    completed_req: Optional[bool] = None
 
 
 class StorageOperation:
@@ -271,7 +289,7 @@ class StorageOperation:
 
     def __init__(
         self,
-        host_indices: torch.Tensor,
+        host_indices: Optional[torch.Tensor],
         token_ids: List[int],
         last_hash: Optional[str] = None,
         hash_value: Optional[List[str]] = None,
@@ -283,6 +301,13 @@ class StorageOperation:
         self.completed_tokens = 0
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
+        # Full queried page-hash chain, set by _storage_hit_query before
+        # hash_value is truncated to the hit boundary; the tail is the
+        # absence signal that invalidates buffer-mode existence beliefs.
+        self.all_hash_values: Optional[List[str]] = None
+        # Prefetch-outcome accounting, set at enqueue by the tree cache.
+        self.stats_requested_tokens = 0
+        self.stats_total_tokens = 0
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -290,6 +315,15 @@ class StorageOperation:
     def __lt__(self, other: StorageOperation):
         # 中译：按创建 id 排序（先创建的先处理，近似 FIFO）。
         return self.id < other.id
+
+
+# Buffer-mode staging budgets. Prefetch staging is latency-critical
+# (wait_complete gates TTFT), so loads may fill the pool up to this fraction
+# before new prefetches are declined.
+HICACHE_LOAD_POOL_USAGE_FRACTION = 0.9
+# Write-staging floor: writes are deferrable, so the flush gate grows the
+# write window dynamically into whatever load staging is not using.
+HICACHE_WRITE_STAGING_POOL_FRACTION = 0.2
 
 
 class PrefetchOperation(StorageOperation):
@@ -303,7 +337,6 @@ class PrefetchOperation(StorageOperation):
     def __init__(
         self,
         request_id: str,
-        host_indices: torch.Tensor,
         token_ids: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
@@ -312,17 +345,11 @@ class PrefetchOperation(StorageOperation):
 
         self._lock = threading.Lock()
         self._terminated_flag = False
+        self.storage_hit_count = 0
         self.start_time = time.monotonic()
 
-        super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
-
-    def increment(self, num_tokens: int):
         # 中译：原子地推进已完成 token 数。若操作已被终止则返回 False，调用方据此停止后续传输。
-        with self._lock:
-            if self._terminated_flag:
-                return False
-            self.completed_tokens += num_tokens
-            return True
+        super().__init__(None, token_ids, last_hash, prefix_keys=prefix_keys)
 
     def mark_terminate(self):
         # 中译：标记该预取操作终止（线程安全），后台线程在下次 increment 时感知并停止。
@@ -331,7 +358,8 @@ class PrefetchOperation(StorageOperation):
 
     def is_terminated(self) -> bool:
         # 中译：查询该预取操作是否已被终止。
-        return self._terminated_flag
+        with self._lock:
+            return self._terminated_flag
 
 
 class HiCacheController:
@@ -366,15 +394,16 @@ class HiCacheController:
         model_name: Optional[str] = None,
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
+        host_memory_mode: str = "cache",
     ):
         # 中译：保存各分布式进程组（张量并行、注意力 cp/tp、流水线并行），供后续做集合通信。
-        self.tp_group = tp_group  # 张量并行进程组
-        self.attn_cp_group = attn_cp_group  # 注意力上下文并行（context parallel）进程组
-        self.attn_tp_group = attn_tp_group  # 注意力张量并行进程组
-        self.pp_group = pp_group  # 流水线并行进程组
-        # 预取命中数跨 rank 同步用的进程组列表（gloo），由 _create_prefetch_sync_groups 建立。
-        self.prefetch_sync_groups: List[torch.distributed.ProcessGroup] = []
-        # L1 设备侧 KV 池的分配器（负责 device 页的分配/释放）。
+        self.tp_group = tp_group
+        self.host_memory_mode = host_memory_mode
+        self.attn_cp_group = attn_cp_group
+        self.attn_tp_group = attn_tp_group
+        self.pp_group = pp_group
+        self.prefetch_hits_sync_groups: List[torch.distributed.ProcessGroup] = []
+        self.prefetch_completion_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -382,23 +411,20 @@ class HiCacheController:
         # 中译：混合线性 KV 池只对其中的 full KV 子池做分层缓存搬运。
         if isinstance(mem_pool_device, HybridLinearKVPool):
             mem_pool_device = mem_pool_device.full_kv_pool
-        self.mem_pool_device = mem_pool_device  # L1 设备侧（GPU）KV 池
-        self.mem_pool_host = mem_pool_host  # L2 主机侧（CPU 内存）KV 池
-        self.write_policy = write_policy  # 写回策略：write_through / write_through_selective / write_back
-        self.page_size = page_size  # 每页 token 数（分配与搬运的最小粒度）
-        self.io_backend = io_backend  # device<->host 拷贝所用的 IO 后端标识
-        self.enable_storage = False  # 是否已启用 L3 存储后端（attach 成功后置 True）
-        self.storage_backend = None  # L3 存储后端实例（未 attach 时为 None）
-        self.storage_backend_type = None  # L3 存储后端类型名（如 file / mooncake 等）
-        self.enable_storage_metrics = enable_storage_metrics  # 是否采集存储命中/耗时等指标
-
-        # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         # 中译：草稿（draft）KV 池支持（投机解码用）——尽力而为地搭车在目标 KV 的 L2/L3 操作上一起搬运。
-        self.has_draft = False  # 是否存在草稿 KV 池（投机解码启用时为 True）
-        self.mem_pool_device_draft = None  # 草稿 KV 的 L1 设备侧池
-        self.mem_pool_host_draft = None  # 草稿 KV 的 L2 主机侧池
-        self.draft_page_get_func = None  # 草稿 KV 的 storage 读页函数（attach 时设置）
-        self.draft_page_set_func = None  # 草稿 KV 的 storage 写页函数（attach 时设置）
+        self.mem_pool_device = mem_pool_device
+        self.mem_pool_host = mem_pool_host
+        self.storage_host_pool = mem_pool_host
+        self.write_policy = write_policy
+        self.page_size = page_size
+        self.io_backend = io_backend
+        self.enable_storage = False
+        self.storage_backend = None
+        self.storage_backend_type = None
+        self.enable_storage_metrics = enable_storage_metrics
+        # Buffer mode: wired by the tree cache after attach; the load rate
+        # limiter subtracts write staging from actual pool usage.
+        self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
 
         # Default storage page IO functions (may be overridden by attach).
         # 中译：默认的存储页读/写函数（attach 后端时可能被替换为零拷贝版本）。
@@ -406,17 +432,18 @@ class HiCacheController:
         self.page_set_func = self._generic_page_set  # storage 写页函数（attach 后可替换为零拷贝版）
 
         # Dedicated stop event for storage background threads (prefetch/backup).
-        # NOTE: Do NOT reuse `self.stop_event` here since it also guards core HiCache
-        # transfer buffers (CPU<->GPU). We want to allow runtime attach/detach of
-        # storage without stopping the whole controller.
         # 中译：存储后台线程（预取/备份）专用的停止事件。
-        #       注意：不要复用 self.stop_event——后者还守护核心的 CPU<->GPU 传输缓冲；
-        #       单独一个事件才能在运行时 attach/detach 存储后端而不必停掉整个控制器。
-        self.storage_stop_event = threading.Event()  # 存储后台线程（预取/备份）专用停止信号
+        self.storage_stop_event = threading.Event()
 
-        self.device = self.mem_pool_device.device  # 执行设备（如 cuda:0）
-        self.layer_num = self.mem_pool_device.layer_num  # 模型层数（逐层搬运时使用）
-        # 逐层完成计数器：搬运每层完成时打点，供计算与拷贝流水线重叠。
+        # Storage control queues, (re)created whenever the storage threads start.
+        self.prefetch_buffer: Optional[Queue[PrefetchOperation]] = None
+        self.prefetch_sync_queue: Optional[Queue[PrefetchAck]] = None
+        self.prefetch_hit_queue: Optional[Queue[StorageOperation]] = None
+        self.ack_prefetch_queue = Queue[PrefetchAck]()
+        self.ack_backup_queue: Optional[Queue[StorageOperation]] = None
+        self.host_mem_release_queue: Optional[Queue[torch.Tensor]] = None
+        self.device = self.mem_pool_device.device
+        self.layer_num = self.mem_pool_device.layer_num
         self.layer_done_counter = LayerDoneCounter(self.layer_num)
         # 中译：把逐层完成计数器注册给设备 KV 池，使其在逐层搬运时回调标记每层完成事件。
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
@@ -430,19 +457,16 @@ class HiCacheController:
 
         # self.write_queue = PriorityQueue[CacheOperation]()
         # 中译：L1<->L2 的待处理队列与完成回执队列。load/write 各一对：
-        #       *_queue 暂存待发起的操作，ack_*_queue 暂存已发起、等待事件完成的回执。
-        self.load_queue: List[CacheOperation] = []  # 待发起的 L2->L1 加载操作队列
-        self.write_queue: List[CacheOperation] = []  # 待发起的 L1->L2 写回操作队列
-        self.ack_load_queue: List[HiCacheAck] = []  # 已发起加载、等待事件完成的回执队列
-        self.ack_write_queue: List[HiCacheAck] = []  # 已发起写回、等待事件完成的回执队列
-
-        self.stop_event = threading.Event()  # 控制器核心（CPU<->GPU 传输缓冲）的停止信号
-        self.write_buffer = TransferBuffer(self.stop_event)  # 写回用的中转缓冲
-        self.load_buffer = TransferBuffer(self.stop_event, buffer_count=10)  # 加载用的中转缓冲
-
         # 中译：写回与加载各用独立 CUDA stream，与主计算 stream 并发以隐藏拷贝延迟。
-        self.write_stream = device_module.Stream()  # 专用写回流（L1->L2）
-        self.load_stream = device_module.Stream()  # 专用加载流（L2->L1）
+        self.load_queue: List[CacheOperation] = []
+        self.write_queue: List[CacheOperation] = []
+        self.ack_load_queue: List[HiCacheAck] = []
+        # Set by the scheduler to the forward stream; gates load-back H2D
+        # behind in-flight forwards (see start_loading).
+        self.load_fence_stream = None
+        self.ack_write_queue: List[HiCacheAck] = []
+
+        self.l2_transfer_engine = L2TransferEngine(io_backend)
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -474,19 +498,19 @@ class HiCacheController:
             )
         return 0, 1
 
-    def _create_prefetch_sync_groups(self) -> None:
         # 中译：为预取命中数同步创建专用的 gloo 进程组。
-        #       存储是按 rank 分片/复制的，需要在同一组 rank 间对「命中页数」取 MIN 对齐，
-        #       以保证各 rank 预取的页数一致。这里按 attn_cp/attn_tp（或退化到 tp）去重后建组。
+    def _create_sync_groups(self) -> List[torch.distributed.ProcessGroup]:
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
-        self.prefetch_sync_groups = []
-        seen_rank_sets = set()  # 已建组的 rank 集合，用于去重避免重复建组。
+        groups: List[torch.distributed.ProcessGroup] = []
+        seen_rank_sets = set()
 
         if self.attn_cp_group is not None or self.attn_tp_group is not None:
             base_groups = [self.attn_cp_group, self.attn_tp_group]
         else:
             base_groups = [self.tp_group]
+        if self.pp_group is not None:
+            base_groups.append(self.pp_group)
 
         for group in base_groups:
             if group is None or torch.distributed.get_world_size(group=group) == 1:
@@ -495,24 +519,31 @@ class HiCacheController:
             if group_ranks in seen_rank_sets:
                 continue
             seen_rank_sets.add(group_ranks)
-            self.prefetch_sync_groups.append(
+            groups.append(
                 create_custom_parallel_group(
                     group_ranks=list(group_ranks), backend="gloo"
                 )
             )
+        return groups
 
-    def _destroy_prefetch_sync_groups(self) -> None:
         # 中译：销毁预取同步进程组（detach 存储后端时调用），逐个尽力销毁、忽略异常。
-        for group in self.prefetch_sync_groups:
+    def _destroy_sync_groups(
+        self, groups: List[torch.distributed.ProcessGroup]
+    ) -> None:
+        for group in groups:
             try:
                 torch.distributed.destroy_process_group(group)
             except Exception:
                 pass
-        self.prefetch_sync_groups = []
 
-    def _all_reduce_prefetch_groups(self, tensor: torch.Tensor, op) -> None:
         # 中译：在所有预取同步组上对 tensor 做 all_reduce（如对命中页数取 MIN 以跨 rank 对齐）。
-        for group in self.prefetch_sync_groups:
+    def _all_reduce(
+        self,
+        tensor: torch.Tensor,
+        op,
+        groups: List[torch.distributed.ProcessGroup],
+    ) -> None:
+        for group in groups:
             torch.distributed.all_reduce(tensor, op=op, group=group)
 
     def _start_storage_threads(self):
@@ -531,18 +562,27 @@ class HiCacheController:
         self.prefetch_thread = threading.Thread(
             target=self.prefetch_thread_func, daemon=True
         )
-        # 备份线程：把 host（L2）异步写回 L3 storage。
+        self.prefetch_io_aux_thread = threading.Thread(
+            target=self.prefetch_io_aux_func, daemon=True
+        )
+        self.prefetch_sync_thread = threading.Thread(
+            target=self.prefetch_sync_thread_func, daemon=True
+        )
         self.backup_thread = threading.Thread(
             target=self.backup_thread_func, daemon=True
         )
-        self.prefetch_queue = Queue()  # 待处理的预取操作队列
-        self.backup_queue = Queue()  # 待处理的备份操作队列
-
-        self.prefetch_revoke_queue: Queue[str] = Queue()  # 被撤销的预取请求 id 队列
-        self.ack_backup_queue: Queue[StorageOperation] = Queue()  # 备份完成回执队列
-        self.host_mem_release_queue: Queue[torch.Tensor] = Queue()  # 待释放的 host 页索引队列
+        self.prefetch_queue = Queue()
+        self.backup_queue = Queue()
+        self.prefetch_buffer = Queue()
+        self.prefetch_sync_queue = Queue()
+        self.prefetch_hit_queue = Queue()
+        self.ack_prefetch_queue = Queue()
+        self.ack_backup_queue = Queue()
+        self.host_mem_release_queue = Queue()
 
         self.prefetch_thread.start()
+        self.prefetch_io_aux_thread.start()
+        self.prefetch_sync_thread.start()
         self.backup_thread.start()
 
     def _stop_storage_threads(self):
@@ -557,7 +597,7 @@ class HiCacheController:
         # Always request stop. This is safe even when storage is already disabled,
         # and makes detach truly idempotent (previous partial detach may have left
         # threads alive).
-        # NOTE: do NOT clear stop_event unless threads have fully stopped; otherwise
+        # NOTE: do NOT clear storage_stop_event unless threads have fully stopped; otherwise
         # a still-alive thread may resume and touch released state.
         # 中译：务必在线程完全停止前不要清除 stop_event，否则尚存活的线程可能恢复运行、
         #       触碰已释放的状态。
@@ -572,6 +612,8 @@ class HiCacheController:
                 self.backup_queue.put_nowait(None)
             if hasattr(self, "prefetch_buffer"):
                 self.prefetch_buffer.put_nowait(None)
+            if hasattr(self, "prefetch_sync_queue"):
+                self.prefetch_sync_queue.put_nowait(None)
         except Exception:
             pass
 
@@ -583,6 +625,8 @@ class HiCacheController:
             threads.append(self.backup_thread)
         if hasattr(self, "prefetch_io_aux_thread"):
             threads.append(self.prefetch_io_aux_thread)
+        if hasattr(self, "prefetch_sync_thread"):
+            threads.append(self.prefetch_sync_thread)
 
         for t in threads:
             try:
@@ -650,18 +694,25 @@ class HiCacheController:
 
         try:
             self.storage_backend = StorageBackendFactory.create_backend(
-                storage_backend, self.storage_config, self.mem_pool_host
+                storage_backend, self.storage_config, self.storage_host_pool
             )
-            self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+            self.storage_backend.register_mem_pool_host(self.storage_host_pool)
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
             # 中译：预取阈值——命中 token 数低于此值就不值得预取（至少为一页）。
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
             # 中译：预取占用上限——约为「host 池比 device 池多出的容量」的 80%，留有余量防打满。
-            self.prefetch_capacity_limit = max(
-                0, int(0.8 * (self.mem_pool_host.size - self.mem_pool_device.size))
-            )
+            if self.host_memory_mode == "buffer_only":
+                # The whole pool is transient staging; loads may fill it up
+                # to this fraction, and the tree's write flush gate yields
+                # to live fetch demand (the write fraction is a floor).
+                self.prefetch_capacity_limit = int(
+                    HICACHE_LOAD_POOL_USAGE_FRACTION * self.mem_pool_host.size
+                )
+            else:
+                # Budget speculative prefetch at half the host pool, leaving the rest for the write-back staging path.
+                self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             # 中译：当前被预取锁定的 token 数（由主调度线程更新），用于限流判断。
             self.prefetch_tokens_occupied = 0
@@ -669,7 +720,8 @@ class HiCacheController:
             # Use dedicated gloo groups so storage prefetch sync is isolated
             # from other collectives and consistent across CPxTP participants.
             # 中译：用专用 gloo 组做预取同步，与其它集合通信隔离，并在 CP×TP 参与者间保持一致。
-            self._create_prefetch_sync_groups()
+            self.prefetch_hits_sync_groups = self._create_sync_groups()
+            self.prefetch_completion_sync_groups = self._create_sync_groups()
 
             # Select the get and set functions
             # 中译：选择页读写函数。部分后端支持零拷贝（zero-copy），直接在 host 池与后端间传输，
@@ -679,15 +731,13 @@ class HiCacheController:
 
             if (
                 self.storage_backend_type
-                in ["hf3fs", "mooncake", "eic", "nixl", "simm"]
+                in ["hf3fs", "mooncake", "eic", "nixl", "simm", "mori"]
             ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
             ):
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
-
-            self._maybe_register_draft_with_storage()
 
             # Ensure stop_event is clear before starting threads.
             # 中译：启动线程前确保停止事件已清除（否则刚启动的线程会立刻退出）。
@@ -700,7 +750,10 @@ class HiCacheController:
                 self._stop_storage_threads()
             except Exception:
                 pass
-            self._destroy_prefetch_sync_groups()
+            self._destroy_sync_groups(self.prefetch_hits_sync_groups)
+            self._destroy_sync_groups(self.prefetch_completion_sync_groups)
+            self.prefetch_hits_sync_groups = []
+            self.prefetch_completion_sync_groups = []
             try:
                 if (
                     hasattr(self, "storage_backend")
@@ -715,8 +768,6 @@ class HiCacheController:
             self.enable_storage = False
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
-            self.draft_page_get_func = None
-            self.draft_page_set_func = None
             raise
 
     def detach_storage_backend(self):
@@ -745,7 +796,11 @@ class HiCacheController:
             raise RuntimeError("Stop storage threads failed; detach aborted.") from e
 
         # Best-effort destroy process groups created for storage ops.
-        self._destroy_prefetch_sync_groups()
+        self._destroy_sync_groups(
+            self.prefetch_hits_sync_groups + self.prefetch_completion_sync_groups
+        )
+        self.prefetch_hits_sync_groups = []
+        self.prefetch_completion_sync_groups = []
 
         # Best-effort close (some backends rely on GC/destructor).
         try:
@@ -763,8 +818,6 @@ class HiCacheController:
         self.enable_storage = False
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
-        self.draft_page_get_func = None
-        self.draft_page_set_func = None
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
 
@@ -780,16 +833,16 @@ class HiCacheController:
 
         # 中译：启用 DP 注意力时，tp/dp rank 取自注意力并行视角；否则取自全局张量并行。
         if is_dp_attention_enabled():
-            self.tp_rank = get_attention_tp_rank()
-            self.tp_size = get_attention_tp_size()
+            self.tp_rank = get_parallel().attn_tp_rank
+            self.tp_size = get_parallel().attn_tp_size
             self.dp_rank = get_attention_dp_rank()
         else:
-            self.tp_rank = get_tensor_model_parallel_rank()
-            self.tp_size = get_tensor_model_parallel_world_size()
+            self.tp_rank = get_parallel().tp_rank
+            self.tp_size = get_parallel().tp_size
             self.dp_rank = 0
 
-        self.pp_rank = get_pipeline_model_parallel_rank()
-        self.pp_size = get_pipeline_model_parallel_world_size()
+        self.pp_rank = get_parallel().pp_rank
+        self.pp_size = get_parallel().pp_size
 
         # Currently, NPUMLATokenToKVPool is the subclass of MLATokenToKVPool.
         # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
@@ -837,37 +890,45 @@ class HiCacheController:
 
     def reset(self):
         # 中译：重置控制器。先置位两个停止事件让后台线程退出，清空所有队列与缓冲；
-        #       若启用存储则 join 线程、清空存储相关队列；最后清除停止事件并重启存储线程。
-        self.stop_event.set()
         self.storage_stop_event.set()
 
         self.write_queue.clear()
         self.load_queue.clear()
-        self.write_buffer.clear()
-        self.load_buffer.clear()
         self.ack_write_queue.clear()
         self.ack_load_queue.clear()
         if self.enable_storage:
             self.prefetch_thread.join()
+            self.prefetch_io_aux_thread.join()
+            self.prefetch_sync_thread.join()
             self.backup_thread.join()
             self.prefetch_queue.queue.clear()
             self.backup_queue.queue.clear()
-            self.prefetch_revoke_queue.queue.clear()
+            self.prefetch_buffer.queue.clear()
+            self.prefetch_sync_queue.queue.clear()
+            self.prefetch_hit_queue.queue.clear()
+            self.ack_prefetch_queue.queue.clear()
             self.ack_backup_queue.queue.clear()
             self.host_mem_release_queue.queue.clear()
             self.prefetch_tokens_occupied = 0
 
-        self.stop_event.clear()
         self.storage_stop_event.clear()
 
         if self.enable_storage:
             self.prefetch_thread = threading.Thread(
                 target=self.prefetch_thread_func, daemon=True
             )
+            self.prefetch_io_aux_thread = threading.Thread(
+                target=self.prefetch_io_aux_func, daemon=True
+            )
+            self.prefetch_sync_thread = threading.Thread(
+                target=self.prefetch_sync_thread_func, daemon=True
+            )
             self.backup_thread = threading.Thread(
                 target=self.backup_thread_func, daemon=True
             )
             self.prefetch_thread.start()
+            self.prefetch_io_aux_thread.start()
+            self.prefetch_sync_thread.start()
             self.backup_thread.start()
 
     def write(
@@ -899,39 +960,31 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices = self.move_indices(
-            op.host_indices, op.device_indices
-        )
+        host_indices, device_indices, pool_transfers = self._move_write_operation(op)
         self.write_queue.clear()
 
-        start_event = device_module.Event()
-        finish_event = device_module.Event()
+        completion = self.l2_transfer_engine.submit_device_to_host(
+            self._l2_transfers(host_indices, device_indices, pool_transfers)
+        )
 
-        start_event.record()
-        with device_module.stream(self.write_stream):
-            start_event.wait(self.write_stream)
-            self.mem_pool_host.backup_from_device_all_layer(
-                self.mem_pool_device, host_indices, device_indices, self.io_backend
+        self.ack_write_queue.append(
+            HiCacheAck(
+                start_event=completion.start_event,
+                finish_event=completion.finish_event,
+                node_ids=op.node_ids,
+                num_tokens=len(op.device_indices),
+                timing_enabled=completion.timing_enabled,
+                num_tokens_by_pool=self._num_tokens_by_pool(op),
+                num_bytes=self._transfer_num_bytes(op),
             )
-            if self.has_draft:
-                self.mem_pool_host_draft.backup_from_device_all_layer(
-                    self.mem_pool_device_draft,
-                    host_indices,
-                    device_indices,
-                    self.io_backend,
-                )
-            finish_event.record()
-            # NOTE: We must save the host indices and device indices here,
-            # this is because we need to guarantee that these tensors are
-            # still alive when the write stream is executing.
             # 中译：必须在此通过 record_stream 标记这两个索引张量被 write_stream 使用，
-            #       以保证异步拷贝执行期间它们不会被提前释放（跨 stream 的生命周期保护）。
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.write_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.write_stream)
+        )
 
-        self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
+    def _transfer_num_bytes(self, op: CacheOperation) -> int:
+        return len(op.device_indices) * self.mem_pool_host.size_per_token
+
+    def _num_tokens_by_pool(self, op: CacheOperation) -> dict[str, int]:
+        return {PoolName.KV.value: len(op.device_indices)}
 
     def load(
         self,
@@ -954,7 +1007,9 @@ class HiCacheController:
         )
         return device_indices
 
-    def move_indices(self, host_indices: torch.Tensor, device_indices: torch.Tensor):
+    def move_indices(
+        self, host_indices: torch.Tensor, device_indices: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # move indices to GPU if using kernels, to host if using direct indexing
         # 中译：按 IO 后端调整索引张量所在设备并对齐布局：
         #       - kernel：用自定义 kernel 拷贝，host_indices 需在 GPU 上；
@@ -981,6 +1036,47 @@ class HiCacheController:
         else:
             raise ValueError(f"Unsupported io backend")
 
+    def _move_write_operation(
+        self, op: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[List[PoolTransfer]]]:
+        """Keep CPU host indices only for page-first staged write-back."""
+        if (
+            self.io_backend == "kernel"
+            and self.mem_pool_host.layout == "page_first"
+            and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+        ):
+            return op.host_indices, op.device_indices, op.pool_transfers
+        return self._move_op_indices(op)
+
+    def _move_op_indices(
+        self, op: CacheOperation
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[List[PoolTransfer]]]:
+        return (*self.move_indices(op.host_indices, op.device_indices), None)
+
+    def _l2_transfers(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+    ) -> list[L2Transfer]:
+        transfers = [
+            L2Transfer(
+                host_pool=self.mem_pool_host,
+                device_pool=self.mem_pool_device,
+                host_indices=host_indices,
+                device_indices=device_indices,
+            )
+        ]
+        return transfers
+
+    def _l2_load_transfers(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+    ) -> list[L2Transfer]:
+        return self._l2_transfers(host_indices, device_indices, pool_transfers)
+
     def start_loading(self) -> int:
         # 中译：发起一批 host->device 加载。合并加载队列，轮转占用一套逐层事件（producer_id），
         #       在 load_stream 上逐层拷贝并在每层完成后 record 事件，使消费者（前向）可按层等待。
@@ -990,46 +1086,35 @@ class HiCacheController:
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices = self.move_indices(
-            op.host_indices, op.device_indices
-        )
+        host_indices, device_indices, pool_transfers = self._move_op_indices(op)
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
 
-        with device_module.stream(self.load_stream):
-            producer_event.start_event.wait(self.load_stream)
-            for i in range(self.layer_num):
-                self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
-                    host_indices,
-                    device_indices,
-                    i,
-                    self.io_backend,
-                )
-                if self.has_draft and i < self.mem_pool_host_draft.layer_num:
-                    self.mem_pool_host_draft.load_to_device_per_layer(
-                        self.mem_pool_device_draft,
-                        host_indices,
-                        device_indices,
-                        i,
-                        self.io_backend,
-                    )
-                producer_event.complete(i)
-            # NOTE: We must save the host indices and device indices here,
-            # this is because we need to guarantee that these tensors are
-            # still alive when the load stream is executing.
             # 中译：同 start_writing——record_stream 保证异步加载执行期间索引张量不被提前释放。
-            if host_indices.is_cuda:
-                host_indices.record_stream(self.load_stream)
-            if device_indices.is_cuda:
-                device_indices.record_stream(self.load_stream)
+        if self.load_fence_stream is not None:
+            # in overlap scheduling, reclaimed pages might still be written by the forward thread
+            # therefore a fence is needed for loading thread to prevent memory corruption
+            # todo: it's possible to use a finer-grained fence
+            self.l2_transfer_engine.host_to_device_stream.wait_stream(
+                self.load_fence_stream
+            )
+
+        completion = self.l2_transfer_engine.submit_host_to_device(
+            self._l2_load_transfers(host_indices, device_indices, pool_transfers),
+            start_event=producer_event.start_event,
+            on_layer_done=producer_event.complete,
+            layer_num=self.layer_num,
 
         self.ack_load_queue.append(
             HiCacheAck(
-                start_event=producer_event.start_event,
-                finish_event=producer_event.finish_event,
+                start_event=completion.start_event,
+                finish_event=completion.finish_event,
                 node_ids=op.node_ids,
+                num_tokens=len(op.device_indices),
+                timing_enabled=completion.timing_enabled,
+                num_tokens_by_pool=self._num_tokens_by_pool(op),
+                num_bytes=self._transfer_num_bytes(op),
             )
         )
         return producer_id
@@ -1048,73 +1133,9 @@ class HiCacheController:
         self.mem_pool_host.free(host_indices)
         return len(host_indices)
 
-    def set_draft_kv_pool(self, draft_device_pool, draft_host_pool) -> None:
-        """Register draft KV pools so L2/L3 ops piggyback draft transfers.
-
-        中译：登记草稿（draft）KV 池（投机解码用），使其 L2/L3 搬运搭车在目标 KV 操作上一起完成。
-              若存储后端已挂载则立即接好草稿 L3 的 IO 路径，否则延迟到 attach 时再接。
-        """
-        self.has_draft = True
-        self.mem_pool_device_draft = draft_device_pool
-        self.mem_pool_host_draft = draft_host_pool
-        logger.info(
-            "HiCache draft KV registered: %s (host %d slots)",
-            type(draft_device_pool).__name__,
-            draft_host_pool.size,
-        )
-
-        # If storage is already attached, wire up the draft I/O path now.
-        # Otherwise this will be deferred until attach_storage_backend().
-        self._maybe_register_draft_with_storage()
-
-    def _maybe_register_draft_with_storage(self) -> None:
-        """Pick the draft L3 IO implementation.
-
-        中译：根据存储后端类型选择草稿 KV 的 L3 读写实现。
-              - mooncake：用多池零拷贝 v2 接口（需先注册草稿 host 池；不支持 split_heads 时禁用）；
-              - hf3fs/eic/nixl/simm：暂不支持草稿池注册，禁用草稿 L3；
-              - 其它通用后端：用 generic 实现（以 `{hash}.draft` 作为键，与目标页区分）。
-              未启用草稿或未启用存储时，将草稿读写函数置空（不参与）。
-        """
-        self.draft_page_get_func = None
-        self.draft_page_set_func = None
-        if not self.has_draft or not self.enable_storage:
-            return
-
-        backend = self.storage_backend_type
-
-        # Multi-pool zero-copy backends.
-        if backend == "mooncake":
-            if self.storage_config.should_split_heads:
-                logger.warning(
-                    "HiCache draft L3 disabled: should_split_heads not yet "
-                    "supported on the mooncake v2 path."
-                )
-                return
-            self.storage_backend.register_mem_host_pool_v2(
-                self.mem_pool_host_draft, PoolName.DRAFT
-            )
-            self.draft_page_get_func = self._draft_page_get_v2
-            self.draft_page_set_func = self._draft_page_set_v2
-            return
-
-        # TODO: support "hf3fs", "eic", "nixl", "simm"
-        if backend in {"hf3fs", "eic", "nixl", "simm"}:
-            logger.warning(
-                "HiCache draft L3 disabled: backend %s does not yet support "
-                "draft pool registration.",
-                backend,
-            )
-            return
-
-        # Generic backends.
-        self.draft_page_get_func = self._draft_page_get_generic
-        self.draft_page_set_func = self._draft_page_set_generic
-
     def prefetch(
         self,
         request_id: str,
-        host_indices: torch.Tensor,
         new_input_tokens: List[int],
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
@@ -1126,13 +1147,19 @@ class HiCacheController:
               由后台 prefetch_thread 异步执行；返回该操作句柄供上层跟踪/终止。
         """
         operation = PrefetchOperation(
-            request_id, host_indices, new_input_tokens, last_hash, prefix_keys
+            request_id, new_input_tokens, last_hash, prefix_keys
         )
         self.prefetch_queue.put(operation)
         return operation
 
     def terminate_prefetch(self, operation):
         # 中译：终止一个预取操作，返回其已完成的 token 数与已命中的哈希键列表（供上层登记/回收）。
+        """
+        Request to terminate a prefetch operation.
+
+        Must be called in the scheduler thread.
+        Asynchronous prefetch tasks may be running in background threads.  When all prefetch
+        tasks are terminated, a PrefetchAck with completed_req=True will be sent to ack_prefetch_queue.
         operation.mark_terminate()
         return operation.completed_tokens, operation.hash_value
 
@@ -1146,9 +1173,8 @@ class HiCacheController:
 
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
-    ):
         # 中译：零拷贝预取——后端直接把数据写入 host 池对应槽位（batch_get_v1）。
-        #       从头连续累计成功页数，一旦遇到失败页即停止（前缀必须连续命中）。
+    ) -> int:
         results = self.storage_backend.batch_get_v1(
             hash_values, host_indices, extra_info
         )
@@ -1159,73 +1185,126 @@ class HiCacheController:
                     f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
                 )
                 break
-            inc += self.page_size
-        operation.increment(inc)
+            inc += 1
+        return inc
 
     # todo: deprecate
     # 中译：通用预取（非零拷贝，待废弃）——先取出页数据，再逐页写入 host 池。
-    #       关键顺序：必须先 set 数据、再 increment 完成数，否则该页可能在写入前被读取。
-    def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
+    def _generic_page_get(
+        self, operation, hash_values, host_indices, extra_info=None
+    ) -> int:
         dummy_page_dst = [
-            self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
+            self.storage_host_pool.get_dummy_flat_data_page() for _ in hash_values
         ]
         page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
         if page_data is None:
-            return
+            return 0
+        count = 0
         for i in range(len(hash_values)):
             if page_data[i] is None:
                 logger.warning(
                     f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
                 )
                 break
-            # Must set the data before increasing the completed tokens.
-            # Otherwise this page may be read before being set.
-            self.mem_pool_host.set_from_flat_data_page(
+            if operation.is_terminated():
+                break
+            self.storage_host_pool.set_from_flat_data_page(
                 host_indices[i * self.page_size],
                 page_data[i],
             )
-            if not operation.increment(self.page_size):
-                break  # Operation terminated by controller
+            count += 1
+        return count
 
-    def _page_transfer(self, operation):
         # 中译：把一次预取操作命中的所有页从 L3 拉到 L2，分批（STORAGE_BATCH_SIZE）传输。
-        #       每批：先尽力读草稿 L3（须在发布目标完成前，避免竞态把目标 KV 先加载回来），
-        #       再读目标页；若本批未达预期完成数则终止操作。
+    def _page_transfer(self, operation: PrefetchOperation) -> int:
         # Transfer batch by batch
         # 中译：逐批传输。
         prefix_keys = operation.prefix_keys
+        kv_derived_transfers = [
+            transfer
+            for transfer in getattr(operation, "pool_transfers", None) or []
+            if transfer.indices_from_pool == PoolName.KV
+        ]
+        all_success = True
+        completed_pages = 0
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
-            batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
-            batch_host_indices = operation.host_indices[
-                i * self.page_size : (i + len(batch_hashes)) * self.page_size
+            # When an error is occurred, we should keep looping and produce the same number of
+            # PrefetchAck as other ranks do, because prefetch_sync_thread (i.e. consumer of
+            # prefetch_sync_queue) perform reduce on the results.  This is so tricky.
+            if all_success and operation.is_terminated():
+                all_success = False
+            if all_success:
+                batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
+                batch_host_indices = operation.host_indices[
+                    i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                ]
+
+                # Get one batch token, and update the completed_tokens if succeed
+                extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+
+                hit_pages = self._page_transfer_kv_batch(
+                    operation,
+                    batch_hashes,
+                    batch_host_indices,
+                    extra_info,
+                    kv_derived_transfers,
+                )
+                # Check termination
+                if hit_pages != len(batch_hashes):
+                    all_success = False
+                if prefix_keys and len(prefix_keys) > 0:
+                    prefix_keys += batch_hashes
+                completed_pages += hit_pages
+            ack = PrefetchAck(
+                rid=operation.request_id,
+                completed_tokens=completed_pages * self.page_size,
+                operation=operation,
+            )
+            self.prefetch_sync_queue.put(ack)
+        return completed_pages
+
+    def _page_transfer_kv_batch(
+        self,
+        operation: PrefetchOperation,
+        batch_hashes: List[str],
+        batch_host_indices: torch.Tensor,
+        extra_info: HiCacheStorageExtraInfo,
+        kv_derived_transfers: List[PoolTransfer],
+    ) -> int:
+        """Read a single batch from KV and KV-derived pools (e.g. indexer pool).
+
+        Return the number of hit pages.  If the hits from KV and KV-derived pools differ,
+        clamp to the minimal number of hits.
+
+        Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
+        """
+        # Read from KV pool.
+        kv_hits = self.page_get_func(
+            operation, batch_hashes, batch_host_indices, extra_info
+        )
+
+        # Read from KV-derived sidecar pools, if any.
+        sidecar_hits: dict[str, int] = {}
+        if len(kv_derived_transfers) > 0:
+            current_kv_derived_transfers = [
+                PoolTransfer(
+                    name=transfer.name,
+                    host_indices=batch_host_indices,
+                    keys=batch_hashes,
+                )
+                for transfer in kv_derived_transfers
             ]
+            sidecar_results = self.storage_backend.batch_get_v2(
+                current_kv_derived_transfers
+            )
+            sidecar_hits = count_pool_hits(sidecar_results)
 
-            # Best-effort draft L3 read before publishing target completion.
-            # Otherwise wait_complete can race and load back target KV before
-            # draft KV reaches host memory.
             # 中译：在发布目标完成状态之前，尽力（best-effort）先读取草稿（draft）L3。
-            #       否则 wait_complete 可能发生竞态，在草稿 KV 到达 host 内存之前
-            #       就把目标 KV 先加载回来。
-            if self.has_draft:
-                self._draft_page_get(batch_hashes, batch_host_indices)
-
-            prev_completed_tokens = operation.completed_tokens
-            # Get one batch token, and update the completed_tokens if succeed
             # 中译：读取一批 token，成功则更新 completed_tokens。
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
-            # Check termination
             # 中译：检查是否需要终止。
-            if (
-                operation.completed_tokens
-                != prev_completed_tokens + len(batch_hashes) * self.page_size
-            ):
-                operation.mark_terminate()
-                break  # Some operations fail or operation terminated by controller
                 # 中译：部分操作失败，或操作被控制器终止。
-
-            if prefix_keys and len(prefix_keys) > 0:
-                prefix_keys += batch_hashes
+        # Clamp to minimal number of hits.
+        return min([kv_hits, *sidecar_hits.values()])
 
     def prefetch_io_aux_func(self):
         """
@@ -1240,9 +1319,13 @@ class HiCacheController:
                 if operation is None:
                     continue
                 self._page_transfer(operation)
-                # operation terminated by controller, release pre-allocated memory
-                self.append_host_mem_release(
-                    operation.host_indices[operation.completed_tokens :]
+
+                self.prefetch_sync_queue.put(
+                    PrefetchAck(
+                        rid=operation.request_id,
+                        completed_req=True,
+                        operation=operation,
+                    )
                 )
             except Empty:
                 continue
@@ -1254,6 +1337,16 @@ class HiCacheController:
         中译：预取限流——避免压垮存储后端或耗尽 host 内存。
               当前策略：被预取锁定的 token 数达到容量上限即拒绝（返回 True 表示应限流）。
         """
+        if self.host_memory_mode == "buffer_only":
+            # Gate on real pool usage: buffer mode allocates hit-sized, so
+            # prefetch_tokens_occupied's requested spans overstate it. Pool
+            # state mutates only at scheduler-thread lockstep points, so this
+            # stays TP-deterministic. Write staging is the write budget's
+            # usage; charging it here would park hits behind its storage drain.
+            used = self.mem_pool_host.size - self.mem_pool_host.available_size()
+            if self.host_write_staged_tokens_fn is not None:
+                used -= self.host_write_staged_tokens_fn()
+            return max(0, used) >= self.prefetch_capacity_limit
         # cancel prefetch if too much memory is occupied
         # 中译：占用过多内存时取消预取。
         if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
@@ -1271,18 +1364,13 @@ class HiCacheController:
 
         storage_query_count = 0
         hash_value = []
+        page_hashes = self.get_hash_str(
+            tokens_to_fetch, last_hash, page_size=self.page_size
+        )
+        operation.all_hash_values = page_hashes
 
-        for start in range(
-            0, len(tokens_to_fetch), self.page_size * STORAGE_BATCH_SIZE
-        ):
-            end = min(start + self.page_size * STORAGE_BATCH_SIZE, len(tokens_to_fetch))
-            batch_tokens = tokens_to_fetch[start:end]
-            batch_hashes = []
-            for i in range(0, len(batch_tokens), self.page_size):
-                last_hash = self.get_hash_str(
-                    batch_tokens[i : i + self.page_size], last_hash
-                )
-                batch_hashes.append(last_hash)
+        for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
+            batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
@@ -1302,47 +1390,34 @@ class HiCacheController:
               （保证各 rank 预取页数一致）；命中不足阈值则撤销预取并释放预分配的 host 内存，
               否则裁剪 host_indices/hash_value 到命中范围并投入 prefetch_buffer 交由 IO 辅助线程传输。
         """
-        self.prefetch_buffer = Queue()
-        self.prefetch_io_aux_thread = threading.Thread(
-            target=self.prefetch_io_aux_func, daemon=True
-        )
-        self.prefetch_io_aux_thread.start()
         while (not self.storage_stop_event.is_set()) or not self.prefetch_queue.empty():
             try:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                hash_value, storage_hit_count = self._storage_hit_query(operation)
+                if operation.is_terminated():
+                    hash_value, storage_hit_count = [], 0
+                else:
+                    hash_value, storage_hit_count = self._storage_hit_query(operation)
                 storage_hit_count_tensor = torch.tensor(
                     storage_hit_count, dtype=torch.int
                 )
-                self._all_reduce_prefetch_groups(
-                    storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+                self._all_reduce(
+                    storage_hit_count_tensor,
+                    torch.distributed.ReduceOp.MIN,
+                    self.prefetch_hits_sync_groups,
                 )
                 storage_hit_count = storage_hit_count_tensor.item()
 
-                if storage_hit_count < self.prefetch_threshold:
-                    # not to prefetch if not enough benefits
                     # 中译：命中收益不足阈值——撤销该请求的预取并归还预分配的 host 内存。
-                    self.prefetch_revoke_queue.put(operation.request_id)
-                    self.append_host_mem_release(operation.host_indices)
-                    logger.debug(
-                        f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
-                    )
-                else:
-                    operation.hash_value = hash_value[
-                        : (storage_hit_count // self.page_size)
-                    ]
-                    # free the pre-allocated memory for pages that are not hit
                     # 中译：未命中的那部分页对应的预分配 host 内存先行释放，只保留命中范围。
-                    self.append_host_mem_release(
-                        operation.host_indices[storage_hit_count:]
-                    )
-                    operation.host_indices = operation.host_indices[:storage_hit_count]
-                    logger.debug(
-                        f"Prefetching {len(operation.hash_value)} pages for request {operation.request_id}."
-                    )
-                    self.prefetch_buffer.put(operation)
+                # Record the TP-synced hit count; the scheduler thread decides
+                # at drain time whether to revoke (below threshold) or allocate.
+                operation.hash_value = hash_value[
+                    : (storage_hit_count // self.page_size)
+                ]
+                operation.storage_hit_count = storage_hit_count
+                self.prefetch_hit_queue.put(operation)
 
             except Empty:
                 continue
@@ -1370,7 +1445,7 @@ class HiCacheController:
     def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
         # 中译：通用页写出（非零拷贝，待废弃）——从 host 池取出各页数据后 batch_set 到后端。
         data = [
-            self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
+            self.storage_host_pool.get_data_page(host_indices[i * self.page_size])
             for i in range(len(hash_values))
         ]
         return self.storage_backend.batch_set(hash_values, data)
@@ -1381,83 +1456,10 @@ class HiCacheController:
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
         )
 
-    def _draft_page_set(self, hash_values, host_indices) -> None:
-        """Best-effort write draft KV pages to L3 alongside the target backup.
-
-        中译：尽力而为地把草稿 KV 页随目标备份一起写入 L3；未配置或出错则静默跳过（不影响主流程）。
-        """
-        if self.draft_page_set_func is None:
-            return
-        try:
-            self.draft_page_set_func(hash_values, host_indices)
-        except Exception:
-            logger.debug(
-                "Draft L3 write failed (best-effort), skipping.", exc_info=True
-            )
-
-    def _draft_page_get(self, hash_values, host_indices) -> None:
-        """Best-effort read draft KV pages from L3 (mirrors `_draft_page_set`).
-
-        中译：尽力而为地从 L3 读回草稿 KV 页（与 _draft_page_set 对称）；出错静默跳过。
-        """
-        if self.draft_page_get_func is None:
-            return
-        try:
-            self.draft_page_get_func(hash_values, host_indices)
-        except Exception:
-            logger.debug("Draft L3 read failed (best-effort), skipping.", exc_info=True)
-
-    def _draft_page_set_v2(self, hash_values, host_indices) -> None:
         # 中译：多池零拷贝 v2 写出——以 DRAFT 池名打包 PoolTransfer 交给后端 batch_set_v2。
-        self.storage_backend.batch_set_v2(
-            [
-                PoolTransfer(
-                    name=PoolName.DRAFT,
-                    host_indices=host_indices,
-                    keys=list(hash_values),
-                )
-            ]
-        )
-
-    def _draft_page_get_v2(self, hash_values, host_indices) -> None:
         # 中译：多池零拷贝 v2 读回——以 DRAFT 池名打包 PoolTransfer 交给后端 batch_get_v2。
-        self.storage_backend.batch_get_v2(
-            [
-                PoolTransfer(
-                    name=PoolName.DRAFT,
-                    host_indices=host_indices,
-                    keys=list(hash_values),
-                )
-            ]
-        )
-
-    def _draft_page_set_generic(self, hash_values, host_indices) -> None:
-        # `{hash}.draft` mirrors HiCacheStorage._get_component_key's
-        # `{key}.{pool_name}` convention so target/draft pages never collide.
         # 中译：草稿键用 `{hash}.draft`，沿用 HiCacheStorage._get_component_key 的
-        #       `{key}.{pool_name}` 约定，确保目标页与草稿页的键永不冲突。
-        draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
-        draft_data = [
-            self.mem_pool_host_draft.get_data_page(host_indices[i * self.page_size])
-            for i in range(len(draft_keys))
-        ]
-        self.storage_backend.batch_set(draft_keys, draft_data)
-
-    def _draft_page_get_generic(self, hash_values, host_indices) -> None:
         # 中译：通用草稿读回——按 `{hash}.draft` 键 batch_get 取回草稿页，逐页写入草稿 host 池。
-        draft_keys = [f"{h}.{PoolName.DRAFT}" for h in hash_values]
-        draft_dummy = [
-            self.mem_pool_host_draft.get_dummy_flat_data_page() for _ in draft_keys
-        ]
-        draft_pages = self.storage_backend.batch_get(draft_keys, draft_dummy)
-        if draft_pages is None:
-            return
-        for i, p in enumerate(draft_pages):
-            if p is not None:
-                self.mem_pool_host_draft.set_from_flat_data_page(
-                    host_indices[i * self.page_size], p
-                )
-
     # Backup batch by batch
     def _page_backup(self, operation):
         # Backup batch by batch
@@ -1478,10 +1480,6 @@ class HiCacheController:
                     f"Write page to storage: {len(batch_hashes)} pages failed."
                 )
                 break
-
-            # Best-effort draft L3 write alongside target.
-            if self.has_draft:
-                self._draft_page_set(batch_hashes, batch_host_indices)
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
@@ -1506,3 +1504,29 @@ class HiCacheController:
 
             except Empty:
                 continue
+
+    def prefetch_sync_thread_func(self):
+        """Synchronize prefetch results across all PP and TP ranks."""
+        while not self.storage_stop_event.is_set():
+            try:
+                ack = self.prefetch_sync_queue.get(block=True, timeout=1)
+                if ack is None:
+                    continue
+                self._reduce_prefetch_ack(ack)
+                self.ack_prefetch_queue.put(ack)
+            except Empty:
+                continue
+
+    def _reduce_prefetch_ack(self, ack: PrefetchAck) -> None:
+        """Synchronize all ranks to agree on a PrefetchAck."""
+        if ack.completed_tokens is not None:
+            # Determine the minimal successful prefix of tokens.
+            completed_tokens_tensor = torch.tensor(
+                ack.completed_tokens, dtype=torch.int
+            )
+            self._all_reduce(
+                completed_tokens_tensor,
+                torch.distributed.ReduceOp.MIN,
+                self.prefetch_completion_sync_groups,
+            )
+            ack.completed_tokens = completed_tokens_tensor.item()

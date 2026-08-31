@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 """
-Dataclasses for embedding injection.
+Structs for embedding injection.
 
 These are placed in a separate module to avoid circular imports between
 io_struct.py and schedule_batch.py.
@@ -23,14 +23,13 @@ io_struct.py and schedule_batch.py.
       之所以单独放在本模块，是为了避免 io_struct.py 与 schedule_batch.py 之间的循环导入。
 """
 
-from dataclasses import dataclass
-from typing import List, Union
+from typing import List
 
+import msgspec
 import torch
 
 
-@dataclass
-class PositionalEmbeds:
+class PositionalEmbeds(msgspec.Struct, array_like=True):
     """Embeddings to place at specific token positions.
 
     Accepts either a list of [1, hidden_dim] tensors or a pre-stacked [N, hidden_dim] tensor.
@@ -51,7 +50,7 @@ class PositionalEmbeds:
           - positions：长度为 N 的位置列表，指明这些嵌入应注入到序列中的哪些 token 位置。
     """
 
-    embeds: Union[List[torch.Tensor], torch.Tensor]
+    embeds: torch.Tensor
     positions: List[int]
 
     def __post_init__(self):

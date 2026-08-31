@@ -17,8 +17,10 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
+    ClassVar,
     List,
     Optional,
 )
@@ -26,21 +28,32 @@ from typing import (
 import torch
 import zmq
 
+from sglang.srt.beam_search.output import (
+    beam_completion_tokens,
+    pack_beam_search_output,
+)
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
-    GetLoadsReqInput,
+    CachedTokensDetails,
+    wrap_as_pickle,
 )
 from sglang.srt.managers.schedule_batch import (
     BaseFinishReason,
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.runtime_context import get_observability, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.weight_versions import compute_weight_version_spans
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.rust_server import RustServer
+
 
 logger = logging.getLogger(__name__)
 
@@ -52,19 +65,7 @@ DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
 
 @dataclass(kw_only=True, slots=True)
 class SchedulerOutputStreamer:
-    """中译：输出流式发送器。聚合一批请求的输出并发送给 detokenizer。
-
-    各依赖字段（均由调度器注入）：
-    - send_to_detokenizer：发往 detokenizer 的发送封装（带 send_output 方法）。
-    - tree_cache：前缀缓存树，用于查询存储后端类型等。
-    - ps：并行状态（ParallelState），含 dp_rank、attn_tp_rank 等。
-    - is_generation：是否生成模型（否则走 embedding/reward 分支）。
-    - spec_algorithm：投机解码算法（none 时不收集投机统计）。
-    - disaggregation_mode：PD 分离模式（影响 input logprobs 是否发送等）。
-    - enable_hicache_storage / load_inquirer_get_loads：分别为「是否启用分层缓存存储」
-      与「查询负载」的回调。
-    - _test_stream_output_count：仅测试用的计数器（配合故障注入）。
-    """
+    has_additional_customized_info: ClassVar[bool] = False
 
     send_to_detokenizer: zmq.Socket
     tree_cache: BasePrefixCache
@@ -74,8 +75,18 @@ class SchedulerOutputStreamer:
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
-    load_inquirer_get_loads: Callable[..., Any]
+    # When SGLANG_RUST_SERVER is on, generation output is pushed to the embedded
+    # Rust egress ring via `rust_server.push_generation` instead of the zmq
+    # detokenizer. None otherwise. (Rust-specific state lives in RustServer.)
+    rust_server: Optional[RustServer] = None
     _test_stream_output_count: int = 0
+
+    def __post_init__(self) -> None:
+        if self.has_additional_customized_info and self.rust_server is not None:
+            raise ValueError(
+                "additional customized generation output is not supported by "
+                "Rust egress"
+            )
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache.
@@ -91,7 +102,7 @@ class SchedulerOutputStreamer:
                 storage_backend_type = type(storage_backend).__name__
         return storage_backend_type
 
-    def get_cached_tokens_details(self, req: Req) -> Optional[dict]:
+    def get_cached_tokens_details(self, req: Req) -> Optional[CachedTokensDetails]:
         """Get detailed cache breakdown for a request, if available.
 
         Returns:
@@ -185,21 +196,25 @@ class SchedulerOutputStreamer:
         return_indexer_topk = any(
             req.return_indexer_topk for req in reqs if req is not skip_req
         )
+        return_sampling_mask = any(
+            req.return_sampling_mask for req in reqs if req is not skip_req
+        )
 
         acc = _GenerationStreamAccumulator(
             return_logprob=return_logprob,
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
             return_indexer_topk=return_indexer_topk,
+            return_sampling_mask=return_sampling_mask,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
-            default_stream_interval=self.server_args.stream_interval,
+            default_stream_interval=get_serving().stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
+            rust_server_mode=self.rust_server is not None,
+            current_weight_version=get_serving().weight_version,
         )
         # 中译：查询当前核心负载（用于负载均衡/上报），随本批一起发送。
-        load = self.load_inquirer_get_loads(GetLoadsReqInput(include=["core"]))
-
         for req in reqs:
             if req is skip_req:
                 continue
@@ -214,16 +229,49 @@ class SchedulerOutputStreamer:
             acc.accept(req=req)
             self._maybe_log_time_stats(req=req)
 
+        if (
+            self.has_additional_customized_info
+            and self.should_build_additional_customized_info()
+        ):
+            additional_customized_info = self.build_additional_customized_info(
+                acc.output_reqs
+            )
+            for key, values in additional_customized_info.items():
+                if key in acc.customized_info:
+                    raise ValueError(f"duplicate customized_info key: {key}")
+                if len(values) != len(acc.output_reqs):
+                    raise ValueError(
+                        f"customized_info key {key!r} returned {len(values)} values "
+                        f"for {len(acc.output_reqs)} requests"
+                    )
+                acc.customized_info[key] = values
+
         # Send to detokenizer
         # 中译：把累加结果组装为可发送的 payload；为 None（无内容且非空转批次）时不发送。
         payload = acc.to_payload(
-            load=load,
             dp_rank=self.ps.dp_rank,
             is_idle_batch=is_idle_batch,
-            has_reqs=bool(reqs),
         )
         if payload is not None:
-            self.send_to_detokenizer.send_output(payload)
+            if self.rust_server is not None:
+                self.rust_server.push_generation(payload)
+            else:
+                self.send_to_detokenizer.send_output(payload)
+
+    def build_additional_customized_info(self, reqs: List[Req]) -> dict[str, list]:
+        """Return fields aligned with the emitted requests in ``reqs``.
+
+        Subclasses must set ``has_additional_customized_info`` to opt in. Each
+        returned value must have one entry per request. A matching
+        ``HostAuxiliaryOutput.consume`` call has already observed the tokens
+        committed in this scheduler step, so implementations can read buffered
+        per-request state here.
+        """
+        return {}
+
+    def should_build_additional_customized_info(self) -> bool:
+        """Return whether this invocation needs subclass-provided output fields."""
+        return True
 
     def _maybe_log_time_stats(self, *, req: Req) -> None:
         # 中译：仅在请求已结束、且当前是注意力张量并行的 0 号 rank、且开启了时间统计日志时，
@@ -231,7 +279,7 @@ class SchedulerOutputStreamer:
         if (
             req.finished()
             and self.ps.attn_tp_rank == 0
-            and self.server_args.enable_request_time_stats_logging
+            and get_observability().enable_request_time_stats_logging
         ):
             req.log_time_stats()
 
@@ -269,30 +317,35 @@ class SchedulerOutputStreamer:
                 if phs is not None:
                     has_phs = True
 
-        # Optimize PHS for pickle: torch.stack reduces N __reduce_ex__
-        # calls to 1 across the ZMQ IPC boundary.  We can only stack when
-        # *every* entry is non-None (homogeneous batch); mixed batches
-        # (some requests want PHS, others don't) keep the raw list so
-        # positional indexing on the receiver side stays correct.
         # 中译：优化 pooled_hidden_state（PHS）的序列化：把 N 个张量 stack 成一个，
-        #       可将跨 ZMQ 边界的 N 次 pickle 调用降为 1 次。仅当批内每项都非 None
-        #       且形状一致（同质批）才能 stack；混合批保留原列表，以保证接收端按位置索引仍正确。
+        # Optimize pooled hidden states (PHS) for IPC serialization.
+        # Two formats, disambiguated on the receiver side by length:
+        #   Stacked:     [stacked_tensor(N, ...)] — len 1, N > 1 requests
+        #   Non-stacked: [tensor_0, tensor_1, ...] — len == N
+        # Stacking reduces N pickle/__reduce_ex__ calls to 1.
+        # Only possible when all entries are non-None and same shape.
+        # See paired receiver logic in tokenizer_manager.py.
         stacked_phs = None
         if has_phs:
             all_have_phs = all(t is not None for t in phs_list)
             if all_have_phs:
-                if all(t.shape == phs_list[0].shape for t in phs_list):
-                    stacked_phs = torch.stack(phs_list)
+                if len(phs_list) > 1 and all(
+                    t.shape == phs_list[0].shape for t in phs_list
+                ):
+                    # Stacked: single tensor, wrapped in a list.
+                    stacked_phs = [torch.stack(phs_list)]
                 else:
+                    # Non-stacked: 1 request, mixed shapes, or mixed None.
                     stacked_phs = phs_list
             else:
+                # Non-stacked: some requests don't have PHS (None entries).
                 stacked_phs = phs_list
 
         self.send_to_detokenizer.send_output(
             BatchEmbeddingOutput(
                 rids=rids,
                 http_worker_ipcs=http_worker_ipcs,
-                time_stats=time_stats,
+                time_stats=wrap_as_pickle(time_stats),
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
                 prompt_tokens=prompt_tokens,
@@ -320,13 +373,15 @@ class _GenerationStreamAccumulator:
     return_hidden_states: bool
     return_routed_experts: bool
     return_indexer_topk: bool
+    return_sampling_mask: bool = False
     spec_algorithm: Any
     disaggregation_mode: DisaggregationMode
     default_stream_interval: int
     default_force_stream_interval: int
-    get_cached_tokens_details: Callable[[Req], Optional[dict]]
-
+    get_cached_tokens_details: Callable[[Req], Optional[CachedTokensDetails]]
+    current_weight_version: Optional[str]
     rids: list = field(default_factory=list)
+    output_reqs: list[Req] = field(default_factory=list)
     http_worker_ipcs: list = field(default_factory=list)
     finished_reasons: list = field(default_factory=list)
     decoded_texts: list = field(default_factory=list)
@@ -343,14 +398,22 @@ class _GenerationStreamAccumulator:
     cached_tokens_details: list = field(
         default_factory=list
     )  # Detailed breakdown by cache source
+    image_tokens: list = field(default_factory=list)
+    audio_tokens: list = field(default_factory=list)
+    video_tokens: list = field(default_factory=list)
     spec_verify_ct: list = field(default_factory=list)
     spec_num_correct_drafts: list = field(default_factory=list)
+    spec_num_block_accept_tokens: list = field(default_factory=list)
+    spec_num_cap_tokens: list = field(default_factory=list)
     spec_correct_drafts_histogram: list = field(default_factory=list)
+    spec_cap_lens_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
+    weight_versions: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
+    beam_search_output: list = field(default_factory=list)
     time_stats: list = field(default_factory=list)
     input_token_logprobs_val: Optional[list] = None
     input_token_logprobs_idx: Optional[list] = None
@@ -358,12 +421,24 @@ class _GenerationStreamAccumulator:
     output_token_logprobs_idx: Optional[list] = None
     input_top_logprobs_val: Optional[list] = None
     input_top_logprobs_idx: Optional[list] = None
+    # Per-request flat prompt top logprob arrays (return_flat_raw_top_logprobs);
+    # None entries for requests on the nested format.
+    input_top_logprobs_val_flat: Optional[list] = None
+    input_top_logprobs_idx_flat: Optional[list] = None
+    input_top_logprobs_flat_null_prefix: Optional[list] = None
+    has_input_top_logprobs_flat: bool = False
     output_top_logprobs_val: Optional[list] = None
     output_top_logprobs_idx: Optional[list] = None
     input_token_ids_logprobs_val: Optional[list] = None
     input_token_ids_logprobs_idx: Optional[list] = None
     output_token_ids_logprobs_val: Optional[list] = None
     output_token_ids_logprobs_idx: Optional[list] = None
+    output_token_sampling_mask: Optional[list] = None
+    output_token_sampling_logprobs: Optional[list] = None
+    # Rust server mode: the Rust detokenizer reconstructs text/ids from the raw
+    # output tokens itself and never consumes the scheduler's incremental-detok
+    # offsets (decode_ids / read_offset), so that per-step bookkeeping is skipped.
+    rust_server_mode: bool = False
 
     def __post_init__(self) -> None:
         # 中译：根据开关延迟初始化各可选字段为空 list（否则保持 None，表示本批不收集）。
@@ -381,15 +456,27 @@ class _GenerationStreamAccumulator:
             self.output_token_logprobs_idx = []
             self.input_top_logprobs_val = []
             self.input_top_logprobs_idx = []
+            self.input_top_logprobs_val_flat = []
+            self.input_top_logprobs_idx_flat = []
+            self.input_top_logprobs_flat_null_prefix = []
             self.output_top_logprobs_val = []
             self.output_top_logprobs_idx = []
             self.input_token_ids_logprobs_val = []
             self.input_token_ids_logprobs_idx = []
             self.output_token_ids_logprobs_val = []
             self.output_token_ids_logprobs_idx = []
+        if self.return_sampling_mask:
+            self.output_token_sampling_mask = []
+            self.output_token_sampling_logprobs = []
+
+    def _beam_admits(self, *, req: Req) -> bool:
+        # Only the leader is ever streamed, and only at group finish.
+        return req.is_beam_leader and req.finished()
 
     def accept(self, *, req: Req) -> None:
         # 中译：判定本请求本步是否需要输出，并在需要时把其各字段追加进累加器。
+        if req.beam_group is not None and not self._beam_admits(req=req):
+            return
         if req.finished():
             # 中译：请求已结束——必定输出最终结果。用 finished_output 标记避免重复发送，
             #       并记录结束时的输出长度 finished_len。
@@ -432,41 +519,84 @@ class _GenerationStreamAccumulator:
         send_token_offset = req.send_token_offset
         send_output_token_logprobs_offset = req.send_output_token_logprobs_offset
         self.rids.append(req.rid)
-        self.http_worker_ipcs.append(req.http_worker_ipc)
+        self.output_reqs.append(req)
         self.finished_reasons.append(
             req.finished_reason.to_json() if req.finished_reason else None
         )
-        self.decoded_texts.append(req.decoded_text)
         # 中译：初始化增量反向解码所需的数据：累计 token 列表与读取起点（read_offset）。
-        decode_ids, read_offset = req.init_incremental_detokenize()
-
         # 中译：只发送上次之后新增的 token（从 send_decode_id_offset 起切片），减少 IPC 体积。
-        self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
-
         # Exclude the tokens after stop condition
         # 中译：output_ids_through_stop 已排除命中停止条件之后的 token（只保留有效输出）。
         output_ids_ = req.output_ids_through_stop
-
         # 中译：推进 send_decode_id_offset，记录本次已发送到的位置，供下次切片续接。
-        req.send_decode_id_offset = len(decode_ids)
-        self.read_offsets.append(read_offset)
         # 中译：output_ids 同样只取新增部分（从 send_token_offset 起），并推进偏移。
         self.output_ids.append(output_ids_[send_token_offset:])
         req.send_token_offset = len(output_ids_)
-        self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
-        self.spaces_between_special_tokens.append(
-            req.sampling_params.spaces_between_special_tokens
-        )
-        self.no_stop_trim.append(req.sampling_params.no_stop_trim)
         self.prompt_tokens.append(len(req.origin_input_ids))
-        self.reasoning_tokens.append(req.reasoning_tokens)
-        self.completion_tokens.append(len(output_ids_))
-        self.cached_tokens.append(req.cached_tokens)
+        # Index-aligned with the batch items so mixed batches resolve per-item
+        # on the tokenizer side; None for non-beam items and aborted groups.
+        beam_output = (
+            pack_beam_search_output(req) if req.beam_group is not None else None
+        )
+        self.beam_search_output.append(beam_output)
 
-        # Collect detailed cache breakdown if available
-        self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+        if not self.rust_server_mode:
+            # Everything below feeds the Python DetokenizerManager /
+            # TokenizerManager (incremental detok, meta_info, per-request metrics)
+            # or gets pickled into the payload (time_stats). The Rust server
+            # replaces those stages and builds its own metadata from the
+            # ChunkEvent, so `push_generation` never reads these — skip the whole
+            # block. The parallel lists stay empty; the payload goes straight to
+            # `push_generation`, which only indexes the fields appended above.
+            self.http_worker_ipcs.append(req.http_worker_ipc)
+            self.decoded_texts.append(req.decoded_text)
+            decode_ids, read_offset = req.init_incremental_detokenize()
+            self.decode_ids_list.append(decode_ids[req.send_decode_id_offset :])
+            req.send_decode_id_offset = len(decode_ids)
+            self.read_offsets.append(read_offset)
+            self.skip_special_tokens.append(req.sampling_params.skip_special_tokens)
+            self.spaces_between_special_tokens.append(
+                req.sampling_params.spaces_between_special_tokens
+            )
+            self.no_stop_trim.append(req.sampling_params.no_stop_trim)
+            self.reasoning_tokens.append(req.reasoning_tokens)
+            self.completion_tokens.append(
+                beam_completion_tokens(beam_output)
+                if beam_output is not None
+                else len(output_ids_)
+            )
+            self.cached_tokens.append(req.cached_tokens)
+
+            # Collect detailed cache breakdown if available
+            self.cached_tokens_details.append(self.get_cached_tokens_details(req))
+
+        # Multimodal prompt token counts. In disagg decode mode the prefill node
+        # already computed these and transferred them via the metadata buffer
+        # (req.mm_*), so prefer the pre-stored values; otherwise compute them
+        # from the request's multimodal items.
+        if req.mm_image_tokens or req.mm_audio_tokens or req.mm_video_tokens:
+            image_t = req.mm_image_tokens
+            audio_t = req.mm_audio_tokens
+            video_t = req.mm_video_tokens
+        elif req.multimodal_inputs:
+            image_t, audio_t, video_t = req.multimodal_inputs.compute_mm_token_counts()
+        else:
+            image_t = audio_t = video_t = 0
+        self.image_tokens.append(image_t)
+        self.audio_tokens.append(audio_t)
+        self.video_tokens.append(video_t)
 
         self.retraction_counts.append(req.retraction_count)
+        if req.finished():
+            self.weight_versions.append(
+                compute_weight_version_spans(
+                    req.weight_version_events,
+                    current_version=self.current_weight_version,
+                    num_output_tokens=len(output_ids_),
+                )
+            )
+        else:
+            self.weight_versions.append(None)
 
         self.time_stats.append(req.time_stats)
 
@@ -474,7 +604,10 @@ class _GenerationStreamAccumulator:
         if not self.spec_algorithm.is_none():
             self.spec_verify_ct.append(req.spec_verify_ct)
             self.spec_num_correct_drafts.append(req.spec_num_correct_drafts)
+            self.spec_num_block_accept_tokens.append(req.spec_num_block_accept_tokens)
+            self.spec_num_cap_tokens.append(req.spec_num_cap_tokens)
             self.spec_correct_drafts_histogram.append(req.spec_correct_drafts_histogram)
+            self.spec_cap_lens_histogram.append(req.spec_cap_lens_histogram)
 
         if self.return_logprob:
             # 中译：input logprobs 只需发送一次（input_logprob_sent 标记）。
@@ -495,6 +628,17 @@ class _GenerationStreamAccumulator:
                 )
                 self.input_top_logprobs_val.append(req.logprob.input_top_logprobs_val)
                 self.input_top_logprobs_idx.append(req.logprob.input_top_logprobs_idx)
+                self.input_top_logprobs_val_flat.append(
+                    req.logprob.input_top_logprobs_val_flat
+                )
+                self.input_top_logprobs_idx_flat.append(
+                    req.logprob.input_top_logprobs_idx_flat
+                )
+                self.input_top_logprobs_flat_null_prefix.append(
+                    req.logprob.input_top_logprobs_flat_null_prefix
+                )
+                if req.logprob.input_top_logprobs_val_flat is not None:
+                    self.has_input_top_logprobs_flat = True
                 self.input_token_ids_logprobs_val.append(
                     req.logprob.input_token_ids_logprobs_val
                 )
@@ -508,13 +652,17 @@ class _GenerationStreamAccumulator:
                 self.input_token_logprobs_idx.append([])
                 self.input_top_logprobs_val.append([])
                 self.input_top_logprobs_idx.append([])
+                self.input_top_logprobs_val_flat.append(None)
+                self.input_top_logprobs_idx_flat.append(None)
+                self.input_top_logprobs_flat_null_prefix.append(None)
                 self.input_token_ids_logprobs_val.append([])
                 self.input_token_ids_logprobs_idx.append([])
 
             if req.return_logprob:
                 # 中译：output logprobs 取 [已发送偏移, logprob_end) 的增量；至少取 1 个，
-                #       从而保证 prefill 阶段最后一个位置的 logprob 也会被发出。
-                logprob_end = max(len(output_ids_), 1)
+                logprob_end = (
+                    len(output_ids_) if req.is_retracted else max(len(output_ids_), 1)
+                )
                 self.output_token_logprobs_val.append(
                     req.logprob.output_token_logprobs_val[
                         send_output_token_logprobs_offset:logprob_end
@@ -555,10 +703,42 @@ class _GenerationStreamAccumulator:
                 self.output_token_ids_logprobs_val.append([])
                 self.output_token_ids_logprobs_idx.append([])
 
+        if self.return_sampling_mask:
+            if req.return_sampling_mask:
+                send_output_sampling_mask_offset = req.send_output_sampling_mask_offset
+                sampling_mask_end = len(req.output_token_sampling_mask)
+                self.output_token_sampling_mask.append(
+                    req.output_token_sampling_mask[
+                        send_output_sampling_mask_offset:sampling_mask_end
+                    ]
+                )
+                self.output_token_sampling_logprobs.append(
+                    req.output_token_sampling_logprobs[
+                        send_output_sampling_mask_offset:sampling_mask_end
+                    ]
+                )
+                req.send_output_sampling_mask_offset = sampling_mask_end
+            else:
+                self.output_token_sampling_mask.append([])
+                self.output_token_sampling_logprobs.append([])
+
         if self.return_hidden_states:
-            self.output_hidden_states.append(
-                req.hidden_states if req.return_hidden_states else None
-            )
+            if req.return_hidden_states:
+                if req.return_hidden_states == "last":
+                    # Collection keeps this list bounded to the final valid
+                    # accepted token, including speculative verify overshoot.
+                    self.output_hidden_states.append(
+                        req.hidden_states[-1] if req.hidden_states else None
+                    )
+                else:
+                    # Mirror output_ids_through_stop: spec verify steps can
+                    # overshoot finished_len.
+                    hs = req.hidden_states
+                    if req.finished_len is not None:
+                        hs = hs[: req.finished_len]
+                    self.output_hidden_states.append(hs)
+            else:
+                self.output_hidden_states.append(None)
         if self.return_routed_experts:
             self.routed_experts.append(
                 req.routed_experts if req.return_routed_experts else None
@@ -569,18 +749,29 @@ class _GenerationStreamAccumulator:
             )
 
         # 中译：自定义信息按 key 分别收集，同样只取本次新增的 [send_token_offset, len) 区间。
+        current_output_len = len(self.output_ids[-1])
         if req.customized_info is not None:
-            for k, v in req.customized_info.items():
-                if k not in self.customized_info:
-                    self.customized_info[k] = []
-                self.customized_info[k].append(v[send_token_offset : len(output_ids_)])
+            for key, req_values in req.customized_info.items():
+                if key not in self.customized_info:
+                    self.customized_info[key] = [
+                        [None] * len(prev_output_ids)
+                        for prev_output_ids in self.output_ids[:-1]
+                    ]
+                self.customized_info[key].append(
+                    [None] * current_output_len
+                    if req_values is None
+                    else req_values[send_token_offset : len(output_ids_)]
+                )
+
+        for per_request_values in self.customized_info.values():
+            if len(per_request_values) < len(self.output_ids):
+                per_request_values.append([None] * current_output_len)
 
     def to_payload(
-        self, *, load, dp_rank: int, is_idle_batch: bool, has_reqs: bool
+        self, *, dp_rank: int, is_idle_batch: bool
     ) -> Optional[BatchTokenIDOutput]:
         # 中译：把累加结果打包为可发送对象。既无请求又非空转批次时返回 None（无需发送）。
-        #       空转（idle）批次虽无请求，仍需发送以驱动下游/保持节奏。
-        if not (has_reqs or is_idle_batch):
+        if not (self.rids or is_idle_batch):
             return None
         # 中译：为每个请求标注其所属的 data-parallel rank（无请求时置 None）。
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
@@ -589,8 +780,11 @@ class _GenerationStreamAccumulator:
             http_worker_ipcs=self.http_worker_ipcs,
             spec_verify_ct=self.spec_verify_ct,
             spec_num_correct_drafts=self.spec_num_correct_drafts,
+            spec_num_block_accept_tokens=self.spec_num_block_accept_tokens,
+            spec_num_cap_tokens=self.spec_num_cap_tokens,
             spec_correct_drafts_histogram=self.spec_correct_drafts_histogram,
-            time_stats=self.time_stats,
+            spec_cap_lens_histogram=self.spec_cap_lens_histogram,
+            time_stats=wrap_as_pickle(self.time_stats),
             finished_reasons=self.finished_reasons,
             decoded_texts=self.decoded_texts,
             decode_ids=self.decode_ids_list,
@@ -604,12 +798,32 @@ class _GenerationStreamAccumulator:
             completion_tokens=self.completion_tokens,
             cached_tokens=self.cached_tokens,
             cached_tokens_details=self.cached_tokens_details,
+            image_tokens=self.image_tokens,
+            audio_tokens=self.audio_tokens,
+            video_tokens=self.video_tokens,
             input_token_logprobs_val=self.input_token_logprobs_val,
             input_token_logprobs_idx=self.input_token_logprobs_idx,
             output_token_logprobs_val=self.output_token_logprobs_val,
             output_token_logprobs_idx=self.output_token_logprobs_idx,
             input_top_logprobs_val=self.input_top_logprobs_val,
             input_top_logprobs_idx=self.input_top_logprobs_idx,
+            # None on the common path so the wire payload is unchanged when no
+            # request in the batch uses the flat format.
+            input_top_logprobs_val_flat=(
+                self.input_top_logprobs_val_flat
+                if self.has_input_top_logprobs_flat
+                else None
+            ),
+            input_top_logprobs_idx_flat=(
+                self.input_top_logprobs_idx_flat
+                if self.has_input_top_logprobs_flat
+                else None
+            ),
+            input_top_logprobs_flat_null_prefix=(
+                self.input_top_logprobs_flat_null_prefix
+                if self.has_input_top_logprobs_flat
+                else None
+            ),
             output_top_logprobs_val=self.output_top_logprobs_val,
             output_top_logprobs_idx=self.output_top_logprobs_idx,
             input_token_ids_logprobs_val=self.input_token_ids_logprobs_val,
@@ -617,13 +831,26 @@ class _GenerationStreamAccumulator:
             output_token_ids_logprobs_val=self.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=self.output_token_ids_logprobs_idx,
             output_token_entropy_val=None,
+            output_token_sampling_mask=self.output_token_sampling_mask,
+            output_token_sampling_logprobs=self.output_token_sampling_logprobs,
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             indexer_topk=self.indexer_topk,
-            customized_info=self.customized_info,
+            customized_info=(
+                wrap_as_pickle(self.customized_info) if self.customized_info else None
+            ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,
-            load=load,
+            # All-None means no beam item in this batch; drop the list so
+            # non-beam traffic pays no carrier cost.
+            beam_search_output=(
+                self.beam_search_output
+                if any(x is not None for x in self.beam_search_output)
+                else None
+            ),
+            weight_versions=(
+                self.weight_versions if any(self.weight_versions) else None
+            ),
             dp_ranks=dp_ranks,
         )

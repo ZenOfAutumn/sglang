@@ -17,30 +17,16 @@ from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 import torch
 from torch.distributed import TCPStore
 
-logger = logging.getLogger(__name__)
+from sglang.srt.runtime_context import get_resources
 
-# 全局 TCPStore：在分布式环境初始化阶段创建。
-# 这是所有组件都应共用的「唯一」共享存储——TCPStore 是 PyTorch 提供的
-# 基于 TCP 的键值存储（类似分布式 KV 表），常用于在多进程间交换少量元数据
-# （如握手信息、地址、序号等），而非传大张量。
-_global_tcp_store: Optional[TCPStore] = None
+logger = logging.getLogger(__name__)
 
 
 def set_global_tcp_store(store: TCPStore) -> None:
-    """设置全局 TCPStore 实例。
+    """Install the shared TCPStore created during distributed initialization;
+    the handle lives on ``ctx.resources``."""
 
-    应在分布式初始化阶段调用一次，把创建好的 store 挂到全局，
-    使后续所有需要它的组件都能通过 get_global_tcp_store() 拿到同一个实例。
-
-    参数:
-        store: 已创建好的 TCPStore 实例。
-
-    示例:
-        >>> store = TCPStore("127.0.0.1", 29500, world_size=4, is_master=True)
-        >>> set_global_tcp_store(store)   # 之后任意组件均可 get_global_tcp_store() 取到它
-    """
-    global _global_tcp_store
-    _global_tcp_store = store
+    get_resources().tcp_store = store
     logger.info("Global TCPStore has been set")
 
 
@@ -60,15 +46,14 @@ def get_global_tcp_store() -> Optional[TCPStore]:
         ...     store.set("ready", b"1")     # 写入一个键
         ...     val = store.get("ready")      # 其他进程可读到 b"1"
     """
-    global _global_tcp_store
 
-    if _global_tcp_store is None:
+    store = get_resources().tcp_store
+    if store is None:
         logger.warning(
             "Global TCPStore not found. Make sure init_distributed_environment "
             "was called with a tcp:// init method."
         )
-
-    return _global_tcp_store
+    return store
 
 
 def ensure_divisibility(numerator, denominator):
@@ -187,6 +172,10 @@ def get_pp_indices(
     """
     # 环境变量未设置时为 None，走下面的自动均分逻辑。
     partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
+    if pp_size == 1:
+        # A singleton draft PP group owns every layer and must ignore the target's
+        # process-global pipeline partition list.
+        partition_list_str = None
     if partition_list_str is not None:
         # —— 分支 A：手动指定各段层数 ——
         try:

@@ -43,16 +43,29 @@ from sglang.srt.managers.io_struct import (
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
     BlockReqInput,
+    ElasticScaleUpdateReq,
     ProfileReq,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
+    sock_recv,
+    sock_send,
+    unwrap_from_pickle,
+    wrap_as_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
 from sglang.srt.observability.req_time_stats import DPControllerReqTimeStats
+from sglang.srt.observability.startup_time import aggregate_scheduler_startup_times
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+from sglang.srt.runtime_context import (
+    get_device,
+    get_disagg,
+    get_exec,
+    get_parallel,
+    publish,
+)
 from sglang.srt.server_args import (
     DP_ATTENTION_HANDSHAKE_PORT_DELTA,
     PortArgs,
@@ -186,14 +199,13 @@ class DataParallelController:
         self.server_args = server_args
         self.port_args = port_args
         self.load_balance_method = LoadBalanceMethod.from_str(
-            server_args.load_balance_method
+            get_parallel().load_balance_method
         )
         self.run_scheduler_process_func = run_scheduler_process_func
 
         # Init inter-process communication
         # 中译：初始化 ZMQ 上下文（IO 线程数 = 1 + dp_size）。仅 node_rank==0 的主节点直接从
-        #       TokenizerManager 拉取请求；其他节点不接请求，只跟着主节点跑 worker。
-        self.context = zmq.Context(1 + server_args.dp_size)
+        self.context = zmq.Context(1 + get_parallel().dp_size)
         if server_args.node_rank == 0:
             self.recv_from_tokenizer = get_zmq_socket(
                 self.context, zmq.PULL, port_args.scheduler_input_ipc_name, False
@@ -215,11 +227,18 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS,
         )
 
-        # Load balance budget
         # 中译：负载预算表与负载快照读取器（从共享内存读各 scheduler 的运行/等待请求数等）。
-        self.dp_budget = DPBudget(server_args.dp_size)
+        self.launch_dp_size: int = get_parallel().dp_size
+        self.max_dp_size: int = server_args.max_ep_size or get_parallel().dp_size
+        assert self.max_dp_size >= self.launch_dp_size, (
+            f"--max-ep-size ({self.max_dp_size}) must be >= "
+            f"--dp ({self.launch_dp_size})."
+        )
+
+        self.dp_active: List[bool] = [True] * self.launch_dp_size + [False] * (
+            self.max_dp_size - self.launch_dp_size
+        self.dp_budget = DPBudget(get_parallel().dp_size)
         self.load_snapshot_reader = create_load_snapshot_reader(
-            server_args,
             port_args,
             caller="DataParallelController",
         )
@@ -234,21 +253,21 @@ class DataParallelController:
         # 中译：scheduler_procs 保存所有已启动的 scheduler 子进程；workers 是发往各 DP worker 的
         #       PUSH 套接字（下标即 dp_rank）；status 标记各 worker 是否存活/可用。
         self.scheduler_procs = []
-        self.workers: List[zmq.Socket] = [None] * server_args.dp_size
-        self.status: List[bool] = [True] * server_args.dp_size
+        self.workers: List[Optional[zmq.Socket]] = [None] * self.max_dp_size
+        self.status: List[bool] = list(self.dp_active)
+        self._active_workers: List[int] = list(range(self.launch_dp_size))
+        self._active_count_cache: int = self.launch_dp_size
 
-        if server_args.enable_dp_attention:
             # 中译：DP attention 模式——所有 DP rank 复用同一 TP group，启动路径与端口分配不同。
+        if get_parallel().enable_dp_attention:
             self.launch_dp_attention_schedulers(server_args, port_args)
             # When local control broadcast is enabled, send control messages to
             # every DP group leader (attn_tp_rank=0) so each leader broadcasts
             # within its own attn_tp_group instead of the full tp_group.
             # Otherwise fall back to the original behaviour: send to only the
             # first leader, which then broadcasts over the full tp_group.
-            local_ctrl = server_args.enable_dp_attention_local_control_broadcast
             # 中译：control_message_step 是发送控制消息时在 workers 列表上的步长——开启本地控制
-            #       广播时每个 DP 组的 leader 都要收到（步长 1）；否则只发给首个 leader，由它在整个
-            #       tp_group 内广播（步长 = tp_size）。
+            local_ctrl = get_parallel().enable_dp_attention_local_control_broadcast
             self.control_message_step = 1 if local_ctrl else server_args.tp_size
         else:
             # 中译：普通 DP 模式——每个 DP rank 各自独立的 TP group，逐个启动。
@@ -261,7 +280,7 @@ class DataParallelController:
         # 中译：软看门狗，检测控制器是否卡死（soft 模式只告警不直接杀进程）。
         self.soft_watchdog = Watchdog.create(
             debug_name="DataParallelController",
-            watchdog_timeout=server_args.soft_watchdog_timeout,
+            watchdog_timeout=get_device().soft_watchdog_timeout,
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_DP_CONTROLLER.get(),
         )
@@ -273,18 +292,62 @@ class DataParallelController:
     def send_to_all_workers(self, obj):
         # 中译：把对象广播给所有「存活」的 worker（用于阻塞/解阻塞、profile 等全局控制消息）。
         for i, worker in enumerate(self.workers):
-            if self.status[i]:
-                worker.send_pyobj(obj)
+            if worker is not None and self.status[i]:
+                sock_send(worker, obj)
 
     def send_control_message(self, obj):
-        # Send control messages to first worker of tp group
         # 中译：把控制消息按 control_message_step 步长发给各 TP group 的 leader，由 leader 在组内广播。
-        for worker in self.workers[:: self.control_message_step]:
-            worker.send_pyobj(obj)
+        # 中译：更新各 DP rank 的存活状态（如某 worker 故障/恢复后由调度侧通知）。
+        for i in self._active_workers[:: self.control_message_step]:
+            worker = self.workers[i]
+            if worker is not None:
+                sock_send(worker, obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        # 中译：更新各 DP rank 的存活状态（如某 worker 故障/恢复后由调度侧通知）。
-        self.status = ranks.status
+        if get_exec().moe.elastic_ep_backend is not None:
+            if len(ranks.status) != self.max_dp_size:
+                logger.warning(
+                    "[Elastic EP][DPC] active rank status len=%d != max_dp_size=%d; "
+                    "ignoring update",
+                    len(ranks.status),
+                    self.max_dp_size,
+                )
+                return
+            self.status = [
+                self.dp_active[i] and bool(ranks.status[i])
+                for i in range(self.max_dp_size)
+            ]
+            self._refresh_active_workers()
+                "[DPC] update_active_ranks: status len=%d != max_dp_size=%d; "
+        self.status = list(ranks.status)
+    def add_elastic_workers(self, slot_offset: int, slot_count: int):
+        """Activate a range of pre-bound worker slots."""
+        end = slot_offset + slot_count
+        if end > self.max_dp_size:
+            raise ValueError(
+                f"[Elastic EP] add_elastic_workers: slot_offset={slot_offset} + "
+                f"slot_count={slot_count} exceeds max_dp_size={self.max_dp_size}. "
+                f"Restart with a larger --max-ep-size."
+        for slot in range(slot_offset, end):
+            if self.dp_active[slot]:
+                logger.debug(
+                    "[Elastic EP] add_elastic_workers: slot %d already active; "
+                    "skipping",
+                    slot,
+                continue
+            assert self.workers[slot] is not None, (
+                f"[Elastic EP] add_elastic_workers: slot {slot} was not "
+                f"pre-bound at launch; expected a primary-bound PUSH socket."
+            self.dp_active[slot] = True
+            self.status[slot] = True
+            "[Elastic EP] DataParallelController activated slots %s "
+            "(active=%d / max=%d)",
+            list(range(slot_offset, end)),
+            self._active_count_cache,
+    def _refresh_active_workers(self) -> None:
+        self._active_workers = [
+            i for i, active in enumerate(self.dp_active) if active and self.status[i]
+        self._active_count_cache = len(self._active_workers)
 
     def refresh_load_budget(self):
         # 中译：从负载快照刷新预算表，但做 20ms 节流。突发请求时若每次分发都刷新，会用（同一份
@@ -313,10 +376,14 @@ class DataParallelController:
         if refresh_load_budget and self.refresh_load_budget_on_dispatch:
             self.refresh_load_budget()
 
-        req.time_stats = DPControllerReqTimeStats.new_from_obj(req.time_stats)
+        time_stats = DPControllerReqTimeStats.new_from_obj(
+            unwrap_from_pickle(req.time_stats)
+        )
 
-        req.time_stats.set_dp_dispatch_time()
+        time_stats.set_dp_dispatch_time()
+        req.time_stats = wrap_as_pickle(time_stats)
         self.dispatching(req)
+        req.time_stats = time_stats
         req.time_stats.set_dp_dispatch_finish_time()
 
     def dispatch_batch_generate(self, batch_req: BatchTokenizedGenerateReqInput):
@@ -347,6 +414,12 @@ class DataParallelController:
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
+                (
+                    ElasticScaleUpdateReq,
+                    lambda msg: self.add_elastic_workers(
+                        msg.slot_offset, msg.slot_count
+                    ),
+                ),
             ]
         )
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
@@ -363,8 +436,8 @@ class DataParallelController:
         threads = []
         sockets = []
         ready_events = []
-        for dp_rank in range(server_args.dp_size):
             # 中译：为该 dp_rank 生成一套新端口，但复用全局共享的 tokenizer/detokenizer IPC 名与 instance_id。
+        for dp_rank in range(get_parallel().dp_size):
             tmp_port_args = PortArgs.init_new(server_args)
             tmp_port_args.tokenizer_ipc_name = port_args.tokenizer_ipc_name
             tmp_port_args.detokenizer_ipc_name = port_args.detokenizer_ipc_name
@@ -386,7 +459,7 @@ class DataParallelController:
             )
             threads.append(thread)
             base_gpu_id += (
-                server_args.tp_size * server_args.pp_size * server_args.gpu_id_step
+                server_args.tp_size * get_parallel().pp_size * server_args.gpu_id_step
             )
 
             if server_args.node_rank == 0:
@@ -451,9 +524,9 @@ class DataParallelController:
               参数 worker_ports：node 0 预分配待广播的端口（其他节点传入 None）。
               返回：广播后各节点一致的 worker 端口列表。
         """
-        # Determine the endpoint for inter-node communication
         # 中译：确定跨节点通信的端点地址（在分布式初始化地址或 host:port 基础上加固定偏移）。
-        if server_args.dist_init_addr is None:
+        is_joiner = server_args.is_ep_scale_joiner
+        if server_args.dist_init_addr is None or is_joiner:
             na = NetworkAddress(
                 server_args.host or "127.0.0.1",
                 server_args.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA,
@@ -494,12 +567,12 @@ class DataParallelController:
             while connected_clients < expected_clients:
                 # Wait for client handshake
                 # 中译：等待某个客户端节点发来握手（携带其 node rank）。
-                client_rank = rep_socket.recv().decode()
+                # 中译：把端口列表回给该客户端，并累计已连接数。
+                client_rank = sock_recv(rep_socket)
                 logger.debug(f"Received handshake from node {client_rank}")
 
                 # Send worker ports to client
-                # 中译：把端口列表回给该客户端，并累计已连接数。
-                rep_socket.send_pyobj(worker_ports)
+                sock_send(rep_socket, wrap_as_pickle(worker_ports))
                 connected_clients += 1
                 logger.debug(
                     f"Sent worker ports to {connected_clients}/{expected_clients} nodes"
@@ -509,7 +582,7 @@ class DataParallelController:
             return worker_ports
         finally:
             # 中译：未启用弹性 EP 时直接关闭套接字；否则交给后台线程持续应答（供 EP 恢复使用）。
-            if self.server_args.elastic_ep_backend is None:
+            if get_exec().moe.elastic_ep_backend is None:
                 rep_socket.close()
             else:
                 threading.Thread(
@@ -519,17 +592,13 @@ class DataParallelController:
                 ).start()
 
     def _reply_ports_as_server(self, rep_socket: zmq.Socket, worker_ports: List[int]):
-        """
-        Runs as a background thread to broadcast worker ports for recovered EP ranks
-
-        中译：作为后台线程长期运行，为「恢复后的 EP rank」持续应答端口请求（弹性 EP 场景）。
-              单次 recv/decode 失败不致命，记录异常后继续循环等待下一次握手。
-        """
-        while True:
-            # Wait for client handshake
             # 中译：等待客户端握手；失败则记录异常并继续，不退出线程。
+        """Background thread: serve the pre-bound worker-port list to
+        late-arriving elastic joiners. Publishes port numbers only; the primary
+        keeps ownership of every socket."""
+        while True:
             try:
-                client_rank = rep_socket.recv().decode()
+                client_rank = sock_recv(rep_socket)
             except Exception:
                 logger.exception(
                     "Failed to recv/decode handshake in reply thread; continue"
@@ -538,7 +607,7 @@ class DataParallelController:
             logger.debug(f"Received handshake from node {client_rank}")
 
             # Send worker ports to client
-            rep_socket.send_pyobj(worker_ports)
+            sock_send(rep_socket, wrap_as_pickle(worker_ports))
             logger.debug(f"Sent worker ports to node {client_rank}")
 
     def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> List[int]:
@@ -557,11 +626,11 @@ class DataParallelController:
         try:
             # Send handshake with our node rank
             # 中译：发送握手，携带本节点的 node_rank。
-            req_socket.send(str(node_rank).encode())
+            # 中译：接收 node 0 回传的端口列表。
+            sock_send(req_socket, wrap_as_pickle(str(node_rank)))
 
             # Receive worker ports
-            # 中译：接收 node 0 回传的端口列表。
-            worker_ports = req_socket.recv_pyobj()
+            worker_ports = sock_recv(req_socket)
             logger.debug(f"Received {len(worker_ports)} worker ports from node 0")
             return worker_ports
         except zmq.Again:
@@ -571,6 +640,12 @@ class DataParallelController:
             )
         finally:
             req_socket.close()
+
+    def _joiner_local_tp_span(self, server_args: ServerArgs) -> int:
+        return server_args.tp_size
+
+    def _joiner_slot_offset(self, server_args: ServerArgs) -> int:
+        return server_args.ep_join_rank_offset
 
     def launch_dp_attention_schedulers(
         self, server_args: ServerArgs, port_args: PortArgs
@@ -585,27 +660,44 @@ class DataParallelController:
         else:
             bind_host = NetworkAddress.parse(server_args.dist_init_addr).host
 
-        # Pre-allocate worker ports on node 0 to avoid conflicts
         # 中译：在 node 0 上为每个 dp_rank 预分配 PUSH 端口/套接字，避免后续端口冲突。
         worker_ports = []
-        if server_args.node_rank == 0:
-            for dp_rank in range(server_args.dp_size):
+        if server_args.is_ep_scale_joiner:
+            # Scale joiners connect to their pre-bound primary worker sockets.
+            primary = NetworkAddress.parse(server_args.dist_init_addr)
+            primary_endpoint = NetworkAddress(
+                primary.host, primary.port + DP_ATTENTION_HANDSHAKE_PORT_DELTA
+            ).to_tcp()
+            all_ports = self._receive_ports_as_client(
+                primary_endpoint, server_args.node_rank
+            )
+            offset = self._joiner_slot_offset(server_args)
+            local_tp_span = self._joiner_local_tp_span(server_args)
+            broadcasted_ports = all_ports[offset : offset + local_tp_span]
+        elif server_args.node_rank == 0:
+            # Elastic primaries reserve sockets for the maximum DP size.
+            bind_count = (
+                self.max_dp_size
+                if server_args.elastic_ep_backend is not None
+                else get_parallel().dp_size
+            )
+            for slot in range(bind_count):
                 worker_port, worker_socket = get_zmq_socket_on_host(
                     self.context, zmq.PUSH, host=bind_host
                 )
                 worker_ports.append(worker_port)
-                self.workers[dp_rank] = worker_socket
+                self.workers[slot] = worker_socket
                 logger.debug(
-                    "Assigned port %s to worker %s on host %s",
+                    "Assigned port %s to worker slot %s on host %s",
                     worker_port,
-                    dp_rank,
+                    slot,
                     bind_host,
                 )
+            broadcasted_ports = self._broadcast_worker_ports(server_args, worker_ports)
+        else:
+            broadcasted_ports = self._broadcast_worker_ports(server_args, None)
 
         # 中译：把端口广播给所有节点，得到全局一致的端口列表。
-        broadcasted_ports = self._broadcast_worker_ports(
-            server_args, worker_ports if worker_ports else None
-        )
         # 中译：以单个 TP group 启动（dp_rank 传 None，由内部按 attention 分片推导各 rank）。
         self.launch_tensor_parallel_group(
             server_args, port_args, 0, None, broadcasted_ports
@@ -619,14 +711,7 @@ class DataParallelController:
         dp_rank: Optional[int],
         worker_ports: Optional[List[int]] = None,
     ):
-        """中译：启动一个 TP group 内的全部 scheduler 进程（按本节点负责的 PP/TP rank 区间）。
-
-        负责：根据节点拓扑计算本节点应承载的 pp_rank/tp_rank 范围，为每个 (pp_rank, tp_rank)
-        组合算出 GPU id 及各并行维度（attn_cp/moe_dp/moe_ep）的 rank，逐个以子进程方式拉起
-        scheduler，并通过管道等待各进程上报模型加载完成的信息（如 max_total_num_tokens）。
-        参数 dp_rank：普通 DP 模式下为具体 rank；DP attention 模式下传 None，由内部推导。
-        """
-        if not server_args.enable_dp_attention:
+        if not get_parallel().enable_dp_attention:
             logger.info(f"Launch DP{dp_rank} starting at GPU #{base_gpu_id}.")
 
         # 中译：显存节省适配器（可在空闲时把权重暂存到 CPU 等），按配置启用。
@@ -638,8 +723,8 @@ class DataParallelController:
         scheduler_pipe_readers = []
 
         # 中译：以下一段根据节点数 nnodes 把 PP/TP 维度切分到各节点，算出本节点负责的 rank 区间。
-        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
-        nnodes_per_pp_rank = max(server_args.nnodes // server_args.pp_size, 1)
+        pp_size_per_node = max(get_parallel().pp_size // server_args.nnodes, 1)
+        nnodes_per_pp_rank = max(server_args.nnodes // get_parallel().pp_size, 1)
         pp_rank_range = range(
             pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
             pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
@@ -647,10 +732,15 @@ class DataParallelController:
 
         nnodes_per_tp_group = nnodes_per_pp_rank
         tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
-        tp_rank_range = range(
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
-        )
+        if server_args.is_ep_scale_joiner:
+            # Scale joiners enumerate their full local TP span.
+            tp_rank_range = range(server_args.tp_size)
+            tp_size_per_node = server_args.tp_size
+        else:
+            tp_rank_range = range(
+                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
+                tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+            )
 
         attn_cp_rank = 0
         moe_dp_rank = 0
@@ -659,21 +749,31 @@ class DataParallelController:
             for tp_rank in tp_rank_range:
                 rank_port_args = port_args
 
-                if server_args.enable_dp_attention:
+                if get_parallel().enable_dp_attention:
                     # dp attention has different sharding logic
                     # 中译：DP attention 的分片逻辑不同——由 tp_rank 反推该进程所属的 dp_rank，
                     #       并为该 dp_rank 计算独立的 zmq 端口。
                     _, _, dp_rank, _ = compute_dp_attention_world_info(
-                        server_args.enable_dp_attention,
+                        get_parallel().enable_dp_attention,
                         tp_rank,
                         server_args.tp_size,
-                        server_args.dp_size,
-                        server_args.attn_cp_size,
+                        get_parallel().dp_size,
+                        get_parallel().attn_cp_size,
                     )
                     # compute zmq ports for this dp rank
                     rank_port_args = PortArgs.init_new(
                         server_args, dp_rank, worker_ports
                     )
+                    if server_args.is_ep_scale_joiner:
+                        # Scale-joiner outputs return through the primary tokenizer.
+                        primary_addr = NetworkAddress.parse(server_args.dist_init_addr)
+                        primary_port_base = primary_addr.port + 1
+                        rank_port_args.tokenizer_ipc_name = NetworkAddress(
+                            primary_addr.host, primary_port_base
+                        ).to_tcp()
+                        rank_port_args.detokenizer_ipc_name = NetworkAddress(
+                            primary_addr.host, primary_port_base + 1
+                        ).to_tcp()
                     # Data parallelism reuses the tensor parallelism group,
                     # so all dp ranks should use the same nccl port.
                     # 中译：DP attention 复用同一 TP group，故所有 dp rank 共用同一个 nccl 端口。
@@ -690,7 +790,7 @@ class DataParallelController:
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
                 attn_dp_size = (
-                    server_args.dp_size if server_args.enable_dp_attention else 1
+                    get_parallel().dp_size if get_parallel().enable_dp_attention else 1
                 )
 
                 # Parallelism hierarchy (outermost to innermost):
@@ -701,24 +801,28 @@ class DataParallelController:
                 # - MoE 侧：全局 TP → MOE_DP → EP → MOE_TP。
                 #       下面据此从 tp_rank 反推该进程在各并行维度上的 rank。
                 attn_tp_size = (
-                    server_args.tp_size // attn_dp_size // server_args.attn_cp_size
+                    server_args.tp_size // attn_dp_size // get_parallel().attn_cp_size
                 )
-                attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
+                attn_cp_rank = (tp_rank // attn_tp_size) % get_parallel().attn_cp_size
                 moe_dp_rank = tp_rank // (
-                    server_args.tp_size // server_args.moe_dp_size
+                    server_args.tp_size // get_parallel().moe_dp_size
                 )
                 moe_ep_rank = (
                     tp_rank
-                    % (server_args.tp_size // server_args.moe_dp_size)
+                    % (server_args.tp_size // get_parallel().moe_dp_size)
                     // (
                         server_args.tp_size
-                        // server_args.moe_dp_size
-                        // server_args.ep_size
+                        // get_parallel().moe_dp_size
+                        // get_parallel().ep_size
                     )
                 )
 
                 # 中译：env_lock 保护设置设备可见性的临界区；maybe_reindex_device_id 可能把
-                #       gpu_id 重映射为进程内可见的设备序号。随后以子进程启动 scheduler。
+                # Scheduler internals use local ranks; logs use global ranks.
+                offset = server_args.ep_join_rank_offset
+                display_tp_rank = tp_rank + offset
+                display_moe_ep_rank = moe_ep_rank + offset
+                display_dp_rank = dp_rank + offset if dp_rank is not None else None
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
                     proc = mp.Process(
                         target=self.run_scheduler_process_func,
@@ -733,6 +837,9 @@ class DataParallelController:
                             pp_rank,
                             dp_rank,
                             writer,
+                            display_tp_rank,
+                            display_dp_rank,
+                            display_moe_ep_rank,
                         ),
                     )
                     with (
@@ -752,13 +859,24 @@ class DataParallelController:
         # 中译：取首个进程上报的 KV 缓存总 token 容量与最大请求输入长度，作为本控制器的全局上限。
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+        self.startup_time = aggregate_scheduler_startup_times(
+            info.get("startup_time") for info in scheduler_info
+        )
 
     def maybe_external_dp_rank_routing(self, req: Req):
         # 中译：若请求已显式指定目标 DP rank（routed_dp_rank），直接路由到该 worker 并返回 True；
         #       否则返回 False，交由后续负载均衡策略选择目标。
         if req.routed_dp_rank is not None:
-            logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
-            self.workers[req.routed_dp_rank].send_pyobj(req)
+            rank = req.routed_dp_rank
+            if (
+                rank < 0
+                or rank >= len(self.workers)
+                or rank not in self._active_workers
+                or self.workers[rank] is None
+            ):
+                raise ValueError(f"DP rank {rank} is not active.")
+            logger.debug(f"Direct routing to DP rank {rank}")
+            sock_send(self.workers[rank], req)
             return True
         return False
 
@@ -768,17 +886,22 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        while True:
-            if self.status[self.round_robin_counter]:
-                logger.debug(f"Choose worker {self.round_robin_counter}")
-                self.workers[self.round_robin_counter].send_pyobj(req)
-                self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                    self.workers
-                )
-                break
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                self.workers
-            )
+        active = self._active_workers
+        if not active:
+            raise RuntimeError("No active DP workers are available for routing.")
+        attempts = 0
+        while attempts < len(active):
+            slot = active[self.round_robin_counter % len(active)]
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
+            if self.status[slot]:
+                logger.debug(f"Choose worker {slot}")
+                sock_send(self.workers[slot], req)
+                return
+            attempts += 1
+        raise RuntimeError(
+            f"Cannot route request: all {len(active)} active DP workers "
+            "are unavailable."
+        )
 
     def follow_bootstrap_room_scheduler(self, req: Req):
         # 中译：按 bootstrap_room 取模选 worker，保证同一会话的请求落到固定 rank（PD 分离需 prefill
@@ -792,14 +915,14 @@ class DataParallelController:
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
-        self.workers[target_rank].send_pyobj(req)
+        sock_send(self.workers[target_rank], req)
 
     def total_requests_scheduler(self, req: Req):
         # 中译：按「累计请求数最少」选 worker 发送。
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        self.workers[target_worker].send_pyobj(req)
+        sock_send(self.workers[target_worker], req)
 
     def total_tokens_scheduler(self, req: Req):
         # 中译：按「累计 token 数最少」选 worker 发送；用输入 token 数作为本请求的预估负载。
@@ -809,7 +932,7 @@ class DataParallelController:
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
-        self.workers[target_worker].send_pyobj(req)
+        sock_send(self.workers[target_worker], req)
 
     def event_loop(self):
         # 中译：主事件循环。持续非阻塞地从 TokenizerManager 拉取请求并交分发器处理；
@@ -818,7 +941,7 @@ class DataParallelController:
             while True:
                 self.soft_watchdog.feed()
                 try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
                 self._request_dispatcher(recv_req)
@@ -840,6 +963,8 @@ def run_data_parallel_controller_process(
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
+    # This process reads the config namespaces before spawning schedulers.
+    publish(server_args, role="dp_controller")
     configure_logger(server_args)
     if server_args.enable_trace:
         # 中译：启用追踪时初始化追踪上下文，并按 PD 分离角色设置线程标签。
@@ -849,9 +974,9 @@ def run_data_parallel_controller_process(
             trace_modules=server_args.trace_modules,
         )
         thread_label = "DP Controller"
-        if server_args.disaggregation_mode == "prefill":
+        if get_disagg().disaggregation_mode == "prefill":
             thread_label = "Prefill DP Controller"
-        elif server_args.disaggregation_mode == "decode":
+        elif get_disagg().disaggregation_mode == "decode":
             thread_label = "Decode DP Controller"
         trace_set_thread_info(thread_label)
 
@@ -869,11 +994,13 @@ def run_data_parallel_controller_process(
                 "status": "ready",
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
+                "startup_time": controller.startup_time,
                 SCHEDULER_PIDS_ARG: scheduler_pids,
             }
         )
         # 中译：仅主节点跑请求分发事件循环；其余节点不接请求。
-        if server_args.node_rank == 0:
+        # The primary owns routing for the expanded scheduler set.
+        if server_args.node_rank == 0 and not server_args.is_ep_scale_joiner:
             controller.event_loop()
         # 中译：阻塞等待各 scheduler 子进程退出（正常情况下不会发生，退出即视为异常并记录）。
         for proc in controller.scheduler_procs:

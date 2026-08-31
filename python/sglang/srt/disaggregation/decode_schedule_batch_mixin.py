@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import logging
-from array import array
 from http import HTTPStatus
 from typing import TYPE_CHECKING, List
 
 import torch
 
+from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.server_args import ServerArgs
 
 
 class ScheduleBatchDisaggregationDecodeMixin:
@@ -39,33 +38,32 @@ class ScheduleBatchDisaggregationDecodeMixin:
         # 标记为 PREBUILT 前向模式（区别于普通的 EXTEND / DECODE）。
         self.forward_mode = ForwardMode.PREBUILT
         reqs = self.reqs
-        # 每个请求的待填充 token：去掉已命中前缀（prefix_indices）后的那部分输入。
-        input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
-        extend_num_tokens = sum(len(ids) for ids in input_ids)
+        # PREBUILT never enters a model forward. Keep the legacy scalar metadata,
+        # but do not flatten and copy every transferred prompt to the GPU only to
+        # discard it before the first decode step.
         seq_lens = []
         pre_lens = []
         req_pool_indices = []
 
-        # 预先算出总长度（所有请求 extend 部分的 token 总数），一次性分配输出缓存位置张量。
-        total_size = sum(req.extend_input_len for req in reqs)
+        # Pre-calculate total size
+        total_size = sum(req.extend_range.length for req in reqs)
+        extend_num_tokens = total_size
         out_cache_loc = torch.empty(total_size, dtype=torch.int64, device=self.device)
 
         # 单趟遍历填充该张量（避免多次拼接/拷贝）。
         offset = 0
         for i, req in enumerate(reqs):
-            req_pool_indices.append(req.req_pool_idx)
+            req_pool_indices.append(req.kv.req_pool_idx)
             pre_len = len(req.prefix_indices)
 
-            # 从 req_to_token 映射中取出该请求 extend 部分对应的 KV 槽位索引，
-            # 拼到全局的 out_cache_loc 里（告诉前向：输出写到这些 KV 槽位）。
-            chunk = self.req_to_token_pool.req_to_token[req.req_pool_idx][
-                pre_len : pre_len + req.extend_input_len
+            chunk = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx][
+                pre_len : pre_len + req.extend_range.length
             ]
             assert (
-                offset + req.extend_input_len <= total_size
-            ), f"Exceeds total size: offset={offset}, req.extend_input_len={req.extend_input_len}, total_size={total_size}"
-            out_cache_loc[offset : offset + req.extend_input_len] = chunk
-            offset += req.extend_input_len
+                offset + req.extend_range.length <= total_size
+            ), f"Exceeds total size: offset={offset}, req.extend_range.length={req.extend_range.length}, total_size={total_size}"
+            out_cache_loc[offset : offset + req.extend_range.length] = chunk
+            offset += req.extend_range.length
 
             # 序列长度 = 原始输入长度 + 已生成输出（减 1，因最后一个输出 token 本次才待解码）。
             seq_len = len(req.origin_input_ids) + max(0, len(req.output_ids) - 1)
@@ -73,8 +71,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
             if len(req.output_ids) == 0:
                 # 尚未产出任何输出时，序列只包含前缀 + 本次 extend，两者应严格对应。
                 assert (
-                    seq_len - pre_len == req.extend_input_len
-                ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_input_len={req.extend_input_len}"
+                    seq_len - pre_len == req.extend_range.length
+                ), f"seq_len={seq_len}, pre_len={pre_len}, req.extend_range.length={req.extend_range.length}"
 
             if not req.retracted_stain:
                 # 限幅（clamp）以避免重复计数：already_computed 在 _commit_transfer_to_req 里
@@ -85,16 +83,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 req.cached_tokens_device += delta
                 req.already_computed = seq_len
             req.is_retracted = False
+            if getattr(req, "pd_rebootstrap_in_progress", False):
+                req.pd_rebootstrap_in_progress = False
             pre_lens.append(pre_len)
-            # PREBUILT 阶段不重算 prefill 的 logprob，起始位置置 0。
-            req.extend_logprob_start_len = 0
 
-        extend_input_logprob_token_ids = None
-
-        # 把逐请求收集到的元数据写回 batch 字段（同时准备 device 与 cpu 两份，供不同路径使用）。
-        self.input_ids = torch.tensor(
-            sum(input_ids, array("q")), dtype=torch.int32, device=self.device
-        )
+        # Set fields
+        # The first decode input and speculative extras are seeded by
+        # process_prebuilt through FutureMap, so merge/forward-entry rebuilds
+        # input_ids from the relay.
+        self.input_ids = None
         self.req_pool_indices = torch.tensor(
             req_pool_indices, dtype=torch.int64, device=self.device
         )
@@ -114,9 +111,9 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         self.extend_num_tokens = extend_num_tokens
         self.prefix_lens = [len(r.prefix_indices) for r in reqs]
-        self.extend_lens = [r.extend_input_len for r in reqs]
-        self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
-        self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
+        self.extend_lens = [r.extend_range.length for r in reqs]
+        self.extend_logprob_start_lens = None
+        self.extend_input_logprob_token_ids = None
         self.multimodal_inputs = [r.multimodal_inputs for r in reqs]
 
         # 构建采样信息（温度、top-p/top-k、惩罚项等），供后续采样使用。
@@ -127,7 +124,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
     def process_prebuilt(
         self: ScheduleBatch,
-        server_args: ServerArgs,
         future_map: FutureMap,
     ):
         """把缓存的「最后一个输入 token」指派给调度 batch。
@@ -168,14 +164,15 @@ class ScheduleBatchDisaggregationDecodeMixin:
         # 交由投机解码算法基于首 token 构建分离场景的草稿输入（若启用）。
         spec_info = self.spec_algorithm.build_disagg_draft_input(
             self,
-            server_args,
             last_tokens_tensor,
             future_map,
         )
         if spec_info is not None:
             self.spec_info = spec_info
         else:
-            # 非投机场景：把首 token 暂存到 relay，使首次 DECODE 的 resolve_forward_inputs
-            # 能像处理其他解码迭代那样收集到它。
-            future_map.stash(self.req_pool_indices, last_tokens_tensor)
+            # Non-spec: stash last token into the relay so the first DECODE's
+            # resolve_forward_inputs gathers it like any other decode iter.
+            future_map.stash(
+                self.req_pool_indices, RelayPayload(bonus_tokens=last_tokens_tensor)
+            )
             self.input_ids = None

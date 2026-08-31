@@ -1,40 +1,15 @@
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 
-from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 logger = logging.getLogger(__name__)
-
-
-def _draft_runner_of(worker):
-    """跨 worker 形状获取草稿 model_runner 的访问器。
-
-    V2 草稿 worker（``EagleDraftWorker`` 及其子类）通过 ``draft_runner``
-    暴露草稿 model_runner；对于直接运行草稿模型的 worker，回退到 ``model_runner``。
-
-    输入:
-        worker: 投机 worker 实例
-
-    输出:
-        草稿模型的 ModelRunner
-
-    示例::
-
-        >>> runner = _draft_runner_of(eagle_worker)
-        >>> runner.model_config.spec_hidden_size
-        2048
-    """
-    return (
-        worker.draft_runner if hasattr(worker, "draft_runner") else worker.model_runner
-    )
 
 
 @dataclass
@@ -81,7 +56,9 @@ class EagleVerifyInput(SpecInput):
     capture_hidden_mode: CaptureHiddenMode
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
-    grammar: BaseGrammarObject = None
+    # Stacked per-step draft proposal distribution q, shape (bs, num_steps,
+    # vocab); only set under rejection sampling. Consumed by the verify kernel.
+    draft_probs: torch.Tensor = None
 
     # padding 用的形状信息
     num_tokens_per_req: int = -1  # -1 时自动从 draft_token_num 填充
@@ -90,6 +67,7 @@ class EagleVerifyInput(SpecInput):
         super().__init__(SpecInputType.EAGLE_VERIFY)
         if self.num_tokens_per_req < 0:
             self.num_tokens_per_req = self.draft_token_num
+        self.num_tokens_for_logprob_per_req = self.draft_token_num
 
     @property
     def max_tree_depth(self) -> int:
@@ -111,47 +89,22 @@ class EagleVerifyInput(SpecInput):
         """传递给树验证 kernel 的分支因子；-1 表示不规则树（无固定每层分支数）。"""
         return self.topk
 
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        """返回 (显存预留系数, 调度预留系数)，两者均等于 draft_token_num。
-
-        示例::
-
-            >>> # draft_token_num=8 时
-            >>> verify_input.get_spec_adjust_token_coefficient()
-            (8, 8)
-        """
-        return self.draft_token_num, self.draft_token_num
-
     @classmethod
-    def create_idle_input(cls, topk: int, spec_steps: int, num_verify_tokens: int):
-        """创建空闲（无请求）状态的验证输入。
-
-        输入:
-            topk: 分支数
-            spec_steps: 草稿步数
-            num_verify_tokens: 验证 token 数
-
-        输出:
-            EagleVerifyInput，所有张量长度为 0
-
-        示例::
-
-            >>> idle = EagleVerifyInput.create_idle_input(topk=4, spec_steps=5, num_verify_tokens=8)
-            >>> idle.draft_token.shape
-            torch.Size([0])
-        """
+    def create_idle_input(
+        cls, topk: int, spec_steps: int, num_verify_tokens: int, device: str
+    ):
         return cls(
-            draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
-            custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
-            positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
+            draft_token=torch.empty((0,), dtype=torch.long, device=device),
+            custom_mask=torch.full((0,), True, dtype=torch.bool, device=device),
+            positions=torch.empty((0,), dtype=torch.int64, device=device),
             retrieve_index=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_next_token=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_next_sibling=torch.full(
-                (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
+                (0, num_verify_tokens), -1, dtype=torch.long, device=device
             ),
             retrieve_cum_len=None,
             topk=topk,
@@ -245,37 +198,29 @@ class EagleVerifyInput(SpecInput):
 
 
 @dataclass
-class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
-    """EAGLE 草稿前向的输入数据结构。
-
-    包含草稿模型前向所需的 top-k 概率/索引、hidden states、bonus token 等。
-    注意：空闲 stub 请用 ``create_idle_input``，不要直接用构造器，
-    因为 ``filter_batch`` / ``merge_batch`` 会无条件切片/拼接
-    ``topk_p`` / ``topk_index`` / ``hidden_states`` / ``bonus_tokens``。
-
-    以 bs=2、topk=4 为例::
-
-        topk_p: shape (2, 4) — 每个请求的 top-4 概率
-            tensor([[0.3, 0.2, 0.15, 0.1],
-                    [0.4, 0.25, 0.1, 0.05]])
-        topk_index: shape (2, 4) — 每个请求的 top-4 token id
-            tensor([[464, 4062, 3105, 7586],
-                    [318, 257, 1332, 13]])
-        hidden_states: shape (2, hidden_size) — 每个请求一个 hidden state
-            # STANDALONE 时为 None
-        bonus_tokens: shape (2,) — 每个请求的 bonus token（上一轮目标模型的预测）
-    """
+class EagleDraftInput(SpecInput):
+    # For idle stubs use `create_idle_input`, not the bare ctor: `filter_batch`
+    # / `merge_batch` slice / cat `topk_p` / `topk_index` / `hidden_states` /
+    # `bonus_tokens` unconditionally.
 
     # shape: (b, topk)
     topk_p: torch.Tensor = None
     topk_index: torch.Tensor = None
-    # shape: (b, hidden_size) — 每个请求一个 hidden，被草稿前向消费。
-    # 当草稿算法不读取 hidden_states 时为 None（如 STANDALONE — 普通 LLM 草稿）。
+    # Draft proposal q from draft-extend, only set under rejection sampling:
+    # (b, vocab) single-layer; (b, num_steps, vocab) multi-layer chain.
+    draft_probs: torch.Tensor = None
+    # shape: (b, hidden_size) - one hidden per req, consumed by `draft` forward.
+    # None when the spec algorithm's draft doesn't read hidden_states
+    # (e.g., STANDALONE — vanilla LLM draft).
     hidden_states: Optional[torch.Tensor] = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
-    # 每请求的 bonus token（每条接受链末尾的 "+1" 目标预测）；
-    # worker 在 extend 后将其复制到此处供下一轮草稿使用。
+    # Survives across draft steps: spec_info is shared by reference across the
+    # per-step forwards (each runs on a copied ForwardBatch, dropping writebacks).
+    dsa_topk_indices: Optional[torch.Tensor] = None
+
+    # Per-req bonus token (the "+1" target prediction at end of each accept
+    # chain); the worker copies it here post-extend for next iter's draft.
     bonus_tokens: torch.Tensor = None
 
     # shape: (b + 1,)
@@ -287,43 +232,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     # 仅 V2 overlap worker 使用：req_pool_indices 作为缓冲槽位键。
     future_indices: Optional[torch.Tensor] = None
+    future_dsa_topk_indices_available: bool = False
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)
-
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        """返回 (num_tokens_per_req, num_tokens_for_logprob_per_req)。
-
-        示例::
-
-            >>> # topk=4 时
-            >>> draft_input.get_spec_adjust_token_coefficient()
-            (4, 4)
-        """
-        return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
-
-    @classmethod
-    def hidden_size_for(cls, worker) -> Optional[int]:
-        """解码阶段 ``hidden_states`` 的宽度：草稿自链输出
-        （草稿模型通过 ``capture_for_decode`` 和草稿循环写回自己的最后 hidden）。
-        当草稿架构不消费此字段时返回 None（如 STANDALONE）。
-
-        输入:
-            worker: 投机 worker 实例
-
-        输出:
-            hidden_size 整数或 None
-        """
-        if worker.speculative_algorithm.is_standalone():
-            return None
-        return _draft_runner_of(worker).model_config.spec_hidden_size
-
-    @classmethod
-    def dtype_for(cls, worker) -> Optional[torch.dtype]:
-        """获取草稿 hidden_states 的数据类型。STANDALONE 返回 None。"""
-        if worker.speculative_algorithm.is_standalone():
-            return None
-        return _draft_runner_of(worker).model_config.dtype
 
     @classmethod
     def create_idle_input(
@@ -333,6 +245,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         dtype: Optional[torch.dtype],
         topk: int,
         capture_hidden_mode: CaptureHiddenMode,
+        vocab_size: int = 0,
     ):
         """创建空闲（无请求）状态的草稿输入。
 
@@ -362,50 +275,32 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             ),
             topk_p=torch.empty((0, topk), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, topk), device=device, dtype=torch.int64),
+            draft_probs=(
+                torch.empty((0, vocab_size), device=device, dtype=torch.float32)
+                if get_spec().speculative_use_rejection_sampling
+                else None
+            ),
             capture_hidden_mode=capture_hidden_mode,
         )
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
-        """请求退出 batch 时，按 ``new_indices`` 过滤各张量。
-
-        输入:
-            new_indices: 保留下来的请求在原 batch 中的下标，shape [新bs]
-            has_been_filtered: 是否已被上游过滤（True 时做截断而非索引）
-
-        示例::
-
-            >>> # 原 bs=3，req1 已完成
-            >>> new_indices = tensor([0, 2])
-            >>> draft_input.filter_batch(new_indices)
-            >>> # topk_p 从 (3, 4) 变为 (2, 4)
-        """
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        new_indices_cpu: Optional[List[int]] = None,
+    ):
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
             return
 
-        strict_check = envs.SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK.get()
-        if has_been_filtered:
-            # 在 eagle_utils.py:verify 中，已经通过 `unfinished_index` 过滤了 batch，
-            # 因此调度器中不需要再次过滤
-            error_msg = f"new_indices 长度: {len(new_indices)} != topk_p 长度: {len(self.topk_p)}，不应发生"
-            if len(new_indices) != len(self.topk_p):
-                if strict_check:
-                    raise ValueError(error_msg)
-                else:
-                    logger.warning(error_msg)
-
-            self.topk_p = self.topk_p[: len(new_indices)]
-            self.topk_index = self.topk_index[: len(new_indices)]
-            if self.hidden_states is not None:
-                self.hidden_states = self.hidden_states[: len(new_indices)]
-            self.bonus_tokens = self.bonus_tokens[: len(new_indices)]
-        else:
-            # 某些情况下（如 draft_extend），尚未通过 `unfinished_index` 过滤
-            self.topk_p = self.topk_p[new_indices]
-            self.topk_index = self.topk_index[new_indices]
-            if self.hidden_states is not None:
-                self.hidden_states = self.hidden_states[new_indices]
-            self.bonus_tokens = self.bonus_tokens[new_indices]
+        self.topk_p = self.topk_p[new_indices]
+        self.topk_index = self.topk_index[new_indices]
+        if self.draft_probs is not None:
+            self.draft_probs = self.draft_probs[new_indices]
+        if self.hidden_states is not None:
+            self.hidden_states = self.hidden_states[new_indices]
+        self.bonus_tokens = self.bonus_tokens[new_indices]
+        if self.dsa_topk_indices is not None:
+            self.dsa_topk_indices = self.dsa_topk_indices[new_indices]
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         """新请求加入 batch 时，拼接另一个 EagleDraftInput 的各张量。
@@ -424,6 +319,10 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.future_indices = torch.cat(
                 [self.future_indices, spec_info.future_indices]
             )
+            self.future_dsa_topk_indices_available = (
+                self.future_dsa_topk_indices_available
+                and spec_info.future_dsa_topk_indices_available
+            )
             return
 
         # 通过 `topk_index` 长度检测空闲 stub（空闲输入所有字段 shape[0] == 0）。
@@ -433,6 +332,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
             self.bonus_tokens = spec_info.bonus_tokens
             self.topk_p = spec_info.topk_p
             self.topk_index = spec_info.topk_index
+            self.draft_probs = spec_info.draft_probs
+            self.dsa_topk_indices = spec_info.dsa_topk_indices
             return
         if len(spec_info.topk_index) == 0:
             return
@@ -445,6 +346,14 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         )
         self.topk_p = torch.cat([self.topk_p, spec_info.topk_p])
         self.topk_index = torch.cat([self.topk_index, spec_info.topk_index])
+        if self.dsa_topk_indices is not None and spec_info.dsa_topk_indices is not None:
+            self.dsa_topk_indices = torch.cat(
+                [self.dsa_topk_indices, spec_info.dsa_topk_indices]
+            )
+        else:
+            self.dsa_topk_indices = None
+        if self.draft_probs is not None and spec_info.draft_probs is not None:
+            self.draft_probs = torch.cat([self.draft_probs, spec_info.draft_probs])
 
 
 @dataclass
@@ -475,7 +384,8 @@ class EagleDraftExtendInput(SpecInput):
     # 两者都保留以供 CUDA Graph 缓冲区索引。
     num_correct_drafts: torch.Tensor = None
     num_accept_tokens: torch.Tensor = None
-    # CPU 视图，扩展前向期间由注意力后端读取。
+    num_front_tokens: int = 0
+    # CPU view, read by attention backends during the extend forward.
     num_accept_tokens_cpu: List[int] = None
 
     # 每请求的批次状态切片，用于草稿扩展前向:
@@ -497,58 +407,21 @@ class EagleDraftExtendInput(SpecInput):
     num_tokens_per_req: int = -1
     num_tokens_for_logprob_per_req: int = 1
 
+    dsa_seed_topk_capture: Optional[torch.Tensor] = None
+    dsa_seed_topk_select: Optional[torch.Tensor] = None
+
+    # Flat per-req index of each request's last accepted window row
+    # (i * window + front + num_correct_drafts[i]). When set, the logits
+    # processor runs lm_head only on these rows. None under gathered-buffer
+    # (DP) modes, whose logprob buffer sizing assumes all-row logits.
+    select_index: Optional[torch.Tensor] = None
+
+    # None for draft-extend's idle batch; attention backends fall back to
+    # rebuilding plain metadata from seq_lens when this is None.
+    kv_indptr: torch.Tensor = None
+
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT_EXTEND)
-
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        """返回 (num_tokens_per_req, num_tokens_for_logprob_per_req)。"""
-        return self.num_tokens_per_req, self.num_tokens_for_logprob_per_req
-
-    @classmethod
-    def hidden_size_for(cls, worker) -> Optional[int]:
-        """扩展阶段 ``hidden_states`` 的宽度：目标的 ``spec_hidden_size``，
-        EAGLE-3 aux 模式下扩展为 ``num_aux * target_hidden``。
-        当草稿架构不消费此字段时返回 None（如 STANDALONE）。
-
-        输入:
-            worker: 投机 worker 实例
-
-        输出:
-            hidden_size 整数或 None
-
-        示例::
-
-            >>> # 普通 EAGLE: 返回 spec_hidden_size（如 2048）
-            >>> # EAGLE-3 aux 模式: 返回 target_hidden * num_aux（如 4096 * 3 = 12288）
-            >>> # STANDALONE: 返回 None
-        """
-        if worker.speculative_algorithm.is_standalone():
-            return None
-        target_cfg = worker.target_worker.model_runner.model_config
-        if not (
-            worker.speculative_algorithm.is_eagle3()
-            and worker.eagle_use_aux_hidden_state
-        ):
-            return target_cfg.spec_hidden_size
-
-        hf_config = target_cfg.hf_config
-
-        # `num_aux` 解析优先级: 显式属性 > eagle_config layer_ids > 默认 3
-        num_aux = getattr(hf_config, "num_aux_hidden_states", None)
-        if num_aux is None:
-            eagle_config = getattr(hf_config, "eagle_config", None) or {}
-            layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
-            num_aux = len(layer_ids) if layer_ids else 3
-
-        target_hidden = getattr(hf_config, "target_hidden_size", target_cfg.hidden_size)
-        return target_hidden * num_aux
-
-    @classmethod
-    def dtype_for(cls, worker) -> Optional[torch.dtype]:
-        """获取扩展阶段 hidden_states 的数据类型。STANDALONE 返回 None。"""
-        if worker.speculative_algorithm.is_standalone():
-            return None
-        return worker.target_worker.model_runner.model_config.dtype
 
     @classmethod
     def create_idle_input(
@@ -614,8 +487,14 @@ class EagleDraftExtendInput(SpecInput):
         """
         device = req_pool_indices.device
         bs = self.num_correct_drafts.numel()
-        qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
-        qo_indptr[1:] = torch.cumsum(self.num_accept_tokens, dim=0)
+        # Constant num_tokens_per_req qo layout (required for cuda-graph capture).
+        qo_indptr = torch.arange(
+            0,
+            (bs + 1) * self.num_tokens_per_req,
+            step=self.num_tokens_per_req,
+            dtype=torch.int32,
+            device=device,
+        )
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 

@@ -21,6 +21,7 @@ from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
     AttachHiCacheStorageReqOutput,
+    ChecksumInfo,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
     ClearHiCacheReqInput,
@@ -39,7 +40,6 @@ from sglang.srt.managers.io_struct import (
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadsReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -63,6 +63,7 @@ from sglang.srt.managers.io_struct import (
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
@@ -77,10 +78,21 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    UpdateWeightVersionReqInput,
+    UpdateWeightVersionReqOutput,
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
-from sglang.srt.server_args import LoRARef, ServerArgs
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.runtime_context import (
+    get_lora,
+    get_parallel,
+    get_spec,
+)
+from sglang.srt.server_args import LoRARef
+from sglang.srt.utils import (
+    get_bool_env_var,
+    normalize_serialized_named_tensor_payloads,
+)
+from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
@@ -106,6 +118,7 @@ _COMMUNICATOR_SPECS = [
     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
+    ("update_weight_version", UpdateWeightVersionReqOutput),
     ("get_weights_by_name", GetWeightsByNameReqOutput),
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
@@ -123,9 +136,30 @@ _COMMUNICATOR_SPECS = [
     ("set_internal_state", SetInternalStateReqOutput),
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
-    ("get_loads", GetLoadsReqOutput, "watching"),
     ("dumper_control", DumperControlReqOutput),
+    ("scale_elastic_ep", ScaleElasticEPReqOutput),
 ]
+
+
+def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOutput:
+    """Merge the per-rank replies of a LoRA load/unload fan-out into one result.
+
+    The operation succeeded only if every rank succeeded. Reporting a partial
+    failure as success would let the tokenizer-side LoRA registry drift from
+    the ranks that failed, so failures win: their deduplicated error messages
+    are joined, and loaded_adapters reflects the first failed rank.
+    """
+    failed = [r for r in results if not r.success]
+    if not failed:
+        return results[0]
+    error_messages = list(
+        dict.fromkeys(r.error_message for r in failed if r.error_message)
+    )
+    return LoRAUpdateOutput(
+        success=False,
+        error_message=" | ".join(error_messages),
+        loaded_adapters=failed[0].loaded_adapters,
+    )
 
 
 class TokenizerControlMixin:
@@ -141,22 +175,36 @@ class TokenizerControlMixin:
           （如 send_to_scheduler、server_args、各种锁、lora_registry 等）。
     """
 
-    def init_communicators(self: TokenizerManager, server_args: ServerArgs):
-        """根据 _COMMUNICATOR_SPECS 批量创建各控制操作的扇出通信器并注册分发。
-
-        中译：遍历配置表，为每个前缀创建一个 FanOutCommunicator（扇出到 dp_size 个
-              调度器），挂到 self.{prefix}_communicator 上；同时把「响应类型 ->
-              通信器的 handle_recv」追加进结果分发器 _result_dispatcher，使调度器返回
-              的结果能被正确路由回对应通信器。在 TokenizerManager 初始化时调用一次。
-        """
+    def init_communicators(self: TokenizerManager):
         dispatch_pairs = []
         for spec in _COMMUNICATOR_SPECS:
             name, resp_type = spec[0], spec[1]
             mode = spec[2] if len(spec) > 2 else "queueing"
-            comm = FanOutCommunicator(self.send_to_scheduler, server_args.dp_size, mode)
+            comm = FanOutCommunicator(
+                self._dispatch_to_scheduler,
+                get_parallel().dp_size,
+                mode,
+            )
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
+
+    def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
+        primary_group_control = (
+            get_parallel().enable_dp_attention
+            and not get_parallel().enable_dp_attention_local_control_broadcast
+        )
+        if primary_group_control:
+            control_fan_out = (
+                worker_count + get_parallel().tp_size - 1
+            ) // get_parallel().tp_size
+        else:
+            control_fan_out = worker_count
+
+        for spec in _COMMUNICATOR_SPECS:
+            getattr(self, f"{spec[0]}_communicator").set_fan_out(worker_count)
+
+        self.get_internal_state_communicator.set_fan_out(control_fan_out)
 
     async def add_external_corpus(
         self: TokenizerManager, obj: AddExternalCorpusReqInput
@@ -173,7 +221,7 @@ class TokenizerControlMixin:
         """
         self.auto_create_handle_loop()
         # 中译：仅在启用 NGRAM 投机解码时才支持外部语料库，否则直接返回失败。
-        if self.server_args.speculative_algorithm != "NGRAM":
+        if get_spec().speculative_algorithm != "NGRAM":
             return AddExternalCorpusReqOutput(
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
@@ -261,7 +309,7 @@ class TokenizerControlMixin:
               返回成功标志与合并后的消息。未启用 NGRAM 时直接返回失败。
         """
         self.auto_create_handle_loop()
-        if self.server_args.speculative_algorithm != "NGRAM":
+        if get_spec().speculative_algorithm != "NGRAM":
             return RemoveExternalCorpusReqOutput(
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
@@ -281,7 +329,7 @@ class TokenizerControlMixin:
               直接取第一个 rank 的结果。未启用 NGRAM 时返回失败。
         """
         self.auto_create_handle_loop()
-        if self.server_args.speculative_algorithm != "NGRAM":
+        if get_spec().speculative_algorithm != "NGRAM":
             return ListExternalCorporaReqOutput(
                 success=False,
                 message="Ngram speculative decoding is not enabled.",
@@ -307,9 +355,12 @@ class TokenizerControlMixin:
         中译：扇出刷新缓存请求；timeout_s 为可选的等待超时（秒）。取首个 rank 的结果返回。
         """
         self.auto_create_handle_loop()
-        return (
+        result = (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+        if result.success and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
+        return result
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage.
@@ -354,17 +405,18 @@ class TokenizerControlMixin:
         if all_success:
             # Keep tokenizer side server_info consistent with scheduler side.
             # 中译：保持 tokenizer 侧的 server_args 与调度器侧一致（仅在全成功时更新）。
-            self.server_args.hicache_storage_backend = hicache_storage_backend
+            hicache_fields = {"hicache_storage_backend": hicache_storage_backend}
             if hicache_storage_backend_extra_config_json is not None:
-                self.server_args.hicache_storage_backend_extra_config = (
+                hicache_fields["hicache_storage_backend_extra_config"] = (
                     hicache_storage_backend_extra_config_json
                 )
             if hicache_storage_prefetch_policy is not None:
-                self.server_args.hicache_storage_prefetch_policy = (
+                hicache_fields["hicache_storage_prefetch_policy"] = (
                     hicache_storage_prefetch_policy
                 )
             if hicache_write_policy is not None:
-                self.server_args.hicache_write_policy = hicache_write_policy
+                hicache_fields["hicache_write_policy"] = hicache_write_policy
+            self.record_config_updates("tokenizer.attach_hicache", **hicache_fields)
         return out
 
     async def detach_hicache_storage(
@@ -385,22 +437,16 @@ class TokenizerControlMixin:
         # TODO: partial rollback if failed
         # 中译：TODO——若部分 rank 失败，目前不做回滚。
         if all_success:
-            self.server_args.hicache_storage_backend = None
-            self.server_args.hicache_storage_backend_extra_config = None
+            self.record_config_updates(
+                "tokenizer.detach_hicache",
+                hicache_storage_backend=None,
+                hicache_storage_backend_extra_config=None,
+            )
         return out
 
     async def start_profile(
         self: TokenizerManager,
-        output_dir: Optional[str] = None,
-        start_step: Optional[int] = None,
-        num_steps: Optional[int] = None,
-        activities: Optional[List[str]] = None,
-        with_stack: Optional[bool] = None,
-        record_shapes: Optional[bool] = None,
-        profile_by_stage: bool = False,
-        merge_profiles: bool = False,
-        profile_prefix: Optional[str] = None,
-        profile_stages: Optional[List[str]] = None,
+        req: Optional[ProfileReq] = None,
     ):
         """启动性能分析（profiling）。
 
@@ -414,33 +460,24 @@ class TokenizerControlMixin:
         """
         self.auto_create_handle_loop()
         # 中译：with_stack 的最终取值——只要参数或环境变量任一为 False 则关闭，否则开启。
+        req = req or ProfileReq()
+        req.req_type = ProfileReqType.START_PROFILE
         env_with_stack: bool = get_bool_env_var("SGLANG_PROFILE_WITH_STACK", "true")
-        with_stack = False if with_stack is False or env_with_stack is False else True
+        req.with_stack = (
+            False if req.with_stack is False or env_with_stack is False else True
+        )
         env_record_shapes: bool = get_bool_env_var(
             "SGLANG_PROFILE_RECORD_SHAPES", "true"
         )
         # 中译：record_shapes 同理——参数未显式禁用且环境变量开启时才记录张量形状。
-        record_shapes = (record_shapes is not False) and env_record_shapes
-        req = ProfileReq(
-            type=ProfileReqType.START_PROFILE,
-            output_dir=output_dir,
-            start_step=start_step,
-            num_steps=num_steps,
-            activities=activities,
-            with_stack=with_stack,
-            record_shapes=record_shapes,
-            profile_by_stage=profile_by_stage,
-            profile_id=str(time.time()),
-            merge_profiles=merge_profiles,
-            profile_prefix=profile_prefix,
-            profile_stages=profile_stages,
-        )
+        req.record_shapes = (req.record_shapes is not False) and env_record_shapes
+        req.profile_id = req.profile_id or str(time.time())
         return await self._execute_profile(req)
 
     async def stop_profile(self: TokenizerManager):
         """停止性能分析。中译：发送 STOP_PROFILE 请求，结束采样并落盘。"""
         self.auto_create_handle_loop()
-        req = ProfileReq(type=ProfileReqType.STOP_PROFILE)
+        req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
         return await self._execute_profile(req)
 
     async def _execute_profile(self: TokenizerManager, req: ProfileReq):
@@ -484,7 +521,7 @@ class TokenizerControlMixin:
         """
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
         results = await self.init_weights_update_group_communicator(obj)
@@ -502,7 +539,7 @@ class TokenizerControlMixin:
         """
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for destroy parameter update group"
 
         results = await self.destroy_weights_update_group_communicator(obj)
@@ -524,7 +561,7 @@ class TokenizerControlMixin:
         """
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
         # 中译：按需中止所有在途请求，避免它们读到「半更新」的权重。
@@ -544,6 +581,8 @@ class TokenizerControlMixin:
                 results = await self.update_weights_from_distributed_communicator(obj)
 
         success, message = FanOutCommunicator.merge_results(results)
+        if success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -563,7 +602,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         # TODO: support DP
         assert (
-            self.server_args.dp_size == 1
+            get_parallel().dp_size == 1
         ), "dp_size must be 1 for init_weights_send_group_for_remote_instance"
         result = (
             await self.init_weights_send_group_for_remote_instance_communicator(obj)
@@ -583,7 +622,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         # TODO: support DP
         assert (
-            self.server_args.dp_size == 1
+            get_parallel().dp_size == 1
         ), "dp_size must be 1 for send_weights_to_remote_instance"
         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
         return result.success, result.message
@@ -601,7 +640,7 @@ class TokenizerControlMixin:
         """
         self.auto_create_handle_loop()
         assert (
-            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from tensor"
 
         # 中译：按需先中止所有在途请求。
@@ -609,6 +648,9 @@ class TokenizerControlMixin:
             self.abort_request(abort_all=True)
 
         # 中译：已暂停时在条件锁下更新；未暂停时取写锁独占更新。
+        obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
+            obj.serialized_named_tensors
+        )
         async with self.is_pause_cond:
             is_paused = self.is_pause
             if is_paused:
@@ -619,6 +661,8 @@ class TokenizerControlMixin:
                 results = await self.update_weights_from_tensor_communicator(obj)
 
         success, message = FanOutCommunicator.merge_results(results)
+        if success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -641,7 +685,7 @@ class TokenizerControlMixin:
             # For now, we only support single data parallel instance
             # 中译：目前仅支持单 DP 实例（或启用 dp attention）。
             assert (
-                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+                get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
             ), "dp_size must be 1 or dp attention must be enabled for update weights from IPC"
             logger.info("Starting IPC weight update")
 
@@ -660,6 +704,8 @@ class TokenizerControlMixin:
             logger.error(error_msg)
             success, message = False, error_msg
 
+        if success and obj.flush_cache and self.mm_processor is not None:
+            self.mm_processor.clear_preprocess_cache()
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
@@ -692,7 +738,9 @@ class TokenizerControlMixin:
         # ongoing requests using this LoRA adapter are finished.
         # 中译：等待所有仍在使用该适配器的在途请求完成后，再让后端进程真正卸载。
         await self.lora_registry.wait_for_unload(lora_id)
-        result = (await self.update_lora_adapter_communicator(obj))[0]
+        result = _merge_lora_update_results(
+            await self.update_lora_adapter_communicator(obj)
+        )
 
         return result
 
@@ -713,16 +761,14 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
 
         try:
-            if not self.server_args.enable_lora:
+            if not get_lora().enable_lora:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
-            # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
-            # with dp_size > 1.
             assert (
-                self.server_args.dp_size == 1
-            ), "dp_size must be 1 for dynamic lora loading"
+                get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             logger.info(
                 "Start load Lora adapter. Lora name=%s, path=%s",
                 obj.lora_name,
@@ -742,7 +788,9 @@ class TokenizerControlMixin:
                 # Trigger the actual loading operation at the backend processes.
                 # 中译：命令后端进程执行实际加载。
                 obj.lora_id = new_adapter.lora_id
-                result = (await self.update_lora_adapter_communicator(obj))[0]
+                result = _merge_lora_update_results(
+                    await self.update_lora_adapter_communicator(obj)
+                )
 
                 # Register the LoRA adapter only after loading is successful.
                 # 中译：仅在后端加载成功后才注册到 registry 并缓存引用。
@@ -802,17 +850,21 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
 
         try:
-            if not self.server_args.enable_lora:
+            if not get_lora().enable_lora:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
 
             assert (
-                self.server_args.dp_size == 1
-            ), "dp_size must be 1 for dynamic lora loading"
+                get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             logger.info(
                 "Start load Lora adapter from tensors. Lora name=%s",
                 obj.lora_name,
+            )
+
+            obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
+                obj.serialized_named_tensors
             )
 
             async with self.lora_update_lock:
@@ -823,7 +875,9 @@ class TokenizerControlMixin:
                     pinned=obj.pinned,
                 )
                 obj.lora_id = new_adapter.lora_id
-                result = (await self.update_lora_adapter_communicator(obj))[0]
+                result = _merge_lora_update_results(
+                    await self.update_lora_adapter_communicator(obj)
+                )
 
                 # 中译：加载成功后注册并缓存引用。
                 if result.success:
@@ -880,7 +934,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
 
         try:
-            if not self.server_args.enable_lora:
+            if not get_lora().enable_lora:
                 raise ValueError(
                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
                 )
@@ -889,11 +943,9 @@ class TokenizerControlMixin:
                 obj.lora_name is not None
             ), "lora_name must be provided to unload LoRA adapter"
 
-            # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
-            # with dp_size > 1.
             assert (
-                self.server_args.dp_size == 1
-            ), "dp_size must be 1 for dynamic lora loading"
+                get_parallel().dp_size == 1 or get_parallel().enable_dp_attention
+            ), "dp_size must be 1 or dp attention must be enabled for dynamic lora loading"
             logger.info(
                 "Start unload Lora adapter. Lora name=%s",
                 obj.lora_name,
@@ -917,7 +969,7 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         results = await self.get_weights_by_name_communicator(obj)
         all_parameters = [r.parameter for r in results]
-        if self.server_args.dp_size == 1:
+        if get_parallel().dp_size == 1:
             return all_parameters[0]
         else:
             return all_parameters
@@ -964,18 +1016,17 @@ class TokenizerControlMixin:
         per_engine_checksum: Optional[str] = None
         # 中译：仅当有 rank 返回了 payload（校验明细）时才汇总。
         if any(r.payload is not None for r in results):
-            ranks = []
+            rank_infos: List[ChecksumInfo] = []
             for r in results:
                 # 中译：payload 可能是列表（多 GPU）或单条，统一展开收集。
-                if isinstance(r.payload, list):
-                    ranks.extend(r.payload)
-                else:
-                    ranks.append(r.payload)
             # 中译：把各 GPU 校验和按顺序喂入 sha256，得到整引擎级别的总校验和。
+                if r.payload is not None:
+                    rank_infos.extend(r.payload)
             h = hashlib.sha256()
-            for rank in ranks:
-                h.update(rank["per_gpu_checksum"].encode())
+            for info in rank_infos:
+                h.update(info.per_gpu_checksum.encode())
             per_engine_checksum = h.hexdigest()
+            ranks = [msgspec_to_builtins(info) for info in rank_infos]
         return success, message, ranks, per_engine_checksum
 
     async def slow_down(
@@ -1050,7 +1101,9 @@ class TokenizerControlMixin:
         """
         self.auto_create_handle_loop()
         # 中译：dp_rank 越界时直接返回空列表。
-        if dp_rank is not None and (dp_rank < 0 or dp_rank >= self.server_args.dp_size):
+        if dp_rank is not None and (
+            dp_rank < 0 or dp_rank >= self.elastic_worker_count
+        ):
             return []
 
         reader = self.load_snapshot_reader
@@ -1094,7 +1147,7 @@ class TokenizerControlMixin:
         # 中译：注册 future，发请求给调度器，await 等待其回执；无论成败都清理 future。
         future = asyncio.Future()
         self.session_futures[obj.session_id] = future
-        self.send_to_scheduler.send_pyobj(obj)
+        self._dispatch_to_scheduler(obj)
 
         try:
             return await future
@@ -1106,8 +1159,14 @@ class TokenizerControlMixin:
         obj: CloseSessionReqInput,
         request: Optional[fastapi.Request] = None,
     ):
-        """关闭会话。中译：直接把关闭请求发给调度器，无需等待回执。"""
-        await self.send_to_scheduler.send_pyobj(obj)
+        await self._async_dispatch_to_scheduler(obj)
+
+    async def update_weight_version(
+        self: TokenizerManager, obj: UpdateWeightVersionReqInput
+    ) -> None:
+        self.auto_create_handle_loop()
+        await self.update_weight_version_communicator(obj)
+        self._update_weight_version_if_provided(obj.new_version)
 
     def _update_weight_version_if_provided(
         self: TokenizerManager, weight_version: Optional[str]
@@ -1118,4 +1177,6 @@ class TokenizerControlMixin:
               供各权重更新方法在更新成功后调用，使版本号与实际权重保持同步。
         """
         if weight_version is not None:
-            self.server_args.weight_version = weight_version
+            self.record_config_updates(
+                "tokenizer.weight_version", weight_version=weight_version
+            )

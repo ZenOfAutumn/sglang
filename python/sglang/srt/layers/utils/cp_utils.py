@@ -8,16 +8,18 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import (
+    _tbo_event,
     attn_cp_all_gather_into_tensor,
-    get_attention_cp_group,
-    get_attention_cp_rank,
-    get_attention_cp_size,
+    attn_cp_overlap_all_gather_into_tensor,
     is_allocation_symmetric,
 )
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import (
+    get_parallel,
+    uses_mla_backend,
+)
 
 
 @dataclass
@@ -72,12 +74,7 @@ class ContextParallelMetadata:
 
 
 def is_prefill_context_parallel_enabled():
-    """返回服务是否启用了 prefill 上下文并行。
-
-    示例：启动参数包含 ``--enable-prefill-cp`` 时返回 ``True``，否则返回
-    ``False``。
-    """
-    return get_global_server_args().enable_prefill_context_parallel
+    return get_parallel().enable_prefill_context_parallel
 
 
 def is_prefill_cp_in_seq_split():
@@ -88,37 +85,12 @@ def is_prefill_cp_in_seq_split():
     """
     return (
         is_prefill_context_parallel_enabled()
-        and get_global_server_args().prefill_cp_mode == "in-seq-split"
+        and get_parallel().prefill_cp_mode == "in-seq-split"
     )
 
 
-def get_cp_padding_align_size() -> int:
-    """返回 CP 对全局 token 数进行 padding 时所需的对齐粒度。
-
-    zigzag（in-seq-split）需要切出 ``2 * cp_size`` 个逻辑块，因此对齐到
-    ``2 * cp_size``；其他 CP 策略对齐到 ``cp_size``。未开启 CP 时
-    ``cp_size=1``，padding 等价于空操作。不要额外 padding，否则会破坏
-    EAGLE/MTP draft prefill，参见 #23269。该辅助函数用于保证
-    ``prepare_mlp_sync_batch`` 与 ``cal_padded_tokens`` 的规则一致。
-
-    示例：zigzag 且 ``cp_size=4`` 时返回 8；round-robin 且
-    ``cp_size=4`` 时返回 4；未启用 CP 时返回 1。
-    """
-    from sglang.srt.layers.attention.dsa.utils import is_dsa_prefill_cp_in_seq_split
-
-    attn_cp_size = get_attention_cp_size()
-    if is_prefill_cp_in_seq_split() or is_dsa_prefill_cp_in_seq_split():
-        return attn_cp_size * 2
-    return attn_cp_size
-
-
 def is_mla_prefill_cp_enabled() -> bool:
-    """判断 MLA 后端是否启用了 prefill CP。
-
-    仅当全局 prefill CP 与 MLA backend 同时开启时返回 ``True``。
-    """
-    sa = get_global_server_args()
-    return sa.enable_prefill_context_parallel and sa.use_mla_backend
+    return get_parallel().enable_prefill_context_parallel and uses_mla_backend()
 
 
 def mla_use_prefill_cp(forward_batch, mla_enable_prefill_cp=None):
@@ -202,7 +174,7 @@ def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):
     )
 
     if is_dsa_prefill_cp_round_robin_split():
-        cp_size = get_attention_cp_size()
+        cp_size = get_parallel().attn_cp_size
         assert (
             input_.shape[0] % cp_size == 0
         ), f"输入张量第 0 维必须能被 CP 大小整除，实际形状为 {input_.shape}，CP 大小为 {cp_size}"
@@ -232,7 +204,7 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     )
 
     if is_dsa_prefill_cp_round_robin_split():
-        cp_size = get_attention_cp_size()
+        cp_size = get_parallel().attn_cp_size
         assert positions.shape[0] % cp_size == 0, (
             f"位置张量第 0 维必须能被 CP 大小整除，实际形状为 {positions.shape}，"
             f"CP 大小为 {cp_size}"
@@ -261,8 +233,8 @@ def cp_round_robin_input_ids(input_ids):
       - 启用 MoE A2A 时，每个 rank 仅保留自己的交错分片：rank 0 为
         ``[0,8,16,...]``，rank 1 为 ``[1,9,17,...]``，依此类推。
     """
-    cp_size = get_attention_cp_size()
-    cp_rank = get_attention_cp_rank()
+    cp_size = get_parallel().attn_cp_size
+    cp_rank = get_parallel().attn_cp_rank
     if get_moe_a2a_backend().is_none():
         input_ids = input_ids.reshape(-1, cp_size).T.flatten()
     else:
@@ -271,17 +243,12 @@ def cp_round_robin_input_ids(input_ids):
 
 
 def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, stream):
-    """对二维 CP 张量执行异步 all-gather，并去除 padding 后拼接。
-
-    可用于 KV cache、index_k、hidden_states 等形如 ``[token, hidden]`` 的
-    张量。流程为：
-      1. 将各 rank 的 token 数补齐到共同的 ``max_len``；
-      2. 异步 all-gather；
-      3. 按 ``per_rank_actual_token`` 去除各 rank padding 并重新拼接。
-
-    示例：两个 rank 的有效形状分别为 ``[3,128]``、``[5,128]``，通信前
-    都补齐为 ``[5,128]``；all-gather 得到 ``[10,128]``，去 padding 后
-    返回 ``[8,128]``。
+    """
+    Allgather communication for context_parallel(kv_cache, index_k, hidden_states).
+    This implementation mainly consists of three parts:
+    Step 1, padding the input shape to unify the shape for allgather communication (the shape must be the same).
+    Step 2, synchronized allgather communication.
+    Step 3, removing the padding and reassembling the data according to the actual tokens.
     """
     max_len = forward_batch.attn_cp_metadata.max_rank_len[0]
     pad_size = max_len - input_tensor.shape[0]
@@ -289,9 +256,8 @@ def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, 
         input_tensor = F.pad(
             input_tensor, (0, 0, 0, pad_size), mode="constant", value=0
         )
-    with use_symmetric_memory(
-        get_attention_cp_group(), disabled=not is_allocation_symmetric()
-    ):
+    group = get_parallel().attn_cp_group
+    with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
         input_tensor_full = torch.empty(
             max_len * cp_size,
             input_tensor.shape[1],
@@ -299,9 +265,7 @@ def cp_all_gather_reorganized_into_tensor(input_tensor, cp_size, forward_batch, 
             dtype=input_tensor.dtype,
         )
 
-    get_attention_cp_group().cp_all_gather_into_tensor_async(
-        input_tensor_full, input_tensor, stream
-    )
+    group.all_gather_into_tensor(input_tensor_full, input_tensor)
 
     outputs_list_max = list(
         torch.split(
@@ -340,10 +304,9 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
         padding = [0, 0] * (input_tensor.ndim - 1) + [0, pad_size]
         input_tensor = F.pad(input_tensor, padding, mode="constant", value=0)
 
-    # 创建保留其余所有维度的 all-gather 输出张量。
-    with use_symmetric_memory(
-        get_attention_cp_group(), disabled=not is_allocation_symmetric()
-    ):
+    # Create output tensor with proper shape for all dimensions
+    group = get_parallel().attn_cp_group
+    with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
         input_tensor_full = torch.empty(
             max_len * cp_size,
             *input_tensor.shape[1:],
@@ -351,9 +314,7 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
             dtype=input_tensor.dtype,
         )
 
-    get_attention_cp_group().cp_all_gather_into_tensor_async(
-        input_tensor_full, input_tensor, stream
-    )
+    group.all_gather_into_tensor(input_tensor_full, input_tensor)
 
     outputs_list_max = list(
         torch.split(
@@ -371,6 +332,54 @@ def cp_all_gather_reorganized_into_tensor_kv_cache(
     )
 
     return outputs
+
+
+def cp_all_gather_rerange_launch(input_tensor, cp_size, comm_stream, event_key):
+    """Start a round-robin CP all-gather on `comm_stream`; do NOT wait for it.
+
+    Pair with cp_all_gather_rerange_finish(). Splitting launch from wait is the
+    only way an attention-side CP gather can overlap anything: the collectives
+    inside op_attn are consumed a few statements later, so issuing and waiting
+    at the same point just moves the queue (measured in perf_sweep_report §4.6).
+
+    The handle keeps both buffers alive until finish(); without that reference
+    the allocator can hand the input block back to the compute stream before the
+    comm-stream kernel has read it.
+    """
+    from sglang.srt.distributed.parallel_state import (
+        get_attn_cp_group,
+        get_attn_cp_overlap_group,
+    )
+
+    group = get_attn_cp_overlap_group()
+    assert group is not get_attn_cp_group(), (
+        "the comm-stream path needs the duplicate attn_cp_overlap communicator; "
+        "driving one communicator from two streams deadlocks RCCL"
+    )
+
+    input_tensor = input_tensor.contiguous()
+    with use_symmetric_memory(group, disabled=not is_allocation_symmetric()):
+        output_tensor = input_tensor.new_empty(
+            (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),
+        )
+    comm_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(comm_stream):
+        attn_cp_overlap_all_gather_into_tensor(output_tensor, input_tensor)
+        event = _tbo_event(event_key)
+        event.record(comm_stream)
+    return (output_tensor, input_tensor, event, cp_size)
+
+
+def cp_all_gather_rerange_finish(handle):
+    """Wait for a launched gather on the current stream, then rerange."""
+    output_tensor, _keepalive, event, cp_size = handle
+    torch.cuda.current_stream().wait_event(event)
+    out_shape = output_tensor.shape
+    return (
+        output_tensor.view(cp_size, -1, *out_shape[1:])
+        .transpose(0, 1)
+        .reshape(out_shape)
+    )
 
 
 def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
@@ -407,7 +416,7 @@ def cp_all_gather_rerange_output(input_tensor, cp_size, forward_batch, stream):
 
     if is_dsa_prefill_cp_round_robin_split():
         with use_symmetric_memory(
-            get_attention_cp_group(), disabled=not is_allocation_symmetric()
+            get_parallel().attn_cp_group, disabled=not is_allocation_symmetric()
         ):
             output_tensor = input_tensor.new_empty(
                 (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:]),

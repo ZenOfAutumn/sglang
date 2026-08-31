@@ -353,9 +353,22 @@ class BaseFormatDetector(ABC):
         """
         raise NotImplementedError()
 
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Called once when the stream ends; flush any buffered state.
+
+        Detectors that hold text back while waiting for a marker that can no
+        longer arrive (the stream is over) override this to release it.
+        """
+        return StreamingParseResult()
+
     def supports_structural_tag(self) -> bool:
         """如果本检测器支持 structural tag 格式则返回 True。"""
         return True
+
+    def parses_required_natively(self) -> bool:
+        """Return True if ``tool_choice="required"`` must skip grammar
+        constraints and parse the model's native output format instead."""
+        return False
 
     @abstractmethod
     def structure_info(self) -> _GetInfoFunc:
@@ -379,17 +392,24 @@ class BaseFormatDetector(ABC):
         tools: Union[List[Tool], None] = None,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
         thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
     ) -> Optional[StructuralTag]:
         """
         在支持的情况下,返回模型原生的 XGrammar structural tag。
 
         Args:
-            tools: 可用工具列表
-            tool_choice: 请求中的 tool choice 设置
-            thinking_mode: 返回的 structural tag 中是否包含模型的推理前缀。
-                当 SGLang 的 ReasonerGrammarBackend 会负责 <think>...</think> 前缀时
-                (典型情况是配置了 --reasoning-parser),传入 False,
-                以保证只有一层去约束推理部分。
+            tools: List of available tools
+            tool_choice: The tool choice setting from the request
+            thinking_mode: Whether to include the model's reasoning prefix in
+                the returned structural tag. Pass False when SGLang's
+                ReasonerGrammarBackend will own the <think>...</think> prefix
+                (the typical case when --reasoning-parser is configured) so
+                only one layer constrains the reasoning section.
+            parallel_tool_calls: Whether multiple tool calls may appear in one
+                assistant response. xgrammar's get_model_structural_tag does
+                not expose this knob, so this base implementation ignores it;
+                only detectors that build their own tags (e.g. Kimi K3)
+                honor it.
 
         Returns:
             如果本检测器支持模型原生 tag 则返回 StructuralTag,否则返回 None
@@ -410,3 +430,18 @@ class BaseFormatDetector(ABC):
             tool_choice=converted_tool_choice,
             reasoning=thinking_mode,
         )
+
+    def get_auto_tool_call_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        thinking_mode: bool = False,
+        parallel_tool_calls: bool = True,
+    ) -> Optional[StructuralTag]:
+        """Return an always-on structural tag for automatic tool choice.
+
+        Most formats leave unconstrained text generation enabled for
+        ``tool_choice="auto"`` unless strict mode is requested. Formats with a
+        token that unambiguously starts a tool payload can override this hook
+        to constrain only the payload after that token.
+        """
+        return None

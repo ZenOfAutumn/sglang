@@ -12,12 +12,17 @@
 import dataclasses
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_schedule,
+)
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -27,6 +32,33 @@ if TYPE_CHECKING:
 _DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
 
 logger = logging.getLogger(__name__)
+
+
+class RecentPrefillBatchSizeTracker:
+    """Track the largest of the latest non-empty prefill attempts.
+
+    The default window keeps 16 attempts. Successful admissions use their
+    actual batch size; rejected attempts use a conservative local estimate.
+    Decode-only and idle scheduler passes do not age the high-watermark.
+    """
+
+    def __init__(self, window_size: int = 16):
+        if window_size <= 0:
+            raise ValueError(f"window_size must be positive, got {window_size}")
+        self._recent_attempt_sizes = deque(maxlen=window_size)
+
+    @property
+    def max_prefill_bs(self) -> int:
+        return max(self._recent_attempt_sizes, default=0)
+
+    def observe_attempt(self, attempted_prefill_bs: int) -> int:
+        if attempted_prefill_bs <= 0:
+            raise ValueError(
+                "attempted_prefill_bs must be positive for a non-empty attempt, "
+                f"got {attempted_prefill_bs}"
+            )
+        self._recent_attempt_sizes.append(attempted_prefill_bs)
+        return self.max_prefill_bs
 
 
 @dataclass(frozen=True)
@@ -88,30 +120,30 @@ class PrefillDelayer:
         dp_size: int,
         attn_tp_size: int,
         cpu_group,
-        server_args,
         max_delay_passes: int,
         token_usage_low_watermark: Optional[float],
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
         device: Optional["torch.device"] = "cpu",
         device_group=None,
+        debug_log_enabled: bool = True,
     ):
         # 中译：_max_delay_passes —— 最多连续推迟多少轮 forward（兜底，避免无限等待）。
         self._max_delay_passes = max_delay_passes
         # 中译：_token_usage_low_watermark —— token（KV）使用率低水位线，低于它说明 GPU 没吃饱，强制放行。
         self._token_usage_low_watermark = token_usage_low_watermark
+        self._debug_log_enabled = _DEBUG_LOG and debug_log_enabled
         # Queue-based trigger is opt-in: activates only when queue_min_ratio
         # is explicitly set. Additive with the slot-based trigger.
         # 中译：基于「等待队列长度」的触发器是可选项，仅当显式设置 queue_min_ratio 时启用；
-        #       与基于「slot（空位）」的触发器叠加生效（满足任一即推迟）。
-        self._queue_min_ratio = server_args.prefill_delayer_queue_min_ratio
+        # 中译：未设置时回退到 5000ms。这是本地安全上限（wall-clock 超时兜底），不是语义默认值，
+        self._queue_min_ratio = get_schedule().prefill_delayer_queue_min_ratio
         # Fall back to 5000ms if unset; this is a local safety cap, not a
         # semantic default, so we don't surface it via ServerArgs.
-        # 中译：未设置时回退到 5000ms。这是本地安全上限（wall-clock 超时兜底），不是语义默认值，
-        #       故不通过 ServerArgs 暴露给用户。
-        self._max_delay_ms = server_args.prefill_delayer_max_delay_ms
+        self._max_delay_ms = get_schedule().prefill_delayer_max_delay_ms
         if self._max_delay_ms is None:
             self._max_delay_ms = 5000.0
         self._queue_trigger_enabled = self._queue_min_ratio is not None
+        self._prefill_max_requests = get_schedule().prefill_max_requests
         logger.info(
             f"PrefillDelayer initialized with "
             f"max_delay_passes={self._max_delay_passes} "
@@ -121,8 +153,8 @@ class PrefillDelayer:
             f"queue_trigger_enabled={self._queue_trigger_enabled}"
         )
         self.dp_size = dp_size
-        self.enable_dp_attention = server_args.enable_dp_attention
         # 中译：未启用 DP attention 时，所有 DP rank 等价，all-gather 的 DP 维度退化为 1。
+        self.enable_dp_attention = get_parallel().enable_dp_attention
         dp_size_dim = dp_size if self.enable_dp_attention else 1
 
         # Mirror scheduler_dp_attn_mixin's NCCL all-gather path: when the
@@ -131,7 +163,7 @@ class PrefillDelayer:
         # 中译：与 scheduler_dp_attn_mixin 的 NCCL all-gather 路径保持一致：当环境开关打开
         #       （或 overlap 调度被关闭）时，用设备上的 NCCL group 做 all-gather，而不是 CPU 上的 gloo。
         use_nccl = (
-            server_args.disable_overlap_schedule
+            get_schedule().disable_overlap_schedule
             or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
         )
         if use_nccl:
@@ -161,7 +193,7 @@ class PrefillDelayer:
         self.skip_first_delayer = True
 
         assert (
-            not server_args.disable_overlap_schedule
+            not get_schedule().disable_overlap_schedule
         ), "To use PrefillDelayer, disable_overlap_schedule must be False."
 
     def _negotiate_should_allow_prefill(
@@ -289,9 +321,14 @@ class PrefillDelayer:
             #       针对的是「decode 请求逐个完成、把 prefill 切碎成许多小批」的负载。
             queue_condition = False
             if self._queue_trigger_enabled and global_running_batch_max > 0:
+                queue_capacity = (
+                    self._prefill_max_requests
+                    if self._prefill_max_requests is not None
+                    else global_max_prefill_bs_max
+                )
                 queue_min_effective = min(
                     int(global_running_batch_max * self._queue_min_ratio),
-                    global_max_prefill_bs_max,
+                    queue_capacity,
                 )
                 queue_condition = (
                     queue_min_effective > 0
@@ -320,13 +357,25 @@ class PrefillDelayer:
                     pass
                 else:
                     # 中译：非首次——确实推迟本轮 prefill，累加 delayed_count 并返回 output_allow=False。
-                    next_state = prev_state or _State()
-                    next_state = next_state.bump_delayed_count()
+                    # Bound the wait like the "mixed" branch: on a saturated
+                    # engine slot_condition may never turn false, so cap the
+                    # delay by max_delay_passes.
+                    prev_delayed_count = prev_state.delayed_count if prev_state else 0
+                    if prev_delayed_count < self._max_delay_passes - 1:
+                        next_state = prev_state or _State()
+                        next_state = next_state.bump_delayed_count()
+                        return _NegotiateOutput(
+                            next_state=next_state,
+                            output_allow=False,
+                            output_reason="delay",
+                            **debug_info,
+                        )
                     return _NegotiateOutput(
-                        next_state=next_state,
-                        output_allow=False,
-                        output_reason="delay",
+                        next_state=None,
+                        output_allow=True,
+                        output_reason="wait_timeout",
                         **debug_info,
+                        **wait_info,
                     )
             # 中译：放行 prefill。若之前等待过则原因记为 wait_success，否则为 no_wait（本轮无需等待）。
             exist_previous_wait = prev_state is not None
@@ -421,23 +470,47 @@ class PrefillDelayerSinglePassExecutor:
         self._prefill_delayer = prefill_delayer
         self._token_usage = token_usage
         self._result: Optional[_NegotiateOutput] = None
+        self._attempted_prefill_bs = 0
 
     @property
     def _called(self) -> bool:
         # 中译：本轮是否已经协商过（结果已缓存到 _result）。
         return self._result is not None
 
-    def finalize(self, *, actual_prefill: bool):
         # 中译：本轮收尾——若全程未协商过，则以 local_prefillable=False 补一次默认协商，
-        #       然后上报本轮指标（决策结果 vs 实际是否真的执行了 prefill）。
+    def finalize(self, *, actual_prefill_bs: int) -> int:
         if not self._called:
             self.negotiate_should_allow_prefill(local_prefillable=False)
 
         _record_single_pass_result(
-            actual_execution=actual_prefill,
+            actual_execution=actual_prefill_bs > 0,
             output=self._result,
             metrics_collector=self._prefill_delayer._metrics_collector,
+            debug_log_enabled=self._prefill_delayer._debug_log_enabled,
         )
+        return actual_prefill_bs or self._attempted_prefill_bs
+
+    def _estimate_attempted_prefill_bs(
+        self,
+        *,
+        running_batch: int,
+        max_running_requests: int,
+        waiting_queue_len: int,
+    ) -> int:
+        local_max_running_requests = max_running_requests
+        if not self._prefill_delayer.enable_dp_attention:
+            local_max_running_requests = (
+                max_running_requests + self._prefill_delayer.dp_size - 1
+            ) // self._prefill_delayer.dp_size
+
+        # The delayer negotiates before PrefillAdder materializes can_run_list,
+        # so a rejected pass has no exact batch size. This upper bound is exact
+        # when the waiting queue is the limiter (for example, two queued
+        # requests after a cached BS=10 spike), and it never exceeds the local
+        # request slots available to the candidate batch.
+        free_slots = max(local_max_running_requests - running_batch, 1)
+        non_empty_queue_len = max(waiting_queue_len, 1)
+        return min(non_empty_queue_len, free_slots)
 
     def negotiate_should_allow_prefill(
         self,
@@ -448,6 +521,15 @@ class PrefillDelayerSinglePassExecutor:
         waiting_queue_len: int = 0,
     ) -> bool:
         # 中译：本轮首次调用才真正协商并缓存结果；后续调用直接复用缓存的 output_allow（保证每轮只协商一次）。
+        if local_prefillable:
+            self._attempted_prefill_bs = max(
+                self._attempted_prefill_bs,
+                self._estimate_attempted_prefill_bs(
+                    running_batch=running_batch,
+                    max_running_requests=max_running_requests,
+                    waiting_queue_len=waiting_queue_len,
+                ),
+            )
         if not self._called:
             self._result = self._prefill_delayer._negotiate_should_allow_prefill(
                 local_prefillable=local_prefillable,
@@ -464,10 +546,11 @@ def _record_single_pass_result(
     actual_execution: bool,
     output: _NegotiateOutput,
     metrics_collector: Optional["SchedulerMetricsCollector"],
+    *,
+    debug_log_enabled: bool,
 ) -> None:
     # 中译：把本轮单次协商结果记录到日志（调试时）并上报到指标收集器（若有）。
-    #       actual_execution 表示本轮最终是否真的执行了 prefill（协商放行不等于一定执行）。
-    if _DEBUG_LOG:
+    if debug_log_enabled:
         if output.output_allow and (output.output_reason == "wait_timeout"):
             logger.info(
                 f"PrefillDelayer timeout thus not forbid prefill "

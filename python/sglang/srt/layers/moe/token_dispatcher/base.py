@@ -21,10 +21,14 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import CombineOverlapArgs
     from sglang.srt.layers.moe.token_dispatcher import (
+        AscendTPCombineInput,
+        AscendTPDispatchOutput,
         DeepEPLLCombineInput,
         DeepEPLLDispatchOutput,
         DeepEPNormalCombineInput,
         DeepEPNormalDispatchOutput,
+        DeepEPv2CombineInput,
+        DeepEPv2DispatchOutput,
         FlashinferCombineInput,
         FlashinferDispatchOutput,
         StandardCombineInput,
@@ -220,6 +224,12 @@ class DispatchOutputChecker:
         return dispatch_output.format.is_standard()
 
     @staticmethod
+    def format_is_ascend_tp(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[AscendTPDispatchOutput]:
+        return dispatch_output.format.is_ascend_tp()
+
+    @staticmethod
     def format_is_deepep_normal(
         dispatch_output: DispatchOutput,
     ) -> TypeGuard[DeepEPNormalDispatchOutput]:
@@ -263,6 +273,12 @@ class DispatchOutputChecker:
         """
         return dispatch_output.format.is_flashinfer()
 
+    @staticmethod
+    def format_is_deepep_v2(
+        dispatch_output: DispatchOutput,
+    ) -> TypeGuard[DeepEPv2DispatchOutput]:
+        return dispatch_output.format.is_deepep_v2()
+
 
 class DispatchOutputFormat(Enum):
     """dispatcher 与 MoE runner 之间的 dispatch 输出格式。
@@ -275,6 +291,8 @@ class DispatchOutputFormat(Enum):
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
+    DEEPEP_V2 = "deepep_v2"
+    ASCEND_TP = "ascend_tp"
 
     def is_standard(self) -> bool:
         """是否为标准格式。
@@ -282,6 +300,9 @@ class DispatchOutputFormat(Enum):
         输入示例：``DispatchOutputFormat.STANDARD``；输出：``True``。
         """
         return self == DispatchOutputFormat.STANDARD
+
+    def is_ascend_tp(self) -> bool:
+        return self == DispatchOutputFormat.ASCEND_TP
 
     def is_deepep_normal(self) -> bool:
         """是否为 DeepEP normal 兼容格式。
@@ -313,6 +334,9 @@ class DispatchOutputFormat(Enum):
         输入示例：``DispatchOutputFormat.FLASHINFER``；输出：``True``。
         """
         return self == DispatchOutputFormat.FLASHINFER
+
+    def is_deepep_v2(self) -> bool:
+        return self == DispatchOutputFormat.DEEPEP_V2
 
 
 @runtime_checkable
@@ -358,6 +382,12 @@ class CombineInputChecker:
         return combine_input.format == CombineInputFormat.STANDARD
 
     @staticmethod
+    def format_is_ascend_tp(
+        combine_input: CombineInput,
+    ) -> TypeGuard[AscendTPCombineInput]:
+        return combine_input.format == CombineInputFormat.ASCEND_TP
+
+    @staticmethod
     def format_is_deepep_normal(
         combine_input: CombineInput,
     ) -> TypeGuard[DeepEPNormalCombineInput]:
@@ -401,6 +431,12 @@ class CombineInputChecker:
         """
         return combine_input.format == CombineInputFormat.FLASHINFER
 
+    @staticmethod
+    def format_is_deepep_v2(
+        combine_input: CombineInput,
+    ) -> TypeGuard[DeepEPv2CombineInput]:
+        return combine_input.format == CombineInputFormat.DEEPEP_V2
+
 
 class CombineInputFormat(Enum):
     """本地专家计算结果传回 dispatcher.combine 时采用的数据格式。"""
@@ -409,6 +445,8 @@ class CombineInputFormat(Enum):
     DEEPEP_NORMAL = "deepep_normal"
     DEEPEP_LL = "deepep_ll"
     FLASHINFER = "flashinfer"
+    DEEPEP_V2 = "deepep_v2"
+    ASCEND_TP = "ascend_tp"
 
 
 @runtime_checkable

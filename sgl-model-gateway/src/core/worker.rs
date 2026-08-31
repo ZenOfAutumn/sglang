@@ -39,10 +39,36 @@ static WORKER_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("Failed to create worker HTTP client")
 });
 
-/// 按「路由键（routing key）」维度统计的 worker 活跃负载。
-///
-/// 用于会话亲和等场景：以 routing_key 为粒度记录当前有多少个在途请求，
-/// 便于观测某个 worker 上活跃的路由键数量。内部用 `DashMap` 支持并发读写。
+pub(crate) fn parse_bootstrap_host_from_url(url: &str) -> String {
+    let metadata_url = match url.rsplit_once('@') {
+        Some((base_url, rank)) if rank.parse::<usize>().is_ok() => base_url,
+        _ => url,
+    };
+
+    match url::Url::parse(metadata_url) {
+        Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
+        Err(_) if !metadata_url.contains("://") => {
+            match url::Url::parse(&format!("http://{}", metadata_url)) {
+                Ok(parsed) => parsed.host_str().unwrap_or("localhost").to_string(),
+                Err(_) => {
+                    tracing::warn!(
+                        "Failed to parse URL '{}', defaulting to localhost",
+                        metadata_url
+                    );
+                    "localhost".to_string()
+                }
+            }
+        }
+        Err(_) => {
+            tracing::warn!(
+                "Failed to parse URL '{}', defaulting to localhost",
+                metadata_url
+            );
+            "localhost".to_string()
+        }
+    }
+}
+
 pub struct WorkerRoutingKeyLoad {
     /// 所属 worker 的 URL（仅用于指标标签与日志）
     url: String,
@@ -975,6 +1001,8 @@ pub struct DPAwareWorker {
     dp_size: usize,
     /// 不带 DP 后缀的基础 URL
     base_url: String,
+    /// Bootstrap host parsed from the real base URL, not the virtual DP URL.
+    bootstrap_host: String,
 }
 
 impl DPAwareWorker {
@@ -986,11 +1014,13 @@ impl DPAwareWorker {
         dp_rank: usize,
         dp_size: usize,
     ) -> Self {
+        let bootstrap_host = parse_bootstrap_host_from_url(&base_url);
         Self {
             base_worker,
             dp_rank,
             dp_size,
             base_url,
+            bootstrap_host,
         }
     }
 }
@@ -1011,6 +1041,10 @@ impl Worker for DPAwareWorker {
 
     fn connection_mode(&self) -> &ConnectionMode {
         self.base_worker.connection_mode()
+    }
+
+    fn bootstrap_host(&self) -> &str {
+        &self.bootstrap_host
     }
 
     fn is_healthy(&self) -> bool {
@@ -1283,6 +1317,22 @@ mod tests {
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
         DPAwareWorkerBuilder,
     };
+
+    #[test]
+    fn test_parse_bootstrap_host_strips_dp_rank_suffix() {
+        assert_eq!(
+            parse_bootstrap_host_from_url("http://10.66.5.115:20664@3"),
+            "10.66.5.115"
+        );
+        assert_eq!(
+            parse_bootstrap_host_from_url("grpc://cluster.local@1"),
+            "cluster.local"
+        );
+        assert_eq!(
+            parse_bootstrap_host_from_url("localhost:8080@2"),
+            "localhost"
+        );
+    }
 
     #[test]
     fn test_worker_type_display() {
@@ -1689,6 +1739,7 @@ mod tests {
 
         assert_eq!(dp_worker.url(), "http://worker1:8080@2");
         assert_eq!(dp_worker.base_url(), "http://worker1:8080");
+        assert_eq!(dp_worker.bootstrap_host(), "worker1");
         assert!(dp_worker.is_dp_aware());
         assert_eq!(dp_worker.dp_rank(), Some(2));
         assert_eq!(dp_worker.dp_size(), Some(4));
@@ -1704,6 +1755,8 @@ mod tests {
             .build();
 
         assert_eq!(dp_worker.url(), "http://worker1:8080@1");
+        assert_eq!(dp_worker.bootstrap_host(), "worker1");
+        assert_eq!(dp_worker.bootstrap_port(), Some(9090));
         assert!(dp_worker.is_dp_aware());
         assert_eq!(
             dp_worker.worker_type(),
@@ -1722,6 +1775,23 @@ mod tests {
         assert_eq!(dp_worker.url(), "http://worker1:8080@0");
         assert!(dp_worker.is_dp_aware());
         assert_eq!(dp_worker.worker_type(), &WorkerType::Decode);
+    }
+
+    #[test]
+    fn test_dp_aware_worker_bootstrap_host_uses_base_url() {
+        let dp_worker = DPAwareWorkerBuilder::new("http://10.66.5.240:21686", 1, 4)
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: None,
+            })
+            .build();
+
+        assert_eq!(dp_worker.url(), "http://10.66.5.240:21686@1");
+        assert_eq!(
+            dp_worker.endpoint_url("/generate"),
+            "http://10.66.5.240:21686/generate"
+        );
+        assert_eq!(dp_worker.bootstrap_host(), "10.66.5.240");
+        assert_eq!(dp_worker.bootstrap_port(), None);
     }
 
     #[tokio::test]

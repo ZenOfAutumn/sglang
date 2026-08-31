@@ -6,11 +6,11 @@ import logging
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +65,9 @@ class BaseKVCacheMethod(QuantizeMethodBase):
             if is_fp8_fnuz():
                 k_scale *= 2
                 v_scale *= 2
-        elif layer.k_scale < 0.0 and layer.v_scale < 0.0:
-            # 情况二：checkpoint 中没有任何缩放因子（两者仍是无效的负初始值），
-            # 退回到默认值 1.0（相当于不缩放）。
+        elif layer.k_scale <= 0.0 and layer.v_scale <= 0.0:
+            # If no scales were loaded (both scales are invalid non-positive
+            # values), use the default value of 1.0
             k_scale = 1.0
             v_scale = 1.0
         else:

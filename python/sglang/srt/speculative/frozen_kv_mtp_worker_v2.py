@@ -40,11 +40,15 @@ Frozen-KV MTP (Multi-Token Prediction) 的 spec-v2 worker 实现。
 from __future__ import annotations
 
 import logging
+import time
+from dataclasses import replace
 from typing import Optional
 
 import torch
 
+from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.layers.moe.utils import (
+    draft_model_build_scope,
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
@@ -58,13 +62,20 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_device,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import EagleDraftWorkerBase
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
 )
-from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2, _get_plan_stream
+from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 from sglang.srt.speculative.frozen_kv_mtp_info import (
     FrozenKVMTPContext,
     FrozenKVMTPDraftInput,
@@ -82,10 +93,11 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     fast_topk,
+    get_plan_stream,
     select_top_k_tokens,
     spec_stage_span,
 )
-from sglang.srt.utils import empty_context
+from sglang.srt.utils import empty_context, get_available_gpu_memory
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -134,88 +146,52 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        """初始化 Frozen-KV MTP draft worker。
+        EagleDraftWorkerBase.__init__(self)
 
-        参数:
-            server_args: 服务器配置参数，包含 speculative 算法配置
-            gpu_id: GPU 设备 ID
-            tp_rank: Tensor Parallel rank
-            dp_rank: Data Parallel rank (可选)
-            moe_ep_rank: MoE Expert Parallel rank
-            attn_cp_rank: Attention Context Parallel rank
-            moe_dp_rank: MoE Data Parallel rank
-            nccl_port: NCCL 通信端口
-            target_worker: 目标模型工作器，提供 KV cache 和 embedding/head
-
-        初始化流程:
-            1. 保存配置参数 (topk, num_steps, num_draft_tokens 等)
-            2. 验证 speculative_algorithm 为 FROZEN_KV_MTP
-            3. 复用 target 的 req_to_token_pool 和 KV allocator (只读)
-            4. 创建 dummy draft_pool_config (实际不使用)
-            5. 调用 TpModelWorker.__init__ 初始化模型
-            6. 绑定 target 的 embedding 和 head 到 draft 模型
-            7. 绑定 frozen KV context (实现只读 KV 访问)
-            8. 初始化 attention backend 和 CUDA graph (设为 None，后续 init_backends 中创建)
-        """
         self.server_args = server_args
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.topk = get_spec().speculative_eagle_topk
+        self.speculative_num_steps = get_spec().speculative_num_steps
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
+        self.ps = ps
         self.gpu_id = gpu_id
-        self.device = server_args.device
+        self.device = get_device().device
         self.target_worker = target_worker
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
+            get_spec().speculative_algorithm
         )
         assert self.speculative_algorithm.is_frozen_kv_mtp(), (
             "FrozenKVMTPDraftWorker 只能在 SpeculativeAlgorithm.FROZEN_KV_MTP 下创建，"
             f"当前算法为 {self.speculative_algorithm.name}."
         )
 
-        # Draft attention 复用 target 的 req_to_token + KV allocator (只读模式)
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
-
-        # 创建一个 dummy 的 draft pool config (max_total_num_tokens=64)
-        # 实际不使用，仅为保持与 TpModelWorker 初始化接口的兼容性
-        target_cfg = target_worker.model_runner.memory_pool_config
-        self.draft_pool_config = MemoryPoolConfig(
-            max_total_num_tokens=64,  # 哑值，实际不分配 draft KV
-            max_running_requests=target_cfg.max_running_requests,
-        )
+        # Target pools (read-only) are bound in alloc_memory_pool(), not here, so
+        # the worker can be built before the target pool exists (see #29021).
+        self.req_to_token_pool = None
+        self.token_to_kv_pool_allocator = None
+        self.draft_pool_config: Optional[MemoryPoolConfig] = None
 
         self.hot_token_id = None
 
         with (
             empty_context()
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-            # 注意: 显式调用 TpModelWorker.__init__ -- EagleDraftWorkerBase
-            # 是一个没有 __init__ 的 ABC，使用 cooperative super() 会有歧义
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context(), draft_model_build_scope():
+            # Both base classes own initialization, so initialize TpModelWorker
+            # explicitly after EagleDraftWorkerBase above.
             TpModelWorker.__init__(
                 self,
                 server_args=server_args,
                 gpu_id=gpu_id,
-                tp_rank=tp_rank,
-                pp_rank=0,
-                dp_rank=dp_rank,
-                moe_ep_rank=moe_ep_rank,
-                attn_cp_rank=attn_cp_rank,
-                moe_dp_rank=moe_dp_rank,
+                # spec workers don't support pipeline parallelism
+                ps=replace(ps, pp_rank=0, pp_size=1),
                 nccl_port=nccl_port,
                 is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                memory_pool_config=self.draft_pool_config,
+                # The draft runs at absolute target positions.
+                context_length=self.target_worker.model_runner.model_config.context_len,
             )
 
         # 从 target 模型获取 embedding 和 head，绑定到 draft 模型
@@ -232,11 +208,9 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
 
         # 绑定 frozen KV context: 使 draft 模型能以只读方式访问 target KV cache
         self.kv_context: Optional[FrozenKVMTPContext] = None
-        if hasattr(self.draft_model_runner.model, "bind_frozen_kv_context"):
-            self._bind_kv_context()
 
         self.draft_tp_context = (
-            draft_tp_context if server_args.enable_dp_attention else empty_context
+            draft_tp_context if get_parallel().enable_dp_attention else empty_context
         )
 
         # 以下属性在 init_backends() 中初始化，这里先设为 None
@@ -253,62 +227,44 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
-        """分配内存池 (重写)。
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
-        Frozen draft 不拥有自己的 KV pool，复用 target 的内存池。
-        此方法仅为满足 TpModelWorker 的初始化接口要求。
+        self.draft_pool_config = MemoryPoolConfig(
+            max_total_num_tokens=64,  # Dummy value
+            max_running_requests=memory_pool_config.max_running_requests,
+        )
 
-        参数:
-            memory_pool_config: 内存池配置 (未使用，用 self.draft_pool_config 替代)
-            req_to_token_pool: 请求到 token 的映射池 (可选，默认用 target 的)
-            token_to_kv_pool_allocator: token 到 KV pool 的分配器 (可选，默认用 target 的)
-
-        示例::
-
-            >>> draft_worker.alloc_memory_pool()
-            >>> # 内部调用 TpModelWorker.alloc_memory_pool，使用 dummy pool config
-        """
-        # 注意: 显式调用 TpModelWorker.alloc_memory_pool --
-        # EagleDraftWorkerBase 在 MRO 中优先于它，但其 alloc_memory_pool 是空操作桩
+        # NOTE: call TpModelWorker explicitly -- EagleDraftWorkerBase precedes it in
+        # the MRO and its alloc_memory_pool is a no-op stub.
         TpModelWorker.alloc_memory_pool(
             self,
             memory_pool_config=self.draft_pool_config,
-            req_to_token_pool=(
-                req_to_token_pool
-                if req_to_token_pool is not None
-                else self.req_to_token_pool
-            ),
-            token_to_kv_pool_allocator=(
-                token_to_kv_pool_allocator
-                if token_to_kv_pool_allocator is not None
-                else self.token_to_kv_pool_allocator
-            ),
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
 
-    def init_backends(self):
-        """初始化后端: attention backend + CUDA graph。
+        if hasattr(self.draft_model_runner.model, "bind_frozen_kv_context"):
+            self._bind_kv_context()
 
-        初始化流程:
-            1. 在 draft TP context 和 MoE context 下调用 TpModelWorker.init_backends
-               (禁用 CUDA graph，因为 draft 自行管理)
-            2. 初始化 draft attention backend (triton 或复用 target backend)
-            3. 将 draft_attn_backend 设置到 draft_model_runner
-            4. 初始化 CUDA graph (如果支持)
-
-        示例::
-
-            >>> draft_worker.init_backends()
-            >>> # 之后 draft_worker.draft_attn_backend 可用
-        """
+    def init_attention_backends(self):
         with (
             self.draft_tp_context(self.draft_model_runner.tp_group),
             speculative_moe_backend_context(),
             speculative_moe_a2a_backend_context(),
         ):
-            TpModelWorker.init_backends(self, disable_cuda_graph=True)
+            TpModelWorker.init_attention_backends(self)
             self.draft_attn_backend = self._init_draft_attn_backend()
             self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
-            self.init_cuda_graphs()
+
+    def init_cuda_graphs(self):
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            TpModelWorker.init_cuda_graphs(self, capture_decode_cuda_graph=False)
+            self._capture_cuda_graphs()
 
     @property
     def draft_model_runner(self):
@@ -336,27 +292,15 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         pass
 
     def _resolve_draft_backend_type(self) -> str:
-        """解析 draft attention backend 类型。
-
-        按优先级返回:
-            1. speculative_draft_attention_backend (如果配置了专门的 draft backend)
-            2. decode_attention_backend (解码阶段的 backend)
-            3. attention_backend (通用 backend)
-
-        返回:
-            backend 类型字符串，例如 "triton", "flashinfer" 等
-
-        示例::
-
-            >>> backend_type = draft_worker._resolve_draft_backend_type()
-            >>> # 如果 server_args.speculative_draft_attention_backend="triton"
-            >>> # 则返回 "triton"
-        """
-        return (
-            self.server_args.speculative_draft_attention_backend
-            or self.server_args.decode_attention_backend
-            or self.server_args.attention_backend
-        )
+        # The same chain as before, off the bags: the speculative override if
+        # the operator set one, else the configured decode backend (which falls
+        # back to the base one). Deliberately NOT the runner's stamp: this
+        # worker does not hand its runner a draft backend, so the stamp is the
+        # ordinary pair and reading it would drop the speculative setting --
+        # and forcing the runner onto one backend would collapse a hybrid
+        # prefill/decode config for the topk==1 path, which uses the runner's
+        # own backend.
+        return get_spec().speculative_draft_attention_backend or attention_backends()[1]
 
     def _init_draft_attn_backend(self):
         """初始化 draft attention backend。
@@ -381,12 +325,14 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             return self.draft_model_runner.attn_backend
 
         backend_type = self._resolve_draft_backend_type()
-        if backend_type != "triton":
-            raise ValueError(
-                "Frozen-KV MTP topk > 1 当前仅支持 triton attention backend，"
-                f"收到 {backend_type}."
-            )
-        return self._init_triton_draft_attn_backend()
+        if backend_type == "triton":
+            return self._init_triton_draft_attn_backend()
+        if backend_type == "trtllm_mha":
+            return self._init_trtllm_mha_draft_attn_backend()
+        raise ValueError(
+            "Frozen-KV MTP topk > 1 currently supports triton and trtllm_mha "
+            f"attention backends, got {backend_type}."
+        )
 
     def _init_triton_draft_attn_backend(self):
         """初始化 Triton attention backend (用于 topk > 1 的场景)。
@@ -413,6 +359,11 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             skip_prefill=True,
             kv_indptr_buf=kv_indptr_buf,
         )
+
+    def _init_trtllm_mha_draft_attn_backend(self):
+        from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
+
+        return TRTLLMHAAttnBackend(self.draft_model_runner, skip_prefill=True)
 
     def _bind_kv_context(self) -> None:
         """绑定 frozen KV context 到 draft 模型。
@@ -642,24 +593,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         with self._frozen_kv_target_view(forward_batch):
             self.draft_attn_backend.init_forward_metadata_out_graph(fb_view)
 
-    def init_cuda_graphs(self) -> None:
-        """初始化 CUDA graph (如果支持)。
-
-        条件:
-            - CUDA graph 未被完全禁用
-            - speculative_num_steps > 1 (单步无需 CUDA graph)
-            - 设备为 CUDA
-
-        如果条件不满足，则在 eager 模式下运行 draft loop。
-
-        示例::
-
-            >>> draft_worker.init_cuda_graphs()
-            >>> # 如果支持 CUDA graph:
-            >>> #   draft_worker.cuda_graph_runner = FrozenKVMTPCudaGraphRunner(...)
-            >>> # 否则:
-            >>> #   draft_worker.cuda_graph_runner = None (eager 模式)
-        """
+    def _capture_cuda_graphs(self) -> None:
         if cuda_graph_fully_disabled() or self.speculative_num_steps <= 1:
             return
         if self.target_worker.device != "cuda":
@@ -674,9 +608,22 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             FrozenKVMTPCudaGraphRunner,
         )
 
-        logger.info("开始捕获 Frozen-KV MTP draft CUDA graph。")
+        logger.info("Capture Frozen-KV MTP draft cuda graph begin.")
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.cuda_graph_runner = FrozenKVMTPCudaGraphRunner(self)
-        logger.info("完成捕获 Frozen-KV MTP draft CUDA graph。")
+        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        self._specialized_graph_memory_usage["draft_decode"] = (
+            self._specialized_graph_memory_usage.get("draft_decode", 0.0)
+            + before_mem
+            - after_mem
+        )
+        self._specialized_graph_time_usage["draft_decode"] = (
+            self._specialized_graph_time_usage.get("draft_decode", 0.0)
+            + time.perf_counter()
+            - tic
+        )
+        logger.info("Capture Frozen-KV MTP draft cuda graph end.")
 
     def _select_last_extend_hidden(
         self, batch: ScheduleBatch, hidden_states: torch.Tensor
@@ -812,35 +759,43 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         spec_info = batch.spec_info
         assert isinstance(spec_info, FrozenKVMTPDraftInput)
 
-        # 注意: 每轮迭代的记账工作 (penalty 累积, maybe_evict_swa,
-        # decode_batch_idx tick) 由继承的 EagleDraftInputV2Mixin.prepare_for_decode
-        # 完成 (调度器驱动，参见 ScheduleBatch.prepare_for_decode)，不在这里做——
-        # 与 EAGLE v2 一致。在这里重复 evict/tick 会导致双重执行:
-        # idx 时钟控制 SWA eviction 时序和 SWA prefix-lock 释放。
+        # NOTE: per-iter bookkeeping (penalty cumulation, maybe_evict_swa,
+        # decode_batch_idx tick) is done by the scheduler-driven
+        # eagle_utils.eagle_prepare_for_decode (see
+        # ScheduleBatch.prepare_for_decode), not here -- matching EAGLE v2.
+        # Repeating evict/tick here would double-run them: the idx clock
+        # gates SWA eviction timing and the SWA prefix-lock release.
 
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        # Actual width of the next draft-decode forward: topk tokens per req.
         spec_info.num_tokens_per_req = self.topk
         spec_info.num_tokens_for_logprob_per_req = self.topk
         spec_info.positions = self._position_for_batch(batch)
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         batch.return_hidden_states = False
 
-        # 创建 ForwardBatch 并设置 frozen KV 特有的位置和 topk 扩展
-        forward_batch = ForwardBatch.init_new(batch, self.draft_model_runner)
+        forward_batch = ForwardBatch.init_new(
+            batch,
+            self.draft_model_runner,
+            return_hidden_states_before_norm=False,
+        )
         assert forward_batch.capture_hidden_mode == CaptureHiddenMode.LAST
         self._set_positions(forward_batch)
         self._expand_for_topk_draft(forward_batch)
 
-        # 尝试 CUDA graph replay，否则执行 eager draft_forward
-        can_run_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
-            forward_batch
+        # Frozen draft never writes KV; None signals fill_from to skip the slot.
+        forward_batch.out_cache_loc = None
+
+        can_run_cuda_graph = (
+            self.cuda_graph_runner
+            and self.cuda_graph_runner.can_run_graph(forward_batch)
         )
         if can_run_cuda_graph:
-            parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
-                forward_batch
+            parent_list, top_scores_index, draft_tokens = (
+                self.cuda_graph_runner.execute(forward_batch)
             )
         else:
-            forward_batch.can_run_dp_cuda_graph = False
+            forward_batch.can_run_decode_cuda_graph = False
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
                 forward_batch
             )
@@ -1153,53 +1108,43 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         self,
         server_args: ServerArgs,
         gpu_id: int,
-        tp_rank: int,
-        dp_rank: Optional[int],
-        moe_ep_rank: int,
-        attn_cp_rank: int,
-        moe_dp_rank: int,
+        ps: ParallelState,
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        # 注意: 有意不调用 EAGLEWorkerV2.__init__ -- 那会创建
-        # EagleDraftWorker (带有自己的 draft KV pool)。Frozen draft 不拥有 KV，
-        # 因此我们镜像相关设置并创建 FrozenKVMTPDraftWorker。
+        BaseSpecWorker.__init__(self)
+
+        # NOTE: intentionally does NOT call EAGLEWorkerV2.__init__ -- that builds
+        # an EagleDraftWorker (with its own draft KV pool). The frozen draft owns
+        # no KV, so we mirror the relevant setup and build a FrozenKVMTPDraftWorker.
         self.server_args = server_args
-        self.topk = server_args.speculative_eagle_topk
-        self.speculative_num_steps = server_args.speculative_num_steps
-        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
-        self.tp_rank = tp_rank
+        self.topk = get_spec().speculative_eagle_topk
+        self.speculative_num_steps = get_spec().speculative_num_steps
+        self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
+        self.ps = ps
         self.gpu_id = gpu_id
-        self.device = server_args.device
+        self.device = get_device().device
         self._target_worker = target_worker
-        self.page_size = server_args.page_size
+        self.page_size = get_schedule().page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
+            get_spec().speculative_algorithm
         )
 
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-        # 将 draft 上下文长度匹配到 target (assistant 读取 target KV)
-        server_args.context_length = target_worker.model_runner.model_config.context_len
-
-        # 创建 Frozen-KV MTP draft worker
         self._draft_worker = FrozenKVMTPDraftWorker(
             server_args,
             gpu_id,
-            tp_rank,
-            dp_rank,
-            moe_ep_rank,
-            attn_cp_rank,
-            moe_dp_rank,
+            ps,
             nccl_port,
             target_worker,
         )
 
         # Frozen MTP 尚未接入 adaptive 控制器
         assert (
-            not server_args.speculative_adaptive
-        ), "Frozen-KV MTP 尚不支持 adaptive speculative decoding。"
+            not get_spec().speculative_adaptive
+        ), "Frozen-KV MTP does not support adaptive speculative decoding yet."
         self.adaptive_controller = None
 
         # 一些哑张量 (与 EAGLEWorkerV2 初始化保持一致)
@@ -1208,7 +1153,7 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
-        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+        self.plan_stream, self.plan_stream_ctx = get_plan_stream(self.device)
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
@@ -1231,52 +1176,17 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             self._draft_worker.draft_attn_backend,
         )
 
-    def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
-        """执行 forward batch 生成 (overlap 调度)。
-
-        镜像 EAGLEWorkerV2.forward_batch_generation; 唯一的 frozen 特有变化
-        是 idle draft-input (FrozenKVMTPDraftInput + recurrent hidden size)。
-        draft / 基于种子的 draft-extend 钩子在 FrozenKVMTPDraftWorker 中。
-
-        工作流程:
-            - Extend (prefill) 模式:
-                1. Target prefill (捕获 FULL hidden)
-                2. Publish new_seq_lens
-                3. Draft prefill seed (无前向传播)
-            - Decode 模式:
-                1. Draft forward (种子前向 + 循环推测)
-                2. Target verify (验证推测 token)
-                3. Publish new_seq_lens
-                4. Draft extend for decode (从 verify 结果中选取下一轮种子)
-
-        参数:
-            batch: 调度 batch
-            on_publish: 可选的回调函数，在 target/verify 完成后调用
-                        用于发布 new_seq_lens 作为 overlap fence
-
-        返回:
-            batch_output: 包含 logits_output、next_token_ids、next_draft_input 等
-
-        示例::
-
-            >>> # prefill 模式
-            >>> batch.forward_mode = ForwardMode.EXTEND
-            >>> output = worker.forward_batch_generation(batch)
-            >>> # output.next_draft_input = FrozenKVMTPDraftInput (种子)
-            >>>
-            >>> # decode 模式
-            >>> batch.forward_mode = ForwardMode.DECODE
-            >>> batch.spec_info = FrozenKVMTPDraftInput(...)
-            >>> output = worker.forward_batch_generation(batch)
-            >>> # output 包含 verify 结果和下一轮种子
-        """
+    def forward_batch_generation(
+        self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
+    ):
         # Mirrors EAGLEWorkerV2.forward_batch_generation; the only frozen-specific
         # change is the idle draft-input (FrozenKVMTPDraftInput + recurrent hidden
         # size). The draft / seed-based draft-extend hooks are FrozenKVMTPDraftWorker's.
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            # Target prefill (frozen 从不独立运行 -> 捕获 FULL hidden)
-            batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            batch_output = self.target_worker.forward_batch_generation(batch)
+            # Target prefill (frozen is never standalone -> capture FULL hidden).
+            batch_output = self.target_worker.forward_batch_generation(
+                batch, capture_hidden_mode=CaptureHiddenMode.FULL
+            )
 
             # Spec_v2 约定: batch.seq_lens = 本次迭代 token 之前的长度
             batch_output.new_seq_lens = batch.seq_lens
@@ -1318,9 +1228,8 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 verify_input = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
-            # 执行 target verify (复用 EAGLEWorkerV2.verify)
-            batch_output = self.verify(batch)
-            # 在 draft-extend 之前发布，以便 fence 在 verify 端
+            batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
+            # Publish before draft-extend so the fence is at verify-end.
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
             with (

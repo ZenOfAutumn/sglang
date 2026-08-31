@@ -63,71 +63,27 @@ Omit `--service-discovery-namespace` to watch all namespaces (requires
 cluster-wide RBAC). For prefill/decode disaggregation, replace `--selector`
 with `--prefill-selector` and `--decode-selector`.
 
-> 中译：省略 `--service-discovery-namespace` 可监听**所有命名空间**（需要集群级 RBAC 权限）。
-> 若使用 **prefill/decode 分离（PD 分离）** 部署，则把 `--selector` 替换为
-> `--prefill-selector` 与 `--decode-selector`，分别发现预填充与解码两类 worker。
+External KV indexer as the cache-aware signal source:
 
-## 架构与集群拓扑
-
-### Router 是软状态（soft-state），而非持久有状态
-
-Router **不持有任何需要持久化的权威状态**，但为了性能会在内存中维护一份**可从 worker 事件流重建**的软状态：
-
-- **KV 事件哈希前缀树（`HashTree`）**：cache-aware 策略用它跟踪「哪个 worker 缓存了哪些前缀」。它是
-  **每进程一份**，且策略侧**只读**——由后台 indexer 订阅各 worker 通过 ZMQ 推送的 KV 事件来填充
-  （见 `src/policies/cache_aware_zmq.rs` 与 `src/policies/kv_events/`）。
-- **worker 注册表 / 健康状态 / 活跃负载**：均为运行时观测值（见 `src/workers/`、`src/health/`）。
-- **block_size_oracle**：从 worker 上报的 `page_size` 学习到的块大小。
-
-这些状态都能在 router 重启后通过重新订阅事件恢复，**不落盘、不需要 worker 反向依赖某个特定 router**。
-即使前缀树尚未建好或分词器缺失，cache-aware 也会**降级为按负载路由**而非报错：
-
-> The implementation never returns `None` for a non-empty `workers` slice; a misconfigured tree or
-> tokenizer degrades to round-robin-with-load tiebreak, not a routing failure.
->
-> 中译：只要候选 worker 非空，选择逻辑永不返回 `None`；前缀树或分词器异常时会退化为
-> 「带负载 tiebreak 的轮询」，而不会造成路由失败。
-
-因此 Router 本质上是**软状态、shared-nothing 的**，可任意水平扩展、无主从、无一致性协议。
-
-### 集群节点关系
-
-```
-                    ┌─────────────┐
-   Client ────────▶ │   Router    │ (可多副本, 各自维护软状态, 互不通信)
-                    └──────┬──────┘
-              路由决策 ┌───┴────────────┐ 订阅 KV 事件(ZMQ)
-                     ▼                 ▲
-        ┌────────────────────────────────────────┐
-        │        SGLang Worker 池（单模型）         │
-        │  ┌──────────┐        ┌──────────┐        │
-        │  │ Prefill  │──KV──▶ │ Decode   │        │  (PD 分离时)
-        │  │ worker   │ RDMA   │ worker   │        │
-        │  └──────────┘        └──────────┘        │
-        └────────────────────────────────────────┘
-                     ▲
-              服务发现(静态列表 / K8s EndpointSlice)
+```bash
+sgl-router \
+  --model-id qwen3 \
+  --tokenizer-path /models/qwen3/tokenizer.json \
+  --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000 \
+  --policy cache_aware_zmq \
+  --kv-indexer-endpoint http://10.0.0.10:50051 \
+  --kv-indexer-query-timeout-ms 100 \
+  --kv-indexer-query-max-inflight 32
 ```
 
-1. **Router ↔ Worker：单向请求 + 事件反馈**
-   - Router → Worker：转发请求（HTTP），主调用方向。
-   - Worker → Router：通过 ZMQ 推送 KV 事件（前缀块缓存/驱逐），供 router 构建前缀树。
-     Worker **不感知也不依赖具体哪个 router**。
+The existing cache-aware policy and thresholds are reused. When configured, the
+Indexer replaces the Router-local radix tree as the cache signal. A successful
+query with no usable match selects by minimum active load; connection failures,
+timeouts, local admission rejection, and server rejection fail the Router
+request with `503` rather than silently switching signals. The timeout and local
+concurrency bound default to 100ms and 32 respectively.
 
-2. **Router ↔ Router：无关系（shared-nothing）**
-   - 多个 router 副本之间**不通信、不共享状态**，各自独立订阅同一批 worker 的事件、各自维护前缀树，
-     并各自收敛到一致的路由决策（见 `tests/e2e/chat_completions/test_two_router_convergence.py`）。
-   - 因此 router 可自由水平扩展、无主从、无一致性协议——这也是它能在 K8s 中随意扩缩容的原因。
-
-3. **Worker ↔ Worker：仅 PD 分离时有关系**
-   - 普通部署下 worker 之间无关系。
-   - PD 分离时，prefill worker 通过 RDMA/Mooncake 把 KV 直接传给 decode worker，凭 router 注入的
-     `bootstrap_room` 配对（见 `tests/proxy/pd_bootstrap_injection.rs`、`tests/proxy/pd_pool_isolation.rs`）。
-
-**一句话**：Router 软状态、副本零耦合、可水平扩展；集群中 Router 单向转发并反向订阅 Worker 的 KV 事件，
-Worker 之间仅在 PD 分离时通过 RDMA 传 KV。
-
-## License（许可证）
+## License
 
 Apache-2.0.
 

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import time
@@ -27,9 +28,12 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_npu
+from sglang.srt.model_executor.step_span_utils import set_detailed_annotations_enabled
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_device
+from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
+from sglang.srt.utils.profile_utils import ProfileManager
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if TYPE_CHECKING:
@@ -37,8 +41,7 @@ if TYPE_CHECKING:
 
 _is_npu = is_npu()
 # 中译：在昇腾 NPU 平台上，torch.profiler 的若干符号需要替换为 torch_npu 的对应实现，
-#       这里用 monkey-patch 把 profiler.profile 及 ProfilerActivity.CUDA/CPU 映射到 NPU 版本，
-#       从而让后续代码无需区分平台即可调用统一的 torch.profiler 接口。
+_is_mps = is_mps()
 if _is_npu:
     import torch_npu
 
@@ -48,11 +51,12 @@ if _is_npu:
         ["profiler.ProfilerActivity.CPU", torch_npu.profiler.ProfilerActivity.CPU],
     ]
     apply_torch_npu_patches(torch_npu, patches)
+elif _is_mps:
+    from sglang.srt.hardware_backend.mlx.profiler import apply_metal_profiler_patches
+
+    apply_metal_profiler_patches()
 
 logger = logging.getLogger(__name__)
-
-
-from sglang.srt.utils.profile_utils import ProfileManager
 
 
 @dataclass(kw_only=True)
@@ -102,6 +106,7 @@ class SchedulerProfilerManager:
         self.profile_by_stage: bool = False
         self.profile_in_progress: bool = False
         self.merge_profiles = False
+        self.detailed_annotations: bool = False
 
         # For ROCM
         # 中译：ROCm（AMD GPU）平台专用的 RPD profiler 句柄，CUDA/NPU 平台保持为 None。
@@ -119,11 +124,13 @@ class SchedulerProfilerManager:
         profile_id: str,
         merge_profiles: bool = False,
         profile_prefix: str = "",
+        detailed_annotations: bool = False,
         profile_stages: Optional[List[str]] = None,
     ) -> ProfileReqOutput:
         # 中译：解析并保存本次 profiling 的配置（输出目录、起始步、步数、活动类型、是否记录调用栈/形状、
         #       是否按阶段、profile_id 等），但不立即开始采集；实际开始由 _start_profile 触发。
         if envs.SGLANG_PROFILE_V2.get():
+            self.detailed_annotations = detailed_annotations
             return self._profile_manager.configure(
                 output_dir=output_dir,
                 start_step=start_step,
@@ -136,6 +143,7 @@ class SchedulerProfilerManager:
                 merge_profiles=merge_profiles,
                 profile_prefix=profile_prefix,
                 profile_stages=profile_stages,
+                detailed_annotations=detailed_annotations,
             )
 
         # 中译：若已有采集在进行中，拒绝重复配置，提示先调用 /stop_profile。
@@ -161,6 +169,7 @@ class SchedulerProfilerManager:
         self.profiler_activities = activities
         self.profile_id = profile_id
         self.profile_prefix = profile_prefix
+        self.detailed_annotations = detailed_annotations
 
         # 中译：指定了起始步时，起点取 max(start_step, 当前 forward 计数+1)，确保不早于当前步。
         if start_step:
@@ -181,7 +190,7 @@ class SchedulerProfilerManager:
                 )
             else:
                 # 中译：未指定起始步——立即从当前步起算，采集 num_steps 步。
-                self.profiler_target_forward_ct = self.get_forward_ct() + num_steps
+                self.profiler_target_forward_ct = self.get_forward_ct() + num_steps + 1
             # The caller will be notified when reaching profiler_target_forward_ct
             # 中译：到达 profiler_target_forward_ct 时会通知调用方（采集自动结束）。
         else:
@@ -189,6 +198,12 @@ class SchedulerProfilerManager:
             self.profiler_target_forward_ct = None
 
         return ProfileReqOutput(success=True, message="Succeeded")
+
+    def _apply_detailed_annotations(self, enabled: bool) -> None:
+        # Toggle the process-wide flag read by build_step_span_name; folds the
+        # per-phase sq/sqsq/sqsk/sk aggregates (context c_ / generation g_)
+        # into the step span while a detailed-annotation profile is active.
+        set_detailed_annotations_enabled(enabled)
 
     def _start_profile(
         self, stage: Optional[ForwardMode] = None
@@ -200,6 +215,7 @@ class SchedulerProfilerManager:
         stage 仅在按阶段采集时传入，用于日志区分当前是 prefill 还是 decode 阶段。
         """
         if envs.SGLANG_PROFILE_V2.get():
+            self._apply_detailed_annotations(self.detailed_annotations)
             return self._profile_manager.manual_start()
 
         stage_str = f" for {stage.name}" if stage else ""
@@ -218,6 +234,15 @@ class SchedulerProfilerManager:
             "CPU": torch.profiler.ProfilerActivity.CPU,
             "GPU": torch.profiler.ProfilerActivity.CUDA,
         }
+
+        if current_platform.is_out_of_tree():
+            if hasattr(
+                torch.profiler.ProfilerActivity,
+                current_platform.get_torch_profiler_activity_str(),
+            ):
+                activity_map[current_platform.get_torch_profiler_activity_str()] = (
+                    current_platform.get_torch_profiler_activity()
+                )
         if hasattr(torch.profiler.ProfilerActivity, "XPU"):
             activity_map["XPU"] = torch.profiler.ProfilerActivity.XPU
         torchprof_activities = [
@@ -286,21 +311,28 @@ class SchedulerProfilerManager:
                     )
                 ),
             )
-            self.torch_profiler.start()
+            try:
+                self.torch_profiler.start()
+            except RuntimeError as e:
+                self.torch_profiler = None
+                return ProfileReqOutput(success=False, message=str(e))
             self.profile_in_progress = True
 
         # 中译：MEM——开启 CUDA 显存分配历史记录，停止时再 dump 出快照用于分析显存占用。
         if "MEM" in activities:
-            torch.cuda.memory._record_memory_history(max_entries=100000)
+            torch.cuda.memory._record_memory_history(
+                max_entries=envs.SGLANG_MEM_PROFILE_MAX_ENTRIES.get()
+            )
             self.profile_in_progress = True
 
         # 中译：CUDA_PROFILER——调用 cudaProfilerStart（配合 nsys 等外部工具采集），
         #       仅在持有 base_gpu_id 的进程上触发，避免多进程重复启动。
         if "CUDA_PROFILER" in activities:
-            if self.ps.gpu_id == get_global_server_args().base_gpu_id:
+            if self.ps.gpu_id == get_device().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
+        self._apply_detailed_annotations(self.detailed_annotations)
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def _merge_profile_traces(self) -> str:
@@ -350,6 +382,7 @@ class SchedulerProfilerManager:
         必要时合并多 rank trace，最后清空运行状态以便下一轮采集。
         """
         if envs.SGLANG_PROFILE_V2.get():
+            self._apply_detailed_annotations(False)
             return self._profile_manager.manual_stop()
 
         # 中译：当前没有采集在进行时拒绝停止，提示先 /start_profile。
@@ -418,7 +451,8 @@ class SchedulerProfilerManager:
         if self.profiler_activities is not None and "MEM" in self.profiler_activities:
             memory_profile_path = os.path.join(
                 self.torch_profiler_output_dir,
-                str(time.time())
+                stage_prefix
+                + str(time.time())
                 + f"-TP-{self.ps.tp_rank}-memory"
                 + stage_suffix
                 + ".pickle",
@@ -428,7 +462,7 @@ class SchedulerProfilerManager:
 
         # 中译：CUDA_PROFILER——与 start 对称，仅在 base_gpu_id 进程上调用 cudaProfilerStop。
         if "CUDA_PROFILER" in self.profiler_activities:
-            if self.ps.gpu_id == get_global_server_args().base_gpu_id:
+            if self.ps.gpu_id == get_device().base_gpu_id:
                 torch.cuda.cudart().cudaProfilerStop()
 
         # 中译：按需合并多 rank 的 trace，得到追加到结果消息里的说明串。
@@ -440,10 +474,14 @@ class SchedulerProfilerManager:
             merge_message,
         )
         # 中译：清空运行状态，使采集器回到「空闲」可重新配置/启动的状态。
-        self.torch_profiler = None
+
+        if self.torch_profiler is not None:
+            self.torch_profiler = None
+            gc.collect()
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 
+        self._apply_detailed_annotations(False)
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
 
     def _profile_batch_predicate(self, batch: ScheduleBatch):
@@ -500,14 +538,8 @@ class SchedulerProfilerManager:
                 self._start_profile()
 
     def _profile(self, recv_req: ProfileReq):
-        """中译：处理外部 ProfileReq 请求的入口（START_PROFILE / STOP_PROFILE）。
-
-        对于 START：若是「按阶段」或指定了起始步，则只做配置（_init_profile），实际采集交给
-        _profile_batch_predicate 在跑到对应步时自动触发；否则配置后立即 _start_profile。
-        对于 STOP：直接 _stop_profile。
-        """
-        if recv_req.type == ProfileReqType.START_PROFILE:
             # 中译：按阶段 / 指定起始步——延迟启动，只返回配置结果，后续由 predicate 自动起止。
+        if recv_req.req_type == ProfileReqType.START_PROFILE:
             if recv_req.profile_by_stage or recv_req.start_step:
                 return self._init_profile(
                     recv_req.output_dir,
@@ -520,6 +552,7 @@ class SchedulerProfilerManager:
                     recv_req.profile_id,
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
+                    recv_req.detailed_annotations,
                     recv_req.profile_stages,
                 )
             else:
@@ -535,6 +568,7 @@ class SchedulerProfilerManager:
                     recv_req.profile_id,
                     recv_req.merge_profiles,
                     recv_req.profile_prefix,
+                    recv_req.detailed_annotations,
                 )
                 return self._start_profile()
         else:

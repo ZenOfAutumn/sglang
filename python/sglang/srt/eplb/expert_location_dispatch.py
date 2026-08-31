@@ -18,59 +18,29 @@ from typing import Literal, Optional
 import torch
 
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import is_hip
-
-_is_hip = is_hip()
+from sglang.srt.runtime_context import get_exec
 
 
 @dataclass
 class ExpertLocationDispatchInfo:
-    """单个 MoE 层执行“逻辑专家 ID → 物理专家 ID”转换所需的信息。
-
-    Router 选择的是模型定义中的逻辑专家；EPLB 可能移动或复制这些专家，
-    因而执行 MoE kernel 前还需要把逻辑 ID 转换为当前布局中的物理 ID。
-
-    Attributes:
-        ep_dispatch_algorithm: 专家副本分发算法。``static`` 使用预先确定的映射；
-            ``dynamic``/``fake`` 在某个逻辑专家的全部物理副本中随机选择。
-        partial_logical_to_rank_dispatch_physical_map: 当前层的静态映射，形状为
-            ``(num_logical_experts,)``，每个元素是该逻辑专家应使用的物理专家 ID。
-        partial_logical_to_all_physical_map: 当前层的全部副本映射，形状为
-            ``(num_logical_experts, max_num_replicas)``。每行保存一个逻辑专家
-            可用的所有物理专家 ID；无效的尾部槽位不会被访问。
-        partial_logical_to_all_physical_map_num_valid: 每个逻辑专家实际拥有的
-            物理副本数量，形状为 ``(num_logical_experts,)``。
-        num_physical_experts: 当前 EPLB 布局中的物理专家总数。
-    """
-
-    ep_dispatch_algorithm: Literal["static", "random"]
-    # 形状：(逻辑专家数量,)
+    ep_dispatch_algorithm: Literal["static", "dynamic", "fake", "lp"]
+    # (num_logical_experts,)
     partial_logical_to_rank_dispatch_physical_map: Optional[torch.Tensor]
     # 形状：(逻辑专家数量, 最大副本数量)
     partial_logical_to_all_physical_map: torch.Tensor
     # 形状：(逻辑专家数量,)
     partial_logical_to_all_physical_map_num_valid: torch.Tensor
     num_physical_experts: int
+    # Whether every rank must pick the same physical expert for a token. True
+    # without an a2a backend: all EP ranks then run the MoE over the same tokens
+    # and sum their partial outputs, so a rank-dependent pick counts a replicated
+    # logical expert several times. With one, each rank dispatches only its own
+    # tokens and is free to disagree.
+    rank_invariant: bool = False
 
     @classmethod
     def init_new(cls, layer_id: int):
-        """从全局 EPLB 元数据中提取指定 MoE 层的分发信息。
-
-        Args:
-            layer_id: MoE 层在全局专家布局元数据中的层索引。
-
-        Returns:
-            若未启用专家分发算法，则返回 ``None``；否则返回仅包含指定层
-            映射切片的 :class:`ExpertLocationDispatchInfo`。
-
-        输入输出示例：
-            假设 ``layer_id=2``，全局静态映射的形状为 ``(8, 64)``，则输入
-            ``2`` 后，返回对象中的静态映射形状为 ``(64,)``，表示第 2 层
-            64 个逻辑专家各自对应的物理专家 ID。
-        """
-        # 分发算法由服务启动参数统一配置，布局映射由 EPLB 全局元数据维护。
-        ep_dispatch_algorithm = get_global_server_args().ep_dispatch_algorithm
+        ep_dispatch_algorithm = get_exec().moe.ep_dispatch_algorithm
         expert_location_metadata = get_global_expert_location_metadata()
         assert expert_location_metadata is not None
 
@@ -81,6 +51,7 @@ class ExpertLocationDispatchInfo:
         # 全局映射的第 0 维是层，这里只保留当前层，避免调用方重复传 layer_id。
         return cls(
             ep_dispatch_algorithm=ep_dispatch_algorithm,
+            rank_invariant=get_exec().moe.moe_a2a_backend == "none",
             partial_logical_to_rank_dispatch_physical_map=(
                 expert_location_metadata.logical_to_rank_dispatch_physical_map[
                     layer_id, :
@@ -136,7 +107,9 @@ def transform_select_experts_inputs(
 
 
 def topk_ids_logical_to_physical(
-    topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
+    topk_ids: torch.Tensor,
+    info: Optional[ExpertLocationDispatchInfo],
+    log2phy_prob: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """将 Router 选出的逻辑专家 ID 转换成实际执行的物理专家 ID。
 
@@ -168,6 +141,13 @@ def topk_ids_logical_to_physical(
     # dynamic/fake：同一个逻辑专家可在其多个物理副本之间随机分流。
     if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
         return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
+    if info.ep_dispatch_algorithm == "lp":
+        if log2phy_prob is None:
+            raise RuntimeError(
+                "ep_dispatch_algorithm='lp' but log2phy_prob is None at dispatch "
+                f"time (topk_ids.shape={tuple(topk_ids.shape)})."
+            )
+        return _topk_ids_logical_to_physical_probability(topk_ids, info, log2phy_prob)
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
 
 
@@ -189,8 +169,7 @@ def _topk_ids_logical_to_physical_static(
     """
     # PyTorch 高级索引会逐元素查表，并自然保留 topk_ids 的原始形状。
     physical_topk_ids = info.partial_logical_to_rank_dispatch_physical_map[topk_ids]
-    if _is_hip:
-        # HIP 后端的索引结果类型可能与调用方期望不同，显式对齐输入 ID 类型。
+    if physical_topk_ids.dtype != topk_ids.dtype:
         physical_topk_ids = physical_topk_ids.to(topk_ids.dtype)
     return physical_topk_ids
 
@@ -198,41 +177,62 @@ def _topk_ids_logical_to_physical_static(
 def _topk_ids_logical_to_physical_dynamic(
     topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
-    """为每个逻辑专家随机选择一个有效的物理副本。
+    """Spread each (token, logical expert) over that logical expert's replicas.
 
-    每个 Top-K 槽位都会独立采样，因此即使多个 token 选中了同一个逻辑专家，
-    它们也可能被分发到不同的物理副本。采样只在该逻辑专家的有效副本范围内
-    进行，不会访问映射表每行末尾的无效填充槽位。
+    Under ``rank_invariant`` the replica is picked by token row rather than at
+    random: ``torch.randint`` reads the default CUDA generator, so agreement
+    across ranks would rest on their philox offsets staying aligned, which
+    nothing asserts, and it would make greedy requests non-reproducible. Both
+    pick evenly, which is the load split EPLB's placement solver assumes.
 
-    Args:
-        topk_ids: 逻辑专家 ID 张量，通常形状为 ``(num_tokens, top_k)``。
-        info: 包含“逻辑专家 → 全部物理副本”映射及有效副本数的信息。
-
-    Returns:
-        与 ``topk_ids`` 形状相同的物理专家 ID 张量。
-
-    输入输出示例：
-        若 ``topk_ids = tensor([[0, 1]])``，逻辑专家 0 的物理副本是
-        ``[2, 5]``，逻辑专家 1 的物理副本是 ``[3, 7]``，则一次可能输出
-        ``tensor([[5, 3]])``；另一次也可能输出 ``tensor([[2, 7]])``。
+    Row indexing leaves replicas unused for a single-row batch, where there is no
+    imbalance to fix anyway.
     """
-    # 先记录形状，展平后可用一对一的二维高级索引完成所有副本查找。
     topk_ids_original_shape = topk_ids.shape
+    original_dtype = topk_ids.dtype
     device = topk_ids.device
     topk_ids = topk_ids.flatten()
 
-    # 先为每个逻辑专家生成随机整数，再对其有效副本数取模，将副本下标约束在
-    # [0, num_valid_replicas) 内。65536 提供固定且足够大的随机取值范围。
-    chosen_dispatch_index = (
-        torch.randint(0, 65536, topk_ids.shape, dtype=torch.int32, device=device)
-        % info.partial_logical_to_all_physical_map_num_valid[topk_ids]
-    )
-    # 第一维按逻辑专家 ID 选行，第二维按随机副本下标选取物理专家 ID。
+    num_valid = info.partial_logical_to_all_physical_map_num_valid[topk_ids]
+    if info.rank_invariant:
+        slots_per_token = (
+            topk_ids_original_shape[-1] if len(topk_ids_original_shape) > 1 else 1
+        )
+        row_index = (
+            torch.arange(topk_ids.shape[0], dtype=num_valid.dtype, device=device)
+            // slots_per_token
+        )
+        chosen_dispatch_index = row_index % num_valid
+    else:
+        chosen_dispatch_index = (
+            torch.randint(0, 65536, topk_ids.shape, dtype=torch.int32, device=device)
+            % num_valid
+        )
     topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
-    if _is_hip:
-        # HIP 后端的索引结果类型可能与调用方期望不同，显式保持 ID 类型一致。
-        topk_ids = topk_ids.to(topk_ids.dtype)
+    if topk_ids.dtype != original_dtype:
+        topk_ids = topk_ids.to(original_dtype)
 
     # 恢复调用方传入的 Top-K ID 布局。
     topk_ids = topk_ids.view(topk_ids_original_shape)
     return topk_ids
+
+
+def _topk_ids_logical_to_physical_probability(
+    topk_ids: torch.Tensor,
+    info: ExpertLocationDispatchInfo,
+    log2phy_prob: torch.Tensor,
+) -> torch.Tensor:
+    """Select physical experts via the JIT-compiled CUDA dispatch kernel.
+
+    Raises if ``topk_ids`` isn't on CUDA — the LP path requires the fused
+    kernel and there is no torch reference fallback at runtime.
+    """
+    if not topk_ids.is_cuda:
+        raise RuntimeError(
+            "LP dispatch requires CUDA tensors; got topk_ids on " f"{topk_ids.device}."
+        )
+    from sglang.kernels.ops.lplb import cuda_solver
+
+    return cuda_solver.dispatch_probability(
+        topk_ids, log2phy_prob, info.partial_logical_to_all_physical_map
+    )

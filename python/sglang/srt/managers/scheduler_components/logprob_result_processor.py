@@ -11,6 +11,7 @@
 #               的采样 token），故大量逻辑要按 is_multi_item_scoring 分流。
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import (
     List,
@@ -20,19 +21,18 @@ from typing import (
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.io_struct import build_flat_input_top_logprobs_arrays
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.server_args import (
-    MIS_DELIMITER_TOKEN_ID,
-    ServerArgs,
-)
+from sglang.srt.runtime_context import get_exec
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerLogprobResultProcessor:
     # 中译：Scheduler 侧的 logprob 结果处理器。frozen=True 表示实例不可变（只读配置），
-    #       它本身不持有可变状态，所有「写入」都作用在传入的 Req 对象上。
-    server_args: ServerArgs
     model_config: ModelConfig
 
     def _process_input_token_logprobs(
@@ -118,6 +118,35 @@ class SchedulerLogprobResultProcessor:
         # 中译：清空临时存储，释放内存（结果已转入最终字段）。
         req.temp_input_top_logprobs_idx = None
         req.temp_input_top_logprobs_val = None
+
+    def _flatten_input_top_logprobs(self, req: Req) -> None:
+        """Replace the nested input top logprob rows with flat arrays for
+        requests that opted into return_flat_raw_top_logprobs, so the batch
+        output ships two ndarrays instead of num_positions * k python lists.
+        """
+        if req.logprob.top_logprobs_num <= 0:
+            return
+        try:
+            (
+                req.logprob.input_top_logprobs_val_flat,
+                req.logprob.input_top_logprobs_idx_flat,
+                req.logprob.input_top_logprobs_flat_null_prefix,
+            ) = build_flat_input_top_logprobs_arrays(
+                req.logprob.input_top_logprobs_val,
+                req.logprob.input_top_logprobs_idx,
+                req.logprob.top_logprobs_num,
+            )
+        except ValueError as e:
+            # Unrepresentable rows (e.g. multi-item scoring): keep the nested
+            # format, mirroring the tokenizer manager fallback.
+            logger.warning(
+                "Falling back to nested input top logprobs for rid=%s: %s",
+                req.rid,
+                e,
+            )
+            return
+        req.logprob.input_top_logprobs_val = []
+        req.logprob.input_top_logprobs_idx = []
 
     def _process_input_token_ids_logprobs(self, req: Req) -> None:
         """Process input token IDs logprobs.
@@ -221,7 +250,7 @@ class SchedulerLogprobResultProcessor:
               三个条件需同时满足：服务端开启 enable_mis、请求是 prefill-only、且配置了分隔符索引。
         """
         return (
-            self.server_args.enable_mis
+            get_exec().features.enable_mis
             and req.is_prefill_only
             and req.multi_item_delimiter_indices is not None
         )
@@ -339,6 +368,10 @@ class SchedulerLogprobResultProcessor:
                         == relevant_tokens_len
                     )
 
+            # After the length checks: the flat arrays replace the nested rows.
+            if req.return_flat_raw_top_logprobs:
+                self._flatten_input_top_logprobs(req)
+
     def add_logprob_return_values(
         self,
         i: int,
@@ -378,7 +411,13 @@ class SchedulerLogprobResultProcessor:
             self._initialize_empty_logprob_containers(req)
 
         # 中译：追加本步 output 的 top logprob（若用户请求了 top_logprobs_num）。
-        if req.logprob.top_logprobs_num > 0:
+        if (
+            req.logprob.top_logprobs_num > 0
+            and output.next_token_top_logprobs_val is not None
+        ):
+            # Guarded like next_token_logprobs above: a backend may leave the
+            # top-logprob fields unset even for a request that asked for them
+            # (indexing None raises TypeError).
             req.logprob.output_top_logprobs_val.append(
                 output.next_token_top_logprobs_val[i]
             )

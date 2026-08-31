@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable, NamedTuple, Optional, cast
+from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
 
 import torch
 
 from sglang.srt.distributed import (
-    get_moe_expert_parallel_rank,
-    get_moe_expert_parallel_world_size,
     get_tp_group,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -16,6 +14,8 @@ from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_local_dp_buffer,
     is_allocation_symmetric,
+    is_dp_max_padding,
+    mask_dp_pad_moe_topk_ids,
 )
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.base import (
@@ -27,9 +27,11 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutputChecker
 from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
     get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
     get_bool_env_var,
     get_device,
@@ -40,6 +42,10 @@ from sglang.srt.utils.common import (
 # expert_mask_gpu 判断当前 rank 上哪些专家有效，因此不在此处改写 topk_ids。
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+from sglang.srt.environ import envs as _envs
+
+_MASK_DP_PAD_MOE = _envs.SGLANG_OPT_MASK_DP_PAD_MOE.get()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
@@ -85,6 +91,11 @@ class StandardDispatchOutput(NamedTuple):
     hidden_states: torch.Tensor
     hidden_states_scale: Optional[torch.Tensor]
     topk_output: TopKOutput
+    # SGLANG_OPT_MOE_QUANT_ONCE: optional pre-quantized (q, scale) pair for
+    # ``hidden_states`` (per-token-group-128 fp8, q rows possibly padded to a
+    # multiple of 4). Consumed by the standard->triton fused runner so it can
+    # skip its own activation quant; ``hidden_states`` itself stays bf16.
+    hidden_states_pre_quant: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
     @property
     def format(self) -> DispatchOutputFormat:
@@ -129,18 +140,6 @@ assert isinstance(StandardCombineInput, CombineInput)
 
 
 class StandardDispatcher(BaseDispatcher):
-    """不依赖专用 MoE A2A 通信库的标准 token dispatcher。
-
-    该实现包含两条路径：
-
-    1. 常规路径不搬运 hidden states，仅根据 EP rank 把全局专家 ID 映射成本地 ID；
-    2. FlashInfer CUTLASS FP4 特殊路径先量化 hidden，再在 TP/DP 通信域执行
-       ``all_gatherv``，计算结束后由 :meth:`combine` 执行 ``reduce_scatterv``。
-
-    因此“Standard”表示 dispatcher/runner 间采用标准协议，并不意味着所有配置下
-    完全没有集合通信。
-    """
-
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         """初始化后端能力、专家布局和延迟创建的映射缓存。
 
@@ -155,24 +154,27 @@ class StandardDispatcher(BaseDispatcher):
             ``[-1, -1, -1, -1, 0, 1, 2, 3]``。
         """
         super().__init__()
-        self.moe_ep_size = get_moe_expert_parallel_world_size()
-
-        # runner backend 决定谁负责解释专家 ID。部分后端在融合 kernel 内部完成
-        # EP 路由，因此必须保留全局 ID，不能在 StandardDispatcher 中提前改写。
+        self.moe_ep_size = get_parallel().moe_ep_size
         backend = get_moe_runner_backend()
         self.enable_flashinfer_cutlass_moe = backend.is_flashinfer_cutlass()
         self.enable_flashinfer_mxfp4_moe = backend.is_flashinfer_mxfp4()
         self.enable_flashinfer_trtllm_routed_moe = backend.is_flashinfer_trtllm_routed()
-
-        # 当计算后端原生接收全局专家 ID 时，跳过 global-to-local 映射：
-        # - CUTLASS、CuteDSL、TRT-LLM routed 等后端在内部处理 EP；
-        # - MXFP4 dispatcher 生成的专家映射本身已经处于全局 ID 空间。
+        # AITER fast paths can be on while the MoE runner stays Triton; only the
+        # AITER runner keeps global expert IDs, so Triton must remap to local range.
+        self.use_aiter_moe_runner = backend.is_aiter() or (
+            backend.is_auto() and _use_aiter and get_moe_a2a_backend().supports_aiter()
+        )
+        # Skip local expert mapping when the backend handles EP with global expert IDs:
+        # - cutlass / cutedsl / trtllm_routed handle EP internally
+        # - mxfp4 dispatcher mapping is already global
+        # - hpc_ops consumes global ids together with rank_ep / num_expert_total
         self.skip_local_expert_mapping = (
             backend.is_flashinfer_cutlass()
             or backend.is_flashinfer_cutedsl()
             or backend.is_flashinfer_trtllm()
             or backend.is_experimental_sgl_trtllm()
             or backend.is_flashinfer_trtllm_routed()
+            or backend.is_hpc_ops()
             or self.enable_flashinfer_mxfp4_moe
         )
 
@@ -182,10 +184,7 @@ class StandardDispatcher(BaseDispatcher):
         self.num_local_routed_experts = (
             self.num_local_experts - self.num_local_shared_experts
         )
-        self.moe_ep_rank = get_moe_expert_parallel_rank()
-
-        # 映射表依赖运行设备，延迟到首次真正需要时创建，避免初始化阶段提前分配。
-        # 表的索引是全局专家 ID，值是本地专家 ID；-1 表示专家不在当前 rank。
+        self.moe_ep_rank = get_parallel().moe_ep_rank
         self.local_expert_mapping = None
 
         # AITER 使用单独的有效专家 mask，而不是直接把 topk_ids 映射成本地 ID。
@@ -327,9 +326,7 @@ class StandardDispatcher(BaseDispatcher):
                     )
 
         if self.local_expert_mapping is not None and not self.skip_local_expert_mapping:
-            if _use_aiter:
-                # AITER 保留全局 topk_ids，并通过 mask 告诉 kernel 哪些映射槽有效。
-                # mask 的 1 表示 ID 映射到当前 rank 的合法本地专家，0 表示远端专家。
+            if self.use_aiter_moe_runner and self.expert_mask_gpu is None:
                 self.expert_mask_gpu = (
                     (
                         (self.local_expert_mapping >= 0)
@@ -338,13 +335,20 @@ class StandardDispatcher(BaseDispatcher):
                     .to(torch.int32)
                     .to(device="cuda")
                 )
-            else:
+            elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
-                    # 用映射表进行向量化索引：本地专家变为 [0, E_local)，远端为 -1。
-                    # 后续 runner 会跳过 -1 对应的 assignment。
-                    topk_output = topk_output._replace(
-                        topk_ids=self.local_expert_mapping[topk_output.topk_ids]
-                    )
+                    topk_ids_local = self.local_expert_mapping[topk_output.topk_ids]
+                    # Drop dp-attention MAX_LEN pad rows from the dispatch:
+                    # pad rows carry stale hidden through the router and
+                    # their expert outputs are discarded downstream — pure
+                    # wasted compute (and a masked-grouped-GEMM workspace
+                    # blow-up when they collide on the same top-k).  Must
+                    # run POST-translation (a pre-translation -1 aliases to
+                    # the mapping table's last entry); -1 is the drop
+                    # sentinel both the triton and deep_gemm runners honor.
+                    if _MASK_DP_PAD_MOE and is_dp_max_padding():
+                        mask_dp_pad_moe_topk_ids(topk_ids_local)
+                    topk_output = topk_output._replace(topk_ids=topk_ids_local)
                 elif TopKOutputChecker.format_is_triton_kernels(topk_output):
                     # Triton-kernels 的非标准 Top-K 映射尚未实现；避免静默产生错路由。
                     raise NotImplementedError()

@@ -32,6 +32,10 @@ import setproctitle
 import torch
 import zmq
 
+from sglang.srt.beam_search.output import (
+    decode_beam_search_output,
+    is_beam_search_batch,
+)
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
@@ -40,9 +44,18 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     ConfigureLoggingReq,
     FreezeGCReq,
+    sock_recv,
+    sock_send,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+from sglang.srt.runtime_context import (
+    get_device,
+    get_model,
+    get_observability,
+    get_serving,
+    publish,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -161,14 +174,19 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         #       若启用了 skip_tokenizer_init（调用方自行处理 token）则不加载，置为 None。
         if server_args.skip_tokenizer_init:
             self.tokenizer = None
+            self.vocab_size = None
         else:
             self.tokenizer = get_tokenizer(
-                server_args.tokenizer_path,
+                get_serving().tokenizer_path,
                 tokenizer_mode=server_args.tokenizer_mode,
-                trust_remote_code=server_args.trust_remote_code,
+                trust_remote_code=get_model().trust_remote_code,
                 revision=server_args.revision,
                 tokenizer_backend=server_args.tokenizer_backend,
             )
+            try:
+                self.vocab_size = len(self.tokenizer)
+            except TypeError:
+                self.vocab_size = getattr(self.tokenizer, "vocab_size", None)
 
     def init_running_status(self, server_args: ServerArgs):
         # 中译：初始化运行时状态。
@@ -176,19 +194,18 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.decode_status = LimitedCapacityDict(capacity=DETOKENIZER_MAX_STATES)
         # disable_tokenizer_batch_decode：是否禁用批量解码（避免某些边界问题）。
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
-        # is_tool_call_parser_gpt_oss：是否使用 gpt-oss 工具调用解析器（影响停止符裁剪）。
-        self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
+        self.is_tool_call_parser_gpt_oss = get_serving().tool_call_parser == "gpt-oss"
 
         # 中译：软看门狗（soft watchdog），用于检测该进程是否卡死（soft 模式下只告警不直接杀进程）。
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
-            watchdog_timeout=server_args.soft_watchdog_timeout,
+            watchdog_timeout=get_device().soft_watchdog_timeout,
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
         )
 
         # 中译：启用指标采集时，启动一个 CPU 监控线程上报 detokenizer 进程的 CPU 使用。
-        if server_args.enable_metrics:
+        if get_observability().enable_metrics:
             start_cpu_monitor_thread("detokenizer")
 
     def init_request_dispatcher(self):
@@ -211,12 +228,12 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         while True:
             # 中译：阻塞接收期间暂时关闭软看门狗（等消息不算卡死）。
             with self.soft_watchdog.disable():
-                recv_obj = self.recv_from_scheduler.recv_pyobj()
             # 中译：按消息类型路由到对应 handler。
+            # 中译：喂狗（表明本轮处理正常推进）。
+                recv_obj = sock_recv(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
             if output is not None:
-                self.send_to_tokenizer.send_pyobj(output)
-            # 中译：喂狗（表明本轮处理正常推进）。
+                sock_send(self.send_to_tokenizer, output)
             self.soft_watchdog.feed()
 
     def trim_matched_stop(
@@ -259,6 +276,20 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # If it is embedding model, no detokenization is needed.
         # 中译：embedding 模型的输出是向量、无需反向解码，直接原样返回。
         return recv_obj
+
+    @staticmethod
+    def _clamp_decode_ids(ids: List[int], vocab_size: Optional[int]) -> List[int]:
+        """Map out-of-range token ids to 0 so the tokenizer can decode them.
+
+        Multimodal placeholder ids (e.g. Inkling's negative -101/-102, or radix-cache
+        pad-value hashes) are not real vocab tokens; tiktoken-style backends raise
+        OverflowError on negative / out-of-range ids. These only appear in the
+        surrogate-context prefix (before read_offset) and carry no text, and the clamp
+        is applied identically to surr_ids and read_ids, so the incremental
+        (read-minus-surr) output text is unchanged.
+        """
+        hi = vocab_size if vocab_size else None
+        return [t if (0 <= t and (hi is None or t < hi)) else 0 for t in ids]
 
     def _grouped_batch_decode(
         self,
@@ -337,6 +368,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         # 中译：批量增量解码的核心方法。对批次内每个请求：维护/更新其 DecodeStatus，
         #       解码出「上下文文本 surr」与「读取文本 read」，两者之差即本次新增文本。
         bs = len(recv_obj.rids)
+        vocab_size = self.vocab_size
 
         # Initialize decode status
         # 中译：准备每个请求本次要解码的 token。首次出现的请求新建 DecodeStatus，否则追加新 token。
@@ -346,14 +378,18 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if rid not in self.decode_status:
                 s = DecodeStatus(
                     decoded_text=recv_obj.decoded_texts[i],
-                    decode_ids=list(recv_obj.decode_ids[i]),
+                    decode_ids=self._clamp_decode_ids(
+                        recv_obj.decode_ids[i], vocab_size
+                    ),
                     surr_offset=0,
                     read_offset=recv_obj.read_offsets[i],
                 )
                 self.decode_status[rid] = s
             else:
                 s = self.decode_status[rid]
-                s.decode_ids.extend(recv_obj.decode_ids[i])
+                s.decode_ids.extend(
+                    self._clamp_decode_ids(recv_obj.decode_ids[i], vocab_size)
+                )
 
             # 中译：read_ids = 从 surr_offset 到末尾（含本次新 token，并裁掉命中的停止符）；
             #       surr_ids = 仅 [surr_offset, read_offset) 的上下文部分。两者解码后相减得新文本。
@@ -483,6 +519,15 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # 中译：处理 token id 批次输出的 handler：先增量解码出文本，再组装成 BatchStrOutput 转发。
+        # Beam decoding is additive: a batch may mix beam leaders with normal
+        # requests, so every item still goes through the standard decode.
+        if is_beam_search_batch(recv_obj):
+            decode_beam_search_output(
+                recv_obj,
+                tokenizer=self.tokenizer,
+                disable_batch_decode=self.disable_tokenizer_batch_decode,
+                trim_matched_stop=self.trim_matched_stop,
+            )
         # If handling idle batch, set output_strs to [].
         # 中译：若为空转（idle）批次（无请求），输出文本置为空列表。
         output_strs = (
@@ -503,15 +548,24 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             completion_tokens=recv_obj.completion_tokens,
             cached_tokens=recv_obj.cached_tokens,
             cached_tokens_details=recv_obj.cached_tokens_details,
+            image_tokens=recv_obj.image_tokens,
+            audio_tokens=recv_obj.audio_tokens,
+            video_tokens=recv_obj.video_tokens,
             spec_verify_ct=recv_obj.spec_verify_ct,
             spec_num_correct_drafts=recv_obj.spec_num_correct_drafts,
+            spec_num_block_accept_tokens=recv_obj.spec_num_block_accept_tokens,
+            spec_num_cap_tokens=recv_obj.spec_num_cap_tokens,
             spec_correct_drafts_histogram=recv_obj.spec_correct_drafts_histogram,
+            spec_cap_lens_histogram=recv_obj.spec_cap_lens_histogram,
             input_token_logprobs_val=recv_obj.input_token_logprobs_val,
             input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,
             output_token_logprobs_val=recv_obj.output_token_logprobs_val,
             output_token_logprobs_idx=recv_obj.output_token_logprobs_idx,
             input_top_logprobs_val=recv_obj.input_top_logprobs_val,
             input_top_logprobs_idx=recv_obj.input_top_logprobs_idx,
+            input_top_logprobs_val_flat=recv_obj.input_top_logprobs_val_flat,
+            input_top_logprobs_idx_flat=recv_obj.input_top_logprobs_idx_flat,
+            input_top_logprobs_flat_null_prefix=recv_obj.input_top_logprobs_flat_null_prefix,
             output_top_logprobs_val=recv_obj.output_top_logprobs_val,
             output_top_logprobs_idx=recv_obj.output_top_logprobs_idx,
             input_token_ids_logprobs_val=recv_obj.input_token_ids_logprobs_val,
@@ -519,6 +573,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_ids_logprobs_val=recv_obj.output_token_ids_logprobs_val,
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_token_entropy_val=recv_obj.output_token_entropy_val,
+            output_token_sampling_mask=recv_obj.output_token_sampling_mask,
+            output_token_sampling_logprobs=recv_obj.output_token_sampling_logprobs,
             output_hidden_states=recv_obj.output_hidden_states,
             routed_experts=routed_experts,
             indexer_topk=indexer_topk,
@@ -526,7 +582,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
+            weight_versions=recv_obj.weight_versions,
             token_steps=recv_obj.token_steps,
+            beam_search_output=recv_obj.beam_search_output,
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
         )
@@ -594,6 +652,7 @@ def run_detokenizer_process(
     # 中译：按 server_args 配置日志（级别、格式等）。
     configure_logger(server_args)
     # 中译：获取父进程句柄，用于异常时向其发信号。
+    publish(server_args, role="detokenizer")
     parent_process = psutil.Process().parent()
 
     # 中译：先置空，确保异常处理里能安全判断 manager 是否已创建。

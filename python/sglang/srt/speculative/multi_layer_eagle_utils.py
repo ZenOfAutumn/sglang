@@ -12,37 +12,53 @@
 # limitations under the License.
 # ==============================================================================
 
-"""多层 EAGLE 投机解码 Triton 算子封装模块。
-
-本模块从 ``triton_ops.multi_layer_eagle`` 中统一导出多层 EAGLE 算法
-所需的 Triton kernel 及其 PyTorch 参考实现，供 multi_layer_eagle_worker_v2.py 调用。
-
-导出的算子：
-    - assign_hidden_states_pool_kernel:   隐藏状态池分配 kernel 入口
-    - assign_hidden_states_pool_torch:     PyTorch 参考实现
-    - assign_hidden_states_pool_triton:    Triton kernel 实现
-    - assign_new_state_kernel:             新状态分配 kernel 入口
-    - assign_new_state_triton:              Triton kernel 实现
-    - rotate_input_ids_kernel:             input_ids 旋转 kernel 入口
-    - rotate_input_ids_triton:              Triton kernel 实现
-"""
-
-from sglang.srt.speculative.triton_ops.multi_layer_eagle import (
-    assign_hidden_states_pool_kernel,
-    assign_hidden_states_pool_torch,
-    assign_hidden_states_pool_triton,
-    assign_new_state_kernel,
-    assign_new_state_triton,
+from sglang.kernels.ops.speculative.multi_layer_eagle import (
+    compute_widened_draft_extend_locs_positions_triton,
+    fill_draft_extend_prepare_buffers_native,
+    fill_draft_extend_prepare_buffers_triton,
+    fill_widened_draft_extend_inputs_triton,
+    rotate_input_ids,
     rotate_input_ids_kernel,
-    rotate_input_ids_triton,
+    stash_append_boundary_state_triton,
+    wide_row_softmax_triton,
 )
+from sglang.srt.environ import envs
+
+
+def boundary_kv_fix_enabled() -> bool:
+    return envs.SGLANG_ENABLE_MTP_BOUNDARY_KV_FIX.get()
+
+
+def compute_widened_draft_extend_locs_positions(
+    seq_lens,
+    req_pool_indices,
+    req_to_token,
+    stash_valid_lens,
+    draft_token_num: int,
+    num_front_tokens: int,
+    num_warmup_tokens: int,
+):
+    """Batched out_cache_loc + positions for the widened draft-extend window,
+    from pre-verify state. Invalid/warm-up front rows write to sacrificial loc 0."""
+    return compute_widened_draft_extend_locs_positions_triton(
+        seq_lens,
+        req_pool_indices,
+        req_to_token,
+        stash_valid_lens,
+        draft_token_num,
+        num_front_tokens,
+        num_warmup_tokens,
+    )
+
 
 __all__ = [
-    "assign_hidden_states_pool_kernel",
-    "assign_hidden_states_pool_torch",
-    "assign_hidden_states_pool_triton",
-    "assign_new_state_kernel",
-    "assign_new_state_triton",
+    "boundary_kv_fix_enabled",
+    "compute_widened_draft_extend_locs_positions",
+    "fill_draft_extend_prepare_buffers_native",
+    "fill_draft_extend_prepare_buffers_triton",
+    "fill_widened_draft_extend_inputs_triton",
+    "rotate_input_ids",
     "rotate_input_ids_kernel",
-    "rotate_input_ids_triton",
+    "stash_append_boundary_state_triton",
+    "wide_row_softmax_triton",
 ]

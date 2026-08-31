@@ -14,10 +14,17 @@
 #     - 资源回收（finish / retract / abort）：请求结束或被抢占时释放设备与主机资源。
 
 import logging
-from typing import List, NamedTuple, Union
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
+from sglang.kernels.ops.kvcache.hisparse import (
+    copy_cache_planned_mla,
+    load_cache_to_device_buffer_dsv4_mla,
+    load_cache_to_device_buffer_mla,
+)
+from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -26,19 +33,14 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
 )
-from sglang.srt.mem_cache.memory_pool_host import (
-    DeepSeekV4PagedHostPool,
-    MLATokenToKVPoolHost,
-)
-from sglang.srt.utils import get_device_module
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.utils import get_device_module, is_hip
 
 device_module = get_device_module()
 
-from sglang.jit_kernel.hisparse import (
-    load_cache_to_device_buffer_dsv4_mla,
-    load_cache_to_device_buffer_mla,
-)
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+_is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +79,69 @@ class HiSparseTokenStats(NamedTuple):
     host_token_usage: float
 
 
+def resolve_shared_index_layers(
+    *,
+    hf_text_config,
+    pp_size: int,
+    is_speculative: bool,
+) -> Optional[List[bool]]:
+    """Per-layer "reuses the previous layer's top-k index" pattern, or None.
+
+    Mirrors DeepseekV2AttentionMLA's skip_topk derivation (index_topk_pattern /
+    index_topk_freq / cli_factor); None when the model has no sharing or the
+    prefetch cannot run (PP, speculative decoding, kill-switch).
+    """
+    if not is_deepseek_dsa(hf_text_config):
+        return None
+    num_layers = hf_text_config.num_hidden_layers
+    cli_factor = getattr(hf_text_config, "cli_factor", 1) or 1
+    if cli_factor > 1:
+        pattern = [i % cli_factor != 0 for i in range(num_layers)]
+    else:
+        pattern = [dsa_layer_skips_topk(hf_text_config, i) for i in range(num_layers)]
+    if not any(pattern):
+        return None
+    if pp_size != 1 or is_speculative:
+        logger.warning(
+            "HiSparse shared-index prefetch is unsupported under pipeline "
+            "parallelism / speculative decoding; falling back to synchronous "
+            "swap-in."
+        )
+        return None
+    if envs.SGLANG_DISABLE_HISPARSE_PREFETCH.get():
+        logger.info(
+            "HiSparse shared-index prefetch disabled via "
+            "SGLANG_DISABLE_HISPARSE_PREFETCH; using synchronous swap-in."
+        )
+        return None
+    return pattern
+
+
+def _build_prefetch_groups(
+    is_shared_index_layer: List[bool],
+) -> Tuple[Dict[int, List[int]], List[int]]:
+    """Group consecutive shared-index (skip) layers under their anchor layer.
+
+    Returns (groups, slot): anchor layer_id -> ordered skip layers, and each
+    skip layer's position in its group (indexes the per-slot prefetch events).
+    """
+    groups: Dict[int, List[int]] = {}
+    slot = [0] * len(is_shared_index_layer)
+    anchor = None
+    for i, is_shared in enumerate(is_shared_index_layer):
+        if not is_shared:
+            anchor = i  # compute layer; anchors the skip layers after it
+            continue
+        assert anchor is not None, (
+            f"shared-index (skip) layer {i} has no preceding compute layer; "
+            "the model's index-topk pattern is invalid"
+        )
+        group = groups.setdefault(anchor, [])
+        slot[i] = len(group)
+        group.append(i)
+    return groups, slot
+
+
 class HiSparseCoordinator:
     """HiSparse 层次化稀疏 KV 缓存的协调器。
 
@@ -108,6 +173,8 @@ class HiSparseCoordinator:
         device: str,
         tp_group,
         host_to_device_ratio: int = 2,
+        swap_in_block_size: int = 960,
+        shared_index_layers: Optional[List[bool]] = None,
     ):
         # 中译：构造函数。保存依赖对象，并根据分配器类型选择普通 MLA 或 dsv4 两条通路，
         #       预分配后续 staging/备份/换入所需的全部张量缓冲与流（stream）/事件（event）。
@@ -122,6 +189,10 @@ class HiSparseCoordinator:
         self.device_buffer_size = device_buffer_size
         self.device = device
         # 中译：compress_ratio——每多少个原始 token 压缩为一个 KV 槽（dsv4 通路 > 1）。
+        self.swap_in_block_size = swap_in_block_size
+        # Timing probe: skip the host->device KV bytes to measure the "IO is
+        # free" floor. Produces garbage output; benchmarking only.
+        self.skip_io = envs.SGLANG_DEBUG_HISPARSE_SKIP_IO.get()
         self.compress_ratio = self.token_to_kv_pool_allocator.compress_ratio
 
         # 中译：根据分配器类型判定是否为 DeepSeek-V4 专用 HiSparse 通路（带分页主机池+压缩）。
@@ -276,10 +347,79 @@ class HiSparseCoordinator:
         #       已把所有 prefill token 备份过了；用过一次后即清除。
         self._skip_first_backup = [False] * max_num_req_slots
 
+        self._init_shared_index_prefetch(
+            shared_index_layers=shared_index_layers,
+            layer_num=layer_num,
+            max_num_req_slots=max_num_req_slots,
+        )
+
+    def _init_shared_index_prefetch(
+        self,
+        shared_index_layers: Optional[List[bool]],
+        layer_num: int,
+        max_num_req_slots: int,
+    ) -> None:
+        """Set up the plan-then-IO prefetch for shared-index (IndexShare) models:
+        the anchor's kernel records its miss plan and skip layers replay it on
+        `prefetch_stream`, overlapping their IO with the intervening compute."""
+        if shared_index_layers is not None and len(shared_index_layers) != layer_num:
+            # Attention-layer count differs from num_hidden_layers (e.g. Longcat
+            # doubles it): pattern would be misindexed, fall back to synchronous.
+            logger.warning(
+                "HiSparse shared-index prefetch disabled: pattern length %d != "
+                "KV pool layer_num %d; using synchronous swap-in.",
+                len(shared_index_layers),
+                layer_num,
+            )
+            shared_index_layers = None
+        self._is_shared_index_layer = list(shared_index_layers or [False] * layer_num)
+        self.enable_prefetch = any(self._is_shared_index_layer)
+        self._prefetch_groups, self._prefetch_slot = _build_prefetch_groups(
+            self._is_shared_index_layer
+        )
+        if not self.enable_prefetch:
+            return
+
+        # Small fixed grid for the copy-only kernel: low SM footprint so the
+        # copies overlap compute with little contention.
+        self._prefetch_copy_blocks = 4
+        max_group_size = max(len(g) for g in self._prefetch_groups.values())
+        self.prefetch_stream = device_module.Stream()
+        self._prefetch_events = [device_module.Event() for _ in range(max_group_size)]
+        # Plan recorded by the current anchor, replayed by its skip layers. One
+        # buffer set suffices: the last skip layer's event wait orders the next
+        # anchor's writes after this group's copies.
+        self._miss_src = torch.zeros(
+            (max_num_req_slots, self.top_k), dtype=torch.int64, device=self.device
+        )
+        self._miss_dst = torch.zeros(
+            (max_num_req_slots, self.top_k), dtype=torch.int32, device=self.device
+        )
+        self._miss_count = torch.zeros(
+            (max_num_req_slots,), dtype=torch.int32, device=self.device
+        )
+        logger.info(
+            "HiSparse: shared-index prefetch (plan-then-IO) enabled; %d anchor "
+            "group(s), %d skip layer(s) of %d total.",
+            len(self._prefetch_groups),
+            sum(self._is_shared_index_layer),
+            layer_num,
+        )
+
     def set_decode_producer_stream(self, stream) -> None:
         # 中译：注入「解码生产者流」。备份/回收时会让相关流等待它，确保解码计算产出的
         #       KV 已写完再被读取或释放，避免读到未完成的数据。
         self.decode_producer_stream = stream
+
+    def destroy(self) -> None:
+        # Drain in-flight transfers so the buffer is idle, then unregister it.
+        # See HostKVCache.destroy for why the explicit unregister matters.
+        self.write_staging_stream.synchronize()
+        self.decode_backup_stream.synchronize()
+        if self.enable_prefetch:
+            # Skip-layer copies read the pinned host pool on the prefetch stream.
+            self.prefetch_stream.synchronize()
+        self.mem_pool_host.destroy()
 
     def get_token_stats(self) -> HiSparseTokenStats:
         # 中译：采集设备池与主机池的 token 占用量/占用率，返回统计快照（供监控上报）。
@@ -308,7 +448,7 @@ class HiSparseCoordinator:
 
         # 中译：取该请求 prefill 部分的全量 KV 槽位，并翻译为 hisparse 设备索引空间。
         full_kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : req.fill_len
+            req.kv.req_pool_idx, : req.extend_range.end
         ].to(dtype=torch.int64, copy=True)
         device_indices = (
             self.mem_pool_device.translate_loc_from_full_to_hisparse_device(
@@ -321,7 +461,7 @@ class HiSparseCoordinator:
         host_indices = self.mem_pool_host.alloc_paged_token_slots(
             self.req_to_host_pool,
             self.req_to_host_pool_allocated_len,
-            req.req_pool_idx,
+            req.kv.req_pool_idx,
             0,
             prefill_len,
         )
@@ -371,7 +511,7 @@ class HiSparseCoordinator:
         """
         self.alloc_device_buffer(req)
 
-        host_len = self.host_token_len(req.kv_allocated_len)
+        host_len = self.host_token_len(req.kv.kv_allocated_len)
         if host_len <= self.device_buffer_size:
             # Short sequences (seq_len <= device_buffer_size): the kernel fast path
             # returns device_buffer_locs directly without any host loading, so we
@@ -386,12 +526,12 @@ class HiSparseCoordinator:
             # 中译：长序列——把 device_buffer_tokens 全置 -1，让核函数看到所有槽为空，
             #       从而每个 top-k 查找都视为 miss → 触发从主机加载。
             self.req_device_buffer_tokens[
-                :, req.req_pool_idx, : self.device_buffer_size
+                :, req.kv.req_pool_idx, : self.device_buffer_size
             ] = -1
 
         req.hisparse_staging = False
         # 中译：直连通路下 KV 已在主机，故首步解码跳过备份。
-        self._skip_first_backup[req.req_pool_idx] = True
+        self._skip_first_backup[req.kv.req_pool_idx] = True
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
     def host_token_len(self, kv_allocated_len: int) -> int:
@@ -402,13 +542,10 @@ class HiSparseCoordinator:
         return kv_allocated_len
 
     def _preload_to_device_buffer(self, req: Req) -> None:
-        """Preload all tokens from host pool into the device buffer.
-
-        中译：把主机池中该请求的全部 token 逐层加载进设备缓冲区（短序列直连通路使用）。
-        """
-        n = self.host_token_len(req.kv_allocated_len)
-        host_indices = self.req_to_host_pool[req.req_pool_idx, :n]
-        device_locs = self.req_to_device_buffer[req.req_pool_idx, :n]
+        """Preload all tokens from host pool into the device buffer."""
+        n = self.host_token_len(req.kv.kv_allocated_len)
+        host_indices = self.req_to_host_pool[req.kv.req_pool_idx, :n]
+        device_locs = self.req_to_device_buffer[req.kv.req_pool_idx, :n]
 
         for layer_id in range(self.mem_pool_device.layer_num):
             self.mem_pool_host.load_to_device_per_layer(
@@ -426,10 +563,10 @@ class HiSparseCoordinator:
         #       副作用：写入 req_to_device_buffer / req_device_buffer_size /
         #       req_device_buffer_tokens / req_device_buffer_token_locs。分配失败抛 RuntimeError。
         if self.is_dsv4_hisparse:
-            allocated_len = req.fill_len
+            allocated_len = req.extend_range.end
             alloc_size = self.padded_buffer_size
         else:
-            allocated_len = req.kv_allocated_len
+            allocated_len = req.kv.kv_allocated_len
             page_size = self.mem_pool_device.page_size
             # Allocate only enough for current tokens (page-aligned).
             # When prefill already fills device_buffer_size, include the reserved page.
@@ -443,7 +580,7 @@ class HiSparseCoordinator:
 
         compressed_logical_indices = (
             self.mem_pool_device.translate_loc_from_full_to_compressed(
-                self.req_to_token_pool.req_to_token[req.req_pool_idx, :allocated_len]
+                self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :allocated_len]
             )
         )
         compressed_len = len(compressed_logical_indices)
@@ -462,15 +599,15 @@ class HiSparseCoordinator:
             raise RuntimeError("HiSparse alloc_device_buffer returned None")
 
         buffer_indices = buffer_indices.to(torch.int32)
-        self.req_to_device_buffer[req.req_pool_idx, :alloc_size] = buffer_indices
-        self.req_device_buffer_size[req.req_pool_idx] = alloc_size
+        self.req_to_device_buffer[req.kv.req_pool_idx, :alloc_size] = buffer_indices
+        self.req_device_buffer_size[req.kv.req_pool_idx] = alloc_size
 
         # 中译：把缓冲槽标记为「缓存了 token 位置 0..buf-1」，并写入各层的物理槽位映射，
         #       供换入核函数判断命中/缺失。（直连通路会在 admit_request_direct 中按需修正此标记。）
         self.req_device_buffer_tokens[
-            :, req.req_pool_idx, : self.device_buffer_size
+            :, req.kv.req_pool_idx, : self.device_buffer_size
         ] = self._device_buffer_arange_i32
-        self.req_device_buffer_token_locs[:, req.req_pool_idx, :alloc_size] = (
+        self.req_device_buffer_token_locs[:, req.kv.req_pool_idx, :alloc_size] = (
             buffer_indices[:alloc_size]
         )
 
@@ -592,7 +729,7 @@ class HiSparseCoordinator:
             # prepare device buffer and update req
             # 中译：为就绪请求分配设备缓冲，并把它标记为非 staging、首步跳过备份，加入返回列表。
             self.alloc_device_buffer(req)
-            self._skip_first_backup[req.req_pool_idx] = True
+            self._skip_first_backup[req.kv.req_pool_idx] = True
             req.hisparse_staging = False
             finish_count -= 1
             ready_reqs.append(req)
@@ -624,13 +761,25 @@ class HiSparseCoordinator:
                 :, req_pool_indices, self.device_buffer_size
             ] = reserved_buffer_loc.to(torch.int32)
 
-            # No need to clear prior mappings: the only consumer of the mapping
-            # for past tokens is the swap-in kernel, and it goes through
-            # top_k_device_locs returned by swap_in_selected_pages -- not via
-            # mapping[old_out_cache_loc] -- so stale entries are harmless.
             compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
                 out_cache_loc
             )
+            # ROCm: the decode remap creates a temporary hisparse device slot per
+            # new token (via the page_size==1 allocator path). Free the stale
+            # slot before pointing the mapping at the reserved device-buffer slot,
+            # otherwise the temporary slots leak and corrupt later swap-in lookups.
+            # CUDA keeps the original behavior: the swap-in kernel consumes only
+            # top_k_device_locs, so stale mapping entries are harmless there.
+            if _is_hip:
+                previous_locs = self.mem_pool_device._translate_loc_to_hisparse_device(
+                    compressed_locs
+                )
+                stale_locs = previous_locs[
+                    (previous_locs > 0) & (previous_locs != reserved_buffer_loc)
+                ]
+                if stale_locs.numel() > 0:
+                    self.token_to_kv_pool_allocator.free_hisparse_indices(stale_locs)
+
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
                 compressed_locs
             ] = reserved_buffer_loc
@@ -902,9 +1051,9 @@ class HiSparseCoordinator:
         # 中译：释放前先同步 staging 流，等待仍在途的 DMA 拷贝完成，避免释放后被写。
         self.write_staging_stream.synchronize()
 
-        prefill_len = req.fill_len
+        prefill_len = req.extend_range.end
         allocated_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :prefill_len
+            req.kv.req_pool_idx, :prefill_len
         ]
         self.token_to_kv_pool_allocator.free_hisparse(allocated_locs)
 
@@ -912,14 +1061,14 @@ class HiSparseCoordinator:
         # 中译：释放 admit_request_into_staging 时在主机池分配的内存，并把映射复位为 -1/0。
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,
-            req.req_pool_idx,
-            self.req_to_host_pool_allocated_len[req.req_pool_idx],
+            req.kv.req_pool_idx,
+            self.req_to_host_pool_allocated_len[req.kv.req_pool_idx],
         )
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
-        self.req_to_host_pool[req.req_pool_idx, :] = -1
-        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
-        self._skip_first_backup[req.req_pool_idx] = False
+        self.req_to_host_pool[req.kv.req_pool_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = 0
+        self._skip_first_backup[req.kv.req_pool_idx] = False
         req.hisparse_staging = False
 
     def retract_req(self, req: Req) -> None:
@@ -945,20 +1094,19 @@ class HiSparseCoordinator:
         # subsequent release_kv_cache -> allocator.free -> free_hisparse path
         # re-frees them (double-free into the page allocator's free list).
         # 中译：用 kv_allocated_len 而非 seqlen——投机解码下分配器可能超额分配，
-        #       多出的槽位可能残留映射，若不一并清理会在后续释放路径造成「重复释放（double-free）」。
-        allocated_len = req.kv_allocated_len
+        # 中译：只释放真正分配过的设备缓冲槽位（去重且 >0），归还给分配器。
+        allocated_len = req.kv.kv_allocated_len
 
         # release memory -- only free actually-allocated buffer indices
-        # 中译：只释放真正分配过的设备缓冲槽位（去重且 >0），归还给分配器。
-        current_cap = int(self.req_device_buffer_size[req.req_pool_idx])
+        current_cap = int(self.req_device_buffer_size[req.kv.req_pool_idx])
         if current_cap > 0:
-            side_buf_hi = self.req_to_device_buffer[req.req_pool_idx, :current_cap]
+            side_buf_hi = self.req_to_device_buffer[req.kv.req_pool_idx, :current_cap]
             all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
             if all_hi.numel() > 0:
                 self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
 
         allocated_locs = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :allocated_len
+            req.kv.req_pool_idx, :allocated_len
         ]
         compressed_locs = self.mem_pool_device.translate_loc_from_full_to_compressed(
             allocated_locs
@@ -967,52 +1115,54 @@ class HiSparseCoordinator:
 
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,
-            req.req_pool_idx,
-            self.req_to_host_pool_allocated_len[req.req_pool_idx],
+            req.kv.req_pool_idx,
+            self.req_to_host_pool_allocated_len[req.kv.req_pool_idx],
         )
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
 
         # clear req info
         # 中译：把该请求槽位的所有逐请求状态复位（token 标记/槽位映射/容量/LRU/备份标志）。
-        self.req_device_buffer_tokens[:, req.req_pool_idx, :] = -1
-        self.req_device_buffer_token_locs[:, req.req_pool_idx, :] = -1
-        self.req_to_device_buffer[req.req_pool_idx, :] = 0
-        self.req_device_buffer_size[req.req_pool_idx] = 0
-        self.req_to_host_pool[req.req_pool_idx, :] = -1
-        self.req_to_host_pool_allocated_len[req.req_pool_idx] = 0
-        self.lru_slots[:, req.req_pool_idx, :].copy_(self._lru_init)
-        self._skip_first_backup[req.req_pool_idx] = False
+        self.req_device_buffer_tokens[:, req.kv.req_pool_idx, :] = -1
+        self.req_device_buffer_token_locs[:, req.kv.req_pool_idx, :] = -1
+        self.req_to_device_buffer[req.kv.req_pool_idx, :] = 0
+        self.req_device_buffer_size[req.kv.req_pool_idx] = 0
+        self.req_to_host_pool[req.kv.req_pool_idx, :] = -1
+        self.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = 0
+        self.lru_slots[:, req.kv.req_pool_idx, :].copy_(self._lru_init)
+        self._skip_first_backup[req.kv.req_pool_idx] = False
 
-    def swap_in_selected_pages(
+    def _run_swap_in_kernel(
         self,
         req_pool_indices: torch.Tensor,
         compressed_seq_lens: torch.Tensor,
         top_k_result: torch.Tensor,
         layer_id: int,
+        record_plan: bool = False,
     ) -> torch.Tensor:
-        """Swap selected top-k tokens into device memory and return their indices.
+        # 中译：从预分配缓冲切出本批所需部分并清为 -1（CUDA Graph 复用同一地址）。
+        """Run the full plan+IO swap-in kernel for one layer; return its slot table.
 
-        中译：把 top-k 选中的 token 换入设备内存，并返回它们的设备槽位索引（生产路径）。
-              调用 JIT CUDA 核函数完成「设备缓冲命中检查 + 缺失时从主机加载 + LRU 淘汰」。
-              复用预分配输出缓冲 top_k_device_locs_buffer，对 CUDA Graph 安全。
-        参数：req_pool_indices/compressed_seq_lens——各请求的池索引与压缩后序列长度；
-              top_k_result——top-k 选中的 token 位置；layer_id——当前层。
-        返回：形状 (num_reqs, top_k) 的设备 KV 索引。
+        record_plan (set on the anchor of a shared-index group) also records the
+        miss plan into self._miss_{src,dst,count} for the skip layers to replay.
         """
         num_reqs = req_pool_indices.size(0)
-
-        # 中译：从预分配缓冲切出本批所需部分并清为 -1（CUDA Graph 复用同一地址）。
         top_k_indices = self.top_k_device_locs_buffer[:num_reqs]
-        top_k_indices.fill_(-1)
 
-        # todo, adjustable for performance
         # 中译：核函数分块大小（可调以优化性能）；按通路选择 dsv4 或普通 MLA 的换入核函数。
-        block_size = 1024
         swap_in_fn = (
             load_cache_to_device_buffer_dsv4_mla
             if self.is_dsv4_hisparse
             else load_cache_to_device_buffer_mla
+        )
+        plan = (
+            dict(
+                miss_src=self._miss_src[:num_reqs],
+                miss_dst=self._miss_dst[:num_reqs],
+                miss_count=self._miss_count[:num_reqs],
+            )
+            if record_plan
+            else {}
         )
         swap_in_fn(
             top_k_tokens=top_k_result,
@@ -1029,7 +1179,72 @@ class HiSparseCoordinator:
             num_top_k=self.top_k,
             hot_buffer_size=self.device_buffer_size,
             page_size=1,
-            block_size=block_size,
+            block_size=self.swap_in_block_size,
             num_real_reqs=self.num_real_reqs,
+            skip_io=self.skip_io,
+            **plan,
         )
         return top_k_indices
+
+    def _run_copy_only_kernel(self, num_reqs: int, skip_layer: int) -> None:
+        """Replay the anchor's recorded miss plan into a skip layer's buffers
+        (IO-only; the anchor's slot table stays valid -- lockstep layout)."""
+        copy_cache_planned_mla(
+            miss_src=self._miss_src[:num_reqs],
+            miss_dst=self._miss_dst[:num_reqs],
+            miss_count=self._miss_count[:num_reqs],
+            num_real_reqs=self.num_real_reqs,
+            host_cache=self.mem_pool_host.kv_buffer[skip_layer],
+            device_buffer=self.mem_pool_device.kv_buffer[skip_layer],
+            item_size_bytes=self.item_size_bytes,
+            num_blocks=self._prefetch_copy_blocks,
+            is_dsv4_layout=self.is_dsv4_hisparse,
+            skip_io=self.skip_io,
+        )
+
+    def swap_in_selected_pages(
+        self,
+        req_pool_indices: torch.Tensor,
+        compressed_seq_lens: torch.Tensor,
+        top_k_result: torch.Tensor,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Swap selected top-k tokens into device memory and return their indices.
+
+        With prefetch enabled, anchors swap in synchronously (recording the miss
+        plan) and prefetch their skip layers' copies; skip layers just wait.
+        """
+        if not self.enable_prefetch:
+            return self._run_swap_in_kernel(
+                req_pool_indices, compressed_seq_lens, top_k_result, layer_id
+            )
+
+        num_reqs = req_pool_indices.size(0)
+        if self._is_shared_index_layer[layer_id]:
+            # Skip layer: wait for its prefetched copy; the anchor's slot table
+            # applies (shared index + lockstep buffers).
+            slot = self._prefetch_slot[layer_id]
+            self._prefetch_events[slot].wait(device_module.current_stream())
+            return self.top_k_device_locs_buffer[:num_reqs]
+
+        # Anchor: swap in synchronously (recording the plan), then prefetch the
+        # skip layers' copies on the side stream.
+        group = self._prefetch_groups.get(layer_id)
+        anchor_locs = self._run_swap_in_kernel(
+            req_pool_indices,
+            compressed_seq_lens,
+            top_k_result,
+            layer_id,
+            record_plan=group is not None,
+        )
+        if group:
+            # Fork: the prefetch stream must observe the anchor's plan (produced
+            # on the current stream) before replaying it.
+            self.prefetch_stream.wait_stream(device_module.current_stream())
+            with device_module.stream(self.prefetch_stream):
+                for skip_layer in group:
+                    self._run_copy_only_kernel(num_reqs, skip_layer)
+                    self._prefetch_events[self._prefetch_slot[skip_layer]].record(
+                        self.prefetch_stream
+                    )
+        return anchor_locs

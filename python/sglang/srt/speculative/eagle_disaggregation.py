@@ -14,46 +14,30 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.layers.attention.dsa.utils import (
+    should_remap_pd_dsa_seed_to_local_slots,
+)
+from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
     from sglang.srt.managers.schedule_batch import ScheduleBatch
-    from sglang.srt.server_args import ServerArgs
 
 
 def build_eagle_disagg_draft_input(
     batch: ScheduleBatch,
-    server_args: ServerArgs,
     last_tokens_tensor: torch.Tensor,
     future_map: FutureMap,
 ) -> EagleDraftInput:
-    """在分布式（PD 分离）场景下构建 EAGLE 草稿模型输入。
-
-    从各请求的 output_topk_p / output_topk_index / hidden_states_tensor
-    中收集数据，组装为 EagleDraftInput。当启用 overlap 时，
-    通过 future_map 发布和暂存 spec_info 以供异步消费。
-
-    参数：
-        batch:               调度批次
-        server_args:         服务器参数（含 eagle_topk / num_steps 配置）
-        last_tokens_tensor:  最后 token 张量 [bs]，作为 bonus_tokens
-        future_map:          异步 future 映射（用于 overlap 传递 spec_info）
-
-    返回：EagleDraftInput 实例，含 topk_p / topk_index / hidden_states / bonus_tokens
-
-    示例：
-        >>> spec_info = build_eagle_disagg_draft_input(
-        ...     batch, server_args, last_tokens, future_map)
-        >>> spec_info.topk_p.shape       # [bs, num_states]
-        >>> spec_info.topk_index.shape   # [bs, num_states]
-        >>> spec_info.hidden_states.shape # [bs, hidden_dim]
-        >>> spec_info.bonus_tokens.shape  # [bs]
-    """
-    num_states = server_args.speculative_eagle_topk
-    if server_args.enable_multi_layer_eagle:
-        num_states *= server_args.speculative_num_steps
+    # Adaptive spec moves the step count after publish, and this runs once per
+    # prebuilt batch.
+    spec = get_spec()
+    num_states = spec.speculative_eagle_topk
+    if spec.enable_multi_layer_eagle:
+        num_states *= spec.speculative_num_steps
 
     topk_p = torch.stack(
         [
@@ -82,17 +66,54 @@ def build_eagle_disagg_draft_input(
         [req.hidden_states_tensor for req in batch.reqs], dim=0
     ).to(batch.device)
 
+    dsa_topk_indices = None
+    dsa_indices_list = [req.output_dsa_topk_indices for req in batch.reqs]
+    if dsa_indices_list and all(t is not None for t in dsa_indices_list):
+        dsa_topk_indices = torch.stack(dsa_indices_list, dim=0).to(batch.device)
+        if should_remap_pd_dsa_seed_to_local_slots():
+            # PD sends request-relative positions; fused TopK consumes
+            # decode-local physical slots. Remap once before the draft loop/graph.
+            req_to_token = batch.req_to_token_pool.req_to_token
+            table_width = req_to_token.shape[1]
+            valid_positions = dsa_topk_indices >= 0
+            gather_positions = dsa_topk_indices.clamp(min=0, max=table_width - 1).to(
+                torch.int64
+            )
+            local_slots = req_to_token[
+                batch.req_pool_indices[:, None], gather_positions
+            ]
+            invalid_rows = torch.any(
+                (dsa_topk_indices < -1)
+                | (dsa_topk_indices >= batch.seq_lens[:, None])
+                | (dsa_topk_indices >= table_width)
+                # Slot 0 is the reserved padding sink; real KV allocations
+                # start at 1, and untouched req-to-token entries remain 0.
+                | (valid_positions & (local_slots <= 0)),
+                dim=1,
+            )
+            local_slots.masked_fill_(~valid_positions, -1)
+            local_slots.masked_fill_(invalid_rows[:, None], -1)
+            dsa_topk_indices = local_slots
+        if torch.any(torch.all(dsa_topk_indices < 0, dim=1)).item():
+            dsa_topk_indices = None
+
     spec_info = EagleDraftInput(
         topk_p=topk_p,
         topk_index=topk_index,
         hidden_states=hidden_states,
         bonus_tokens=last_tokens_tensor,
+        dsa_topk_indices=dsa_topk_indices,
     )
     spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
 
     if batch.enable_overlap:
+        spec_info.future_dsa_topk_indices_available = dsa_topk_indices is not None
         spec_info.future_indices = batch.req_pool_indices
+        # Seed the relay buf with the known seq_lens; publish's chained record
+        # keeps the in-flight forward's fence intact (see FutureMap.publish).
         future_map.publish(spec_info.future_indices, batch.seq_lens)
-        future_map.stash(spec_info.future_indices, spec_info)
+        future_map.stash(
+            spec_info.future_indices, RelayPayload.from_draft_input(spec_info)
+        )
 
     return spec_info

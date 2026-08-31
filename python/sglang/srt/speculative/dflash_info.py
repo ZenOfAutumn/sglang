@@ -13,11 +13,11 @@ DFLASH 采用线性（非树形）草稿序列，验证时目标模型对整个 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -25,9 +25,13 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+
+_is_npu = is_npu()
 
 
 @dataclass
@@ -73,8 +77,13 @@ class DFlashVerifyInput(SpecInput):
     custom_mask: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
 
-    # 形状信息，用于 padding（如 DP attention / CUDA graph）。
-    num_tokens_per_batch: int = -1
+    # Shape info for padding (e.g., DP attention / CUDA graph).
+    num_tokens_per_req: int = -1
+
+    ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+    # Committed/live lengths before the verify caller temporarily expands
+    # batch.seq_lens_cpu to the target-attention KV lengths.
+    live_seq_lens_cpu: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         """初始化后处理：设置 spec_input_type 并默认 num_tokens_per_batch。
@@ -85,17 +94,9 @@ class DFlashVerifyInput(SpecInput):
             >>> # input.num_tokens_per_batch == 4
         """
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
-        if self.num_tokens_per_batch == -1:
-            self.num_tokens_per_batch = int(self.draft_token_num)
-
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        """返回投机 token 调整系数 (分子, 分母)。
-
-        DFLASH 中两者都等于 draft_token_num，表示不做额外调整。
-
-        返回：(draft_token_num, draft_token_num)
-        """
-        return self.draft_token_num, self.draft_token_num
+        if self.num_tokens_per_req == -1:
+            self.num_tokens_per_req = int(self.draft_token_num)
+        self.num_tokens_for_logprob_per_req = int(self.draft_token_num)
 
     def prepare_for_verify(
         self,
@@ -104,44 +105,58 @@ class DFlashVerifyInput(SpecInput):
     ) -> tuple[ForwardBatch, bool]:
         """为 DFLASH 验证前向准备 ScheduleBatch 和 ForwardBatch。
 
-        调用方在此之前已计算并存储 `batch.out_cache_loc`。
-        本方法仅打包验证前向数据，并预初始化 CUDA graph replay
-        元数据或 eager attention 元数据，使实际前向可以以
-        `skip_attn_backend_init=True` 运行。
-
-        参数：
-            batch:         当前调度 batch
-            target_worker: 目标模型 worker
-
-        返回：(verify_forward_batch, can_run_cuda_graph)
-            - verify_forward_batch: 构建好的 ForwardBatch
-            - can_run_cuda_graph:   是否可使用 CUDA graph replay
-
-        示例：
-            >>> fwd_batch, use_cg = verify_input.prepare_for_verify(batch, target_worker)
-            >>> if use_cg:
-            ...     target_worker.model_runner.decode_cuda_graph_runner.replay(fwd_batch)
-            ... else:
-            ...     target_worker.model_runner.forward(fwd_batch)
+        The caller computes and stores `batch.out_cache_loc` before this
+        method is called. GPU keeps the original pre-planning path. NPU leaves
+        attention/graph metadata initialization to ModelRunner because DP/EP
+        padding can still change the compressor's runtime shapes.
         """
+        from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
+
         batch.input_ids = self.draft_token
         batch.spec_info = self
+        if _is_npu and not batch.forward_mode.is_idle():
+            from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                maybe_build_dsv4_verify_bundle,
+            )
+
+            batch.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
+                batch,
+                self.draft_token_num,
+                live_seq_lens_cpu=self.live_seq_lens_cpu,
+            )
+
         batch.forward_mode = (
             ForwardMode.IDLE
             if batch.forward_mode.is_idle()
             else ForwardMode.TARGET_VERIFY
         )
-        batch.capture_hidden_mode = self.capture_hidden_mode
-        verify_forward_batch = ForwardBatch.init_new(batch, target_worker.model_runner)
+        if not batch.forward_mode.is_idle():
+            # Rebuild mamba track indices (lazy: gather the positions planned
+            # by mamba_lazy_spec_prepare) and clear the stale extend-time mask
+            # before init_new snapshots them into the verify ForwardBatch.
+            # Same hook eagle/ngram/dspark run before TARGET_VERIFY.
+            prepare_mamba_track_for_verify(batch)
+        verify_forward_batch = ForwardBatch.init_new(
+            batch,
+            target_worker.model_runner,
+            capture_hidden_mode=self.capture_hidden_mode,
+            return_hidden_states_before_norm=False,
+        )
 
         can_run_cuda_graph = bool(
             target_worker.model_runner.decode_cuda_graph_runner
-            and target_worker.model_runner.decode_cuda_graph_runner.can_run(
+            and target_worker.model_runner.decode_cuda_graph_runner.can_run_graph(
                 verify_forward_batch
             )
         )
-        if can_run_cuda_graph:
-            target_worker.model_runner.decode_cuda_graph_runner.replay_prepare(
+        if _is_npu:
+            # Do not pre-plan target verify on NPU. DP/EP padding can change
+            # the compressor's logical batch without changing ForwardBatch's
+            # stale-plan shape fields. Let ModelRunner select graph/eager and
+            # initialize metadata after final batch preparation.
+            return verify_forward_batch, can_run_cuda_graph
+        elif can_run_cuda_graph:
+            target_worker.model_runner.decode_cuda_graph_runner.load_batch(
                 verify_forward_batch
             )
         elif not batch.forward_mode.is_idle():
@@ -158,6 +173,7 @@ class DFlashVerifyInput(SpecInput):
         paged_kernel_lens_sum: int,
         req_to_token: torch.Tensor,
         kv_start_idx: Optional[torch.Tensor] = None,
+        kv_indices_buf: Optional[torch.Tensor] = None,
     ):
         """为 prefill 阶段的注意力计算生成参数（kv_indices、indptr、mask 等）。
 
@@ -184,26 +200,43 @@ class DFlashVerifyInput(SpecInput):
         device = req_pool_indices.device
         bs = len(req_pool_indices)
 
-        # 构建 query 偏移指针：每请求 draft_token_num 个 query
-        qo_indptr = torch.arange(
-            0,
-            (bs + 1) * self.draft_token_num,
-            step=self.draft_token_num,
-            dtype=torch.int32,
-            device=device,
-        )
+        layout = self.ragged_verify_layout
+        if layout is not None and layout.bs != bs:
+            # Graph replay pads the batch to the captured slots; match it.
+            layout = layout.padded_to_bucket(padded_bs=bs)
+
+        if layout is None:
+            qo_indptr = torch.arange(
+                0,
+                (bs + 1) * self.draft_token_num,
+                step=self.draft_token_num,
+                dtype=torch.int32,
+                device=device,
+            )
+            verify_lens = self.draft_token_num
+            kv_indices_extra = self.draft_token_num * bs
+        else:
+            qo_indptr = layout.qo_indptr_device
+            verify_lens = layout.verify_lens
+            kv_indices_extra = layout.total_verify_tokens
 
         # 累积 KV 序列长度：原始长度 + 草稿 token 数
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
-        paged_kernel_lens = paged_kernel_lens + self.draft_token_num
+        paged_kernel_lens = paged_kernel_lens + verify_lens
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 
-        # 使用 Triton kernel 生成 KV cache 索引
-        kv_indices = torch.empty(
-            paged_kernel_lens_sum + self.draft_token_num * bs,
-            dtype=torch.int32,
-            device=device,
-        )
+        if kv_indices_buf is not None:
+            # Sync-free fast-plan path: write straight into the attention
+            # backend's cuda-graph kv_indices buffer (the captured kernels read
+            # it), skipping both the fresh allocation and the wrapper plan()'s
+            # device-to-device refresh copy.
+            kv_indices = kv_indices_buf
+        else:
+            kv_indices = torch.empty(
+                paged_kernel_lens_sum + kv_indices_extra,
+                dtype=torch.int32,
+                device=device,
+            )
         create_flashinfer_kv_indices_triton[(bs,)](
             req_to_token,
             req_pool_indices,

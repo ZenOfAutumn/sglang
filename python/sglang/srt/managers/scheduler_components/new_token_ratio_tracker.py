@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Sequence
 
 from sglang.srt.environ import envs
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -37,13 +37,11 @@ class NewTokenRatioTracker:
     current: float
 
     @classmethod
-    def from_server_args(cls, server_args: ServerArgs) -> NewTokenRatioTracker:
-        """中译：从 ServerArgs / 环境变量构造跟踪器并算好衰减步长。"""
         # 中译：初始比率 = 基准比率 × 调度保守度（schedule_conservativeness），并夹到 <=1.0；
-        #       conservativeness 越大越保守（预留越多）。
+    def from_config(cls) -> NewTokenRatioTracker:
         init = min(
             envs.SGLANG_INIT_NEW_TOKEN_RATIO.get()
-            * server_args.schedule_conservativeness,
+            * get_schedule().schedule_conservativeness,
             1.0,
         )
         # 中译：下限 = init × 下限系数（<1），同样夹到 <=1.0。

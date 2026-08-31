@@ -38,56 +38,15 @@ NGRAM 则直接从 N-gram 语料库（后缀 trie）里按历史 token 匹配出
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import List, Optional
 
 import torch
 
-from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
-from sglang.srt.speculative.eagle_info_v2 import EagleDraftInputV2Mixin
+from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 
-class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
-    """NGRAM 一轮验证所需的全部输入。
-
-    由 `NGRAMWorker` 在语料匹配后构造，随 `ForwardBatch` 一路传给注意力后端
-    和采样逻辑。所有 tensor 的第一维都按「batch 内所有请求的草稿 token 拍平」
-    组织，即长度 = bs * draft_token_num。
-
-    参数（以 bs=2、draft_token_num=4 为例）：
-        draft_token: 拍平的候选 token id，shape [bs*draft_token_num] = [8]
-            tensor([464, 4062, 3105, 7586,   318,  257, 1332,  13])
-                    └────── req0 的 4 个 ──┘  └───── req1 的 4 个 ───┘
-        custom_mask: 树形注意力 mask，bool 一维拍平，见 generate_attn_arg_prefill
-            的 mask_numel 计算。每个草稿 token 只能看见「自己的祖先链」，
-            兄弟分支之间互相不可见——这是树形验证的关键。
-        positions: 各草稿 token 的绝对位置，shape [8]
-            tensor([100, 101, 101, 102,  50,  51,  52,  52])
-        retrieve_index: 各节点在拍平数组中的全局下标，shape [bs, draft_token_num]
-            tensor([[0, 1, 2, 3],
-                    [4, 5, 6, 7]])
-        retrieve_next_token: 「左孩子」下标，shape [bs, draft_token_num]，-1 表无子
-            tensor([[ 1,  3, -1, -1],
-                    [ 1,  2, -1, -1]])
-        retrieve_next_sibling: 「右兄弟」下标，同 shape，-1 表无兄弟
-            tensor([[-1,  2, -1, -1],
-                    [-1, -1,  3, -1]])
-        draft_token_num: 每个请求每轮验证的草稿 token 数（含 root），如 4 / 12 / 16。
-            对应 CLI 的 --speculative-num-draft-tokens。
-        grammar: 结构化输出（JSON schema / 正则）约束对象，无约束时为 None。
-
-    以下 4 个字段仅在 V2 overlap worker（草稿与上一轮验证重叠执行）下使用：
-        future_indices: 「未来 token」占位索引。overlap 模式下 CPU 侧还拿不到
-            上一轮的真实采样结果，先用占位符排队，GPU 侧再回填。
-        new_seq_lens: 本轮接受后各请求的新序列长度，shape [bs]
-            tensor([102, 52])
-        accept_tokens: 本轮实际被接受的 token，拍平后 shape [bs*draft_token_num]
-            未接受的位置是填充值。
-        accept_lens: 各请求本轮接受了几个 token，shape [bs]
-            tensor([3, 1])  # req0 接受 3 个（含 bonus），req1 只接受 1 个
-    """
-
+class NgramVerifyInput(SpecInput):
     def __init__(
         self,
         draft_token: torch.Tensor = None,
@@ -97,7 +56,6 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
         retrieve_next_token: torch.Tensor = None,
         retrieve_next_sibling: torch.Tensor = None,
         draft_token_num: int = None,
-        grammar: BaseGrammarObject = None,
         future_indices: Optional[torch.Tensor] = None,
         new_seq_lens: Optional[torch.Tensor] = None,
         accept_tokens: Optional[torch.Tensor] = None,
@@ -111,7 +69,8 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
         self.retrieve_next_token = retrieve_next_token
         self.retrieve_next_sibling = retrieve_next_sibling
         self.draft_token_num = draft_token_num
-        self.grammar = grammar
+        self.num_tokens_per_req = draft_token_num
+        self.num_tokens_for_logprob_per_req = draft_token_num
 
         # V2 overlap worker 专用输入
         self.future_indices = future_indices
@@ -147,18 +106,6 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
         所以那里返回的是一个正整数。
         """
         return -1
-
-    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        """返回 (显存预留系数, 调度预留系数)。
-
-        调度器据此判断「一个请求本轮最多会新增多少 token」，用于预留 KV cache
-        槽位和控制并发。NGRAM 两者都等于 draft_token_num，因为整棵树的
-        draft_token_num 个节点都要写入 KV cache 参与验证。
-
-        示例：draft_token_num=16 → 返回 (16, 16)，
-        即调度器给每个请求每轮预留 16 个 KV 槽位（哪怕最终只接受 2 个）。
-        """
-        return self.draft_token_num, self.draft_token_num
 
     def generate_attn_arg_prefill(
         self,
@@ -256,23 +203,15 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
 
         return kv_indices, cum_kv_seq_len, self.qo_indptr, custom_mask
 
-    def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
-        """请求退出 batch（生成结束/被抢占）时，把对应的行从各 tensor 中剔除。
-
-        参数：
-            new_indices: 保留下来的请求在**原 batch** 中的下标，shape [新bs]
-                例如原 bs=3、req1 已完成 → new_indices = tensor([0, 2])
-            has_been_filtered: 调用方标记，本实现未使用。
-
-        效果（draft_token_num=4，原 bs=3）：
-            accept_lens:   [3, 1, 2]      → [3, 2]
-            accept_tokens: 12 个元素拍平  →  8 个元素
-                reshape 成 [3, 4] 后按行取 [0, 2]，再 flatten 回一维。
-                这就是下面先 reshape 再 flatten 的原因——accept_tokens 是
-                按请求拍平存储的，不能直接用请求下标去索引。
-        """
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        new_indices_cpu: Optional[List[int]] = None,
+    ):
         if self.future_indices is not None:
             self.future_indices = self.future_indices[new_indices]
+            return
+
         if self.new_seq_lens is not None:
             self.new_seq_lens = self.new_seq_lens[new_indices]
         self.accept_tokens = self.accept_tokens.reshape(-1, self.draft_token_num)[
@@ -300,6 +239,8 @@ class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin):
             self.future_indices = torch.cat(
                 (self.future_indices, spec_info.future_indices), dim=0
             )
+            return
+
         if self.new_seq_lens is not None:
             assert spec_info.new_seq_lens is not None
             self.new_seq_lens = torch.cat(

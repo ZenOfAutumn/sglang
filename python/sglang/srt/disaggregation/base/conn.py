@@ -15,14 +15,20 @@ if TYPE_CHECKING:
 
 
 class StateType(str, enum.Enum):
-    """PD 分离传输中，KV 之外需额外搬运的「状态」类型（各后端据此拆分组件）。"""
-
-    MAMBA = "mamba"  # Mamba/线性注意力的循环状态（temporal + conv）
-    SWA = "swa"  # 滑动窗口注意力（Sliding Window Attention）的侧缓存
-    DSA = "dsa"  # DeepSeek Sparse Attention 的 indexer 状态
-    # DeepSeek-V4 的 unified_kv SWA 环形缓冲：按环形槽位逐行寻址
-    # （req_pool_idx * ring_stride + pos % ring_stride），需作为独立组件处理。
+    MAMBA = "mamba"
+    SWA = "swa"
+    DSA = "dsa"
+    MINIMAX_INDEX_K = "minimax_index_k"
+    # DeepSeek-V4 unified_kv SWA ring: addressed per-row by ring slot
+    # (req_pool_idx * ring_stride + pos % ring_stride), needs its own component.
     SWA_RING = "swa_ring"
+    # DeepSeek-V4 online C128 request-scoped state.
+    C128_STATE = "c128_state"
+    # A block-scaled KV dtype keeps its per-block scales in buffers parallel to
+    # K/V, one component per sub-pool so each carries the index payload of the
+    # KV it describes (whole sequence for full attention, window for SWA).
+    BLOCK_SCALE = "block_scale"
+    BLOCK_SCALE_SWA = "block_scale_swa"
 
 
 @dataclasses.dataclass
@@ -37,28 +43,35 @@ class KVTransferMetric:
 
 
 class KVArgs:
-    """KV 传输后端初始化所需的全部参数（内存布局、并行维度、设备信息等）。"""
-
-    engine_rank: int  # 当前 engine 的全局 rank
-    kv_data_ptrs: List[int]  # 各 KV 缓冲区的起始指针
-    kv_data_lens: List[int]  # 各 KV 缓冲区的总字节长度
-    kv_item_lens: List[int]  # 各 KV 缓冲区中单个 item（每 token/page）的字节数
-    aux_data_ptrs: List[int]  # 辅助数据缓冲区指针（如 aux/metadata）
-    aux_data_lens: List[int]  # 辅助数据缓冲区总长度
-    aux_item_lens: List[int]  # 辅助数据单 item 字节数
-    state_types: List[StateType]  # 需额外传输的状态类型列表（见 StateType）
-    state_data_ptrs: List[List[int]]  # 各状态类型对应的缓冲区指针（按类型分组）
-    state_data_lens: List[List[int]]  # 各状态缓冲区总长度
-    state_item_lens: List[List[int]]  # 各状态缓冲区单 item 字节数
-    # 每个 state 张量的 TP 切分维度；当 prefill/decode 两侧 attn_tp_size 不同时用于对齐切分。
+    engine_rank: int
+    kv_data_ptrs: List[int]
+    kv_data_lens: List[int]
+    kv_item_lens: List[int]
+    kv_layer_ids: List[int]
+    kv_cache_dtype_str: str
+    aux_data_ptrs: List[int]
+    aux_data_lens: List[int]
+    aux_item_lens: List[int]
+    state_types: List[StateType]
+    state_data_ptrs: List[List[int]]
+    state_data_lens: List[List[int]]
+    state_item_lens: List[List[int]]
+    state_layer_ids: List[List[int]]
+    # Per-tensor TP slice dim, used when prefill/decode attn_tp_size differ.
     state_dim_per_tensor: List[List[int]]
-    ib_device: str  # InfiniBand 设备名
-    ib_traffic_class: str  # IB 流量分类（QoS）
-    gpu_id: int  # 本地 GPU 编号
-    kv_head_num: int  # 本 rank 的 KV head 数
-    total_kv_head_num: int  # 全模型的 KV head 总数
-    page_size: int  # 每 page 的 token 数
-    # 用于 system dp（数据并行）
+    # Number of rows before the slice axis in each per-slot state tensor.
+    state_slice_outer_counts: List[List[int]]
+    is_hybrid_mla_backend: bool
+    # Per-tensor conv sub-block dims (GDN: [key_dim, key_dim, value_dim]) so the
+    # scatter transfer can slice each independently head-sharded sub-block; None
+    # per tensor when the single contiguous slice already matches the layout.
+    state_conv_shard_groups: List[List[Optional[List[int]]]]
+    ib_device: str
+    gpu_id: int
+    kv_head_num: int
+    total_kv_head_num: int
+    page_size: int
+    # for system dp
     system_dp_rank: int
     # 用于 PP（流水线并行）下的 prefill
     pp_rank: int
@@ -105,8 +118,6 @@ class BaseKVManager(ABC):
 
 
 class BaseKVSender(ABC):
-    """KV 发送端基类（prefill 侧）：负责把 KV cache 传给 decode 侧。"""
-
     @abstractmethod
     def __init__(
         self,
@@ -115,6 +126,7 @@ class BaseKVSender(ABC):
         bootstrap_room: int,
         dest_tp_ranks: List[int],
         pp_rank: int,
+        req_has_disagg_prefill_dp_rank: bool = False,
     ): ...
 
     @abstractmethod
@@ -127,6 +139,7 @@ class BaseKVSender(ABC):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
+        num_kv_tokens: Optional[int] = None,
     ):
         """把给定 kv 索引处的 KV cache、以及给定索引处的额外 cache/state 发送到 decode 端。"""
         ...
@@ -154,10 +167,20 @@ class BaseKVSender(ABC):
         """当 KV cache 传输失败时抛出异常。"""
         ...
 
+    def clear(self):
+        """
+        Clear any internal states.
+        """
+        pass
+
+    def abort(self):
+        """
+        Abort the current transfer.
+        """
+        pass
+
 
 class BaseKVReceiver(ABC):
-    """KV 接收端基类（decode 侧）：负责从 prefill 侧接收 KV cache。"""
-
     @abstractmethod
     def __init__(
         self,

@@ -24,9 +24,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.configs.model_config import is_cross_encoding_pooler_model
+from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
-from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID
 
 logger = logging.getLogger(__name__)
 
@@ -82,33 +82,6 @@ class TokenizerManagerScoreMixin:
 
         This is a thin wrapper over `score_request` that treats `prompts` as
         already-composed inputs (i.e., no query/item concatenation needed).
-
-        Args:
-            prompts: A single prompt string, a list of prompt strings, or a list of
-                pre-tokenized prompt token ID sequences.
-            label_token_ids: Token IDs to compute probabilities for.
-            apply_softmax: Whether to normalize probabilities using softmax.
-            request: Optional FastAPI request object.
-
-        Returns:
-            ScoreResult with:
-                scores: List of score lists, one for each prompt, each in the order of label_token_ids.
-                prompt_tokens: The number of prompt tokens processed.
-
-        中译：对每个「完整 prompt」之后，计算指定 token id（label_token_ids）的出现概率。
-
-        本方法是 score_request 的轻量包装：把 prompts 当作已经组装好的完整输入
-        （即不需要再做 query/item 拼接），因此固定传入空 query。
-
-        参数：
-            prompts：单个 prompt 字符串、prompt 字符串列表，或已分词的 token id 序列列表。
-            label_token_ids：需要计算概率的目标 token id 列表。
-            apply_softmax：是否对结果做 softmax 归一化。
-            request：可选的 FastAPI 请求对象。
-
-        返回：
-            ScoreResult，其 scores 为每个 prompt 一个分数列表（顺序与 label_token_ids 一致），
-            prompt_tokens 为处理的 prompt token 数。
         """
         # Text prompts
         # 中译：文本类 prompt（字符串、字符串列表、或空列表）。以空 query 走单条打分。
@@ -144,26 +117,6 @@ class TokenizerManagerScoreMixin:
         """
         Build a single token sequence for multi-item scoring.
         Format: query<delimiter>item1<delimiter>item2<delimiter>item3<delimiter>
-
-        Args:
-            query: Query token IDs
-            items: List of item token ID sequences
-            delimiter_token_id: Token ID to use as delimiter
-
-        Returns:
-            Tuple of (combined token sequence, delimiter indices)
-
-        中译：为「多条打分（multi-item scoring）」构建单条 token 序列。
-        格式：query<分隔符>item1<分隔符>item2<分隔符>item3<分隔符>
-
-        参数：
-            query：query 的 token id 序列。
-            items：各 item 的 token id 序列列表。
-            delimiter_token_id：用作分隔符的 token id。
-
-        返回：
-            (combined token sequence, delimiter indices) —— 拼接后的整条序列，
-            以及每个分隔符在序列中的下标（后续在这些位置提取 logprob）。
         """
         combined_sequence = query[:]  # Start with query  # 中译：以 query 的拷贝起头
         delimiter_indices = []
@@ -186,26 +139,6 @@ class TokenizerManagerScoreMixin:
         query: Optional[Union[str, List[int]]],
         items: Optional[Union[str, List[str], List[List[int]]]],
     ) -> Tuple[List[int], List[List[int]]]:
-        """
-        Tokenize query and items into token IDs.
-
-        Args:
-            query: The query text (str) or pre-tokenized token IDs (List[int]).
-            items: Item texts or pre-tokenized token IDs.
-
-        Returns:
-            (query_ids, items_ids): query token IDs and list of per-item token IDs.
-
-        中译：把 query 与 items 分词成 token id。
-
-        参数：
-            query：query 文本（str）或已分词的 token id（List[int]）。
-            items：item 文本或已分词的 token id。
-
-        返回：
-            (query_ids, items_ids)：query 的 token id，以及每个 item 的 token id 列表。
-            已经是 token id 的输入直接拷贝，文本输入则调用 self.tokenizer.encode 分词。
-        """
         if isinstance(query, str):
             query_ids = self.tokenizer.encode(query)
         else:
@@ -238,38 +171,6 @@ class TokenizerManagerScoreMixin:
         populated (input_token_ids_logprobs for generation models,
         embedding for classification models), then uniformly validates,
         skips the query-boundary delimiter, and normalizes.
-
-        Args:
-            results: Results from generate_request
-            items: List of items being scored
-            label_token_ids: Token IDs to extract scores for
-            apply_softmax: Whether to apply softmax normalization
-            batch_request: The original batch request containing input sequence
-            return_pooled_hidden_states: Whether to extract pooled hidden states
-                from the result and include them in the ScoreResult.
-
-        Returns:
-            ScoreResult with per-item scores, prompt token count, and optional
-            pooled_hidden_states (when return_pooled_hidden_states=True and the
-            model populated the field).
-
-        中译：解析「多条打分（multi-item scoring）」请求的返回结果。
-
-        从调度器实际填充的字段里提取每个分隔符位置的分数（生成式模型用
-        input_token_ids_logprobs，分类模型用 embedding），然后统一做校验、跳过
-        query 边界的那个分隔符、并按需归一化。
-
-        参数：
-            results：generate_request 的返回结果。
-            items：被打分的 item 列表。
-            label_token_ids：需要提取分数的 token id。
-            apply_softmax：是否做 softmax 归一化。
-            batch_request：原始批请求（含输入序列）。
-            return_pooled_hidden_states：是否一并提取 pooled hidden states。
-
-        返回：
-            ScoreResult，包含每个 item 的分数、prompt token 数，以及可选的
-            pooled_hidden_states（仅当开启且模型填充了该字段时）。
         """
         # 中译：多条打分时输入只有一条拼接序列，故取第一个（或唯一）结果即可。
         single_result = results[0] if isinstance(results, list) else results
@@ -356,30 +257,6 @@ class TokenizerManagerScoreMixin:
         For generation (CausalLM) models: reads output_token_ids_logprobs.
         For non-generation (SequenceClassification) models: reads the embedding field
         which contains pooled class logits from the classification head.
-
-        Args:
-            results: Results from generate_request
-            label_token_ids: Token IDs to extract scores for (generation models only)
-            apply_softmax: Whether to apply softmax normalization
-            return_pooled_hidden_states: Whether to extract pooled hidden states
-
-        Returns:
-            ScoreResult with per-item scores, prompt token count, and optional pooled_hidden_states.
-
-        中译：解析「单条打分（single-item scoring）」请求的返回结果。
-
-        - 生成式模型（CausalLM）：读取 output_token_ids_logprobs。
-        - 非生成式模型（SequenceClassification）：读取 embedding 字段，其中是分类头输出的
-          pooled class logits。
-
-        参数：
-            results：generate_request 的返回结果（每个 item 一条）。
-            label_token_ids：需要提取分数的 token id（仅生成式模型用到）。
-            apply_softmax：是否做 softmax 归一化。
-            return_pooled_hidden_states：是否提取 pooled hidden states。
-
-        返回：
-            ScoreResult，包含每个 item 的分数、prompt token 数，以及可选的 pooled_hidden_states。
         """
         scores = []
         phs_list = []
@@ -459,34 +336,7 @@ class TokenizerManagerScoreMixin:
         label: str = "input",
     ) -> Tuple[List[torch.Tensor], List[int]]:
         """Scan token_ids for placeholder occurrences and pair with embeddings.
-
-        Args:
-            token_ids: The token sequence to scan.
-            embeds: Embedding tensors to place at placeholder positions (None = skip).
-            embed_override_token_id: The placeholder token ID.
-            position_offset: Added to each found position (for absolute coordinates).
-            label: Label for error messages (e.g. "query", "items[2]").
-
-        Returns:
-            (embeds, positions) lists. Empty lists if embeds is None.
-
-        中译：扫描 token_ids 中占位 token（embed_override_token_id）出现的位置，
-        并与传入的覆盖 embedding 一一配对。
-
-        所谓 embedding 覆盖（embed override）：把序列中某些占位 token 的嵌入向量替换为
-        外部直接提供的向量（如多模态特征），占位 token 仅用于标记位置。
-
-        参数：
-            token_ids：待扫描的 token 序列。
-            embeds：放到占位位置的 embedding 张量（None 表示跳过）。
-            embed_override_token_id：占位 token id。
-            position_offset：加到每个找到的位置上（用于换算成绝对坐标）。
-            label：报错信息中的标签（如 "query"、"items[2]"）。
-
-        返回：
-            (embeds, positions) 两个列表；若 embeds 为 None 则返回空列表。
-            占位 token 数量与提供的 embedding 数量必须一致，否则报错。
-        """
+        Returns empty lists when embeds is None."""
         if embeds is None:
             return [], []
         positions = [
@@ -512,15 +362,7 @@ class TokenizerManagerScoreMixin:
         item_position_offset: int,
         item_label: str,
     ) -> Optional[PositionalEmbeds]:
-        """Resolve embed overrides for a single query+item pair.
-
-        Returns PositionalEmbeds if any overrides exist, None otherwise.
-
-        中译：为单个 query+item 对解析 embedding 覆盖。
-
-        分别在 query 与 item 上解析占位位置（item 需加 item_position_offset 偏移到拼接后的
-        绝对坐标），合并后若存在覆盖则返回 PositionalEmbeds，否则返回 None。
-        """
+        """Resolve embed overrides for a query+item pair; None when no overrides exist."""
         q_embeds, q_positions = self._resolve_overrides_for_sequence(
             query,
             query_embed_overrides,
@@ -557,19 +399,8 @@ class TokenizerManagerScoreMixin:
     ) -> Tuple[None, List[List[int]], Optional[list], Optional[List[int]]]:
         """Build input_ids and resolve embed overrides for token-ID inputs.
 
-        Works identically for multi-item-scoring and single-item modes — the only difference is
-        how input_ids are assembled and what position offset each item gets.
-
-        Returns:
-            (text_prompts, input_ids, positional_embed_overrides, delimiter_indices)
-
-        中译：为「token id 输入」构建 input_ids，并解析 embedding 覆盖。
-
-        多条打分模式与单条模式逻辑相通——唯一区别在于 input_ids 如何拼装、以及每个 item
-        获得的位置偏移不同。返回的第一个元素恒为 None（token id 输入没有文本 prompt）。
-
-        返回：
-            (text_prompts, input_ids, positional_embed_overrides, delimiter_indices)
+        Multi-item-scoring and single-item modes differ only in how input_ids
+        are assembled and what position offset each item gets.
         """
         # Both query and items are token IDs
         has_embeds = (
@@ -708,46 +539,8 @@ class TokenizerManagerScoreMixin:
         - Generation (CausalLM): Requires label_token_ids; returns logprob-based scores.
         - SequenceClassification: label_token_ids is optional; returns pooled class logits.
 
-        Args:
-            query: The query text or pre-tokenized query token IDs
-            items: The item text(s) or pre-tokenized item token IDs
-            label_token_ids: List of token IDs to compute probabilities for
-            apply_softmax: Whether to normalize probabilities using softmax
-            item_first: If True, prepend items to query. Ignored for multi-item scoring.
-            embed_override_token_id: Placeholder token ID for embedding override positions.
-            query_embed_overrides: Embedding vectors replacing placeholder tokens in query.
-            item_embed_overrides: Per-item embedding vectors replacing placeholder tokens in items.
-            request: Optional FastAPI request object
-            return_pooled_hidden_states: Whether to include the raw pooled transformer
-                hidden states (before the task-specific head) in the result. Only
-                supported for non-generation models (SequenceClassification,
-                RewardModel). Raises ValueError for CausalLM models.
-
-        Returns:
-            ScoreResult with:
-                scores: List of score lists, one per item.
-                prompt_tokens: The number of prompt tokens processed.
-                pooled_hidden_states: Per-item CPU tensors when
-                    return_pooled_hidden_states=True and the model supports it;
-                    None otherwise.
-
-        中译：打分主入口——计算指定 token id 出现在 (query + item) 拼接序列之后的概率/分数。
-
-        支持两种打分方式：
-        1. 单条打分（默认）：每个 query+item 对各自独立处理。
-        2. 多条打分（设置 --enable-mis 时）：用分隔符把 query 与多个 item 合成单条序列，
-           一次前向高效处理。注意此模式下忽略 item_first，固定采用
-           query<分隔符>item1<分隔符>item2<分隔符>item3<分隔符> 的格式；文本与已分词输入皆可。
-
-        支持两类模型：
-        - 生成式（CausalLM）：必须提供 label_token_ids，返回基于 logprob 的分数。
-        - 序列分类（SequenceClassification）：label_token_ids 可选，返回池化后的分类 logits。
-
-        参数：见上方英文；其中 embed_override_token_id / query_embed_overrides /
-        item_embed_overrides 用于 embedding 覆盖；return_pooled_hidden_states 仅非生成式模型
-        支持（对 CausalLM 会抛 ValueError）。
-
-        副作用：最终通过 self.generate_request 提交一次实际推理请求。
+        return_pooled_hidden_states is only supported for non-generation models
+        (SequenceClassification, RewardModel); raises ValueError for CausalLM.
         """
         is_generation = self.is_generation
 
@@ -929,27 +722,6 @@ class TokenizerManagerScoreMixin:
         label_token_ids: List[int],
         apply_softmax: bool,
     ) -> List[float]:
-        """
-        Convert logprobs dictionary to ordered score list.
-
-        Args:
-            logprobs: Dictionary mapping token_id to logprob
-            label_token_ids: Token IDs in desired order
-            apply_softmax: Whether to apply softmax normalization
-
-        Returns:
-            List of scores in the same order as label_token_ids
-
-        中译：把 logprob 字典转换成按 label_token_ids 顺序排列的分数列表。
-
-        参数：
-            logprobs：token_id -> logprob 的映射。
-            label_token_ids：期望的输出顺序。
-            apply_softmax：是否做 softmax 归一化。
-
-        返回：
-            与 label_token_ids 顺序一致的分数列表。缺失的 token 取 -inf。
-        """
         # 中译：按顺序取分数，缺失的 token 用 -inf 占位。
         score_list = [
             logprobs.get(token_id, float("-inf")) for token_id in label_token_ids
@@ -969,25 +741,7 @@ class TokenizerManagerScoreMixin:
     def _extract_logprobs_for_tokens(
         self, logprobs_data: List, label_token_ids: List[int]
     ) -> Dict[int, float]:
-        """
-        Extract logprobs for specified token IDs from logprobs data.
-
-        Args:
-            logprobs_data: List of (logprob, token_id, text) tuples
-            label_token_ids: Token IDs to extract logprobs for
-
-        Returns:
-            Dictionary mapping token_id to logprob
-
-        中译：从 logprob 数据中提取指定 token id 的 logprob。
-
-        参数：
-            logprobs_data：(logprob, token_id, text) 三元组列表。
-            label_token_ids：需要提取的目标 token id。
-
-        返回：
-            token_id -> logprob 的字典（仅包含命中 label_token_ids 的项）。
-        """
+        """Extract logprobs for label_token_ids from (logprob, token_id, text) tuples."""
         logprobs = {}
         if logprobs_data:
             for logprob, token_id, _ in logprobs_data:

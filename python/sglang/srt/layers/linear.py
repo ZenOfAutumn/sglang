@@ -12,11 +12,9 @@ import torch
 from torch import nn
 from torch.nn.parameter import Parameter, UninitializedParameter
 
-from sglang.kernel_api_logging import wrap_method_with_debug_kernel_once
+from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.srt.distributed import (
     divide,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
     get_tp_group,
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
@@ -26,10 +24,11 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
-    get_attention_tp_group,
     is_allocation_symmetric,
 )
+from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
@@ -40,7 +39,7 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:
@@ -67,7 +66,6 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQMarlin24LinearMethod",
     "TPUInt8LinearMethod",
     "GPTQLinearMethod",
-    "FBGEMMFp8LinearMethod",
     "GPTQLinearAscendMethod",
     "GPTQLinearIntelAMXMethod",
     "GPTQMoEAscendMethod",
@@ -77,6 +75,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "IPEXAWQLinearMethod",
     "PetitNvFp4LinearMethod",
     "QuarkInt4Fp8LinearMethod",
+    "HummingLinearMethod",
     "QuarkLinearMethod",
 ]
 
@@ -156,6 +155,15 @@ class LinearBase(torch.nn.Module):
         quant_config: Quantization configure.
     """
 
+    # Set by quant methods that attach a per-layer scheme, eagerly in
+    # get_quant_method(), which runs before create_weights() picks the loader,
+    # or lazily inside create_weights() itself (GPTQ). The default is what lets
+    # callers probe with `is None`; a hasattr() probe answers "yes" once it
+    # exists. Schemes must stay plain objects -- nn.Module.__setattr__ files a
+    # Module value under self._modules, which this default then shadows on read.
+    # VocabParallelEmbedding and FusedMoE carry the same default.
+    scheme = None
+
     def __init__(
         self,
         input_size: int,
@@ -228,6 +236,7 @@ class ReplicatedLinear(LinearBase):
 
         # All the linear layer supports quant method.
         assert self.quant_method is not None
+        self.with_bias = bias
         self.quant_method.create_weights(
             self,
             self.input_size,
@@ -257,6 +266,14 @@ class ReplicatedLinear(LinearBase):
         # (such scales for AutoFp8).
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
+
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+        if is_gguf_weight_type:
+            param.weight_type = loaded_weight.item()
+
+        if is_gguf_weight and isinstance(param, UninitializedParameter):
+            param.materialize(tuple(loaded_weight.shape), dtype=loaded_weight.dtype)
 
         # The per-tensor quant-scale must be 1 dimension
         if _is_npu:
@@ -348,6 +365,7 @@ class ColumnParallelLinear(LinearBase):
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
         )
 
+        self.with_bias = bias
         self.gather_output = gather_output
         self.use_presharded_weights = use_presharded_weights
 
@@ -355,9 +373,9 @@ class ColumnParallelLinear(LinearBase):
         # tp_rank / tp_size 允许外部显式传入（例如某些模块使用自定义子通信组），
         # 未传入时回退到全局张量并行通信组的 rank 与 world size。
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_parallel().tp_size
         self.tp_rank, self.tp_size = tp_rank, tp_size
         assert self.quant_method is not None
         # 本 rank 负责的输出列数；divide() 会断言必须整除，避免出现不均匀切分。
@@ -390,7 +408,13 @@ class ColumnParallelLinear(LinearBase):
                 # 新版参数类型（vLLM Parameter 体系）走 v2 加载路径，
                 # 由参数对象自身实现切分逻辑；否则走本类的传统 weight_loader。
                 self.weight_loader_v2
-                if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                if (
+                    self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                    or (
+                        self.scheme is not None
+                        and self.scheme.requires_weight_loader_v2
+                    )
+                )
                 else self.weight_loader
             ),
         )
@@ -595,14 +619,12 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
     ):
-        # 注意：output_sizes 必须在 super().__init__() 之前设置。
-        # 因为父类 ColumnParallelLinear.__init__ 会通过
-        # hasattr(self, "output_sizes") 来判定要不要按段计算 output_partition_sizes。
+        self.with_bias = bias
         self.output_sizes = output_sizes
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_parallel().tp_size
         self.tp_rank, self.tp_size = tp_rank, tp_size
         # 每一段都必须能被 tp_size 整除：否则无法在保持段边界的前提下均匀切分。
         assert all(output_size % tp_size == 0 for output_size in output_sizes)
@@ -679,7 +701,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
 
         if loaded_shard_id is None:
-            # 进入此分支说明 checkpoint 中权重已经是合并好的（qkv/mlp 融合存储）。
+            # Loaded weight is already fused-in-checkpoint (qkv/mlp).
             if output_dim is None:
                 # 不按输出维切分的参数（如 per-tensor scale），直接整体拷贝。
                 if needs_scalar_to_array:
@@ -719,8 +741,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 # 若已量化，需要把偏移和长度换算到「打包后」的坐标系上
                 #（除以 pack_factor），否则会切错位置。
                 if packed_dim == output_dim:
-                    shard_size = shard_size // param.pack_factor
-                    shard_offset = shard_offset // param.pack_factor
+                    shard_size = round(shard_size // param.pack_factor)
+                    shard_offset = round(shard_offset // param.pack_factor)
                     # Special case for Marlin.
                     shard_size, shard_offset = adjust_marlin_shard(
                         param, shard_size, shard_offset
@@ -758,9 +780,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             # 若已量化，需要把偏移和长度换算到打包后的坐标系上。
             packed_dim = getattr(param, "packed_dim", None)
             if packed_dim == output_dim:
-                shard_size = shard_size // param.pack_factor
-                shard_offset = shard_offset // param.pack_factor
-                # Marlin 布局的特殊修正。
+                shard_size = round(shard_size // param.pack_factor)
+                shard_offset = round(shard_offset // param.pack_factor)
+                # Special case for Marlin.
                 shard_size, shard_offset = adjust_marlin_shard(
                     param, shard_size, shard_offset
                 )
@@ -772,7 +794,14 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_size = loaded_weight.shape[output_dim]
                 shard_offset = loaded_weight.shape[output_dim] * loaded_shard_id
 
-            # 把目标参数裁剪到「本段对应的子区域」，后续只往这个子区域写。
+            # Needed for experimental ModelSlim W4A4 int4x2 packing support
+            # TODO: remove env variable once new packing is fully released
+            if envs.SGLANG_NPU_W4A4_NEW_PACKING.get():
+                pack_factor = getattr(param, "pack_factor", None)
+                if pack_factor is not None:
+                    shard_size = shard_size // pack_factor
+                    shard_offset = shard_offset // pack_factor
+
             param_data = param_data.narrow(output_dim, shard_offset, shard_size)
             # 第二层偏移：在「全局的本段权重」中，本 rank 应该取哪一段。
             start_idx = self.tp_rank * shard_size
@@ -841,7 +870,11 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         loaded_weight: torch.Tensor,
         output_sizes: list[int] | None = None,
     ):
-        """处理「MLP 层在 checkpoint 中已经融合存储」的特殊情况。
+        """
+        Handle special case for models where MLP layers are already
+        fused-in-checkpoint. In this case, we have no shard id. This function
+        determines the shard id by splitting these layers and then calls
+        the weight loader using the shard id.
 
         这种情况下调用方拿不到 shard id（因为磁盘上就是一个大权重），
         本函数负责把它拆成各段、推导出每段的 shard id，
@@ -965,13 +998,28 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         """
         if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
             if isinstance(param, PerTensorScaleParameter):
-                # per-tensor scale 全层只有一个值，不存在段的概念，固定用 shard_id=0。
-                param.load_merged_column_weight(
-                    loaded_weight=loaded_weight,
-                    shard_id=0,
-                    tp_rank=self.tp_rank,
-                    tp_size=self.tp_size,
-                )
+                if loaded_weight.numel() != 1:
+                    raise ValueError(
+                        "Expected scalar scale for fused-in-checkpoint "
+                        "merged-column checkpoint load, got shape "
+                        f"{tuple(loaded_weight.shape)}"
+                    )
+                if loaded_shard_id is None:
+                    # The checkpoint tensor is already fused-in-checkpoint, so a
+                    # scalar scale applies to the entire merged matrix. Fill
+                    # every logical slot so later reductions only see valid
+                    # scale values.
+                    shard_ids = range(param.data.shape[0])
+                else:
+                    shard_ids = loaded_shard_id
+
+                for shard_id in shard_ids:
+                    param.load_merged_column_weight(
+                        loaded_weight=loaded_weight,
+                        shard_id=shard_id,
+                        tp_rank=self.tp_rank,
+                        tp_size=self.tp_size,
+                    )
                 return
             elif isinstance(param, BlockQuantScaleParameter):
                 # block 量化 scale 需要按 block 粒度拆段，走专用路径。
@@ -1086,7 +1134,10 @@ class QKVParallelLinear(ColumnParallelLinear):
         load_presharded_attn: bool = False,
         v_head_size: Optional[int] = None,
         skip_block_quant_check: bool = False,
+        kv_tp_rank: Optional[int] = None,
+        kv_tp_size: Optional[int] = None,
     ):
+        self.with_bias = bias
         self.hidden_size = hidden_size
         self.head_size = head_size
         self.v_head_size = v_head_size if v_head_size is not None else head_size
@@ -1096,21 +1147,21 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.total_num_kv_heads = total_num_kv_heads
         # 沿最后一个维度（输出/头方向）切分权重矩阵。
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_parallel().tp_size
         self.tp_rank, self.tp_size = tp_rank, tp_size
-        # q 头常规切分：每个 rank 拿 total_num_heads / tp_size 个头。
+        if kv_tp_rank is None:
+            kv_tp_rank = tp_rank
+        if kv_tp_size is None:
+            kv_tp_size = tp_size
+        self.kv_tp_rank, self.kv_tp_size = kv_tp_rank, kv_tp_size
         self.num_heads = divide(self.total_num_heads, tp_size)
-        if tp_size >= self.total_num_kv_heads:
-            # kv 头数不够分（GQA/MQA 且 TP 很大）：
-            # 每个 rank 至少保留 1 个 kv 头，并在 num_kv_head_replicas 个 rank 之间复制。
-            # 这会带来冗余的 KV cache 开销，但能避开跟不上切分粒度的问题。
+        if kv_tp_size >= self.total_num_kv_heads:
             self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
+            self.num_kv_head_replicas = divide(kv_tp_size, self.total_num_kv_heads)
         else:
-            # kv 头数足够：与 q 头一样常规切分，无需复制。
-            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+            self.num_kv_heads = divide(self.total_num_kv_heads, kv_tp_size)
             self.num_kv_head_replicas = 1
         # 本 rank 上 q / k / v 各自占用的输出列数。
         self.q_proj_shard_size = self.num_heads * self.head_size
@@ -1183,7 +1234,11 @@ class QKVParallelLinear(ColumnParallelLinear):
     def _load_fused_module_from_checkpoint(
         self, param: BasevLLMParameter, loaded_weight: torch.Tensor
     ):
-        """处理「QKV 层在 checkpoint 中已经融合存储」的特殊情况。
+        """
+        Handle special case for models where QKV layers are already
+        fused-in-checkpoint. In this case, we have no shard id. This function
+        determines the shard id by splitting these layers and then calls
+        the weight loader using the shard id.
 
         这种情况下调用方拿不到 shard id（磁盘上就是一个大的 qkv 权重），
         本函数负责把它拆成 q/k/v 三段，再带着 shard id 回调
@@ -1261,7 +1316,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                 shard_id=shard_id,
                 shard_offset=rank_shard_offset,
                 shard_size=rank_shard_size,
-                tp_rank=self.tp_rank,
+                tp_rank=(self.tp_rank if shard_id == "q" else self.kv_tp_rank),
                 use_presharded_weights=self.use_presharded_weights,
             )
 
@@ -1282,8 +1337,19 @@ class QKVParallelLinear(ColumnParallelLinear):
         """
         if loaded_shard_id is None:  # 部分模型的特殊情况
             if isinstance(param, PerTensorScaleParameter):
-                # per-tensor scale 全层只有一个值，不区分 q/k/v。
-                param.load_qkv_weight(loaded_weight=loaded_weight, shard_id=0)
+                # The checkpoint tensor is already fused-in-checkpoint, so a scalar
+                # scale applies to the entire QKV matrix. Fill every logical
+                # slot so later reductions only see valid scale values.
+                if loaded_weight.numel() != 1:
+                    raise ValueError(
+                        "Expected scalar scale for fused-in-checkpoint QKV "
+                        "checkpoint load when loaded_shard_id is None, got "
+                        f"shape {tuple(loaded_weight.shape)}"
+                    )
+                for shard_id in param.qkv_idxs:
+                    param.load_qkv_weight(
+                        loaded_weight=loaded_weight, shard_id=shard_id
+                    )
                 return
             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
                 # 不按输出维（头方向）切分的参数，无需拆段。
@@ -1321,7 +1387,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             shard_id=loaded_shard_id,
             shard_offset=shard_offset,
             shard_size=shard_size,
-            tp_rank=self.tp_rank,
+            tp_rank=(self.tp_rank if loaded_shard_id == "q" else self.kv_tp_rank),
             use_presharded_weights=self.use_presharded_weights,
         )
 
@@ -1354,10 +1420,13 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         if is_gguf_weight:
             output_dim = getattr(param, "output_dim", None)
-            # GGUF 不预先分配合并大矩阵，而是把各段切好的分片存入
-            # data_container 列表，并用 shard_id_map 记录段 -> 下标的映射。
-            shard_size = loaded_weight.size(output_dim) // self.tp_size
-            start_idx = self.tp_rank * shard_size
+            shard_tp_rank, shard_tp_size = (
+                (self.kv_tp_rank, self.kv_tp_size)
+                if loaded_shard_id in ("k", "v")
+                else (self.tp_rank, self.tp_size)
+            )
+            shard_size = loaded_weight.size(output_dim) // shard_tp_size
+            start_idx = shard_tp_rank * shard_size
 
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
 
@@ -1375,7 +1444,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         needs_scalar_to_array = getattr(param, "needs_scalar_to_array", False)
 
         if loaded_shard_id is None:
-            # 进入此分支说明 checkpoint 中权重已经是合并好的（qkv/mlp 融合存储）。
+            # Loaded weight is already fused-in-checkpoint (qkv/mlp).
             if output_dim is None:
                 # 不按输出维切分的参数（如 per-tensor scale），直接整体拷贝。
                 if needs_scalar_to_array:
@@ -1416,8 +1485,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                 # 量化权重的特殊情况：
                 # 若已量化，需要把偏移和长度换算到打包后的坐标系上。
                 if packed_dim == output_dim:
-                    shard_size = shard_size // param.pack_factor
-                    shard_offset = shard_offset // param.pack_factor
+                    shard_size = round(shard_size // param.pack_factor)
+                    shard_offset = round(shard_offset // param.pack_factor)
 
                     # Marlin 布局的特殊修正。
                     shard_size, shard_offset = adjust_marlin_shard(
@@ -1480,8 +1549,8 @@ class QKVParallelLinear(ColumnParallelLinear):
             # 若已量化，需要把偏移和长度换算到打包后的坐标系上。
             packed_dim = getattr(param, "packed_dim", None)
             if packed_dim == output_dim:
-                shard_size = shard_size // param.pack_factor
-                shard_offset = shard_offset // param.pack_factor
+                shard_size = round(shard_size // param.pack_factor)
+                shard_offset = round(shard_offset // param.pack_factor)
 
                 # Marlin 布局的特殊修正。
                 shard_size, shard_offset = adjust_marlin_shard(
@@ -1523,7 +1592,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             if loaded_shard_id == "q":
                 shard_id = self.tp_rank
             else:
-                shard_id = self.tp_rank // self.num_kv_head_replicas
+                shard_id = self.kv_tp_rank // self.num_kv_head_replicas
             start_idx = shard_id * shard_size
 
             if _is_cpu:
@@ -1650,6 +1719,7 @@ class RowParallelLinear(LinearBase):
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
         )
 
+        self.with_bias = bias
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
         self.use_dp_attention_reduce = use_dp_attention_reduce
@@ -1658,14 +1728,16 @@ class RowParallelLinear(LinearBase):
         # tp_rank / tp_size 允许外部显式传入（例如某些模块使用自定义子通信组），
         # 未传入时回退到全局张量并行通信组的 rank 与 world size。
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_parallel().tp_rank
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_parallel().tp_size
         self.tp_rank, self.tp_size = tp_rank, tp_size
         # 本 rank 负责的输入行数；divide() 会断言必须整除。
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None
         self.use_presharded_weights = use_presharded_weights
+        # Flag set by CpDecodeAttnTpContext to enable all_reduce during decode.
+        self.use_decode_attn_tp: bool = False
 
         # 由量化方法负责创建权重（及可能的 scale 等附属参数）。
         # 与列并行相反：这里传入的是切分后的 input_size_per_partition，
@@ -1681,7 +1753,13 @@ class RowParallelLinear(LinearBase):
                 # 新版参数类型（vLLM Parameter 体系）走 v2 加载路径，
                 # 由参数对象自身实现切分逻辑；否则走本类的传统 weight_loader。
                 self.weight_loader_v2
-                if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                if (
+                    self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                    or (
+                        self.scheme is not None
+                        and self.scheme.requires_weight_loader_v2
+                    )
+                )
                 else self.weight_loader
             ),
         )
@@ -1825,15 +1903,13 @@ class RowParallelLinear(LinearBase):
                 # 兜底：某些参数实现不接受额外的关键字参数。
                 param.load_row_parallel_weight(loaded_weight)
 
-    def forward(self, input_, skip_all_reduce=False, forward_batch=None):
-        """前向计算。
-
-        参数:
-            input_: 输入张量。是否已沿最后一维切分由 input_is_parallel 决定。
-            skip_all_reduce: 临时跳过本次 all-reduce（例如调用方打算把多个
-                层的归约合并，或已在外层自行归约）。
-            forward_batch: 当前批次信息，仅用于判定能否开启量化通信。
-        """
+    def forward(
+        self,
+        input_,
+        skip_all_reduce=False,
+        forward_batch=None,
+        output_tensor=None,
+    ):
         if self.input_is_parallel:
             # 上游（通常是列并行层）已经交付了切分好的输入，直接用。
             input_parallel = input_
@@ -1857,20 +1933,37 @@ class RowParallelLinear(LinearBase):
         # one-shot / 融合路径，避开一次额外拷贝。
         # 需与实际用于归约的通信组保持一致，所以这里也要区分 DP attention。
         if self.use_dp_attention_reduce:
-            symm_ctx = use_symmetric_memory(get_attention_tp_group())
+            symm_ctx = use_symmetric_memory(get_parallel().attn_tp_group)
         else:
             symm_ctx = use_symmetric_memory(
                 get_tp_group(), disabled=not is_allocation_symmetric()
             )
         with symm_ctx:
-            # 输出是「形状完整但数值不完整」的部分和 X_i A_i。
-            output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+            if output_tensor is None:
+                output_parallel = self.quant_method.apply(
+                    self, input_parallel, bias=bias_
+                )
+            else:
+                apply_into = getattr(self.quant_method, "apply_into", None)
+                if apply_into is None:
+                    raise RuntimeError(
+                        f"{type(self.quant_method).__name__} cannot write into "
+                        "caller-owned linear output"
+                    )
+                output_parallel = apply_into(
+                    self, input_parallel, output_tensor, bias=bias_
+                )
 
-        if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
-            # 把各 rank 的部分和相加，得到完整的 Y = sum_i X_i A_i。
+        # skip_all_reduce: explicit call-site override. Also honor
+        # ForwardFlags (fuse_mlp_allreduce / mlp_reduce_scatter) published by
+        # the decoder — callers should not thread those flags into modules.
+        if (
+            ((self.reduce_results and self.tp_size > 1) or self.use_decode_attn_tp)
+            and not skip_all_reduce
+            and not should_skip_mlp_all_reduce()
+        ):
             if self.use_dp_attention_reduce:
-                # DP attention 场景：在 attention 的 TP 子组内归约。
-                output = get_attention_tp_group().all_reduce(output_parallel)
+                output = get_parallel().attn_tp_group.all_reduce(output_parallel)
             else:
                 # 量化通信：用低精度传输以降低通信量。
                 # 仅在非 decode/idle（即 prefill 类、通信量大且对精度不敏感）
@@ -1878,7 +1971,7 @@ class RowParallelLinear(LinearBase):
                 quantize_communications = (
                     (
                         not forward_batch.forward_mode.is_decode_or_idle()
-                        and get_global_server_args().enable_quant_communications
+                        and get_exec().comm.enable_quant_communications
                     )
                     if forward_batch is not None
                     else False
@@ -1919,6 +2012,10 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
         skip_bias_add: If true, skip adding bias but instead return it.
         params_dtype: Data type for the parameters.
         quant_config: Quantization configure.
+        tp_rank: Rank to shard the column-parallel part on. Defaults to the
+            global TP rank; pass the attention-TP rank to shard on attn-TP
+            instead (see KimiDeltaAttention's shard_on_attn_tp).
+        tp_size: World size matching ``tp_rank``. Defaults to global TP size.
     """
 
     def __init__(
@@ -1930,6 +2027,8 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ):
         output_size = sum(column_output_sizes) + sum(repeated_output_sizes)
         super().__init__(
@@ -1941,8 +2040,11 @@ class MergedColumnParallelRepeatedLinear(LinearBase):
             prefix=prefix,
         )
         self.num_column_parallel = len(column_output_sizes)
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        if tp_rank is None:
+            tp_rank = get_parallel().tp_rank
+        if tp_size is None:
+            tp_size = get_parallel().tp_size
+        self.tp_rank, self.tp_size = tp_rank, tp_size
 
         self.output_partition_sizes = [
             divide(x, self.tp_size) for x in column_output_sizes
@@ -1987,14 +2089,27 @@ class ColumnParallelBatchedLinear(nn.Module):
         input_size: input dimension of the linear layer.
         output_size: output dimension of the linear layer.
         dtype: Data type for the parameters.
+        tp_rank: Rank to shard the output dimension on. Defaults to the global
+            TP rank; pass the attention-TP rank to shard on attn-TP instead
+            (see KimiDeltaAttention's shard_on_attn_tp).
+        tp_size: World size matching ``tp_rank``. Defaults to global TP size.
     """
 
     def __init__(
-        self, batch: int, input_size: int, output_size: int, dtype: torch.dtype
+        self,
+        batch: int,
+        input_size: int,
+        output_size: int,
+        dtype: torch.dtype,
+        tp_rank: Optional[int] = None,
+        tp_size: Optional[int] = None,
     ):
         super().__init__()
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        if tp_rank is None:
+            tp_rank = get_parallel().tp_rank
+        if tp_size is None:
+            tp_size = get_parallel().tp_size
+        self.tp_rank, self.tp_size = tp_rank, tp_size
         self.weight = nn.Parameter(
             torch.empty(batch, output_size // self.tp_size, input_size, dtype=dtype),
             requires_grad=False,

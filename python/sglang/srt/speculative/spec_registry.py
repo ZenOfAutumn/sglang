@@ -7,9 +7,12 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
 import torch
+
+from sglang.srt.arg_groups.overrides import resolving_view
 
 if TYPE_CHECKING:
     from sglang.srt.managers.overlap_utils import FutureMap
@@ -103,6 +106,12 @@ class CustomSpecAlgo:
         """是否为 DFlash。默认 False。"""
         return False
 
+    def is_dspark(self) -> bool:
+        return False
+
+    def is_dflash_family(self) -> bool:
+        return False
+
     def is_standalone(self) -> bool:
         """是否为 Standalone。默认 False。"""
         return False
@@ -115,23 +124,25 @@ class CustomSpecAlgo:
         """草稿阶段是否需要 target verify。默认 False。"""
         return False
 
+    def supports_ragged_verify(self) -> bool:
+        return False
+
+    def supports_grammar_overlap(self) -> bool:
+        # Whether the worker advances the grammar FSM inside verify() (via the
+        # scheduler's grammar barrier), letting spec + grammar decode overlap.
+        return False
+
     def has_draft_kv(self) -> bool:
         """草稿阶段是否写入 KV 链。保守默认值：返回 True（更大的 KV 预留）。"""
         return True
 
+    def handle_server_args(self, server_args: ServerArgs) -> None:
+        pass
+
     def create_worker(self, server_args: ServerArgs) -> Type:
-        """创建 Worker 类。
 
-        输入:
-            server_args: 服务参数
-
-        输出:
-            Worker 类（注意是类本身，不是实例）
-
-        异常:
-            ValueError: 当 overlap 调度已启用但算法不支持 overlap 时抛出
-        """
-        if not server_args.disable_overlap_schedule and not self.supports_overlap:
+        cfg = resolving_view(server_args)
+        if not cfg.disable_overlap_schedule and not self.supports_overlap:
             raise ValueError(
                 f"投机算法 {self.name} 不支持 overlap 调度。"
             )
@@ -145,7 +156,7 @@ class CustomSpecAlgo:
             )
         return self.factory(server_args)
 
-    def get_num_tokens_per_bs_for_target_verify(
+    def get_num_tokens_per_req_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
     ) -> int:
         """获取 target verify 阶段每个请求的 token 数。
@@ -161,14 +172,31 @@ class CustomSpecAlgo:
         """
         return num_draft_tokens
 
+    def get_num_tokens_per_bs_for_target_verify(
+        self, num_draft_tokens: int, is_draft_worker: bool
+    ) -> int:
+        # Deprecated alias; remove together with the FIXME above.
+        warnings.warn(
+            "get_num_tokens_per_bs_for_target_verify is deprecated; use "
+            "get_num_tokens_per_req_for_target_verify instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_num_tokens_per_req_for_target_verify(
+            num_draft_tokens, is_draft_worker
+        )
+
     def build_disagg_draft_input(
         self,
         batch: ScheduleBatch,
-        server_args: ServerArgs,
         last_tokens_tensor: torch.Tensor,
         future_map: FutureMap,
     ) -> Optional[SpecInput]:
-        """在 PD 分离场景下构建草稿输入。默认返回 None。"""
+        """Build the disaggregation draft input for ``batch``, or ``None``.
+
+        The speculative config comes from ``runtime_context.get_spec()``, which
+        follows a runtime override where the startup record does not.
+        """
         return None
 
 

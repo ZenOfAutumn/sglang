@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.constants import (
@@ -25,6 +26,7 @@ from sglang.srt.constants import (
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
+    ChecksumInfo,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
     DestroyWeightsUpdateGroupReqInput,
@@ -134,6 +136,9 @@ class SchedulerWeightUpdaterManager:
             )
             assert flush_cache_success, "Cache flush failed after updating weights"
 
+    def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
+        self.scheduler.record_weight_version_change(new_version=weight_version)
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk.
 
@@ -148,9 +153,13 @@ class SchedulerWeightUpdaterManager:
                 success, message = self.draft_worker.update_weights_from_disk(recv_req)
             if tp_success:
                 self.flush_cache_after_weight_update(recv_req)
-            if not success:
+            if success:
+                self.record_weight_version_after_update(recv_req.weight_version)
+            else:
                 logger.error(message)
-            return UpdateWeightFromDiskReqOutput(success, message, 0)
+            return UpdateWeightFromDiskReqOutput(
+                success=success, message=message, num_paused_requests=0
+            )
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group.
@@ -158,7 +167,7 @@ class SchedulerWeightUpdaterManager:
         中译：初始化「在线权重更新通信组」（用于 distributed 方式广播权重前的握手建组）。
         """
         success, message = self.tp_worker.init_weights_update_group(recv_req)
-        return InitWeightsUpdateGroupReqOutput(success, message)
+        return InitWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def destroy_weights_update_group(
         self,
@@ -169,7 +178,7 @@ class SchedulerWeightUpdaterManager:
         中译：销毁上面建立的在线权重更新通信组，释放相关资源。
         """
         success, message = self.tp_worker.destroy_weights_update_group(recv_req)
-        return DestroyWeightsUpdateGroupReqOutput(success, message)
+        return DestroyWeightsUpdateGroupReqOutput(success=success, message=message)
 
     def update_weights_from_distributed(
         self,
@@ -183,9 +192,12 @@ class SchedulerWeightUpdaterManager:
             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
             if success:
                 self.flush_cache_after_weight_update(recv_req)
+                self.record_weight_version_after_update(recv_req.weight_version)
             else:
                 logger.error(message)
-            return UpdateWeightsFromDistributedReqOutput(success, message)
+            return UpdateWeightsFromDistributedReqOutput(
+                success=success, message=message
+            )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors.
@@ -201,11 +213,12 @@ class SchedulerWeightUpdaterManager:
             success, message = worker.update_weights_from_tensor(recv_req)
             if success:
                 self.flush_cache_after_weight_update(recv_req)
+                self.record_weight_version_after_update(recv_req.weight_version)
             else:
                 logger.error(message)
             # 中译：所有 TP rank 在此对齐，确保更新完成后再继续，避免 rank 间权重不一致。
             torch.distributed.barrier(group=self.tp_cpu_group)
-            return UpdateWeightsFromTensorReqOutput(success, message)
+            return UpdateWeightsFromTensorReqOutput(success=success, message=message)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration.
@@ -220,15 +233,33 @@ class SchedulerWeightUpdaterManager:
                 success, message = self.draft_worker.update_weights_from_ipc(recv_req)
             if tp_success:
                 self.flush_cache_after_weight_update(recv_req)
-            if not success:
+            if success:
+                self.record_weight_version_after_update(recv_req.weight_version)
+            else:
                 logger.error(message)
             torch.distributed.barrier(group=self.tp_cpu_group)
-            return UpdateWeightsFromIPCReqOutput(success, message)
+            return UpdateWeightsFromIPCReqOutput(success=success, message=message)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         # 中译：按名字读取某个权重张量（调试/校验用）。
         parameter = self.tp_worker.get_weights_by_name(recv_req)
-        return GetWeightsByNameReqOutput(parameter)
+        return GetWeightsByNameReqOutput(parameter=parameter)
+
+    def _assert_weight_cache_inactive(self, op: str) -> None:
+        """Reject freeing/restoring model weights while the CUDA IPC weight
+        cache is active: the weights are shared with the daemon via CUDA IPC, so
+        freeing them would leave the daemon and every peer pointing at released
+        memory.
+        """
+        mode = self.tp_worker.model_runner.server_args.weight_cache_mode
+        if mode != "off":
+            raise RuntimeError(
+                f"[weight_cache] {op} of model weights is not supported while the "
+                f"weight cache is active (--weight-cache-mode {mode}): the weights "
+                f"are shared with the daemon via CUDA IPC, so freeing them would "
+                f"corrupt the daemon's master copy and every co-attached engine. "
+                f"Restart with --weight-cache-mode off to use this operation."
+            )
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         # 中译：释放（让出）GPU 显存占用，把指定标签的显存 pause 掉。仅允许在引擎完全空闲时调用，
@@ -270,7 +301,7 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             # 中译：让出权重显存前，先把模型的静态缓冲（buffers，如旋转位置编码缓存等）导出暂存，
-            #       因为这些 buffer 不会被重新加载，resume 时需原样回填。
+            self._assert_weight_cache_inactive("release_memory_occupation")
             self.stashed_model_static_state = _export_static_state(
                 self.tp_worker.model_runner.model
             )
@@ -300,6 +331,7 @@ class SchedulerWeightUpdaterManager:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
+            self._assert_weight_cache_inactive("resume_memory_occupation")
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
             torch.distributed.barrier(self.tp_cpu_group)
             # 中译：把之前暂存的静态缓冲回填到模型，并删除暂存引用以释放内存。
@@ -332,13 +364,18 @@ class SchedulerWeightUpdaterManager:
     def check_weights(self, recv_req: CheckWeightsReqInput):
         # 中译：校验权重——对每个权重计算校验和并按 TP rank 汇总，用于验证多机/多卡间权重一致性。
         try:
-            payload = self.tp_worker.model_runner.check_weights(action=recv_req.action)
+            payload = self.tp_worker.model_runner.check_weights(
+                action=recv_req.action, allow_quant_error=recv_req.allow_quant_error
+            )
 
             # 中译：若有草稿模型，也校验其权重，并把两者的校验和合并（draft 名加前缀）。
             if self.draft_worker is not None:
                 draft_runner = _get_draft_model_runner(self.draft_worker)
                 if draft_runner is not None:
-                    draft_payload = draft_runner.check_weights(action=recv_req.action)
+                    draft_payload = draft_runner.check_weights(
+                        action=recv_req.action,
+                        allow_quant_error=recv_req.allow_quant_error,
+                    )
                     if payload is not None and draft_payload is not None:
                         payload = _merge_checksum_payloads(payload, draft_payload)
 
@@ -350,6 +387,11 @@ class SchedulerWeightUpdaterManager:
                     all_payloads, payload, group=self.tp_cpu_group
                 )
                 payload = all_payloads
+            if payload is not None:
+                # Normalize to one ChecksumInfo per rank so the wire shape is a
+                # uniform List[ChecksumInfo] (tp==1 becomes a single-element list).
+                per_rank = payload if isinstance(payload, list) else [payload]
+                payload = [msgspec.convert(p, ChecksumInfo) for p in per_rank]
             return CheckWeightsReqOutput(
                 success=True, message="Success.", payload=payload
             )
@@ -363,18 +405,18 @@ class SchedulerWeightUpdaterManager:
         # 中译：把当前权重保存到远端（URL）。有草稿模型时必须同时提供 draft_url。
         url = params["url"]
 
-        self.tp_worker.model_runner.save_remote_model(url)
+        self.tp_worker.model_runner.weight_exporter.save_remote_model(url)
 
         if self.draft_worker is not None:
             draft_url = params.get("draft_url", None)
             assert (
                 draft_url is not None
             ), "draft_url must be provided when draft model is enabled"
-            self.draft_worker.model_runner.save_remote_model(draft_url)
+            self.draft_worker.model_runner.weight_exporter.save_remote_model(draft_url)
 
     def save_sharded_model(self, params):
         # 中译：把权重按分片（sharded）格式保存到本地路径，便于后续分片加载。
-        self.tp_worker.model_runner.save_sharded_model(
+        self.tp_worker.model_runner.weight_exporter.save_sharded_model(
             path=params["path"],
             pattern=params["pattern"],
             max_size=params["max_size"],

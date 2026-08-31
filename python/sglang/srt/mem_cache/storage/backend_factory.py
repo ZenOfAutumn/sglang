@@ -167,13 +167,8 @@ class StorageBackendFactory:
         storage_config: HiCacheStorageConfig,
         mem_pool_host: Any,
     ) -> HiCacheStorage:
-        """按各内置后端各自的初始化约定创建实例。
-
-        不同后端的构造签名并不统一：file/nixl 只需 storage_config；
-        mooncake/aibrix/eic/simm 还需要 mem_pool_host；hf3fs 则需要先根据内存池
-        布局算出每 page 字节数与 dtype，再走 from_env_config 从环境配置构造。
-        """
-        if backend_name == "file":
+        """Create built-in backend with original initialization logic."""
+        if backend_name in ("file", "sim"):
             return backend_class(storage_config)
         elif backend_name == "nixl":
             return backend_class(storage_config)
@@ -202,6 +197,10 @@ class StorageBackendFactory:
             return backend_class(storage_config, mem_pool_host)
         elif backend_name == "simm":
             return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "mori":
+            return backend_class(storage_config, mem_pool_host)
+        elif backend_name == "shm":
+            return backend_class(storage_config, mem_pool_host)
         else:
             raise ValueError(f"Unknown built-in backend: {backend_name}")
 
@@ -209,6 +208,10 @@ class StorageBackendFactory:
 # 注册内置存储后端（此处仅登记模块路径与类名，import 推迟到首次创建时）。
 StorageBackendFactory.register_backend(
     "file", "sglang.srt.mem_cache.hicache_storage", "HiCacheFile"
+)
+
+StorageBackendFactory.register_backend(
+    "sim", "sglang.srt.mem_cache.storage.sim_storage", "SimHiCacheStorage"
 )
 
 StorageBackendFactory.register_backend(
@@ -245,4 +248,16 @@ StorageBackendFactory.register_backend(
     "simm",
     "sglang.srt.mem_cache.storage.simm.hicache_simm",
     "HiCacheSiMM",
+)
+
+StorageBackendFactory.register_backend(
+    "mori",
+    "sglang.srt.mem_cache.storage.umbp.umbp_store",
+    "UMBPStore",
+)
+
+StorageBackendFactory.register_backend(
+    "shm",
+    "sglang.srt.mem_cache.storage.shm",
+    "HiCacheShm",
 )

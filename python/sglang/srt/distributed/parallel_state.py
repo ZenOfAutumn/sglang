@@ -48,11 +48,19 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
     is_in_tc_piecewise_cuda_graph,
 )
 from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
+from sglang.srt.runtime_context import (
+    derive_parallel_widths,
+    get_global_dwdp_manager,
+    get_parallel,
+    set_global_dwdp_manager,
+)
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
+    is_cuda,
     is_cuda_alike,
+    is_gfx95_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -61,6 +69,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -205,6 +214,22 @@ def outplace_all_reduce(
     return group._all_reduce_out_place(tensor, outplace_all_reduce_method)
 
 
+@register_custom_op(out_shape="tensor")
+def flashinfer_allreduce(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
+    """FlashInfer kAllReduce over ``group_name``.
+
+    Registered as a custom op so it stays opaque under Dynamo and can run inside
+    piecewise CUDA graphs. Applicability is decided by
+    ``GroupCoordinator._can_use_flashinfer_allreduce`` before the call -- this op
+    has no fallback of its own.
+    """
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._flashinfer_allreduce(tensor)
+
+
 @register_custom_op(mutates_args=["output"])
 def reg_all_gather_into_tensor(
     output: torch.Tensor, input: torch.Tensor, group_name: str
@@ -320,6 +345,8 @@ class GroupCoordinator:
         group_name: Optional[str] = None,
         gloo_timeout: timedelta = timedelta(seconds=120 * 60),
         recovered_rank: bool = False,
+        rank_offset: int = 0,
+        max_world_size: Optional[int] = None,
     ):
         """
         Args:
@@ -346,10 +373,16 @@ class GroupCoordinator:
 
         # 设置 rank 信息
         self.rank = torch.distributed.get_rank()
+        # Joiner group ranks are local; shift them into global rank space.
+        if rank_offset > 0:
+            group_ranks = [[r + rank_offset for r in ranks] for ranks in group_ranks]
         self.local_rank = local_rank
         self.device_group = None
         self.cpu_group = None
-        # 单机内的进程数，用于判断 CPU 共享内存集体通信（shm）是否可用
+        # Which FlashInfer fusion workspace this group owns, or None when the
+        # group is not eligible for the allreduce-only kAllReduce path. Stamped
+        # by _tag_groups_for_flashinfer_allreduce_only() after group init.
+        self._fi_workspace_hint: Optional[str] = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
         # 根据硬件平台确定本 rank 绑定的设备
@@ -371,38 +404,74 @@ class GroupCoordinator:
         # 遍历所有子组划分：torch.distributed.new_group 是集体调用，必须由所有进程
         # 以相同顺序调用；每个进程只保留自己所在的那个子组句柄。
         for ranks in group_ranks:
-            # active_ranks 用于弹性 EP（mooncake 后端）标记哪些 rank 当前存活
-            active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
-            active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
-            # 复用用户传入的全局超时，避免子组静默地退回后端默认值
             subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
             if "mooncake" in torch_distributed_backend:
-                from mooncake.ep import MooncakeBackendOptions
+                from mooncake.pg import MooncakeBackendOptions
 
+                pg_active_size = len(ranks)
+                if not recovered_rank and max_world_size is not None:
+                    assert max_world_size >= len(ranks), (
+                        f"max_world_size ({max_world_size}) must be >= "
+                        f"group size ({len(ranks)})"
+                    )
+                    pg_active_size = max_world_size
+
+                pg_active_ranks = torch.zeros(
+                    pg_active_size, dtype=torch.int32, device=self.device
+                )
+                pg_active_ranks[: len(ranks)] = 1
+                pg_active_ranks_cpu = torch.zeros(pg_active_size, dtype=torch.int32)
+                pg_active_ranks_cpu[: len(ranks)] = 1
+
+                if not recovered_rank and max_world_size is not None:
+                    dev_opts = MooncakeBackendOptions(
+                        pg_active_ranks, recovered_rank, max_world_size
+                    )
+                    cpu_opts = MooncakeBackendOptions(
+                        pg_active_ranks_cpu, recovered_rank, max_world_size
+                    )
+                else:
+                    dev_opts = MooncakeBackendOptions(pg_active_ranks, recovered_rank)
+                    cpu_opts = MooncakeBackendOptions(
+                        pg_active_ranks_cpu, recovered_rank
+                    )
+
+                active_ranks = pg_active_ranks[: len(ranks)]
+                active_ranks_cpu = pg_active_ranks_cpu[: len(ranks)]
                 device_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake",
-                    pg_options=MooncakeBackendOptions(active_ranks, recovered_rank),
+                    pg_options=dev_opts,
                     timeout=subgroup_timeout,
+                    group_desc=f"{group_name}:device",
                 )
                 cpu_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake-cpu",
-                    pg_options=MooncakeBackendOptions(active_ranks_cpu, recovered_rank),
+                    pg_options=cpu_opts,
                     timeout=subgroup_timeout,
+                    group_desc=f"{group_name}:cpu",
                 )
             else:
+                active_ranks = torch.ones(
+                    len(ranks), dtype=torch.int32, device=self.device
+                )
+                active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
                 pg_options = get_torch_distributed_pg_options(group_name)
                 device_group = torch.distributed.new_group(
                     ranks,
                     backend=torch_distributed_backend,
                     pg_options=pg_options,
                     timeout=subgroup_timeout,
+                    group_desc=f"{group_name}:device",
                 )
                 # 额外再建一个 `gloo` 后端的组，使得进程之间可以直接通过 CPU 协同
                 # （例如传递 Python 对象、barrier），避免占用 device 流与显存。
                 cpu_group = torch.distributed.new_group(
-                    ranks, backend="gloo", timeout=gloo_timeout
+                    ranks,
+                    backend="gloo",
+                    timeout=gloo_timeout,
+                    group_desc=f"{group_name}:cpu",
                 )
             # 只有当前 rank 属于这个子组时，才把它记录为自己的通信组
             if self.rank in ranks:
@@ -463,6 +532,7 @@ class GroupCoordinator:
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
+                is_symmetric_memory_enabled=self.is_symmetric_memory_enabled(),
             )
 
         self.pymscclpp_comm: Optional[PyMscclppCommunicator] = None
@@ -593,7 +663,7 @@ class GroupCoordinator:
     def graph_capture(
         self,
         graph_capture_context: Optional[GraphCaptureContext] = None,
-        stream: Optional[torch.cuda.Stream] = None,
+        stream=None,
     ):
         """
         CUDA Graph 捕获期间使用的上下文管理器。
@@ -659,22 +729,12 @@ class GroupCoordinator:
         求和（SUM），且每个 rank 都得到完整结果。在 SGLang 中的典型使用场景：
         张量并行（TP）中 RowParallelLinear 的输出聚合、Attention 输出投影之后。
 
-        之所以需要这层，是因为 Dynamo 不支持向自定义算子传入任意对象（这里就是
-         `self`）。我们只能把组名以字符串传入，然后在算子内部根据组名反查到
-         GroupCoordinator，再把 all-reduce 分发给它。
-
-        另外，PyTorch 自定义算子不允许在同一个算子里既原地修改又返回新张量，
-        所以必须提前判断本次操作是原地（in-place）还是非原地（out-of-place）：
-          - 原地：调用 `inplace_all_reduce`，结果写回 `input_` 本身；
-          - 非原地：调用 `outplace_all_reduce`，返回一个新张量（自定义 kernel 往往
-            会写到它自己的临时/注册缓冲区）。
-
-        整体分发优先级（从上到下）：
-          CPU shm → HPU/XPU/NPU 专用 → pynccl+symm-mem →
-          ca(custom) → qr(quick, ROCm) → pymscclpp → torch symm-mem → pynccl → 原地回退
-
-        输入输出示例（两 rank、SUM）：rank 0 输入 ``tensor([1., 2.])``，rank 1 输入
-        ``tensor([3., 4.])``；两个 rank 都得到 ``tensor([4., 6.])``。
+        In addition, PyTorch custom ops do not support mutation or returning
+        a new tensor in the same op. So we need to figure out if the op is
+        in-place or out-of-place ahead of time — except under Dynamo tracing,
+        where the method selection would guard on the symbolic shape; there we
+        always emit the out-of-place op with method "auto" and resolve the
+        method at runtime inside the op.
         """
         # 只有 1 张 GPU 时直接返回，无需通信
         if self.world_size == 1:
@@ -694,57 +754,75 @@ class GroupCoordinator:
             return self.hpu_communicator.all_reduce(input_)
 
         if self.xpu_communicator is not None and not self.xpu_communicator.disabled:
-            return self.xpu_communicator.all_reduce(input_)
+            # Route through inplace_all_reduce custom op so Dynamo treats this as
+            # an opaque call and does not decompose it into _c10d_functional primitives
+            # (which invoke sycl_event.wait() and break XPU graph capture).
+            # Keeps the operation in-place; the all-reduce is performed by
+            # _all_reduce_in_place, which for XPU falls through to
+            # torch.distributed.all_reduce on self.device_group (the same group
+            # used by xpu_communicator).
+            inplace_all_reduce(input_, group_name=self.unique_name)
+            return input_
 
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.all_reduce(input_)
 
-        # mscclpp 有自己的尺寸/条件阈值，先算好结果，后面多处复用
+        if torch.compiler.is_compiling():
+            if self._can_use_flashinfer_allreduce(input_):
+                return flashinfer_allreduce(input_, group_name=self.unique_name)
+
+            # Byte-size thresholds in method selection (e.g. `_pick_algo` or
+            # `should_mscclpp_allreduce`) would guard on the symbolic token dim
+            # and recompile per shape; defer the selection to runtime inside
+            # the opaque custom op. Groups without any accelerated
+            # communicator keep the inplace split op so their collective
+            # stays outside captured graphs. The symmetric-memory in-place
+            # path below is deliberately bypassed under compile: its raw
+            # pynccl call is untraceable (hard error with fullgraph, graph
+            # break otherwise) and its in-place contract does not fit the
+            # outplace custom op.
+            if (
+                self.ca_comm is None
+                and self.qr_comm is None
+                and self.pymscclpp_comm is None
+                and self.torch_symm_mem_comm is None
+                and self.pynccl_comm is None
+            ):
+                inplace_all_reduce(input_, group_name=self.unique_name)
+                return input_
+            return outplace_all_reduce(
+                input_,
+                group_name=self.unique_name,
+                outplace_all_reduce_method="auto",
+            )
+
         should_use_pymscclpp_allreduce = (
             self.pymscclpp_comm is not None
             and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
         )
-        # 开启对称内存（symmetric memory）时：各 rank 的缓冲区地址已提前互相注册，
-        # NCCL 可以走零拷贝的快路径，因此直接原地 all-reduce 并提前返回。
+        should_use_custom_allreduce = (
+            self.ca_comm is not None
+            and not self.ca_comm.disabled
+            and self.ca_comm.should_custom_ar(input_)
+        )
         if (
             self.pynccl_comm is not None
             and self.is_symmetric_memory_enabled()
             and not should_use_pymscclpp_allreduce
+            and not should_use_custom_allreduce
         ):
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
             with self.pynccl_comm.change_state(enable=True):
                 self.pynccl_comm.all_reduce(input_)
                 return input_
 
-        # 按优先级选择一种“非原地” all-reduce 实现；全部不满足则回退到原地实现。
-        # 注意：这里只是“选方法名”，真正的调用在 _all_reduce_out_place 里完成。
-        outplace_all_reduce_method = None
-        if (
-            self.ca_comm is not None
-            and not self.ca_comm.disabled
-            and not should_use_pymscclpp_allreduce
-            # should_custom_ar 会检查张量尺寸上限与对齐；超过阈值则不适用
-            and self.ca_comm.should_custom_ar(input_)
-        ):
-            outplace_all_reduce_method = "ca"
-        elif (
-            self.qr_comm is not None
-            and not self.qr_comm.disabled
-            and self.qr_comm.should_quick_allreduce(input_)
-        ):
-            outplace_all_reduce_method = "qr"
-        elif self.pymscclpp_comm is not None and should_use_pymscclpp_allreduce:
-            outplace_all_reduce_method = "pymscclpp"
-        elif (
-            self.torch_symm_mem_comm is not None
-            and not self.torch_symm_mem_comm.disabled
-            and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
-        ):
-            outplace_all_reduce_method = "torch_symm_mem"
-        elif is_in_tc_piecewise_cuda_graph() and self.pynccl_comm is not None:
-            # piecewise cuda graph 下不能原地改写图外的输入缓冲区，
-            # 因此使用 pynccl 的非原地 allreduce。
-            outplace_all_reduce_method = "pynccl"
+        if self._can_use_flashinfer_allreduce(input_):
+            return flashinfer_allreduce(input_, group_name=self.unique_name)
+
+        outplace_all_reduce_method = self._resolve_outplace_all_reduce_method(
+            input_=input_,
+            should_use_pymscclpp_allreduce=should_use_pymscclpp_allreduce,
+        )
         if outplace_all_reduce_method is not None:
             # 通过自定义算子调用（传组名字符串而非 self），以便被 torch.compile 追踪
             return outplace_all_reduce(
@@ -840,14 +918,163 @@ class GroupCoordinator:
         )
         return fused_outputs
 
+    def fused_allreduce_rmsnorm_quant_per_group(
+        self,
+        input_: torch.Tensor,
+        residual_inp_: torch.Tensor,
+        weight_: torch.Tensor,
+        eps: float,
+        group_size: int = 128,
+        emit_bf16: bool = False,
+        transpose_scale: bool = False,
+    ) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Attempt fused all-reduce + RMSNorm + per-group FP8 quant.
+
+        ROCm/aiter/gfx95-only entry point. Returns ``None`` on any other
+        platform or when the aiter custom-all-reduce communicator cannot
+        service the request, letting the caller fall back to the existing
+        ``fused_allreduce_rmsnorm`` + separate per-group quant path.
+
+        When ``emit_bf16=True`` the fused kernel also writes the
+        pre-quantization bf16/fp16 normed output and returns
+        ``(fp8, residual_out, scale, bf16)`` — used by GDN-style layers that
+        need both an FP8 projection and a bf16 gating projection without
+        launching a separate per-group quant kernel.
+
+        When ``transpose_scale=True`` the kernel writes the per-group scale in
+        the column-major layout the gfx95 bpreshuffle GEMM consumes, so the
+        caller can skip the post-kernel scale transpose.
+        """
+        if not (is_hip() and is_gfx95_supported()):
+            return None
+
+        ca_comm = self.ca_comm
+        if ca_comm is None or getattr(ca_comm, "disabled", True):
+            return None
+        if not hasattr(ca_comm, "custom_fused_ar_rms_per_group_quant"):
+            return None
+
+        # Shape / size eligibility mirrors aiter's internal gate so we fail
+        # fast without entering the HIP kernel dispatch.
+        K = input_.shape[-1]
+        if K % group_size != 0 or K > 16384:
+            return None
+        total_bytes = input_.numel() * input_.element_size()
+        if total_bytes == 0 or total_bytes > 8 * 1024 * 8192:
+            return None
+        if self.world_size == 6:
+            return None
+
+        if envs.SGLANG_USE_1STAGE_ALLREDUCE.is_set():
+            use_1stage_ar = envs.SGLANG_USE_1STAGE_ALLREDUCE.get()
+        else:
+            token_num = input_.numel() // K
+            use_1stage_ar = total_bytes <= 128 * 1024
+            if (
+                # Keep the default 128 KiB cutoff except for the measured TP=8
+                # K=7168 graph-replay crossover. K=4096 remains on the default
+                # rule because token_num=8/16 still favored 1-stage there.
+                self.world_size == 8
+                and 4096 < K <= 7168
+                and token_num >= 8
+                and use_1stage_ar
+            ):
+                use_1stage_ar = False
+
+        try:
+            return ca_comm.custom_fused_ar_rms_per_group_quant(
+                input_,
+                residual_inp_,
+                weight_,
+                eps,
+                group_size,
+                use_1stage_ar,
+                emit_bf16=emit_bf16,
+                transpose_scale=transpose_scale,
+            )
+        except Exception:
+            return None
+
+    def _resolve_outplace_all_reduce_method(
+        self,
+        input_: torch.Tensor,
+        should_use_pymscclpp_allreduce: Optional[bool] = None,
+    ) -> Optional[str]:
+        if should_use_pymscclpp_allreduce is None:
+            should_use_pymscclpp_allreduce = (
+                self.pymscclpp_comm is not None
+                and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
+            )
+        if (
+            self.ca_comm is not None
+            and not self.ca_comm.disabled
+            and not should_use_pymscclpp_allreduce
+            and self.ca_comm.should_custom_ar(input_)
+        ):
+            return "ca"
+        if (
+            self.qr_comm is not None
+            and not self.qr_comm.disabled
+            and self.qr_comm.should_quick_allreduce(input_)
+        ):
+            return "qr"
+        if self.pymscclpp_comm is not None and should_use_pymscclpp_allreduce:
+            return "pymscclpp"
+        if (
+            self.torch_symm_mem_comm is not None
+            and not self.torch_symm_mem_comm.disabled
+            and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
+        ):
+            return "torch_symm_mem"
+        if is_in_tc_piecewise_cuda_graph() and self.pynccl_comm is not None:
+            # For piecewise cuda graph, we use pynccl outplace allreduce
+            return "pynccl"
+        return None
+
+    def _can_use_flashinfer_allreduce(self, input_: torch.Tensor) -> bool:
+        if self._fi_workspace_hint is None:
+            return False
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            can_use_flashinfer_allreduce,
+        )
+
+        return can_use_flashinfer_allreduce(
+            input_,
+            use_attn_tp_group=(self._fi_workspace_hint == "attn_tp"),
+            expected_world_size=self.world_size,
+            expected_group_key=(self.device_group, self.cpu_group),
+        )
+
+    def _flashinfer_allreduce(self, input_: torch.Tensor) -> torch.Tensor:
+        from sglang.srt.layers.flashinfer_comm_fusion import (
+            flashinfer_allreduce as _flashinfer_allreduce_impl,
+        )
+
+        return _flashinfer_allreduce_impl(
+            input_, use_attn_tp_group=(self._fi_workspace_hint == "attn_tp")
+        )
+
     def _all_reduce_out_place(
         self, input_: torch.Tensor, outplace_all_reduce_method: str
     ) -> torch.Tensor:
-        """非原地 all-reduce 的实际执行体：根据上层选定的方法名调用对应通信器。
-
-        由 `outplace_all_reduce` 自定义算子回调进来（算子只能拿到组名字符串，
-        因此先反查到本对象再调用本方法）。返回的是新张量，不修改 `input_`。
-        """
+        if outplace_all_reduce_method == "auto":
+            outplace_all_reduce_method = self._resolve_outplace_all_reduce_method(
+                input_
+            )
+            if outplace_all_reduce_method == "pymscclpp":
+                # pymscclpp reduces in place and returns its input; feed it a
+                # clone to honor the op's no-mutation contract.
+                input_ = input_.clone()
+            elif outplace_all_reduce_method is None:
+                # Force pynccl over the in-place fallback: it is graph-capture
+                # safe and NCCL is natively out-of-place, avoiding the clone
+                # the in-place fallback needs.
+                if self.pynccl_comm is not None:
+                    outplace_all_reduce_method = "pynccl"
+                else:
+                    out = input_.clone()
+                    self._all_reduce_in_place(out)
+                    return out
         ca_comm = self.ca_comm
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
@@ -884,10 +1111,51 @@ class GroupCoordinator:
         torch_symm_mem_comm = self.torch_symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.all_reduce(input_)
-        elif torch_symm_mem_comm is not None and not torch_symm_mem_comm.disabled:
-            torch_symm_mem_comm.all_reduce(input_)
+        elif (
+            torch_symm_mem_comm is not None
+            and not torch_symm_mem_comm.disabled
+            and torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
+        ):
+            torch_symm_mem_comm.all_reduce(input_, out=input_)
         else:
             torch.distributed.all_reduce(input_, group=self.device_group)
+
+    def reduce_scatter_along_dim(
+        self, input_: torch.Tensor, dim: int = -1
+    ) -> torch.Tensor:
+        world_size = self.world_size
+        # Bypass the function if we are using only 1 GPU.
+        if world_size == 1:
+            return input_
+        assert (
+            -input_.dim() <= dim < input_.dim()
+        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+
+        if dim < 0:
+            # Convert negative dim to positive.
+            dim += input_.dim()
+
+        with self.use_symmetric_memory(self):
+            # TODO: make sure whether tensor layout affects nccl reduce_scatter
+            # Note: This will produce an incorrect answer if we don't make
+            # the input_tensor contiguous. Possible bug in reduce_scatter_tensor?
+            input_tensor = input_.movedim(dim, 0).contiguous()
+
+        assert input_tensor.shape[0] % world_size == 0
+        chunk_size = input_tensor.shape[0] // world_size
+        output_shape = (chunk_size,) + input_tensor.shape[1:]
+
+        with self.use_symmetric_memory(self):
+            output_tensor = torch.empty(
+                output_shape,
+                dtype=input_tensor.dtype,
+                device=input_tensor.device,
+            )
+
+        self.reduce_scatter_tensor(output_tensor, input_tensor)
+
+        # Reshape before returning
+        return output_tensor.movedim(0, dim)
 
     def _reduce_scatter_tensor(
         self,
@@ -927,25 +1195,71 @@ class GroupCoordinator:
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        """reduce-scatter 对外入口（等长版，结果写入预分配的 `output`）。
-
-        NPU 直接调用实现；其他平台走自定义算子 `reg_reduce_scatter_tensor`，
-        以便 torch.compile 能正确识别“会修改 output”这一副作用。
-
-        输入输出示例（world_size=2）：``input.shape == [8, d]`` 时，每个 rank 需传入
-        ``output.shape == [4, d]``；调用后不同 rank 分别持有归约结果的前、后半段。
-        """
-        if _is_npu:
+        if _is_npu or _is_cpu:
+            # TODO: add optimized reduce_scatter_tensor kernel for cpu
             self._reduce_scatter_tensor(output, input)
+        elif self._maybe_aiter_reduce_scatter(output, input):
+            return
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
 
-    def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
-        """all-to-all 的实际执行体：每个 rank 把自己的数据均分后分发给全部 rank。
+    def _has_aiter_custom_reduce_scatter(self) -> bool:
+        ca_comm = self.ca_comm
+        return (
+            ca_comm is not None
+            and not getattr(ca_comm, "disabled", True)
+            and hasattr(ca_comm, "should_custom_ar")
+            and hasattr(ca_comm, "reduce_scatter")
+        )
 
-        输入输出示例见 ``all_to_all_single``；本方法只负责调用底层进程组。
-        """
-        torch.distributed.all_to_all_single(output, input, group=self.device_group)
+    def _maybe_aiter_reduce_scatter(
+        self, output: torch.Tensor, input: torch.Tensor
+    ) -> bool:
+        # Aiter custom reduce-scatter (ROCm). Mirrors `_all_gather_into_tensor`'s
+        # custom all-gather path: an equal-chunk (no variable sizes) reduce-scatter
+        # using the registered symmetric-memory buffers, which is faster than the
+        # generic RCCL kernel for the small, latency-bound decode collective.
+        # Gated by SGLANG_DP_USE_REDUCE_SCATTER. Falls back (returns False)
+        # for non-ROCm / unsupported shape/size/topology so the caller uses RCCL.
+        if not (
+            is_hip()
+            and envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
+            and self._has_aiter_custom_reduce_scatter()
+            and input.is_contiguous()
+            and output.is_contiguous()
+            and input.dtype in (torch.float32, torch.float16, torch.bfloat16)
+        ):
+            return False
+        ca_comm = self.ca_comm
+        # input is the full (pre-reduce) buffer; should_custom_ar bounds its size.
+        if not ca_comm.should_custom_ar(input):
+            return False
+        # Equal-chunk only: input rows must split evenly into world_size chunks
+        # matching the per-rank output rows.
+        if input.shape[0] != output.shape[0] * self.world_size:
+            return False
+        if getattr(ca_comm, "_IS_CAPTURING", False):
+            if torch.cuda.is_current_stream_capturing():
+                if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                    ca_comm.reduce_scatter(input, output, registered=False)
+                else:
+                    ca_comm.reduce_scatter(input, output, registered=True)
+            elif is_in_tc_piecewise_cuda_graph():
+                ca_comm.reduce_scatter(input, output, registered=False)
+            else:
+                # True CUDA graph warmup: avoid a different host collective.
+                output.zero_()
+            return True
+        ca_comm.reduce_scatter(input, output, registered=False)
+        return True
+
+    def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
+        # pynccl path keeps the a2a exchange CUDA-graph-capturable (DCP a2a backend).
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.all_to_all_single(output, input)
+        else:
+            torch.distributed.all_to_all_single(output, input, group=self.device_group)
 
     def all_to_all_single(self, output: torch.Tensor, input: torch.Tensor):
         """all-to-all 对外入口；单卡时退化为一次拷贝。
@@ -1030,17 +1344,13 @@ class GroupCoordinator:
             return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        """all-gather 的实际执行体。
-
-        语义：把各 rank 的 `input` 按 rank 顺序沿第 0 维拼接，写入预分配的 `output`：
-            output.shape[0] == world_size * input.shape[0]
-        它是 reduce-scatter 的“对偶”操作，两者合起来等价于一次 all-reduce。
-        """
-        # Aiter 自定义 all-gather（ROCm）。设置 SGLANG_USE_AITER_AG=0 可关闭。
-        # 形状/布局的校验仍然由 Aiter 的 should_custom_ag 负责：
-        # 16B 对齐、弱连续、拓扑受支持，以及单 rank 尺寸 <= max_size/(world*2)。
-        # 命中时直接写入调用方预分配的 `output`：CUDA Graph 捕获中用 all_gather_reg，
-        # 否则用 all_gather_unreg。
+        # Aiter custom all-gather (ROCm). Set SGLANG_USE_AITER_AG=0 to disable.
+        # Aiter's should_custom_ag still owns shape/layout validation:
+        # 16B alignment, weak-contiguous, supported topology, and per-rank
+        # size <= max_size/(world*2).
+        # On a hit, writes directly into the caller's pre-allocated `output` via
+        # all_gather_reg during CUDA-graph capture, and all_gather_unreg
+        # under torch_memory_saver and other paths.
         ca_comm = self.ca_comm
         if (
             is_hip()
@@ -1054,8 +1364,10 @@ class GroupCoordinator:
             # _IS_CAPTURING 表示当前处于 CUDA Graph 的捕获/预热阶段
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
-                    # 真正在捕获：用已注册缓冲区版本，保证地址在回放时仍然有效
-                    ca_comm.all_gather_reg(input, out=output, dim=0)
+                    if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
+                        ca_comm.all_gather_unreg(input, out=output, dim=0)
+                    else:
+                        ca_comm.all_gather_reg(input, out=output, dim=0)
                 elif is_in_tc_piecewise_cuda_graph():
                     ca_comm.all_gather_unreg(input, out=output, dim=0)
                 else:
@@ -1102,37 +1414,15 @@ class GroupCoordinator:
         return envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        """all-gather 对外入口（结果写入预分配的 `output`，沿第 0 维拼接）。
-
-        NPU/XPU 直接调用实现；其他平台走自定义算子 `reg_all_gather_into_tensor`，
-        以便 torch.compile 能正确识别“会修改 output”这一副作用。
-
-        输入输出示例（两 rank）：各 rank 输入形状 ``[1, d]``，预分配输出形状
-        ``[2, d]``；调用后每个 rank 的输出都按 rank 顺序包含两份输入。
-        """
-        if _is_npu or _is_xpu:
+        if _is_npu or _is_cpu:
+            # TODO: add optimized all_gather_into_tensor kernel for cpu
             self._all_gather_into_tensor(output, input)
         else:
+            # XPU and CUDA both go through reg_all_gather_into_tensor (custom_op) to
+            # stay opaque to Dynamo. Calling torch.distributed.all_gather_into_tensor
+            # directly causes Dynamo to rewrite it as _c10d_functional.all_gather_into_tensor
+            # + wait_tensor, which invokes sycl_event.wait() and breaks XPU graph capture.
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
-
-    def cp_all_gather_into_tensor_async(
-        self, output: torch.Tensor, input: torch.Tensor, stream: torch.cuda.Stream
-    ):
-        """
-        在指定 stream 上实现异步的 `allgather` 操作。
-        （默认的 `torch.distributed.all_gather_into_tensor` 会触发 event 同步），
-        从而消除由同步导致的 CPU 侧 launch-kernel 阻塞问题。
-        具体实现上使用 pynccl 提供的接口，去掉 event 的同步逻辑。
-        主要用于 context parallel（CP）下的通信-计算重叠。
-
-        输入输出示例（两 rank）：各 rank 输入 ``[1, d]``、输出缓冲区 ``[2, d]``；
-        调用立即把通信排入指定 stream，待该 stream 完成后输出包含两份输入。
-        """
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is None or pynccl_comm.disabled:
-            self.all_gather_into_tensor(output, input)
-        else:
-            pynccl_comm.cp_all_gather_into_tensor(output, input, stream=stream)
 
     def all_gather(
         self,
@@ -1232,25 +1522,14 @@ class GroupCoordinator:
         self,
         input_: Union[torch.Tensor, List[torch.Tensor]],
         sizes: Optional[List[int]] = None,
+        output: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         """
-        变长版 all-gather（v = variable）：支持每个 rank 长度不同，
-        也支持一次传入多个输入张量（合并为一次 NCCL 批量提交）。
-
-        与 `all_gather` 的区别：只能沿第 0 维拼接，但允许各 rank 行数不等。
-        典型场景：DP attention 下各 DP rank 的 token 数不相等。
-
-        Args:
-            input_: 单个张量或张量列表（列表内各张量共用同一份 `sizes`）。
-            sizes: 长度为 world_size 的列表，表示每个 rank 要 gather 的行数；
-                为 None 时退化为等长 all-gather。
-        Returns:
-            与输入一一对应的输出张量列表（即使传入的是单个张量）。
-
-        注：变长语义仅 pynccl 支持，无 torch.distributed 回退路径。
-
-        输入输出示例（两 rank，``sizes=[1, 2]``）：rank 0 输入形状 ``[1,d]``，
-        rank 1 输入形状 ``[2,d]``；两边输出列表中的张量形状均为 ``[3,d]``。
+        Supports varying sizes per rank and input tensor list.
+        `sizes`: a list of len(world_size) with the number of items per rank to gather.
+        `output`: optional pre-allocated destination buffer (single-tensor input only).
+            When given, NCCL writes the gathered result directly into it, avoiding an
+            extra output allocation + caller-side copy.
         """
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
@@ -1261,7 +1540,9 @@ class GroupCoordinator:
             ), "pynccl is required for all_gatherv"
 
             def _all_gather_allocate_output(
-                input_: torch.Tensor, sizes: Optional[List[int]] = None
+                input_: torch.Tensor,
+                sizes: Optional[List[int]] = None,
+                output: Optional[torch.Tensor] = None,
             ):
                 input_size = input_.size()
                 if sizes is not None:
@@ -1273,22 +1554,32 @@ class GroupCoordinator:
                         sizes = None
                 else:
                     output_size = (input_size[0] * world_size,) + input_size[1:]
-                # 分配输出张量（变长场景下不能使用对称内存）。
+                if output is not None:
+                    assert tuple(output.shape) == tuple(output_size), (
+                        f"all_gatherv output buffer shape {tuple(output.shape)} "
+                        f"!= expected {tuple(output_size)}"
+                    )
+                    return output, sizes
+                # Allocate output tensor.
                 with self.use_symmetric_memory(self, disabled=sizes is not None):
                     output_tensor = torch.empty(
                         output_size, dtype=input_.dtype, device=input_.device
                     )
                 return output_tensor, sizes
 
-            # 统一成列表形式处理，后续逻辑不再区分单/多输入
-            if isinstance(input_, torch.Tensor):
+            single_input = isinstance(input_, torch.Tensor)
+            if single_input:
                 input_ = [input_]
+            elif output is not None:
+                raise ValueError("all_gatherv `output` requires a single-tensor input")
 
             # 先为所有输入分配好输出，再一次性提交通信
             output_list = []
             size_list = []
             for inp in input_:
-                output_tensor, s = _all_gather_allocate_output(inp, sizes=sizes)
+                output_tensor, s = _all_gather_allocate_output(
+                    inp, sizes=sizes, output=output
+                )
                 output_list.append(output_tensor)
                 size_list.append(s)
 
@@ -1419,6 +1710,7 @@ class GroupCoordinator:
         obj: Any,
         dst: int,
         async_send: bool = False,
+        tag: int = 0,
     ) -> List[P2PWork]:
         """
         向目标 rank 发送一个 Python 对象。本函数的所有通信都走 CPU 组。
@@ -1455,6 +1747,7 @@ class GroupCoordinator:
             size_tensor,
             self.ranks[dst],
             group=self.cpu_group,
+            tag=tag,
         )
         if async_send:
             p2p_work.append(P2PWork(size_work, size_tensor))
@@ -1464,6 +1757,7 @@ class GroupCoordinator:
             object_tensor,
             self.ranks[dst],
             group=self.cpu_group,
+            tag=tag,
         )
         if async_send:
             p2p_work.append(P2PWork(object_work, object_tensor))
@@ -1473,6 +1767,7 @@ class GroupCoordinator:
     def recv_object(
         self,
         src: int,
+        tag: int = 0,
     ) -> Any:
         """从源 rank 接收一个 Python 对象（与 ``send_object`` 配对，走 CPU 组）。
 
@@ -1490,7 +1785,7 @@ class GroupCoordinator:
         # 先接收对象大小。
         # 这里必须用 irecv，才能同时兼容发送端使用 isend 和 send 两种情况。
         work = torch.distributed.irecv(
-            size_tensor, src=self.ranks[src], group=self.cpu_group
+            size_tensor, src=self.ranks[src], group=self.cpu_group, tag=tag
         )
         work.wait()
 
@@ -1502,7 +1797,7 @@ class GroupCoordinator:
         )
 
         work = torch.distributed.irecv(
-            object_tensor, src=self.ranks[src], group=self.cpu_group
+            object_tensor, src=self.ranks[src], group=self.cpu_group, tag=tag
         )
         work.wait()
 
@@ -1832,6 +2127,8 @@ def init_model_parallel_group(
     use_mscclpp_allreduce: Optional[bool] = None,
     use_torch_symm_mem_allreduce: Optional[bool] = None,
     recovered_rank: bool = False,
+    rank_offset: int = 0,
+    max_world_size: Optional[int] = None,
 ) -> GroupCoordinator:
     """创建某一并行维度的组协调器，并按平台与全局开关选择通信优化。
 
@@ -1862,12 +2159,16 @@ def init_model_parallel_group(
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
         recovered_rank=recovered_rank,
+        rank_offset=rank_offset,
+        max_world_size=max_world_size,
     )
 
 
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
+_ATTN_CP_OVERLAP: Optional[GroupCoordinator] = None
+_DCP: Optional[GroupCoordinator] = None
 
 # 为 PD-Multiplexing 的 prefill 阶段复制一份独立的 GroupCoordinator。
 _PDMUX_PREFILL_TP_GROUP: Optional[GroupCoordinator] = None
@@ -1916,6 +2217,64 @@ def get_attn_cp_group() -> GroupCoordinator:
     return _ATTN_CP
 
 
+def get_attn_cp_overlap_group() -> GroupCoordinator:
+    return _ATTN_CP_OVERLAP if _ATTN_CP_OVERLAP is not None else get_attn_cp_group()
+
+
+def _init_attn_cp_overlap_group(
+    *,
+    world_size: int,
+    attn_cp_size: int,
+    attn_tp_size: int,
+    backend: Optional[str],
+    recovered_rank: bool,
+    rank_offset: int,
+    max_world_size: Optional[int],
+) -> None:
+    """Second communicator over the attention CP ranks; RCCL deadlocks when one
+    communicator is driven from two streams at once."""
+    global _ATTN_CP_OVERLAP
+    assert (
+        _ATTN_CP_OVERLAP is None
+    ), "attention context parallel overlap group is already initialized"
+    if attn_cp_size <= 1:
+        return
+
+    span = attn_tp_size * attn_cp_size
+    group_ranks = [
+        list(range(base + i, base + i + span, attn_tp_size))
+        for base in range(0, world_size, span)
+        for i in range(attn_tp_size)
+    ]
+    rank = torch.distributed.get_rank()
+    mine = next(ranks for ranks in group_ranks if rank in ranks)
+    assert mine == get_attn_cp_group().ranks, (
+        f"attn_cp_overlap partition {mine} does not match attn_cp "
+        f"{get_attn_cp_group().ranks}; the two communicators must span the "
+        "same ranks or the overlapped collectives will not pair up"
+    )
+
+    _ATTN_CP_OVERLAP = init_model_parallel_group(
+        group_ranks,
+        get_world_group().local_rank,
+        backend,
+        use_message_queue_broadcaster=False,
+        group_name="attn_cp_overlap",
+        recovered_rank=recovered_rank,
+        rank_offset=rank_offset,
+        max_world_size=max_world_size,
+    )
+
+
+def get_dcp_group_no_assert() -> Optional[GroupCoordinator]:
+    return _DCP
+
+
+def get_dcp_group() -> GroupCoordinator:
+    assert _DCP is not None, "decode context parallel group is not initialized"
+    return _DCP
+
+
 _MOE_DP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
@@ -1943,6 +2302,12 @@ def get_moe_tp_group() -> GroupCoordinator:
 get_tensor_model_parallel_group = get_tp_group
 
 _PP: Optional[GroupCoordinator] = None
+_SELF_PP: Optional[GroupCoordinator] = None
+
+
+def get_self_pp_group() -> GroupCoordinator:
+    assert _SELF_PP is not None, "self pipeline group is not initialized"
+    return _SELF_PP
 
 
 def get_pp_group() -> GroupCoordinator:
@@ -1972,24 +2337,27 @@ def get_mooncake_transfer_engine():
 
 
 @contextmanager
-def graph_capture(stream: Optional[torch.cuda.Stream] = None):
-    """为 CUDA Graph 捕获统一切换各模型并行通信组的上下文管理器。
-
-    进入上下文时，TP、PP、MoE EP/TP 通信器会切换到支持图捕获的状态，并在独立
-    stream 上执行待捕获 kernel，避免混入默认 stream 后台启动的其他 kernel。退出后
-    恢复通信器状态。返回的 ``GraphCaptureContext`` 当前只保存捕获所用 stream。
-
-    输入输出示例：
-        ``with graph_capture() as ctx: model(x)``；代码块内 ``ctx.stream`` 是捕获流，
-        退出代码块后通信器恢复普通执行状态。
+def graph_capture(stream=None):
+    """
+    `graph_capture` is a context manager which should surround the code that
+    is capturing the CUDA graph. Its main purpose is to ensure that the
+    some operations will be run after the graph is captured, before the graph
+    is replayed. It returns a `GraphCaptureContext` object which contains the
+    necessary data for the graph capture. Currently, it only contains the
+    stream that the graph capture is running on. This stream is set to the
+    current CUDA stream when the context manager is entered and reset to the
+    default stream when the context manager is exited. This is to ensure that
+    the graph capture is running on a separate stream from the default stream,
+    in order to explicitly distinguish the kernels to capture
+    from other kernels possibly launched on background in the default stream.
     """
     with (
         get_tp_group().graph_capture(stream=stream) as context,
         get_pp_group().graph_capture(context),
     ):
         with contextlib.ExitStack() as stack:
-            seen = {id(_TP)}
-            for group in (_MOE_EP, _MOE_TP):
+            seen = {id(_TP), id(_PP)}
+            for group in (_DCP, _ATTN_TP, _MOE_EP, _MOE_TP):
                 if group is not None and id(group) not in seen:
                     seen.add(id(group))
                     stack.enter_context(group.graph_capture(context))
@@ -2001,6 +2369,7 @@ logger = logging.getLogger(__name__)
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
 _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = False
+_ENABLE_FLASHINFER_ALLREDUCE_ONLY = False
 
 
 def set_custom_all_reduce(enable: bool):
@@ -2018,7 +2387,42 @@ def set_torch_symm_mem_all_reduce(enable: bool):
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
 
 
-# TODO：重构仓库内的平台实现，最终移除这个包装函数。
+def set_flashinfer_allreduce_only(enable: bool):
+    global _ENABLE_FLASHINFER_ALLREDUCE_ONLY
+    _ENABLE_FLASHINFER_ALLREDUCE_ONLY = enable
+
+
+def _tag_groups_for_flashinfer_allreduce_only():
+    """Stamp _fi_workspace_hint on the group coordinators that own a FlashInfer
+    fusion workspace, so all_reduce() can dispatch to flashinfer_allreduce()
+    without touching the call sites.
+
+    Only two workspaces exist (see ``_get_workspace_manager``): one for
+    attention TP and one for MoE. A group may only be tagged for the workspace
+    that was rendezvoused on its own peers -- reducing over a workspace built
+    for a different set of peers silently returns wrong data.
+
+    - ``_TP`` is deliberately absent: it *is* ``_ATTN_TP`` when
+      ``attn_tp_size == tp_size``, and a strict superset of it otherwise (DP
+      attention), where the attention workspace addresses the wrong peers.
+    - The MoE workspace rendezvouses on the EP group when ``moe_ep_size > 1``
+      and on the MoE-TP group otherwise, so exactly one of ``_MOE_EP`` /
+      ``_MOE_TP`` is eligible. Tagging both makes a MoE-TP allreduce reduce
+      across the EP peers under hybrid EP+TP (e.g. tp=4, ep=2).
+    """
+    if not _ENABLE_FLASHINFER_ALLREDUCE_ONLY:
+        return
+
+    moe_group = _MOE_EP if (_MOE_EP is not None and _MOE_EP.world_size > 1) else _MOE_TP
+    # Attention is tagged last on purpose: when a coordinator backs both roles
+    # (e.g. _ATTN_TP is _MOE_EP is _TP at tp=4, ep=4) either workspace spans the
+    # same peers and is correct, so we just pick one deterministically.
+    for group, hint in ((moe_group, "moe"), (_ATTN_TP, "attn_tp")):
+        if group is not None:
+            group._fi_workspace_hint = hint
+
+
+# TODO: refactor in-tree platforms to get rid of this wrapper
 def get_default_distributed_backend(device: str) -> str:
     """返回设备类型对应的默认 PyTorch 分布式后端。
 
@@ -2033,8 +2437,13 @@ def get_default_distributed_backend(device: str) -> str:
     return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
 
-def _create_global_tcp_store(rank: int, world_size: int) -> None:
-    """创建供所有 rank 协调使用的全局 ``TCPStore``。
+def _create_global_tcp_store(
+    rank: int,
+    world_size: int,
+    dist_init_addr: Optional[str] = None,
+    allow_dynamic_membership: bool = False,
+) -> None:
+    """Create a global TCPStore for coordination across ranks.
 
     该 Store 用于 NIXL 缓冲区初始化等不适合走 device collective 的控制面协作。
     rank 0 作为服务端，其余 rank 连接同一 ``MASTER_ADDR:port``。
@@ -2044,42 +2453,51 @@ def _create_global_tcp_store(rank: int, world_size: int) -> None:
     """
     from torch.distributed import TCPStore
 
-    master_ip = os.environ.get("MASTER_ADDR")
+    base_store_port = envs.SGLANG_TCP_STORE_PORT.get()
 
+    master_ip = os.environ.get("MASTER_ADDR")
+    if not master_ip and allow_dynamic_membership and dist_init_addr:
+        addr = dist_init_addr
+        if addr.startswith("tcp://"):
+            addr = addr[len("tcp://") :]
+        master_ip = addr.rsplit(":", 1)[0]
     if not master_ip:
         logger.warning(
             "Could not determine master IP for global TCPStore. "
             "Broadcasting from rank 0 to all ranks."
         )
-
-    base_store_port = envs.SGLANG_TCP_STORE_PORT.get()
-
-    # 环境变量未提供主节点地址时，由 rank 0 获取本机 IP 并广播给所有 rank。
-    # ``broadcast_object_list`` 可适配任意后端，并自动处理 CPU/GPU 对象通信。
-    if not master_ip:
         if rank == 0:
             master_ip = get_local_ip_auto()
             ip_list = [master_ip]
         else:
             ip_list = [None]
-
         torch.distributed.broadcast_object_list(ip_list, src=0)
         master_ip = ip_list[0]
 
     try:
-        tcp_store = TCPStore(
-            host_name=master_ip,
-            port=base_store_port,
-            world_size=world_size,
-            is_master=(rank == 0),
-        )
+        if allow_dynamic_membership:
+            is_master = rank == 0
+            tcp_store = TCPStore(
+                host_name=master_ip,
+                port=base_store_port,
+                is_master=is_master,
+                wait_for_workers=False,
+            )
+        else:
+            is_master = rank == 0
+            tcp_store = TCPStore(
+                host_name=master_ip,
+                port=base_store_port,
+                world_size=world_size,
+                is_master=is_master,
+            )
         set_global_tcp_store(tcp_store)
         logger.info(
-            "Created global TCPStore at %s:%d (rank=%d, world_size=%d)",
+            "Created global TCPStore at %s:%d (rank=%d, is_master=%s)",
             master_ip,
             base_store_port,
             rank,
-            world_size,
+            is_master,
         )
     except Exception as e:
         logger.warning(
@@ -2100,6 +2518,7 @@ def init_distributed_environment(
     timeout: Optional[int] = None,
     moe_a2a_backend: Optional[str] = None,
     recovered_rank: bool = False,
+    max_world_size: Optional[int] = None,
 ):
     """初始化 PyTorch 分布式环境以及 SGLang 的 WORLD 组封装。
 
@@ -2125,17 +2544,6 @@ def init_distributed_environment(
         distributed_init_method,
         backend,
     )
-    if "mooncake" in backend:
-        try:
-            from mooncake import ep as mooncake_ep
-        except ImportError as e:
-            raise ImportError(
-                "Please install mooncake by following the instructions at "
-                "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "  # noqa: E501
-                "to run SGLang with Mooncake Backend."
-            ) from e
-        mooncake_ep.set_host_ip(get_local_ip_auto())
-
     if not torch.distributed.is_initialized():
         global _MODEL_PARALLEL_GROUP_TIMEOUT
         assert distributed_init_method is not None, (
@@ -2150,11 +2558,18 @@ def init_distributed_environment(
         _MODEL_PARALLEL_GROUP_TIMEOUT = timeout
 
         if backend == "mooncake":
-            from mooncake.ep import MooncakeBackendOptions
+            from mooncake.pg import MooncakeBackendOptions
 
-            # 此分支仅在 Mooncake 后端下执行，因此这里固定使用 ``cuda`` 是安全的。
-            active_ranks = torch.ones(world_size, dtype=torch.int32, device="cuda")
-            pg_options = MooncakeBackendOptions(active_ranks, recovered_rank)
+            use_max_ws = max_world_size and max_world_size > world_size
+            ar_size = max_world_size if use_max_ws else world_size
+            active_ranks = torch.zeros(ar_size, dtype=torch.int32, device="cuda")
+            active_ranks[:world_size] = 1
+            if use_max_ws:
+                pg_options = MooncakeBackendOptions(
+                    active_ranks, recovered_rank, max_world_size
+                )
+            else:
+                pg_options = MooncakeBackendOptions(active_ranks, recovered_rank)
         else:
             pg_options = get_torch_distributed_pg_options()
 
@@ -2170,7 +2585,15 @@ def init_distributed_environment(
 
         # NIXL 需要额外的全局 TCPStore 完成各 rank 间的控制面协调。
         if moe_a2a_backend == "nixl":
-            _create_global_tcp_store(rank, world_size)
+            _create_global_tcp_store(
+                rank,
+                world_size,
+                dist_init_addr=distributed_init_method,
+                allow_dynamic_membership=(
+                    recovered_rank
+                    or (max_world_size is not None and max_world_size > world_size)
+                ),
+            )
 
     # 设置节点内 local rank。PyTorch ProcessGroup 本身不提供 local_rank，
     # 参见 https://github.com/pytorch/pytorch/issues/122816。
@@ -2199,18 +2622,36 @@ def initialize_model_parallel(
     attention_data_parallel_size: int = 1,
     attention_context_model_parallel_size: int = 1,
     moe_data_model_parallel_size: int = 1,
+    decode_context_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    duplicate_attn_cp_group: bool = False,
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
+    rank_offset: int = 0,
+    max_world_size: Optional[int] = None,
 ) -> None:
     """
     初始化模型并行相关的各类进程组。
 
-    本函数在 `world` 组（全部 rank）之上，按照传入的各并行度切分出
-    张量并行（TP）、注意力上下文并行（Attention CP）、注意力张量并行（Attention TP）、
-    MoE 数据并行（MoE DP）、MoE 专家并行（MoE EP）、MoE 张量并行（MoE TP）
-    以及流水线并行（PP）等进程组，并保存到对应的全局变量中。
+    Arguments:
+        tensor_model_parallel_size: number of GPUs used for tensor model
+            parallelism.
+        expert_model_parallel_size: number of GPUs used for expert model
+            parallelism.
+        pipeline_model_parallel_size: number of GPUs used for pipeline model
+            parallelism.
+        attention_data_parallel_size: number of GPUs used for attention data
+            parallelism.
+        attention_context_model_parallel_size: number of GPUs used for attention context
+            parallelism.
+        moe_data_model_parallel_size: number of GPUs used for moe data
+            parallelism.
+        decode_context_parallel_size: number of GPUs used for decode context
+            parallelism, which splits the KV cache across GPUs within each
+            tensor-parallel group during decoding. Must be a divisor of
+            tensor_model_parallel_size and is currently only supported on the
+            AMD HIP platform.
 
     参数：
         tensor_model_parallel_size: 张量并行使用的 GPU 数（即外层 TP 规模，也是
@@ -2226,9 +2667,22 @@ def initialize_model_parallel(
         enable_symm_mem: 是否启用对称内存（影响 Attention TP 是否走 pynccl）。
         recovered_rank: 弹性场景下标记该 rank 是否为恢复出来的 rank。
 
-    分解关系（均需整除）：
-        attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
-        moe_tp_size  = tensor_model_parallel_size // moe_ep_size  // moe_dp_size
+    Let's say we use 2 GPUs for attention context parallelism (attn_cp_size=2) and 4 GPUs for
+    attention tensor parallelism (attn_tp_size=4). As for MoE part, we use 2 GPUs for moe data
+    parallelism (moe_dp_size=2) and 4 GPUs for moe expert parallelism (moe_ep_size=4). Note that
+    this implies tensor_model_parallel_size=8 (attn_tp_size = tp_size // attn_cp_size //
+    attn_dp_size), so all 8 GPUs form a single tensor model-parallel group. The present
+    function will create the following groups:
+        1 tensor model-parallel group:
+            [g0, g1, g2, g3, g4, g5, g6, g7]
+        4 attention context-parallel groups:
+            [g0, g4], [g1, g5], [g2, g6], [g3, g7]
+        2 attention tensor-parallel groups:
+            [g0, g1, g2, g3], [g4, g5, g6, g7]
+        2 moe expert-parallel groups:
+            [g0, g1, g2, g3], [g4, g5, g6, g7]
+        4 moe data-parallel groups:
+            [g0, g4], [g1, g5], [g2, g6], [g3, g7]
 
     ------------------------------------------------------------------
     示例 1（TP + PP）：
@@ -2262,15 +2716,36 @@ def initialize_model_parallel(
     """
     # 获取 world size，并做基本一致性校验。
     assert torch.distributed.is_initialized()
-    world_size: int = torch.distributed.get_world_size()
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
 
-    # 一个模型实例的 rank 域大小 = TP × PP，必须与总卡数一致。
+    # Joiners construct their local TP/PP layout in global rank space.
+    world_size: int = (
+        tensor_model_parallel_size * pipeline_model_parallel_size
+        if recovered_rank
+        else torch.distributed.get_world_size()
+    )
+
     if world_size != tensor_model_parallel_size * pipeline_model_parallel_size:
         raise RuntimeError(
             f"world_size ({world_size}) is not equal to "
             f"tensor_model_parallel_size ({tensor_model_parallel_size}) x "
             f"pipeline_model_parallel_size ({pipeline_model_parallel_size})"
+        )
+    if decode_context_parallel_size < 1:
+        raise RuntimeError(
+            f"decode_context_parallel_size ({decode_context_parallel_size}) must be >= 1"
+        )
+    if decode_context_parallel_size > 1 and not (is_hip() or is_cuda()):
+        raise RuntimeError(
+            "Decode context parallel (decode_context_parallel_size > 1) is "
+            "currently only supported on the AMD HIP platform or CUDA platform, but got "
+            f"decode_context_parallel_size ({decode_context_parallel_size}) "
+            "on a non-HIP or non-CUDA platform."
+        )
+    if tensor_model_parallel_size % decode_context_parallel_size != 0:
+        raise RuntimeError(
+            f"tensor_model_parallel_size ({tensor_model_parallel_size}) must be divisible by "
+            f"decode_context_parallel_size ({decode_context_parallel_size})"
         )
 
     # 构建张量并行（TP）组：把连续的 tensor_model_parallel_size 个 rank 归为一组。
@@ -2296,6 +2771,8 @@ def initialize_model_parallel(
         use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
         group_name="tp",
         recovered_rank=recovered_rank,
+        rank_offset=rank_offset,
+        max_world_size=max_world_size,
     )
 
     # PD 分离多路复用：为 prefill 复制一份与 TP 相同 rank 划分的独立进程组，
@@ -2312,16 +2789,50 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="pdmux_prefill_tp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
         if _TP.pynccl_comm:
             _TP.pynccl_comm.disabled = False
             _PDMUX_PREFILL_TP_GROUP.pynccl_comm.disabled = False
 
-    # 注意力侧的三个并行度：DP（按 token/请求切）、CP（按序列切）、TP（按 head/张量切）。
-    # 三者相乘应等于外层 TP 规模，故 attn_tp_size 由整除推出。
+    # Build decode context-parallel groups inside each TP group only when DCP is enabled.
+    global _DCP
+    assert _DCP is None, "decode context parallel group is already initialized"
+    if decode_context_parallel_size > 1:
+        dcp_group_ranks = []
+        for tp_group in group_ranks:
+            for start in range(0, len(tp_group), decode_context_parallel_size):
+                dcp_group_ranks.append(
+                    tp_group[start : start + decode_context_parallel_size]
+                )
+        _DCP = init_model_parallel_group(
+            dcp_group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+            group_name="dcp",
+            recovered_rank=recovered_rank,
+        )
+        if get_tensor_model_parallel_rank() == 0:
+            logger.info(
+                f"DCP enabled, dcp_size={decode_context_parallel_size}, tp_size={tensor_model_parallel_size}"
+            )
+
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size
-    attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
+    # The groups below are built at these numbers, and the same dict is stamped
+    # once they exist.
+    derived_widths = derive_parallel_widths(
+        tp_size=tensor_model_parallel_size,
+        attn_cp_size=attn_cp_size,
+        attn_dp_size=attn_dp_size,
+        moe_ep_size=expert_model_parallel_size,
+        moe_dp_size=moe_data_model_parallel_size,
+        dcp_size=decode_context_parallel_size,
+        dcp_enabled=_DCP is not None,
+    )
+    attn_tp_size = derived_widths["attn_tp_size"]
 
     # 构建注意力上下文并行（Attention CP）组。
     # 若 CP 规模等于外层 TP，则整组共享，直接复用 _TP，避免新建冗余组。
@@ -2359,6 +2870,19 @@ def initialize_model_parallel(
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attn_cp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+
+    if duplicate_attn_cp_group and is_hip():
+        _init_attn_cp_overlap_group(
+            world_size=world_size,
+            attn_cp_size=attn_cp_size,
+            attn_tp_size=attn_tp_size,
+            backend=backend,
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
     from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
@@ -2393,19 +2917,20 @@ def initialize_model_parallel(
             get_world_group().local_rank,
             backend,
             use_pynccl=SYNC_TOKEN_IDS_ACROSS_TP or enable_symm_mem,
-            use_mscclpp_allreduce=False,
             use_custom_allreduce=False,
             use_torch_symm_mem_allreduce=False,
             use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
             group_name="attention_tp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
     # MoE 侧的三个并行度：DP（按 token 切）、EP（按专家切）、TP（切单个专家的张量维）。
     # 三者相乘应等于外层 TP 规模，故 moe_tp_size 由整除推出。
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
-    moe_tp_size = tensor_model_parallel_size // moe_ep_size // moe_dp_size
+    moe_tp_size = derived_widths["moe_tp_size"]
 
     # 构建 MoE 数据并行（MoE DP）组。
     global _MOE_DP
@@ -2436,13 +2961,16 @@ def initialize_model_parallel(
             backend,
             group_name="moe_dp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
     # 构建 MoE 专家并行（MoE EP）组。
     # 若 moe_ep_size 等于外层 TP，则整组即一个 EP 组，直接复用 _TP。
     global _MOE_EP
     assert _MOE_EP is None, "expert model parallel group is already initialized"
-    if moe_ep_size == tensor_model_parallel_size:
+    # NPU requires a standalone group for MOE expert parallelism
+    if moe_ep_size == tensor_model_parallel_size and not _is_npu:
         _MOE_EP = _TP
     else:
         # 在每个 TP 组内，固定 (moe_dp_idx, moe_tp_idx)，以 moe_tp_size 为步长跨
@@ -2468,6 +2996,8 @@ def initialize_model_parallel(
             use_custom_allreduce=False,
             group_name="moe_ep",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
     # 构建 MoE 张量并行（MoE TP）组：用于切分单个专家的张量维。
@@ -2500,6 +3030,8 @@ def initialize_model_parallel(
             use_custom_allreduce=False,
             group_name="moe_tp",
             recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
     # 构建流水线并行（PP）组：以 num_pipeline_model_parallel_groups 为步长跨越整个
@@ -2522,7 +3054,23 @@ def initialize_model_parallel(
         use_custom_allreduce=False,
         group_name="pp",
         recovered_rank=recovered_rank,
+        rank_offset=rank_offset,
+        max_world_size=max_world_size,
     )
+
+    # The one-layer draft uses a singleton PP group; every rank creates all groups
+    # because new_group is collective.
+    global _SELF_PP
+    if _SELF_PP is None:
+        _SELF_PP = init_model_parallel_group(
+            [[r] for r in range(world_size)],
+            get_world_group().local_rank,
+            backend,
+            use_custom_allreduce=False,
+            group_name="self_pp",
+        )
+
+    get_parallel().stamp_derived_widths(**derived_widths)
 
 
 def create_custom_parallel_group(
@@ -2587,6 +3135,7 @@ def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     expert_model_parallel_size: int,
     pipeline_model_parallel_size: int,
+    decode_context_parallel_size: int = 1,
     backend: Optional[str] = None,
 ) -> None:
     """确保模型并行组已按期望规模初始化。
@@ -2600,10 +3149,11 @@ def ensure_model_parallel_initialized(
     backend = backend or torch.distributed.get_backend(get_world_group().device_group)
     if not model_parallel_is_initialized():
         initialize_model_parallel(
-            tensor_model_parallel_size,
-            expert_model_parallel_size,
-            pipeline_model_parallel_size,
-            backend,
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            expert_model_parallel_size=expert_model_parallel_size,
+            pipeline_model_parallel_size=pipeline_model_parallel_size,
+            decode_context_parallel_size=decode_context_parallel_size,
+            backend=backend,
         )
         return
 
@@ -2618,6 +3168,11 @@ def ensure_model_parallel_initialized(
         f"{pp_world_size=} vs. "
         f"{pipeline_model_parallel_size=}"
     )
+    if decode_context_parallel_size > 1:
+        dcp_world_size = get_dcp_group().world_size
+        assert (
+            dcp_world_size == decode_context_parallel_size
+        ), f"decode context parallel group already initialized, but of unexpected size: {dcp_world_size=} {decode_context_parallel_size=}"
 
 
 def model_parallel_is_initialized():
@@ -2626,18 +3181,44 @@ def model_parallel_is_initialized():
 
 
 _TP_STATE_PATCHED = False
+_PP_STATE_PATCHED = False
+
+
+@contextmanager
+def patch_pipeline_parallel_group(pp_group: GroupCoordinator):
+    """Patch the pp group temporarily until this function ends.
+
+    This method is for draft workers of speculative decoding, whose model does not
+    span pipeline stages and must not read the target's pp topology.
+    """
+    global _PP_STATE_PATCHED
+    assert not _PP_STATE_PATCHED, "Should not call when it's already patched"
+
+    _PP_STATE_PATCHED = True
+    old_pp_group = get_pp_group()
+    global _PP
+    _PP = pp_group
+    try:
+        yield
+    finally:
+        _PP_STATE_PATCHED = False
+        _PP = old_pp_group
 
 
 @contextmanager
 def patch_tensor_parallel_group(tp_group: GroupCoordinator):
-    """临时替换（patch）当前 TP 组，直到本上下文管理器退出时恢复。
+    """Run under a different tensor-parallel group until this scope ends.
 
-    用于推投解码（speculative decoding）的 draft worker：让 draft 模型以与
-    target 模型不同的 TP 度运行。
+    This is for draft workers of speculative decoding, which run the draft model
+    at the target's attention-TP width rather than its global TP width.
+
+    The scope replaces both the module global that ``get_tp_group()`` reads and
+    the three members the runtime context answers with.
 
     参数：
         tp_group (GroupCoordinator): 用于临时生效的 TP 组协调器。
     """
+
     global _TP_STATE_PATCHED
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
 
@@ -2646,9 +3227,13 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
     global _TP
     _TP = tp_group
     try:
-        yield
+        with get_parallel().override(
+            tp_size=tp_group.world_size,
+            tp_rank=tp_group.rank_in_group,
+            tp_group=tp_group,
+        ):
+            yield
     finally:
-        # 恢复为原来的状态。
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
 
@@ -2666,6 +3251,14 @@ def get_world_rank():
 def get_tensor_model_parallel_world_size():
     """返回张量并行组（TP）的进程数。"""
     return get_tp_group().world_size
+
+
+def get_dcp_world_size():
+    return get_dcp_group().world_size
+
+
+def get_dcp_rank():
+    return get_dcp_group().rank_in_group
 
 
 def get_tensor_model_parallel_rank():
@@ -2739,11 +3332,13 @@ def get_moe_tensor_parallel_rank():
 
 
 def destroy_model_parallel():
-    """销毁所有模型并行组并清空全局引用。
+    """Set the groups to none and destroy them."""
+    get_parallel().clear_derived_widths()
+    dwdp_mgr = get_global_dwdp_manager()
+    if dwdp_mgr is not None:
+        dwdp_mgr.cleanup()
+        set_global_dwdp_manager(None)
 
-    输入输出示例：初始化 TP/PP/EP 后调用本函数，随后 ``model_parallel_is_initialized()``
-    返回 ``False``；函数无返回值。共享/别名进程组会避免重复销毁。
-    """
     global _TP
     if _TP:
         _TP.destroy()
@@ -2753,6 +3348,11 @@ def destroy_model_parallel():
     if _PP:
         _PP.destroy()
     _PP = None
+
+    global _DCP
+    if _DCP:
+        _DCP.destroy()
+    _DCP = None
 
     global _MOE_EP
     if _MOE_EP:
@@ -2765,12 +3365,16 @@ def destroy_model_parallel():
     _MOE_TP = None
 
     global _ATTN_CP
+    global _ATTN_CP_OVERLAP
     global _MOE_DP
     # 先销毁 _MOE_DP 再销毁 _ATTN_CP，因为 _MOE_DP 可能是 _ATTN_CP 的别名（同一对象）。
     # 只有当 _MOE_DP 不是其他组的别名时，才真正销毁它，避免重复销毁。
     if _MOE_DP and _MOE_DP is not _ATTN_CP and _MOE_DP is not _TP:
         _MOE_DP.destroy()
     _MOE_DP = None
+    if _ATTN_CP_OVERLAP:
+        _ATTN_CP_OVERLAP.destroy()
+    _ATTN_CP_OVERLAP = None
     if _ATTN_CP:
         _ATTN_CP.destroy()
     _ATTN_CP = None
@@ -2852,8 +3456,10 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
     rank = torch.distributed.get_rank(group=pg)
     world_size = torch.distributed.get_world_size(group=pg)
 
-    # 每个进程各自保存结果的本地张量。
-    is_in_the_same_node = torch.tensor([0] * world_size, dtype=torch.int32)
+    # local tensor in each process to store the result
+    is_in_the_same_node = torch.tensor(
+        [0] * world_size, dtype=torch.int32, device="cpu"
+    )
 
     # 组内各进程的全局 rank。
     ranks = torch.distributed.get_process_group_ranks(pg)
@@ -2864,8 +3470,10 @@ def in_the_same_node_as(pg: ProcessGroup, source_rank: int = 0) -> List[bool]:
     try:
         with contextlib.suppress(OSError):
             if rank == source_rank:
-                # 创建一块共享内存段。
-                shm = shared_memory.SharedMemory(create=True, size=128)
+                # create a shared memory segment
+                shm = shared_memory.SharedMemory(
+                    create=True, size=128, name=make_shm_name("nodecheck")
+                )
                 shm.buf[: len(magic_message)] = magic_message
                 torch.distributed.broadcast_object_list(
                     [shm.name], src=ranks[source_rank], group=pg

@@ -35,7 +35,6 @@ limitations under the License.
                   对外接口（继承自 BasePrefixCache，签名与调度器约定一致）。
 """
 
-import hashlib
 import heapq
 import logging
 import sys
@@ -60,8 +59,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.events import KVCacheEventMixin
-from sglang.srt.mem_cache.utils import get_eviction_strategy, split_node_hash_value
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.utils import (
+    get_eviction_strategy,
+    get_hash_str,
+    split_node_hash_value,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -70,25 +73,7 @@ if TYPE_CHECKING:
 class RadixKey:
     """前缀缓存的键，封装一段 token 序列及其命名空间信息。
 
-    什么是 bigram（相邻二元组）：
-        “bigram” 即“二元组”，指把序列中**相邻的两个 token**绑成一个逻辑单元。
-        对序列 [t0, t1, t2, t3] 取 bigram 视图，得到的逻辑单元序列为：
-            (t0, t1), (t1, t2), (t2, t3)
-        注意相邻二元组之间**共享一个边界 token**（如 t1 同时属于第 1、2 个二元组），
-        因此 N 个 token 恰好产生 N-1 个 bigram。这与普通模式（每个 token 自成
-        一个逻辑单元，N 个 token 即 N 个单元）不同。
-        举例：token 序列 ["我", "爱", "北京"] 的 bigram 单元是
-            ("我","爱"), ("爱","北京") —— 3 个 token、2 个二元组。
-
-    is_bigram=True 时：token_ids 仍保存原始 token（N 个 bigram 需要 N+1 个 token）；
-    对其切片时，相邻切片会共享一个边界 token（因为二元组天然重叠）。
-
-    bigram 视图主要服务 EAGLE 投机解码：把序列看作
-    (t0,t1), (t1,t2), ... 这样相邻成对的逻辑单元来做前缀匹配。
-    """
-
-    # 使用 __slots__ 固定属性集合，省去每个实例的 __dict__，降低海量节点下的内存开销。
-    __slots__ = ("token_ids", "extra_key", "is_bigram", "limit")
+    __slots__ = ("token_ids", "extra_key", "cache_salt", "is_bigram", "limit")
 
     def __init__(
         self,
@@ -96,12 +81,18 @@ class RadixKey:
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
         limit: Optional[int] = None,
+        cache_salt: Optional[str] = None,
     ):
         # token id 序列（两种模式下都存原始 int）
         self.token_ids = token_ids
-        # 额外的命名空间键（例如 lora_id、cache_salt）：extra_key 不同的键互不共享前缀
+        # Extra key for caller-defined cache classification.
         self.extra_key = extra_key
-        # 是否启用 bigram 视图；启用后逻辑长度 = max(0, len(token_ids) - 1)
+        # Cache salt is kept distinct so it cannot collide with extra_key.
+        # It namespaces the in-process radix tree and external KV events;
+        # external L3/remote storage keys remain token-only and are outside
+        # this contract.
+        self.cache_salt = cache_salt or None
+        # bigram view over token_ids: length = max(0, len(token_ids) - 1)
         self.is_bigram = is_bigram
         # 对原始 token 数的可选上限：效果等同于 token_ids[:limit]，但不做 O(n) 拷贝。
         # None 表示使用全部 token。
@@ -157,13 +148,22 @@ class RadixKey:
             # bigram 区间 [start, stop) 覆盖原始 token 区间 [start, stop + 1)（多取一个边界 token）；
             # 空切片应得到空的原始 token（而不是残留一个悬空的边界 token）。
             raw = self.token_ids[start : stop + 1] if stop > start else array("q")
-            return RadixKey(raw, self.extra_key, is_bigram=True)
-        return RadixKey(self.token_ids[start:stop], self.extra_key)
+            return RadixKey(
+                raw,
+                self.extra_key,
+                is_bigram=True,
+                cache_salt=self.cache_salt,
+            )
+        return RadixKey(
+            self.token_ids[start:stop],
+            self.extra_key,
+            cache_salt=self.cache_salt,
+        )
 
     def __repr__(self) -> str:
         # 仅预览前 10 个 token，序列过长时以省略号收尾，避免日志被刷屏。
         preview = self.token_ids[:10]
-        return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''}, is_bigram={self.is_bigram})"
+        return f"RadixKey(extra_key={self.extra_key!r}, cache_salt={self.cache_salt!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''}, is_bigram={self.is_bigram})"
 
     def page_aligned(self, page_size: int) -> RadixKey:
         # 把键截断到 page_size 的整数倍长度。page 是命中/插入/淘汰的最小单位，
@@ -192,6 +192,11 @@ class RadixKey:
             raise ValueError(
                 f"RadixKey operations require matching extra_key, but got "
                 f"{self.extra_key=} != {other.extra_key=}"
+            )
+        if self.cache_salt != other.cache_salt:
+            raise ValueError(
+                f"RadixKey operations require matching cache_salt, but got "
+                f"{self.cache_salt=} != {other.cache_salt=}"
             )
 
     def match(self, other: RadixKey, page_size: int = 1) -> int:
@@ -245,29 +250,15 @@ class RadixKey:
                 plain = tuple((t[j], t[j + 1]) for j in range(page_size))
         else:
             plain = t[0] if page_size == 1 else tuple(t[:page_size])
-        # extra_key 为 None 时直接用 token；否则把它并入键以隔离命名空间。
+        if self.cache_salt is not None:
+            return ((self.extra_key, self.cache_salt), plain)
         return plain if self.extra_key is None else (self.extra_key, plain)
 
     def hash_page(self, start: int, end: int, prior_hash: Optional[str] = None) -> str:
-        """对逻辑单元区间 [start, end) 计算 SHA256；bigram 模式会喂入重叠的 (t_i, t_{i+1}) 字节对。
-
-        prior_hash 用于把前一页的哈希作为种子串联进来，从而让每页哈希隐含其全部前缀，
-        这是 HiCache 等按页定位/去重所需的“前缀链式哈希”。
-        """
-        hasher = hashlib.sha256()
-        if prior_hash:
-            # 把前一页哈希作为前缀种子，使本页哈希隐含全部历史前缀。
-            hasher.update(bytes.fromhex(prior_hash))
-        t = self.token_ids
-        # 每个 token 以 4 字节小端、无符号方式编码后喂入哈希器。
-        if self.is_bigram:
-            for j in range(start, end):
-                hasher.update(t[j].to_bytes(4, byteorder="little", signed=False))
-                hasher.update(t[j + 1].to_bytes(4, byteorder="little", signed=False))
-        else:
-            for j in range(start, end):
-                hasher.update(t[j].to_bytes(4, byteorder="little", signed=False))
-        return hasher.hexdigest()
+        """SHA256 for logical units [start, end); bigram mode feeds overlapping (t_i, t_{i+1}) byte pairs."""
+        hash_value = get_hash_str(self[start:end], prior_hash)
+        assert isinstance(hash_value, str)
+        return hash_value
 
 
 class TreeNode:
@@ -295,7 +286,9 @@ class TreeNode:
         self.write_through_pending_id: Optional[int] = None  # 正在进行的 write-through（写穿透到 host）的标识
         # 本节点各页的哈希值列表（按页计算，惰性填充）
         self.hash_value: Optional[List[str]] = None
-        # 优先级，供“优先级感知”的淘汰策略使用
+        # Namespace-aware hashes used only for external KV events.
+        self.event_hash_value: Optional[List[str]] = None
+        # priority for priority-aware eviction
         self.priority = priority
 
         self.id = TreeNode.counter if id is None else id
@@ -341,25 +334,19 @@ class TreeNode:
         return self.last_access_time < other.last_access_time
 
 
-class RadixCache(KVCacheEventMixin, BasePrefixCache):
-    """基于 radix 树的前缀缓存实现。
-
-    多继承自 KVCacheEventMixin（提供 KV 缓存事件上报能力）与 BasePrefixCache
-    （定义统一的对外接口）。所有外部交互都通过 BasePrefixCache 约定的方法进行。
-    """
-
+class RadixCache(BasePrefixCache):
     def __init__(self, params: CacheInitParams):
-        # 各项配置均来自 CacheInitParams，统一打包传入以保持构造签名稳定。
-        self.disable = params.disable  # 是否禁用前缀复用
-        self.req_to_token_pool = params.req_to_token_pool  # 请求 -> token 槽位映射池
-        self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator  # KV 槽位分配器
-        self.page_size = params.page_size  # 分页粒度
-        self.enable_kv_cache_events = params.enable_kv_cache_events  # 是否上报 KV 缓存事件
-        self.is_eagle = params.is_eagle  # 是否为 EAGLE 投机解码（决定是否启用 bigram 视图）
-        self.disable_finished_insert = params.disable_finished_insert  # 确定性模式下禁止已完成请求插入树
-        self.eviction_policy = params.eviction_policy.lower()  # 淘汰策略名称（如 lru / lfu）
+        self.disable = params.disable
+        self.req_to_token_pool = params.req_to_token_pool
+        self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
+        self.page_size = params.page_size
+        self.is_eagle = params.is_eagle
+        self.disable_finished_insert = params.disable_finished_insert
+        self.eviction_policy = params.eviction_policy.lower()
 
-        self.kv_event_queue = []  # 待上报的 KV 缓存事件队列
+        self.kv_events = KVCacheEventRecorder(
+            enabled=params.enable_kv_cache_events, page_size=self.page_size
+        )
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -422,7 +409,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             last_host_node=self.root_node,
             best_match_node=self.root_node,
         )
-        self._record_all_cleared_event()
+        self.kv_events.record_all_cleared()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """在 radix 树中查找 ``key`` 的最长已缓存前缀。
@@ -497,33 +484,39 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             # 调试/测试场景下的兜底：直接用 token id 本身充当 value。
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
-        prefix_len = self._insert_helper(self.root_node, key, value, priority, chunked)
-        return InsertResult(prefix_len=prefix_len)
+        prefix_len, last_node = self._insert_helper(
+            self.root_node, key, value, priority, chunked
+        )
+        return InsertResult(prefix_len=prefix_len, last_device_node=last_node)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
-        """请求结束时缓存其 KV，并释放占用、解锁所持节点。"""
-        # 确定性（deterministic）模式下，禁止把已完成请求插入 radix 缓存，
-        # 以保证可复现性。
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+    ):
+        """Cache request when it finishes."""
+        # In deterministic mode, disable finished request insertion to radix cache
         if self.disable_finished_insert:
             is_insert = False
 
-        kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
-            # 禁用前缀复用时不入树，直接把该请求占用的 KV 槽位全部归还分配器。
+            # The protected prefix is not this req's to free.
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, :kv_committed_len
+                req.kv.req_pool_idx, req.kv.cache_protected_len : kv_len_to_handle
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.token_to_kv_pool_allocator.free_segment(
+                kv_indices, start_pos=req.kv.cache_protected_len
+            )
             return
 
-        # 取已确认（committed）部分的完整 token 序列及其对应的 KV 槽位索引。
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        token_ids = (req.origin_input_ids + req.output_ids)[:kv_len_to_handle]
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.kv.req_pool_idx, : len(token_ids)
         ]
 
         radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
+            token_ids,
+            req.extra_key,
+            is_bigram=self.is_eagle,
+            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         key_len = len(radix_key)
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
@@ -534,18 +527,20 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
-            # 释放“本就已在树中”的那段重复 KV（命中前缀部分），只保留树里已有的那一份。
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : result.prefix_len]
-            )
+            freed_end = result.prefix_len
         else:
-            # 不入树时，释放从受保护长度到对齐长度之间的 KV。
-            self.token_to_kv_pool_allocator.free(
-                kv_indices[req.cache_protected_len : key_len]
-            )
+            freed_end = key_len
 
-        # 释放不足一页、未参与建树的对齐尾部。
-        self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
+        # duplicates / uninserted range, then the unaligned tail
+        self.token_to_kv_pool_allocator.free_segments(
+            [
+                (
+                    kv_indices[req.kv.cache_protected_len : freed_end],
+                    req.kv.cache_protected_len,
+                ),
+                (kv_indices[key_len:], key_len),
+            ]
+        )
 
         # 释放请求槽位，解开该请求对末端节点持有的缓存锁。
         if req.last_node is not None:
@@ -558,11 +553,14 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         token_ids = req.get_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, : len(token_ids)
+            req.kv.req_pool_idx, : len(token_ids)
         ]
 
         radix_key = RadixKey(
-            token_ids, req.extra_key, is_bigram=self.is_eagle
+            token_ids,
+            req.extra_key,
+            is_bigram=self.is_eagle,
+            cache_salt=req.cache_salt,
         ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 
@@ -577,9 +575,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         new_prefix_len = result.prefix_len
 
-        # 释放命中前缀部分的重复 KV（这部分树里已有）。
-        self.token_to_kv_pool_allocator.free(
-            kv_indices[req.cache_protected_len : new_prefix_len]
+        self.token_to_kv_pool_allocator.free_segment(
+            kv_indices[req.kv.cache_protected_len : new_prefix_len],
+            start_pos=req.kv.cache_protected_len,
         )
 
         # 插入可能分裂/更新了节点，重新匹配一次以拿到最新的索引与末端节点并复用。
@@ -594,15 +592,15 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # 把树中（可能已去重/复用）的最新索引写回该请求的 token 映射，覆盖受保护长度之后的部分。
         self.req_to_token_pool.write(
-            (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
-            new_indices[req.cache_protected_len :],
+            (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
+            new_indices[req.kv.cache_protected_len :],
         )
 
-        # cache_protected_len 不总等于 len(req.prefix_indices)：当 page_size > 1 时，
-        # 末尾不足一页的部分会被加入 req.prefix_indices，但这段 KV 索引并未加入树。
-        # 这部分需要在下一次 cache_unfinished_req 以及最终的 cache_finished_req 中被释放，
-        # 否则会内存泄漏。因此引入 cache_protected_len 字段来确保这段“零头”能被正确释放。
-        req.cache_protected_len = len(new_indices)
+        # The cache_protected_len is not always equal to len(req.prefix_indices)
+        # since for page_size > 1, the partial part is added to req.prefix_indices, but that part of kv indices is not added to the tree.
+        # It should be freed in the next cache_unfinished_req and final cache_finished_req to avoid memory leak.
+        # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
+        req.kv.cache_protected_len = len(new_indices)
 
         # 锁的转移：先解开旧末端节点，再锁住新末端节点，确保正在使用的前缀不被淘汰。
         self.dec_lock_ref(req.last_node)
@@ -646,8 +644,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
-            # 归还该叶子占用的 KV 槽位，并把它从树中摘除。
-            self.token_to_kv_pool_allocator.free(x.value)
+            # Tree values are page-aligned copies of a kv row: page-exact segment.
+            self.token_to_kv_pool_allocator.free_segment(x.value, start_pos=0)
             num_evicted += len(x.value)
             self._delete_leaf(x)
 
@@ -656,7 +654,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
-            self._record_remove_event(x)
+            self.kv_events.record_remove(x)
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
@@ -698,7 +696,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             if node.parent is None:
                 assert (
                     node is self.root_node
-                ), f"This request holds the node from another tree"
+                ), "This request holds the node from another tree"
             node = node.parent
         return DecLockRefResult(delta=delta)
 
@@ -773,6 +771,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
+        new_node.event_hash_value, child.event_hash_value = split_node_hash_value(
+            child.event_hash_value, split_len, self.page_size
+        )
 
         return new_node
 
@@ -799,7 +800,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # 沿路径更新优先级（取 max，使更高优先级向上传播）。
         node.priority = max(node.priority, priority)
         if len(key) == 0:
-            return 0
+            return 0, node
 
         child_key = key.child_key(self.page_size)
 
@@ -836,9 +837,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self.evictable_size_ += len(key)  # 新增内容默认可淘汰，更新计数
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
-            # 哈希在事件上报时再惰性计算，此处先登记一次 store 事件。
-            self._record_store_event(new_node)
-        return total_prefix_length
+            # Hash will be computed lazily during event emission
+            self.kv_events.record_store(new_node)
+            node = new_node
+        return total_prefix_length, node
 
     def _print_helper(self, node: TreeNode, indent: int):
         """以人类可读的格式打印 radix 树（调试用）。"""

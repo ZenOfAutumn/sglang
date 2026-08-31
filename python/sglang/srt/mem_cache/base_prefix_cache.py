@@ -29,6 +29,7 @@ from typing import (
     NamedTuple,
     Optional,
     Protocol,
+    Sequence,
     Tuple,
     runtime_checkable,
 )
@@ -36,20 +37,25 @@ from typing import (
 import torch
 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_RADIX_CACHE,
     RadixCacheMetricsCollector,
     resolve_collector_class,
 )
+from sglang.srt.runtime_context import get_observability
 
 # 这些导入只在静态类型检查（TYPE_CHECKING）时生效，运行时不会真正 import，
 # 用于避免循环依赖（schedule_batch / radix_cache 反过来又会引用本模块）。
 if TYPE_CHECKING:
+    from sglang.srt.managers.cache_controller import HiCacheController
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.radix_cache import RadixKey
-    from sglang.srt.mem_cache.unified_cache_components.tree_component import (
-        ComponentType,
+    from sglang.srt.mem_cache.unified_cache.cache_action import (
+        CacheAction,
+        ComponentAction,
     )
 
 
@@ -85,23 +91,46 @@ class InsertParams:
     # 仅 Mamba 缓存使用的字段：
     mamba_value: Optional[torch.Tensor] = None  # Mamba 状态对应的槽位
 
-    # 仅 SWA（Sliding Window Attention，滑动窗口注意力）缓存使用的字段：
-    prev_prefix_len: int = 0  # 本次插入前已命中的前缀长度
-    swa_evicted_seqlen: int = 0  # 因滑动窗口而已被淘汰的序列长度
+    # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
+    c128_value: Optional[torch.Tensor] = None
 
-    # 通用字段：
-    chunked: bool = False  # 是否为分块（chunked prefill）场景下的插入
-    priority: int = 0  # 插入优先级，影响后续淘汰顺序
+    # SWA specific
+    prev_prefix_len: int = 0
+    swa_evicted_seqlen: int = 0
+
+    # General
+    chunked: bool = False
+    priority: int = 0
+    track_adopted_ranges: bool = False
 
 
 @dataclasses.dataclass
 class InsertResult:
     """insert（插入）操作的返回结果。"""
 
-    prefix_len: int  # 本次插入命中的已有前缀长度
-    total_len: int = 0  # 插入后该键对应的总长度
-    mamba_exist: bool = False  # 对应的 Mamba 状态此前是否已存在
-    inserted_host_node: Any = None  # 在 host（CPU）侧新插入的树节点（HiCache 场景）
+    prefix_len: int
+    total_len: int = 0
+    last_device_node: Any = None
+    mamba_exist: bool = False
+    inserted_host_node: Any = None
+    host_insert_dropped: bool = False
+    adopted_ranges: Optional[dict[ComponentType, list[tuple[int, int]]]] = None
+    # Controller-applied actions from the non-stepped channels (e.g. insert_host); the stepped insert emits via InsertStepResult.actions.
+    cache_actions: list[CacheAction | ComponentAction] = dataclasses.field(
+        default_factory=list
+    )
+
+    def record_adopted_range(
+        self, component_type: ComponentType, start: int, end: int
+    ) -> None:
+        if self.adopted_ranges is None or start >= end:
+            return
+        ranges = self.adopted_ranges.setdefault(component_type, [])
+        if ranges and start <= ranges[-1][1]:
+            prev_start, prev_end = ranges[-1]
+            ranges[-1] = (min(prev_start, start), max(prev_end, end))
+        else:
+            ranges.append((start, end))
 
 
 @dataclasses.dataclass
@@ -191,29 +220,30 @@ class InitLoadBackParams:
 class MatchResult(NamedTuple):
     """前缀匹配（match_prefix）操作的返回结果。
 
-    一次前缀匹配会沿着 radix（基数）树查找与请求 token 序列最长的公共前缀，
-    并把命中部分按所处存储层级（device 显存 / host CPU）拆分汇报，供调度器
-    决定哪些 KV 可直接复用、哪些需要从 host 回载（load-back）到 device。
-
-    属性:
-        device_indices  :   命中公共前缀的那部分 KV 缓存在 device（显存）上的槽位索引。
-        last_device_node:   在 device 上匹配到的最后一个 TreeNode（树节点）。
-        last_host_node  :   在 host（CPU）上匹配到的最后一个 TreeNode。
-                            注意：若未启用 HiCache，该值**必须**等于 `last_device_node`。
-                            它保留用于 L3 存储预取（prefetch）的锚点；
-                            L2 的回载（load_back）则改用 `best_match_node`。
-        best_match_node :   match_prefix 过程中被所有组件校验器（component validators）
-                            接受的最深节点。它是每一次 L2（host->device）回载遍历
-                            （FULL / SWA / ...）的锚点。对于不做多组件校验的旧式缓存，
-                            把它设为与 `last_host_node` 相同即可。
-        host_hit_length :   命中于 host（CPU）、需要回载到 device 的 Full-KV token 数量。
-                            这是纯 KV 缓存（Pure-KV）的语义。
-        swa_host_hit_length  :   命中于 host（在滑动窗口范围内）、将被回载进 SWA device 池
-                            的 SWA token 数量。
-        mamba_host_hit_length:   命中于 host、将被回载进 Mamba device 池的 Mamba 槽位数量，
-                            通常为 0 或 1。
-        mamba_branching_seqlen: Mamba radix 缓存的分叉点（branching point），即在存在某个
-                            Mamba 状态的前提下，本可命中的最长 page 对齐位置。
+    Attributes:
+        device_indices  :   Indices of the KV cache on the device matched by common prefix.
+        last_device_node:   The last TreeNode on the device that was matched.
+        last_host_node  :   The last TreeNode on the host that was matched.
+                            Note that if HiCache is not enabled,
+                            this **must** be the same as `last_device_node`.
+                            Reserved for L3 storage prefetch anchoring; L2 load_back
+                            uses `best_match_node` instead.
+        best_match_node :   Deepest node accepted by all component validators
+                            during match_prefix. Anchor for every L2 host->device
+                            load_back walk (FULL / SWA / ...). For legacy caches
+                            that don't run multi-component validation, set this
+                            equal to `last_host_node`.
+        host_hit_length :   Number of Full-KV tokens that hit on host (CPU) and need to be
+                            loaded back to device. Pure-KV cache semantics;
+        swa_host_hit_length  :   Number of SWA tokens that hit on host (within the sliding
+                            window) and will be load-back into the SWA device pool.
+        mamba_host_hit_length:   Number of Mamba slots that hit on host and will be load-back
+                            into the Mamba device pool. Typically 0 or 1.
+        mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
+                                page-aligned position that could've been cache hit if there
+                                exists a mamba state.
+        full_kv_hit_length: Longest Full-KV prefix available on either device or
+                            host, independent of other components.
     """
 
     device_indices: torch.Tensor
@@ -224,21 +254,20 @@ class MatchResult(NamedTuple):
     swa_host_hit_length: int = 0
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
-    cache_protected_len: Optional[int] = None  # 被保护（不可淘汰）的命中前缀长度
+    cache_protected_len: Optional[int] = None
+    full_kv_hit_length: int = 0
+    # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
+    cache_actions: Sequence[CacheAction | ComponentAction] = ()
 
 
-def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
-    """把一个 MatchResult “清零”为“未命中”形态。
-
-    某些场景下（例如校验后判定本次匹配整体不可用）需要把已构造的匹配结果
-    回退成“一无所获”：命中长度全部归零，并把各锚点节点重置回树的根节点。
-    本函数在保留原张量 dtype/device 的前提下完成这一回退。
-    """
+def zero_match_result(
+    tree_cache, match_result: MatchResult, extra_key: Optional[str] = None
+) -> MatchResult:
     if tree_cache.is_chunk_cache():
         # Chunk（分块）缓存的 match_prefix 本就直接返回未命中，没有可回溯的 root_node，
         # 因此原样返回即可。
         return match_result
-    root = tree_cache.root_node
+    root = tree_cache.root_node_handle(extra_key=extra_key)
     return match_result._replace(
         # [:0] 取空切片：保留原张量的 dtype 与 device（例如 CUDA int64），
         # 又不必新分配一个空张量。
@@ -249,6 +278,7 @@ def zero_match_result(tree_cache, match_result: MatchResult) -> MatchResult:
         host_hit_length=0,
         swa_host_hit_length=0,
         mamba_host_hit_length=0,
+        full_kv_hit_length=0,
     )
 
 
@@ -269,22 +299,15 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     metrics_collector: Optional[RadixCacheMetricsCollector] = (
         None  # 该缓存的指标采集器（observability metrics），默认未初始化
     )
+    cache_controller: Optional[HiCacheController] = None
+    # Set by caches that publish KV placement events; None means they don't.
+    kv_events: Optional[KVCacheEventRecorder] = None
 
     def init_metrics_collector(self):
-        """初始化指标采集器。
-
-        从全局 server_args 读取配置，给指标打上 ``cache_type``（具体缓存类名）等标签，
-        再按角色解析出对应的采集器类并实例化。子类在构造时按需调用本方法即可接入监控。
-        """
-        from sglang.srt.server_args import get_global_server_args
-
-        server_args = get_global_server_args()
         labels = {"cache_type": self.__class__.__name__}
-        # 允许通过 server_args 注入额外的指标标签（例如多实例区分）。
-        if server_args.extra_metric_labels:
-            labels.update(server_args.extra_metric_labels)
+        if get_observability().extra_metric_labels:
+            labels.update(get_observability().extra_metric_labels)
         radix_cache_cls = resolve_collector_class(
-            server_args,
             STAT_LOGGER_ROLE_RADIX_CACHE,
             RadixCacheMetricsCollector,
         )
@@ -303,6 +326,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             )
             self.metrics_collector.increment_eviction_num_tokens(num_evicted)
 
+    def release_host_resources(self) -> None:
+        """Release pinned host buffers in userspace on graceful shutdown.
+
+        Kernel-side unpinning during process reclaim can stall teardown for
+        tens of seconds (see HostKVCache.destroy). Idempotent.
+        """
+
     @abstractmethod
     def reset(self):
         """重置缓存到初始空状态（清空所有缓存的前缀）。子类必须实现。"""
@@ -320,6 +350,37 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         return False
 
+    def resolve_node_handle(self, node_handle: Any) -> Any:
+        """Map a node handle to its node -- e.g. UnifiedRadixCache looks up the
+        node object from its NodeId. Temporary API for the Unified Radix Cache
+        split migration.
+
+        TODO(Jialin): Remove after the Unified Radix Cache split.
+        """
+        return node_handle
+
+    def root_node_handle(self, extra_key: Optional[str] = None) -> Any:
+        """The root handle as match results carry it -- the raw node by default,
+        the root's NodeId for UnifiedRadixCache. extra_key scopes the root for
+        implementations that shard trees per cache namespace."""
+        return self.root_node
+
+    def is_backuped(self, node: Any) -> bool:
+        """Whether the node's Full KV is present on host."""
+        return node.backuped
+
+    def is_root(self, node: Any) -> bool:
+        """Whether the node is a tree root."""
+        return node is self.root_node
+
+    def get_last_hash_value(self, node: Any) -> Optional[str]:
+        """The node's last page hash, or None when it was never hashed."""
+        return node.get_last_hash_value()
+
+    def get_prefix_hash_values(self, node: Any) -> list[str]:
+        """The hash chain of the node's ancestors, in root-to-parent order."""
+        return node.get_prefix_hash_values(node.parent)
+
     @abstractmethod
     def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs):
         """请求结束时，把其 KV 缓存写入缓存结构（默认插入）。子类必须实现。"""
@@ -334,6 +395,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def evict(self, params: EvictParams) -> EvictResult:
         """按需淘汰缓存以腾出空间，返回实际淘汰量。子类必须实现。"""
         pass
+
+    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
+        """Evict cache entries to cover allocator shortfalls.
+
+        The default implementation preserves the component-count semantics of
+        :meth:`evict`. Multi-component caches backed by shared memory can
+        override this entry point to stop once collateral frees make the
+        requested allocation feasible.
+        """
+        return self.evict(params)
 
     @abstractmethod
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
@@ -400,14 +471,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         raise NotImplementedError()
 
-    def flush_write_through_acks(self) -> None:
-        """释放那些 write-through（写穿透）已完成的 radix 树节点上的 lock_ref。
-
-        这是一个轻量操作，只处理已完成的写回确认（ack）。
-        对于不支持分级写穿透的缓存，本方法为空操作（no-op）。
-        """
-        pass
-
     def check_hicache_events(self) -> Any:
         """检查 HiCache 相关活动，必要时更新 radix 树并在各 TP（张量并行）worker 间同步。
 
@@ -416,13 +479,25 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         raise NotImplementedError()
 
     def take_events(self):
-        """取出并清空累积的缓存事件，默认无事件返回空列表。"""
-        return []
+        return [] if self.kv_events is None else self.kv_events.take()
 
     # ---- 能力声明：默认均为“不支持”，具备相应能力的子类覆写为 True ----
     def supports_swa(self) -> bool:
         """是否支持 SWA（滑动窗口注意力）缓存。"""
         return False
+
+    def swa_retain_floor(self, req) -> int | None:
+        # A match lands on a state checkpoint rather than on the tail, so a cache
+        # that pairs SWA with mamba/conv checkpoints has to keep the window behind
+        # the last checkpoint. Those caches override this. Everyone else has
+        # nothing deeper than the tail to protect.
+        return None
+
+    def swa_reprefill_tail_tokens(self) -> int:
+        # Only the unified_kv compress-only HiCache layout needs to hold back a
+        # trailing sliding window for re-prefill; every other cache keeps SWA
+        # content-stable and overrides this where relevant.
+        return 0
 
     def supports_mamba(self) -> bool:
         """是否支持 Mamba 状态缓存。"""
@@ -436,8 +511,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """释放指定流式会话占用的资源，默认无操作。"""
         pass
 
-    # ---- 会话持有量查询：默认返回 0，支持流式会话的子类按需覆写 ----
-    # active_pool_idxs 可用于把统计限定在指定的活跃池索引集合内。
+    def release_radix_session(self, session_id: str) -> None:
+        pass
+
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         """会话当前持有的 token 总量。"""
         return 0

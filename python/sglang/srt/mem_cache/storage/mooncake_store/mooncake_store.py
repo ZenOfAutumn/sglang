@@ -21,16 +21,14 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import (
-    HostKVCache,
-    HostTensorAllocator,
-    MLATokenToKVPoolHost,
-)
+from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
+from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 # Mooncake 零拷贝接口不需要本地缓冲区，但 setup 仍要求传入一个默认大小占位。
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
-SETUP_TIMEOUT = 600  # 等待 mooncake store server 启动的超时时间（10 分钟）
+SETUP_TIMEOUT = 600  # 10min
+DEFAULT_TENANT_ID = "default"
 
 logger = logging.getLogger(__name__)
 
@@ -96,25 +94,28 @@ def _parse_global_segment_size(value) -> int:
     return int(value)
 
 
+def _normalize_tenant_id(value) -> str:
+    if value is None:
+        return DEFAULT_TENANT_ID
+    tenant_id = str(value).strip()
+    return tenant_id if tenant_id else DEFAULT_TENANT_ID
+
+
 @dataclass
 class MooncakeStoreConfig:
-    """MooncakeStore 的连接与部署配置。
-
-    支持三种加载来源（优先级：extra_config > 配置文件 > 环境变量），三者字段一致。
-    """
-
-    local_hostname: str  # 本地主机名（transfer engine 会话标识用）
-    metadata_server: str  # 元数据服务地址（如 "P2PHANDSHAKE"）
-    global_segment_size: int  # 全局段大小（字节），会按 tp_size 均摊到每个 rank
-    protocol: str  # 传输协议，如 "rdma" / "tcp"
-    device_name: str  # RDMA 设备名；也可传 JSON 按 tp_rank 映射不同网卡
-    master_server_address: str  # master 服务地址
-    master_metrics_port: int  # master 指标端口（check_server 时轮询）
-    check_server: bool  # 启动时是否等待并检查 server 就绪
-    standalone_storage: bool  # 是否为独立存储（dummy client）模式
-    client_server_address: str  # standalone 模式下真实 client 的地址
-    enable_ssd_offload: bool = False  # 是否启用 SSD 卸载
-    ssd_offload_path: Optional[str] = None  # SSD 卸载路径
+    local_hostname: str
+    metadata_server: str
+    global_segment_size: int
+    protocol: str
+    device_name: str
+    master_server_address: str
+    master_metrics_port: int
+    check_server: bool
+    standalone_storage: bool
+    client_server_address: str
+    enable_ssd_offload: bool = False
+    ssd_offload_path: Optional[str] = None
+    tenant_id: str = DEFAULT_TENANT_ID
 
     @staticmethod
     def from_file() -> "MooncakeStoreConfig":
@@ -172,6 +173,9 @@ class MooncakeStoreConfig:
             ssd_offload_path=config.get(
                 "ssd_offload_path", envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.default
             ),
+            tenant_id=_normalize_tenant_id(
+                config.get("tenant_id", envs.MOONCAKE_TENANT_ID.default)
+            ),
         )
 
     @staticmethod
@@ -212,6 +216,7 @@ class MooncakeStoreConfig:
             client_server_address=envs.MOONCAKE_CLIENT.get(),
             enable_ssd_offload=envs.MOONCAKE_ENABLE_SSD_OFFLOAD.get(),
             ssd_offload_path=envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.get(),
+            tenant_id=_normalize_tenant_id(envs.MOONCAKE_TENANT_ID.get()),
         )
 
     @staticmethod
@@ -261,6 +266,9 @@ class MooncakeStoreConfig:
             ssd_offload_path=extra_config.get(
                 "ssd_offload_path", envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.default
             ),
+            tenant_id=_normalize_tenant_id(
+                extra_config.get("tenant_id", envs.MOONCAKE_TENANT_ID.default)
+            ),
         )
 
 
@@ -283,6 +291,20 @@ class MooncakeBaseStore:
                 "https://kvcache-ai.github.io/Mooncake/getting_started/build.html "
                 "to run SGLang with MooncakeConnector."
             ) from e
+
+    def _import_mooncake_group_semantics(self):
+        try:
+            from mooncake.store import ReplicateConfig
+        except ImportError:
+            return None, False
+
+        supports_group_ids = hasattr(ReplicateConfig, "group_ids")
+        if not supports_group_ids:
+            try:
+                supports_group_ids = hasattr(ReplicateConfig(), "group_ids")
+            except Exception:
+                supports_group_ids = False
+        return ReplicateConfig, supports_group_ids
 
     def _load_config(self, storage_config: Any = None):
         """按优先级加载配置：extra_config > 配置文件 > 环境变量。"""
@@ -316,6 +338,9 @@ class MooncakeBaseStore:
             raise RuntimeError("Mooncake store is not initialized.")
         ptr = tensor.data_ptr()
         size = tensor.numel() * tensor.element_size()
+        if size == 0:
+            # conv-only models have a 0-element ssm state; nothing to register
+            return
         ret_code = self.store.register_buffer(ptr, size)
         if ret_code != 0:
             logger.error(f"Failed to register buffer, error code: {ret_code}")
@@ -384,6 +409,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     ):
         MooncakeBaseStore.__init__(self)
         MooncakeDistributedStore = self._import_mooncake_store()
+        self._replicate_config_cls, self._supports_group_ids = (
+            self._import_mooncake_group_semantics()
+        )
         try:
             self.store = MooncakeDistributedStore()
 
@@ -393,18 +421,44 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if storage_config
                 else None
             )
-            # 全局段大小按 tp_size 均摊：每个 TP rank 只占用其中一份。
-            tp_scale_factor = 1 if storage_config is None else storage_config.tp_size
-
-            per_tp_global_segment_size = (
-                self.config.global_segment_size // tp_scale_factor
+            self.enable_group_semantics = bool(
+                extra_config.get("enable_group_semantics", False)
+                if extra_config
+                else False
+            )
+            self._use_group_semantics = (
+                self.enable_group_semantics
+                and self._supports_group_ids
+                and self._replicate_config_cls is not None
+            )
+            if self.enable_group_semantics and not self._supports_group_ids:
+                logger.warning(
+                    "Mooncake group semantics is enabled, but the installed "
+                    "Mooncake package does not support ReplicateConfig.group_ids. "
+                    "Falling back to the existing batch_put_from path."
+                )
+            rank_scale_factor = (
+                1
+                if storage_config is None
+                else (storage_config.tp_size * storage_config.pp_size)
             )
 
-            # extra_backend_tag：可选的 key 前缀，用于隔离不同后端/租户的对象命名空间。
-            self.extra_backend_tag = None
-            if extra_config and "extra_backend_tag" in extra_config:
-                self.extra_backend_tag = extra_config["extra_backend_tag"]
-                logger.info(f"Using extra_backend_tag: {self.extra_backend_tag}")
+            per_rank_global_segment_size = (
+                self.config.global_segment_size // rank_scale_factor
+            )
+
+            # Use the backend tag and model name as a prefix to isolate tenants
+            # and models sharing one store.
+            self.config_prefix = None
+            config_prefix_parts = []
+            if extra_config and extra_config.get("extra_backend_tag") is not None:
+                config_prefix_parts.append(str(extra_config["extra_backend_tag"]))
+            if storage_config is not None and storage_config.model_name:
+                model_name = "-".join(storage_config.model_name.split("/"))
+                config_prefix_parts.append(model_name)
+            if config_prefix_parts:
+                self.config_prefix = "_".join(config_prefix_parts)
+                logger.info(f"Using Mooncake config prefix: {self.config_prefix}")
 
             # 若配置要求，先阻塞等待 server 就绪。
             if self.config.check_server:
@@ -434,7 +488,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     raise RuntimeError(
                         "MooncakeStore with standalone_storage=True requires MooncakeHostTensorAllocator. "
                         "Please set standalone_storage=False "
-                        "or upgrade Mooncake by 'pip install mooncake --upgrade'."
+                        "or upgrade Mooncake by 'pip install mooncake-transfer-engine --upgrade'."
                     )
                 required_bytes = self._standalone_required_bytes(mem_pool)
                 ret_code = self.store.setup_dummy(
@@ -483,6 +537,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     setup_kwargs["enable_ssd_offload"] = True
                 if self.config.ssd_offload_path is not None:
                     setup_kwargs["ssd_offload_path"] = self.config.ssd_offload_path
+                if self.config.tenant_id != DEFAULT_TENANT_ID:
+                    setup_kwargs["tenant_id"] = self.config.tenant_id
 
                 # 循环重试：若安装的 Mooncake 版本不支持某些 setup 参数，剔除后重试。
                 while True:
@@ -490,8 +546,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         ret_code = self.store.setup(
                             client_hostname,
                             self.config.metadata_server,
-                            per_tp_global_segment_size,
-                            DEFAULT_LOCAL_BUFFER_SIZE,  # 零拷贝接口不需要本地缓冲区
+                            per_rank_global_segment_size,
+                            DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
                             self.config.protocol,
                             device_name,
                             self.config.master_server_address,
@@ -506,6 +562,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         ]
                         if not unsupported_kwargs:
                             raise
+                        if "tenant_id" in unsupported_kwargs:
+                            raise RuntimeError(
+                                "The installed Mooncake version does not support "
+                                "tenant_id in MooncakeDistributedStore.setup(). "
+                                "Please upgrade Mooncake to use non-default "
+                                "Mooncake tenants with SGLang."
+                            ) from e
                         logger.warning(
                             "The installed Mooncake version does not support the "
                             f"{', '.join(unsupported_kwargs)} parameter(s) in setup(). "
@@ -558,8 +621,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # should_split_heads：当本 rank 需把注意力头拆分写到多个逻辑 rank 时，
             # split_factor 表示拆分份数，mha_suffix 相应扩展为多后缀列表。
             self.storage_config = storage_config
+            self.should_split_heads = storage_config.should_split_heads
             self.split_factor = 0
-            if self.storage_config.should_split_heads:
+            if self.should_split_heads:
                 self.split_factor = (
                     self.storage_config.tp_lcm_size // self.storage_config.tp_size
                 )
@@ -703,10 +767,30 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             super().register_buffer(buf)
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
-        """为所有 key 加上 extra_backend_tag 前缀（未配置则原样返回）。"""
-        if self.extra_backend_tag is None:
+        if self.config_prefix is None:
             return keys
-        return [f"{self.extra_backend_tag}_{key}" for key in keys]
+        return [f"{self.config_prefix}_{key}" for key in keys]
+
+    def _can_use_group_semantics(self) -> bool:
+        return self._use_group_semantics
+
+    def _make_group_id(self, logical_key: str) -> str:
+        return f"sglang-hicache:{logical_key}"
+
+    def _expand_group_ids(
+        self, logical_keys: List[str], key_multiplier: int
+    ) -> List[str]:
+        group_ids = []
+        for key in logical_keys:
+            group_ids.extend([self._make_group_id(key)] * key_multiplier)
+        return group_ids
+
+    def _filter_group_ids(
+        self, group_ids: Optional[List[str]], indices: List[int]
+    ) -> Optional[List[str]]:
+        if group_ids is None:
+            return None
+        return [group_ids[i] for i in indices]
 
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
@@ -725,11 +809,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         pool_name = transfer.name
         suffixes = []
         if pool_name == PoolName.MAMBA:
-            # Mamba：一个 temporal 对象 + 每个 conv 状态一个对象。
+            # Mamba stores one temporal object plus one object per conv state.
+            # conv-only models have no ssm state; drop the 0-element temporal
+            # object (mooncake rejects 0-size puts). get_page_buffer_meta drops
+            # its temporal pointer under the same condition to stay aligned.
             conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
-            suffixes = [f"_{self.mha_suffix}_temporal"] + [
-                f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)
-            ]
+            suffixes = [f"_{self.mha_suffix}_conv_{i}" for i in range(conv_num)]
+            if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
+                suffixes = [f"_{self.mha_suffix}_temporal"] + suffixes
         elif pool_name == PoolName.DRAFT:
             # 草稿池的 MLA/MHA 布局与目标模型相互独立（如 MLA 目标上挂 EAGLE-MHA 草稿），
             # 因此后缀方案取自草稿池自身的类。`_draft` 标签用于避免这些 key 与目标模型的
@@ -742,8 +829,25 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     f"_{self.mha_suffix}_{PoolName.DRAFT}_k",
                     f"_{self.mha_suffix}_{PoolName.DRAFT}_v",
                 ]
+        elif pool_name == PoolName.DRAFT_SWA:
+            from sglang.srt.mem_cache.memory_pool_host import (
+                DeepSeekV4PagedHostPool,
+            )
+            from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+            if isinstance(
+                host_pool,
+                (DeepSeekV4PagedHostPool, MLATokenToKVPoolHost),
+            ):
+                suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+            elif isinstance(host_pool, MHATokenToKVPoolHost):
+                suffixes = [
+                    f"_{self.mha_suffix}_{pool_name}_k",
+                    f"_{self.mha_suffix}_{pool_name}_v",
+                ]
         elif pool_name in (
             PoolName.INDEXER,
+            PoolName.DRAFT_INDEXER,
             PoolName.DEEPSEEK_V4_C4,
             PoolName.DEEPSEEK_V4_C4_INDEXER,
             PoolName.DEEPSEEK_V4_C128,
@@ -847,7 +951,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             assert len(keys) > 0
             assert len(keys) == len(host_indices) // page_size
 
-            # 展开成组件级 key，并拿到对应的 (缓冲区指针, 元素字节数) 元数据。
+            tagged_keys = self._tag_keys(keys)
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
@@ -860,7 +964,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
 
             if is_set:
-                # 写入前先查存在性：已存在的对象记为成功(0)、跳过，只写缺失(-1)的部分。
+                group_ids = (
+                    self._expand_group_ids(tagged_keys, key_multiplier)
+                    if self._can_use_group_semantics()
+                    else None
+                )
                 exist_result = self._batch_exist(key_strs)
                 io_results = [0 if state == 1 else -1 for state in exist_result]
                 missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
@@ -869,6 +977,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         [key_strs[i] for i in missing_idx],
                         [ptr_list[i] for i in missing_idx],
                         [element_size_list[i] for i in missing_idx],
+                        self._filter_group_ids(group_ids, missing_idx),
                     )
                     for i, res in zip(missing_idx, put_results):
                         io_results[i] = res
@@ -974,7 +1083,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
-            if self.storage_config.should_split_heads:
+            if self.should_split_heads:
                 return self._get_mha_split_heads_buffer_meta(keys, host_indices)
             else:
                 return self._get_mha_buffer_meta(keys, host_indices)
@@ -994,7 +1103,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_multiplier = 1
             else:
                 key_multiplier = 2
-                if self.storage_config.should_split_heads:
+                if self.should_split_heads:
                     key_multiplier *= self.split_factor
 
         # 每 key_multiplier 个结果为一组（对应一个逻辑 page），组内全成功才算该 page 成功。
@@ -1022,7 +1131,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # DeepSeek V4 的 KV 锚点是逻辑的、无物理数据；实际数据由 v2 side pool 承载。
             return [True] * len(keys)
 
-        # 若配置了 extra_backend_tag，先给 key 加前缀。
+        # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
@@ -1053,10 +1162,16 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # DeepSeek V4 的 KV 锚点是逻辑的、无物理数据；实际数据由 v2 side pool 承载。
             return [True] * len(keys)
 
-        # 若配置了 extra_backend_tag，先给 key 加前缀。
+        # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
+        key_multiplier = len(key_strs) // len(keys)
+        group_ids = (
+            self._expand_group_ids(keys, key_multiplier)
+            if self._can_use_group_semantics()
+            else None
+        )
         exist_result = self._batch_exist(key_strs)
 
         # 挑出尚不存在的 key 待写入；已存在的直接记为成功(0)。
@@ -1078,7 +1193,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if len(set_keys) > 0:
             start_time = time.perf_counter()
             put_results = self._put_batch_zero_copy_impl(
-                set_keys, set_buffer_ptrs, set_buffer_sizes
+                set_keys,
+                set_buffer_ptrs,
+                set_buffer_sizes,
+                self._filter_group_ids(group_ids, set_indices),
             )
             end_time = time.perf_counter()
 
@@ -1232,8 +1350,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def batch_exists(
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
-        """批量存在性查询，返回从头开始连续存在的 page 数。"""
-        # 若配置了 extra_backend_tag，先给 key 加前缀。
+        # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
         # 按后端类型拼出实际查询 key，并确定每 page 的对象数 key_multiplier。
@@ -1242,8 +1359,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             key_multiplier = 1
         else:
             query_keys = []
-            if self.storage_config.should_split_heads:
-                # 拆头 MHA：每 page 拆成 split_factor 个 rank，各含 K、V。
+            if self.should_split_heads:
                 for key in keys:
                     for suffix in self.mha_suffix:
                         query_keys.append(f"{key}_{suffix}_k")
@@ -1271,14 +1387,33 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self.store.remove_all()
 
     def _put_batch_zero_copy_impl(
-        self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
+        self,
+        key_strs: List[str],
+        buffer_ptrs: List[Any],
+        buffer_sizes: List[Any],
+        group_ids: Optional[List[str]] = None,
     ) -> List[int]:
-        """零拷贝批量写入底层实现：按是否 multi-buffer 选择对应的 Mooncake 接口。"""
+        config = None
+        if self._can_use_group_semantics() and group_ids is not None:
+            if len(group_ids) != len(key_strs):
+                raise ValueError(
+                    "Mooncake group_ids length must match key_strs length: "
+                    f"{len(group_ids)} != {len(key_strs)}"
+                )
+            config = self._replicate_config_cls()
+            config.group_ids = group_ids
+
         if self._uses_multi_buffer(buffer_ptrs):
+            config = config or self._replicate_config_cls()
             return self.store.batch_put_from_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes
+                key_strs, buffer_ptrs, buffer_sizes, config
             )
-        return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+        elif config is not None:
+            return self.store.batch_put_from(
+                key_strs, buffer_ptrs, buffer_sizes, config
+            )
+        else:
+            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]

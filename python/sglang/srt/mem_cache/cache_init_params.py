@@ -8,8 +8,8 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-    from sglang.srt.mem_cache.unified_cache_components import ComponentType
-    from sglang.srt.mem_cache.unified_cache_components.tree_component import (
+    from sglang.srt.mem_cache.unified_cache.components import ComponentType
+    from sglang.srt.mem_cache.unified_cache.components.tree_component import (
         TreeComponent,
     )
 
@@ -52,6 +52,7 @@ class CacheInitParams:
     enable_metrics: bool = False
     # 是否发布 KV cache 事件（如 BlockStored / BlockRemoved），供外部 router 构建/维护缓存索引。
     enable_kv_cache_events: bool = False
+    enable_session_radix_cache: bool = False
 
     # 是否为 Mamba/线性注意力等混合模型分配额外的状态缓冲区（存放 SSM/卷积等循环状态）。
     enable_mamba_extra_buffer: bool = False
@@ -85,3 +86,5 @@ class CacheInitParams:
     component_registry_override: Optional[dict[ComponentType, type[TreeComponent]]] = (
         None
     )
+
+    mtp_draft_device_pools: tuple[object, ...] = ()

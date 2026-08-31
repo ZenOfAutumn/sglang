@@ -48,14 +48,14 @@ import sys
 import threading
 import zlib
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type
 
 import psutil
 import setproctitle
 import zmq
 import zmq.asyncio
 
-from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
+from sglang.srt.disaggregation.utils import TransferBackend
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -65,15 +65,24 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     ContinueGenerationReqInput,
     FreezeGCReq,
-    PauseContinueBroadcast,
+    PauseContinueBroadcastReq,
     PauseGenerationReqInput,
-    TokenizerWorkerRegistration,
+    TokenizerWorkerRegistrationReq,
+    async_sock_recv,
+    async_sock_send,
+    sock_recv,
+    sock_send,
+    unwrap_from_pickle,
+    wrap_as_pickle,
 )
 from sglang.srt.managers.load_snapshot import (
     create_load_snapshot_reader,
     zmq_reader_owner,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.runtime_context import (
+    get_disagg,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -130,7 +139,7 @@ class SocketMapping:
 
         if ipc_name not in self._mapping:
             self._register_ipc_mapping(ipc_name, is_tokenizer=is_tokenizer)
-        self._mapping[ipc_name].send_pyobj(output)
+        sock_send(self._mapping[ipc_name], output)
 
 
 def _extract_field_by_index(
@@ -164,10 +173,20 @@ def _extract_field_by_index(
         return None
 
     # 中译：字段是 dict 时（如按 key 分组的统计），对每个 value 列表分别取第 index 项。
+    should_wrap_result = field_name in ("customized_info", "time_stats")
+    if should_wrap_result:
+        field = unwrap_from_pickle(field)
+        if field is None:
+            return None
     if isinstance(field, dict):
         new_field = {}
         for k, v in field.items():
-            new_field[k] = v[index] if len(v) > index else None
+            if len(v) > index:
+                new_field[k] = [v[index]] if should_wrap_result else v[index]
+            else:
+                new_field[k] = [None] if should_wrap_result else None
+        if should_wrap_result:
+            return wrap_as_pickle(new_field) if new_field else None
         return new_field
 
     # 中译：需要检查长度时，越界则返回 None，避免 IndexError。
@@ -175,7 +194,8 @@ def _extract_field_by_index(
         if len(field) <= index:
             return None
 
-    return [field[index]]
+    new_field = [field[index]]
+    return wrap_as_pickle(new_field) if should_wrap_result else new_field
 
 
 def _handle_output_by_index(output, i):
@@ -195,6 +215,15 @@ def _handle_output_by_index(output, i):
             ),
             spec_correct_drafts_histogram=_extract_field_by_index(
                 output, "spec_correct_drafts_histogram", i
+            ),
+            spec_num_block_accept_tokens=_extract_field_by_index(
+                output, "spec_num_block_accept_tokens", i
+            ),
+            spec_num_cap_tokens=_extract_field_by_index(
+                output, "spec_num_cap_tokens", i
+            ),
+            spec_cap_lens_histogram=_extract_field_by_index(
+                output, "spec_cap_lens_histogram", i
             ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
@@ -216,6 +245,9 @@ def _handle_output_by_index(output, i):
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),
+            image_tokens=_extract_field_by_index(output, "image_tokens", i),
+            audio_tokens=_extract_field_by_index(output, "audio_tokens", i),
+            video_tokens=_extract_field_by_index(output, "video_tokens", i),
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),
@@ -233,6 +265,15 @@ def _handle_output_by_index(output, i):
             ),
             input_top_logprobs_idx=_extract_field_by_index(
                 output, "input_top_logprobs_idx", i, check_length=False
+            ),
+            input_top_logprobs_val_flat=_extract_field_by_index(
+                output, "input_top_logprobs_val_flat", i, check_length=False
+            ),
+            input_top_logprobs_idx_flat=_extract_field_by_index(
+                output, "input_top_logprobs_idx_flat", i, check_length=False
+            ),
+            input_top_logprobs_flat_null_prefix=_extract_field_by_index(
+                output, "input_top_logprobs_flat_null_prefix", i, check_length=False
             ),
             output_top_logprobs_val=_extract_field_by_index(
                 output, "output_top_logprobs_val", i, check_length=False
@@ -255,6 +296,12 @@ def _handle_output_by_index(output, i):
             output_token_entropy_val=_extract_field_by_index(
                 output, "output_token_entropy_val", i, check_length=False
             ),
+            output_token_sampling_mask=_extract_field_by_index(
+                output, "output_token_sampling_mask", i, check_length=False
+            ),
+            output_token_sampling_logprobs=_extract_field_by_index(
+                output, "output_token_sampling_logprobs", i, check_length=False
+            ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
@@ -265,8 +312,12 @@ def _handle_output_by_index(output, i):
                 output, "indexer_topk", i, check_length=False
             ),
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            weight_versions=_extract_field_by_index(output, "weight_versions", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
+            beam_search_output=_extract_field_by_index(
+                output, "beam_search_output", i, check_length=True
+            ),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
@@ -295,6 +346,15 @@ def _handle_output_by_index(output, i):
             spec_correct_drafts_histogram=_extract_field_by_index(
                 output, "spec_correct_drafts_histogram", i
             ),
+            spec_num_block_accept_tokens=_extract_field_by_index(
+                output, "spec_num_block_accept_tokens", i
+            ),
+            spec_num_cap_tokens=_extract_field_by_index(
+                output, "spec_num_cap_tokens", i
+            ),
+            spec_cap_lens_histogram=_extract_field_by_index(
+                output, "spec_cap_lens_histogram", i
+            ),
             time_stats=_extract_field_by_index(output, "time_stats", i),
             finished_reasons=_extract_field_by_index(output, "finished_reasons", i),
             output_strs=_extract_field_by_index(output, "output_strs", i),
@@ -306,6 +366,9 @@ def _handle_output_by_index(output, i):
             cached_tokens_details=_extract_field_by_index(
                 output, "cached_tokens_details", i
             ),
+            image_tokens=_extract_field_by_index(output, "image_tokens", i),
+            audio_tokens=_extract_field_by_index(output, "audio_tokens", i),
+            video_tokens=_extract_field_by_index(output, "video_tokens", i),
             input_token_logprobs_val=_extract_field_by_index(
                 output, "input_token_logprobs_val", i, check_length=False
             ),
@@ -323,6 +386,15 @@ def _handle_output_by_index(output, i):
             ),
             input_top_logprobs_idx=_extract_field_by_index(
                 output, "input_top_logprobs_idx", i, check_length=False
+            ),
+            input_top_logprobs_val_flat=_extract_field_by_index(
+                output, "input_top_logprobs_val_flat", i, check_length=False
+            ),
+            input_top_logprobs_idx_flat=_extract_field_by_index(
+                output, "input_top_logprobs_idx_flat", i, check_length=False
+            ),
+            input_top_logprobs_flat_null_prefix=_extract_field_by_index(
+                output, "input_top_logprobs_flat_null_prefix", i, check_length=False
             ),
             output_top_logprobs_val=_extract_field_by_index(
                 output, "output_top_logprobs_val", i, check_length=False
@@ -345,6 +417,12 @@ def _handle_output_by_index(output, i):
             output_token_entropy_val=_extract_field_by_index(
                 output, "output_token_entropy_val", i, check_length=False
             ),
+            output_token_sampling_mask=_extract_field_by_index(
+                output, "output_token_sampling_mask", i, check_length=False
+            ),
+            output_token_sampling_logprobs=_extract_field_by_index(
+                output, "output_token_sampling_logprobs", i, check_length=False
+            ),
             output_hidden_states=_extract_field_by_index(
                 output, "output_hidden_states", i, check_length=False
             ),
@@ -361,6 +439,10 @@ def _handle_output_by_index(output, i):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            beam_search_output=_extract_field_by_index(
+                output, "beam_search_output", i, check_length=True
+            ),
+            weight_versions=_extract_field_by_index(output, "weight_versions", i),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),
@@ -392,34 +474,35 @@ class MultiHttpWorkerDetokenizerMixin:
               把结果按来源回送给对应的 TokenizerWorker。
         """
         self.socket_mapping = SocketMapping()
+        # Watchdog wiring mirrors DetokenizerManager.event_loop: the watchdog is
+        # paused while waiting for input and fed once per processed message.
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            with self.soft_watchdog.disable():
+                recv_obj = sock_recv(self.recv_from_scheduler)
             output = self._request_dispatcher(recv_obj)
-            if output is None:
                 # 中译：handler 返回 None（如 FreezeGC/配置日志类请求）时无需回送，继续下一轮。
-                continue
-
-            # Fan out the output back to the originating tokenizer worker(s).
-            # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
-            # forward either batched or single requests, so handle both shapes.
             # 中译：把输出扇出回发起方 TokenizerWorker。多 detokenizer 模式下，上游
-            #       MultiDetokenizerRouter 可能转发「批量」或「单条」请求，两种形态都要处理。
-            if isinstance(recv_obj, BaseBatchReq):
                 # 中译：批量请求——按每条的 http_worker_ipc 拆出单条结果，分别回送。
-                for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
-                    new_output = _handle_output_by_index(output, i)
+            if output is not None:
+                # Fan out the output back to the originating tokenizer worker(s).
+                # In multi-detokenizer mode the upstream MultiDetokenizerRouter may
+                # forward either batched or single requests, so handle both shapes.
+                if isinstance(recv_obj, BaseBatchReq):
+                    for i, ipc_name in enumerate(recv_obj.http_worker_ipcs):
+                        new_output = _handle_output_by_index(output, i)
+                        self.socket_mapping.send_output(
+                            ipc_name, new_output, is_tokenizer=True
+                        )
+                elif isinstance(recv_obj, BaseReq):
                     self.socket_mapping.send_output(
-                        ipc_name, new_output, is_tokenizer=True
+                        recv_obj.http_worker_ipc, output, is_tokenizer=True
                     )
-            elif isinstance(recv_obj, BaseReq):
                 # 中译：单条请求——直接回送到它自带的 http_worker_ipc。
-                self.socket_mapping.send_output(
-                    recv_obj.http_worker_ipc, output, is_tokenizer=True
-                )
-            else:
-                raise ValueError(
-                    f"multi_http_worker_event_loop got unexpected req type {type(recv_obj)}"
-                )
+                else:
+                    raise ValueError(
+                        f"multi_http_worker_event_loop got unexpected req type {type(recv_obj)}"
+                    )
+            self.soft_watchdog.feed()
 
 
 class MultiTokenizerRouter:
@@ -445,6 +528,7 @@ class MultiTokenizerRouter:
     ):
         # 中译：创建 3 个 ZMQ asyncio 套接字：从 detokenizer 收结果、向 scheduler 发、从 worker 收。
         self.server_args = server_args
+        self.startup_time: Optional[Dict[str, Any]] = None
         context = zmq.asyncio.Context(3)
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
@@ -477,14 +561,14 @@ class MultiTokenizerRouter:
         #       （load snapshot）」的 PULL 套接字，故由本路由器进程独占它（zmq → 共享内存 SHM），
         #       worker 只读 SHM。这里用套接字 fd 的可读事件来驱动排空，而非定时轮询。
         self.load_snapshot_reader = None
-        if zmq_reader_owner(server_args, "MultiTokenizerRouter"):
+        if zmq_reader_owner("MultiTokenizerRouter"):
             self.load_snapshot_reader = create_load_snapshot_reader(
-                server_args, port_args, caller="MultiTokenizerRouter"
+                port_args, caller="MultiTokenizerRouter"
             )
             self._loop.call_soon_threadsafe(self._register_load_snapshot_reader)
 
         # 中译：PD 分离（disaggregation）场景下启动 bootstrap 服务。
-        self.disaggregation_bootstrap_server = start_disagg_service(self.server_args)
+        self.disaggregation_bootstrap_server = start_disagg_service()
 
         # Worker IPC names for pause/continue broadcasting
         # 中译：记录所有已注册 worker 的 IPC 名，用于 pause/continue 广播。
@@ -492,6 +576,9 @@ class MultiTokenizerRouter:
         # Shared socket mapping (both coroutines run on self._loop, so safe)
         # 中译：共享的套接字映射（前后向两个协程都跑在 self._loop 上，单线程访问故安全）。
         self.socket_mapping = SocketMapping()
+
+    def set_startup_time(self, startup_time: Dict[str, Any]) -> None:
+        self.startup_time = startup_time
 
     def _run_loop(self):
         # 中译：后台线程入口——永久运行该事件循环。
@@ -524,10 +611,10 @@ class MultiTokenizerRouter:
               pause/continue 三类特殊消息做单独处理。
         """
         while True:
-            recv_obj = await self.receive_from_worker.recv_pyobj()
+            recv_obj = await async_sock_recv(self.receive_from_worker)
 
             # 中译：worker 注册消息——把该 worker 的 IPC 名记入集合（用于后续广播），不转发。
-            if isinstance(recv_obj, TokenizerWorkerRegistration):
+            if isinstance(recv_obj, TokenizerWorkerRegistrationReq):
                 if recv_obj.worker_ipc_name not in self.all_worker_ipcs:
                     self.all_worker_ipcs.add(recv_obj.worker_ipc_name)
                     logger.info(
@@ -542,7 +629,7 @@ class MultiTokenizerRouter:
                 # Broadcast to ALL workers so every worker's is_pause is set
                 # 中译：暂停/继续请求——广播给所有 worker，使每个 worker 的 is_pause 同步更新。
                 is_pause = isinstance(recv_obj, PauseGenerationReqInput)
-                broadcast = PauseContinueBroadcast(is_pause=is_pause)
+                broadcast = PauseContinueBroadcastReq(is_pause=is_pause)
                 for ipc_name in self.all_worker_ipcs:
                     self.socket_mapping.send_output(ipc_name, broadcast)
                 # Forward to scheduler rank 0 (it broadcasts to all TP/PP/DP
@@ -553,11 +640,11 @@ class MultiTokenizerRouter:
                     isinstance(recv_obj, PauseGenerationReqInput)
                     and recv_obj.mode == "abort"
                 ):
-                    await self.send_to_scheduler.send_pyobj(recv_obj)
+                    await async_sock_send(self.send_to_scheduler, recv_obj)
                 continue
 
             # 中译：普通请求——直接转发给 scheduler。
-            await self.send_to_scheduler.send_pyobj(recv_obj)
+            await async_sock_send(self.send_to_scheduler, recv_obj)
 
     async def handle_loop(self):
         """Backward path: detokenizer → route results to correct worker.
@@ -565,7 +652,7 @@ class MultiTokenizerRouter:
         中译：反向路径——从 detokenizer 收结果，并路由到正确的 worker。
         """
         while True:
-            recv_obj = await self.recv_from_detokenizer.recv_pyobj()
+            recv_obj = await async_sock_recv(self.recv_from_detokenizer)
             await self._distribute_result_to_workers(recv_obj)
 
     async def _distribute_result_to_workers(self, recv_obj):
@@ -617,7 +704,7 @@ class MultiDetokenizerRouter:
     def event_loop(self):
         # 中译：主事件循环——从调度器收输出，按类型分流到对应的 detokenizer worker。
         while True:
-            recv_obj = self.recv_from_scheduler.recv_pyobj()
+            recv_obj = sock_recv(self.recv_from_scheduler)
 
             # FreezeGCReq must freeze every detokenizer process.
             # 中译：冻结 GC 请求必须作用于每个 detokenizer 进程，故广播给全部 worker。
@@ -707,44 +794,43 @@ class TokenizerWorker(TokenizerManager):
         port_args: PortArgs,
     ):
         setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
-        # prevent init prefill bootstrapserver again
         # 中译：先临时把分离模式置为 "null"，避免基类 __init__ 里重复启动 prefill bootstrap 服务；
-        #       构造完成后再恢复原始的 disaggregation_mode（见下方）。
-        disaggregation_mode = server_args.disaggregation_mode
-        server_args.disaggregation_mode = "null"
-        super().__init__(server_args, port_args)
+        import torch
+
+        torch.set_num_threads(1)
+        super().__init__(
+            server_args,
+            port_args,
+            start_pd_bootstrap_service=False,
+        )
 
         # 中译：以进程 PID 作为 worker_id；记录本 worker 的 tokenizer IPC 名（结果回送地址）。
         self.worker_id = os.getpid()
         self.tokenizer_ipc_name = port_args.tokenizer_ipc_name
 
-        # For PD disaggregtion
         # 中译：恢复并重建 PD 分离相关配置（模式与传输后端）。
-        self.server_args.disaggregation_mode = disaggregation_mode
-        self.disaggregation_mode = DisaggregationMode(
-            self.server_args.disaggregation_mode
-        )
+        # For PD disaggregation
         self.disaggregation_transfer_backend = TransferBackend(
-            self.server_args.disaggregation_transfer_backend
+            get_disagg().disaggregation_transfer_backend
         )
 
         # Register this worker with the router for pause/continue broadcasting
         # 中译：向路由器注册本 worker 的 IPC 名，使其能在 pause/continue 时被广播到。
-        reg = TokenizerWorkerRegistration(worker_ipc_name=self.tokenizer_ipc_name)
-        self.send_to_scheduler.send_pyobj(reg)
+        reg = TokenizerWorkerRegistrationReq(worker_ipc_name=self.tokenizer_ipc_name)
+        self._dispatch_to_scheduler(reg)
 
         # Future for awaiting pause/continue broadcast confirmation
         # 中译：用于等待 pause/continue 广播确认的 Future（由发起方持有，收到广播回执后置位）。
         self._pause_continue_future: Optional[asyncio.Future] = None
 
-        # Register PauseContinueBroadcast in the result dispatcher so
+        # Register PauseContinueBroadcastReq in the result dispatcher so
         # handle_loop routes it to _handle_pause_continue_broadcast
         # 中译：把 PauseContinueBroadcast 注册进结果分发器，使反向 handle_loop 能把广播
         #       路由到 _handle_pause_continue_broadcast 处理。
         from sglang.utils import TypeBasedDispatcher
 
         self._result_dispatcher += TypeBasedDispatcher(
-            [(PauseContinueBroadcast, self._handle_pause_continue_broadcast)]
+            [(PauseContinueBroadcastReq, self._handle_pause_continue_broadcast)]
         )
 
     async def pause_generation(self, obj: PauseGenerationReqInput):
@@ -754,7 +840,7 @@ class TokenizerWorker(TokenizerManager):
         self._pause_continue_future = loop.create_future()
         # Send to router which will broadcast to all workers
         # (router also handles forwarding to scheduler for non-abort modes)
-        self.send_to_scheduler.send_pyobj(obj)
+        self._dispatch_to_scheduler(obj)
         await self._pause_continue_future
 
         if obj.mode == "abort":
@@ -772,24 +858,16 @@ class TokenizerWorker(TokenizerManager):
         # 中译：发起「继续生成」。流程与 pause 对称：创建 Future、发请求、等待广播确认。
         loop = asyncio.get_event_loop()
         self._pause_continue_future = loop.create_future()
-        self.send_to_scheduler.send_pyobj(obj)
+        self._dispatch_to_scheduler(obj)
         await self._pause_continue_future
 
-    def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcast):
-        """Called from handle_loop when a broadcast arrives from the router.
-
-        中译：当路由器发来的 pause/continue 广播到达时，由反向 handle_loop 调用此方法；
-              它把实际状态应用工作丢到事件循环里异步执行。
-        """
+    def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
+        """Called from handle_loop when a broadcast arrives from the router."""
         loop = asyncio.get_event_loop()
         loop.create_task(self._apply_pause_continue_broadcast(obj))
 
-    async def _apply_pause_continue_broadcast(self, obj: PauseContinueBroadcast):
-        """Apply pause/continue state under the condition lock.
-
-        中译：在条件锁（is_pause_cond）保护下应用 pause/continue 状态。继续时唤醒所有
-              在该条件变量上等待的协程；若本 worker 是发起方，则顺带兑现其等待中的 Future。
-        """
+    async def _apply_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
+        """Apply pause/continue state under the condition lock."""
         async with self.is_pause_cond:
             if obj.is_pause:
                 self.is_pause = True
@@ -803,15 +881,18 @@ class TokenizerWorker(TokenizerManager):
             self._pause_continue_future.set_result(True)
             self._pause_continue_future = None
 
-    def _attach_multi_http_worker_info(self, req: Union[BaseReq, BaseBatchReq]):
         # 中译：给即将发出的请求打上本 worker 的 IPC 名，使其结果日后能被路由器/detokenizer
-        #       正确回送到本进程。单条写 http_worker_ipc，批量则为每条写同一 IPC 名。
-        if isinstance(req, BaseReq):
-            req.http_worker_ipc = self.tokenizer_ipc_name
-        elif isinstance(req, BaseBatchReq):
-            req.http_worker_ipcs = [self.tokenizer_ipc_name] * len(req.rids)
-        else:
-            raise ValueError(f"Unknown req type: {type(req)}")
+
+def get_tokenizer_worker_class(server_args: ServerArgs) -> Type[TokenizerWorker]:
+    worker_class = server_args.get_tokenizer_worker_class()
+    if not isinstance(worker_class, type) or not issubclass(
+        worker_class, TokenizerWorker
+    ):
+        raise TypeError(
+            "ServerArgs.get_tokenizer_worker_class() must return a TokenizerWorker "
+            f"subclass, got {worker_class!r}"
+        )
+    return worker_class
 
 
 async def print_exception_wrapper(func):
@@ -838,19 +919,7 @@ async def print_exception_wrapper(func):
 
 
 def get_main_process_id() -> int:
-    """Get the main process ID.
-
-    Supports override via SGLANG_GRANIAN_PARENT_PID for workers whose
-    multiprocessing parent PID differs from the shared-memory owner.
-
-    中译：获取主进程 ID。支持用环境变量 SGLANG_GRANIAN_PARENT_PID 覆盖——适用于那些
-          multiprocessing 父 PID 与「共享内存拥有者」不一致的 worker（如 Granian 部署场景）。
-    """
-    from sglang.srt.environ import envs
-
-    override = envs.SGLANG_GRANIAN_PARENT_PID.get()
-    if override is not None:
-        return override
+    """Get the main process ID."""
     return multiprocessing.current_process()._parent_pid
 
 
@@ -896,7 +965,9 @@ def read_from_shared_memory(name: str) -> Any:
 
 
 def write_data_for_multi_tokenizer(
-    port_args: PortArgs, server_args: ServerArgs, scheduler_info: Dict
+    port_args: PortArgs,
+    server_args: ServerArgs,
+    scheduler_info: Dict,
 ):
     """Write args information to share memory for multi-tokenizer
 
@@ -913,21 +984,4 @@ def write_data_for_multi_tokenizer(
     args_shm.close()
 
     return args_shm
-
-
-class SenderWrapper:
-    """对「发往调度器的套接字」的轻量包装。
-
-    中译：在 send_pyobj 时自动给 BaseReq 类型的请求补上 http_worker_ipc（本 worker 的
-          tokenizer IPC 名），使其结果日后能被正确回送，调用方无需每处手动设置。
-    """
-
-    def __init__(self, port_args: PortArgs, send_to_scheduler: zmq.Socket):
-        self.port_args = port_args
-        self.send_to_scheduler = send_to_scheduler
-
-    def send_pyobj(self, obj):
         # 中译：发送前，若是 BaseReq 则自动打上本 worker 的 IPC 名，再转发给调度器套接字。
-        if isinstance(obj, BaseReq):
-            obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
-        self.send_to_scheduler.send_pyobj(obj)

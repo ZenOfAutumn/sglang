@@ -93,8 +93,7 @@ class DecodeHiCachePreallocMixin:
         l3_storage_hit_length = 0
         last_host_node = None
         if self.scheduler.enable_decode_hicache:
-            last_host_node = result.last_host_node
-            # 只有当最后一个 host 节点已 backup（或就是根节点）时，其后缀才可能已写入 L3。
+            last_host_node = self.tree_cache.resolve_node_handle(result.last_host_node)
             if last_host_node.backuped or last_host_node is self.tree_cache.root_node:
                 # matched_len：L1(device) + L2(host) 已覆盖的前缀长度；其后的 token 才需查 L3。
                 matched_len = l1_prefix_len + l2_host_hit_length
@@ -108,7 +107,7 @@ class DecodeHiCachePreallocMixin:
                 )
                 # 向 L3 查询后缀命中长度（此处只查询长度，不发起真正的数据预取）。
                 l3_storage_hit_length = self.tree_cache.query_storage_hit_length(
-                    last_host_node,
+                    result.last_host_node,
                     suffix_tokens,
                     last_hash,
                     prefix_keys,
@@ -119,8 +118,9 @@ class DecodeHiCachePreallocMixin:
             l2_host_hit_length=l2_host_hit_length,
             l3_storage_hit_length=l3_storage_hit_length,
             last_device_node=result.last_device_node,
-            # 只有 L3 确有命中时才记录 last_host_node，供后续 _start_hicache_prefetch 使用。
-            last_host_node=last_host_node if l3_storage_hit_length > 0 else None,
+            last_host_node=(
+                result.last_host_node if l3_storage_hit_length > 0 else None
+            ),
         )
 
     def _start_hicache_prefetch(
@@ -138,8 +138,7 @@ class DecodeHiCachePreallocMixin:
         ):
             return
         try:
-            node = prefix_match.last_host_node
-            # 取出 L3 命中区间对应的 token 后缀：从 L1+L2 已覆盖处开始，长度为 L3 命中长度。
+            node = self.tree_cache.resolve_node_handle(prefix_match.last_host_node)
             matched_len = prefix_match.l1_prefix_len + prefix_match.l2_host_hit_length
             suffix = req.origin_input_ids[
                 matched_len : matched_len + prefix_match.l3_storage_hit_length
@@ -152,7 +151,13 @@ class DecodeHiCachePreallocMixin:
             )
             # 发起异步预取，把 L3 数据搬到 L2(host)；实际完成情况后续通过 check_prefetch_progress 轮询。
             self.tree_cache.prefetch_from_storage(
-                req.rid, node, suffix, last_hash, prefix_keys
+                req.rid,
+                prefix_match.last_host_node,
+                suffix,
+                last_hash,
+                prefix_keys,
+                extra_key=req.extra_key,
+                cache_salt=req.cache_salt,
             )
             # 记录预取是否真正登记成功（在 ongoing_prefetch 中即代表已登记）。
             prefix_match.prefetch_registered = (
@@ -356,7 +361,7 @@ class DecodeHiCacheTransferMixin:
         # 把恢复到 device 的 KV 索引写回 req_to_token 映射：覆盖 [L1, decode_prefix] 这段区间。
         self.tree_cache.req_to_token_pool.write(
             (
-                decode_req.req.req_pool_idx,
+                decode_req.req.kv.req_pool_idx,
                 slice(prefix_match.l1_prefix_len, prefix_match.decode_prefix_len),
             ),
             decode_req.hicache_restored_kv_indices,
