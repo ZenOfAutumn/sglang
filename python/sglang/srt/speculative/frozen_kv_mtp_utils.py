@@ -11,6 +11,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
+"""Frozen-KV MTP 投机解码工具函数模块。
+
+本模块提供 Frozen-KV MTP 算法的上下文管理、位置设置、
+topk 扩展等工具函数，被 frozen_kv_mtp_worker_v2.py 调用。
+
+主要功能：
+    - KV 池切换：frozen_kv_target_view / target_kv_pool_view
+    - 位置设置：set_frozen_kv_positions / position_for_batch
+    - topk 扩展：expand_for_topk_draft
+    - 隐藏状态选取：select_last_extend_hidden
+"""
+
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -32,14 +44,27 @@ def frozen_kv_target_view(
     kv_context: FrozenKVMTPContext,
     draft_attn_backend: AttentionBackend,
 ):
-    """Build attention metadata against committed target-prefix geometry.
+    """构建基于已提交目标前缀几何的注意力元数据（上下文管理器）。
 
-    Swaps ``draft_attn_backend.token_to_kv_pool`` to the frozen target pool
-    so any helper that reads ``get_token_to_kv_pool()`` during metadata init
-    sees the frozen target pool. Pool refs are derived from
-    ``get_attn_backend().token_to_kv_pool`` — the single backend-attribute
-    swap is seen by both readers (``get_token_to_kv_pool()`` and the
-    backend's own ``self.token_to_kv_pool``).
+    将 ``draft_attn_backend.token_to_kv_pool`` 临时替换为冻结的目标 KV 池，
+    使元数据初始化期间任何读取 ``get_token_to_kv_pool()`` 的辅助函数
+    都能看到冻结目标池。通过单个 backend 属性交换，
+    ``get_token_to_kv_pool()`` 和 backend 自身的 ``self.token_to_kv_pool``
+    均能看到交换后的池。
+
+    参数：
+        forward_batch:       前向批次
+        kv_context:          Frozen-KV MTP 上下文
+        draft_attn_backend:  草稿模型注意力后端
+
+    Yields：无（上下文管理器，在 with 块内执行目标池视图）
+
+    异常：RuntimeError - 当 kv_context 为 None（未绑定模型）时
+
+    示例：
+        >>> with frozen_kv_target_view(batch, ctx, attn_backend):
+        ...     # 在此块内，注意力后端使用目标 KV 池
+        ...     attn_backend.forward(...)
     """
     if kv_context is None:
         raise RuntimeError(
@@ -63,13 +88,25 @@ def target_kv_pool_view(
     kv_context: FrozenKVMTPContext,
     draft_attn_backend: AttentionBackend,
 ):
-    """Run the draft model's forward with the target's frozen KV pool.
+    """使用目标冻结 KV 池运行草稿模型前向（上下文管理器）。
 
-    Swaps ``draft_attn_backend.token_to_kv_pool`` to the frozen target pool.
-    The single backend-attribute swap is seen by both readers —
-    ``get_token_to_kv_pool()`` (because it resolves through
-    ``get_attn_backend()``) and the backend's own ``self.token_to_kv_pool``
-    reads (because ``self is draft_attn_backend``).
+    将 ``draft_attn_backend.token_to_kv_pool`` 临时替换为冻结的目标 KV 池。
+    通过单个 backend 属性交换，``get_token_to_kv_pool()``
+    和 backend 自身的 ``self.token_to_kv_pool`` 读取均能看到交换后的池。
+
+    参数：
+        forward_batch:       前向批次
+        kv_context:          Frozen-KV MTP 上下文
+        draft_attn_backend:  草稿模型注意力后端
+
+    Yields：无（上下文管理器）
+
+    异常：RuntimeError - 当 kv_context 为 None 时
+
+    示例：
+        >>> with target_kv_pool_view(batch, ctx, attn_backend):
+        ...     # 草稿模型使用目标 KV 池进行前向
+        ...     draft_model.forward(...)
     """
     if kv_context is None:
         raise RuntimeError(
@@ -85,7 +122,20 @@ def target_kv_pool_view(
 
 
 def set_frozen_kv_positions(forward_batch: ForwardBatch, topk: int) -> None:
-    """Rope phase = last written target slot, not advanced per draft step."""
+    """设置 Frozen-KV MTP 的 RoPE 位置。
+
+    RoPE 阶段使用最后写入的目标槽位（seq_len - 1），
+    而非随草稿步推进。当 topk > 1 时，将位置 repeat_interleave 到 B*topk。
+
+    参数：
+        forward_batch: 前向批次
+        topk:          每请求候选数
+
+    示例：
+        >>> # seq_lens = [5, 10], topk = 2
+        >>> set_frozen_kv_positions(batch, topk=2)
+        >>> # batch.positions = tensor([4, 4, 9, 9])
+    """
     seq_lens = forward_batch.seq_lens
     positions = torch.clamp(seq_lens - 1, min=0).to(torch.int64)
     if (
@@ -104,7 +154,22 @@ def set_frozen_kv_positions(forward_batch: ForwardBatch, topk: int) -> None:
 
 
 def expand_for_topk_draft(forward_batch: ForwardBatch, topk: int) -> None:
-    """Repeat committed-prefix metadata for the active ``B * topk`` frontier."""
+    """将已提交前缀的元数据扩展到活跃的 B * topk 前沿。
+
+    当 topk > 1 时，将 batch_size、req_pool_indices、seq_lens 等
+    repeat_interleave topk 倍，使每个请求产生 topk 个候选分支。
+
+    参数：
+        forward_batch: 前向批次（必须未扩展，即 batch_size == len(seq_lens)）
+        topk:          每请求候选数
+
+    异常：RuntimeError - 当 batch 已扩展（batch_size != len(seq_lens)）时
+
+    示例：
+        >>> # batch_size=2, topk=3
+        >>> expand_for_topk_draft(batch, topk=3)
+        >>> # batch.batch_size = 6, seq_lens repeat_interleave(3)
+    """
     if topk == 1 or forward_batch.batch_size == 0:
         return
 
@@ -142,12 +207,38 @@ def expand_for_topk_draft(forward_batch: ForwardBatch, topk: int) -> None:
 
 
 def position_for_batch(batch: ScheduleBatch) -> torch.Tensor:
+    """计算批次的 RoPE 位置（seq_len - 1，clamp 到 0）。
+
+    参数：
+        batch: 调度批次
+
+    返回：int64 位置张量 [bs]
+
+    示例：
+        >>> # batch.seq_lens = [5, 10, 1]
+        >>> position_for_batch(batch)
+        tensor([4, 9, 0])
+    """
     return torch.clamp(batch.seq_lens - 1, min=0).to(torch.int64)
 
 
 def select_last_extend_hidden(
     batch: ScheduleBatch, hidden_states: torch.Tensor
 ) -> torch.Tensor:
+    """从 extend 隐藏状态中选取每个请求的最后一个 token 的隐藏状态。
+
+    参数：
+        batch:         调度批次
+        hidden_states: extend 前向的隐藏状态 [total_extend_tokens, hidden_dim]
+
+    返回：每个请求最后 token 的隐藏状态 [bs, hidden_dim]
+
+    示例：
+        >>> # extend_lens = [3, 2], hidden_states shape = [5, 4096]
+        >>> # last_indices = cumsum([3,2]) - 1 = [2, 4]
+        >>> select_last_extend_hidden(batch, hidden_states).shape
+        torch.Size([2, 4096])
+    """
     if hidden_states.shape[0] == batch.batch_size():
         return hidden_states
     lens = torch.tensor(batch.extend_lens, device=hidden_states.device)

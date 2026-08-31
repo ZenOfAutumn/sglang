@@ -1,3 +1,18 @@
+"""DFLASH 投机解码工具函数模块。
+
+本模块提供 DFLASH 算法的配置解析、KV cache 预算计算、验证采样、
+草稿层选择等工具函数，被 dflash_worker_v2.py 等模块调用。
+
+主要功能：
+    - 配置解析：parse_dflash_draft_config / DFlashDraftConfig
+    - KV cache 预算：scale_kv_cell_size_per_token_for_dflash
+    - 验证采样：compute_dflash_correct_drafts_and_bonus / compute_dflash_sampling_correct_drafts_and_bonus
+    - 草稿层选择：build_target_layer_ids
+    - 请求校验：validate_dflash_request
+    - logit 调整：apply_dflash_verify_logits_adjustments
+    - prefill 批处理延迟：should_delay_dflash_prefill_for_batching
+"""
+
 from __future__ import annotations
 
 import logging
@@ -15,12 +30,16 @@ from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_musa
 
+# DFLASH 默认的 mask token 字符串
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
 logger = logging.getLogger(__name__)
 
+# 是否可以使用 sgl_kernel 的采样验证（仅 CUDA/MUSA）
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
+# 缓存链式验证所需的 buffer，按 (device_index, draft_token_num) 索引
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
+# 这些注意力后端不需要 custom_mask
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     {
         "FlashInferAttnBackend",
@@ -53,11 +72,30 @@ else:
 
 
 def is_dflash_sampling_verify_available() -> bool:
+    """检查当前环境是否支持 DFLASH 非贪心采样验证。
+
+    返回：True 表示 sgl_kernel 的采样验证 kernel 可用
+    """
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
 
 
 def resolve_dflash_prefill_refill_target(max_running_requests: int) -> int:
-    """Choose how many free running-request slots DFlash waits for before refill."""
+    """确定 DFlash prefill 前等待多少个空闲请求槽位再填充。
+
+    小 batch 时逐个填充，大 batch 时批量填充以提高吞吐。
+    可通过 SGLANG_DFLASH_PREFILL_REFILL_TARGET 环境变量覆盖。
+
+    参数：
+        max_running_requests: 最大并发请求数
+
+    返回：prefill 填充目标请求数
+
+    示例：
+        >>> resolve_dflash_prefill_refill_target(4)   # 小 batch -> 1
+        1
+        >>> resolve_dflash_prefill_refill_target(32)  # 大 batch -> 4
+        4
+    """
     override = envs.SGLANG_DFLASH_PREFILL_REFILL_TARGET.get()
     if override is not None:
         return override
@@ -75,6 +113,22 @@ def should_delay_dflash_prefill_for_batching(
     max_running_requests: int,
     prefill_refill_target: int,
 ) -> bool:
+    """判断是否应延迟 DFlash prefill 以积累更多请求进行批处理。
+
+    参数：
+        running_bs:            当前运行中的 batch size
+        num_allocatable_reqs:  可分配的请求数
+        max_running_requests:  最大并发请求数
+        prefill_refill_target: prefill 填充目标
+
+    返回：True 表示应延迟 prefill
+
+    示例：
+        >>> should_delay_dflash_prefill_for_batching(
+        ...     running_bs=10, num_allocatable_reqs=1, max_running_requests=32,
+        ...     prefill_refill_target=4)
+        True  # 只有 1 个可分配请求，少于目标 4，应延迟
+    """
     if running_bs <= 0:
         return False
 
@@ -93,15 +147,25 @@ def scale_kv_cell_size_per_token_for_dflash(
     draft_num_layers: int,
     draft_cell_size_per_token: Optional[int] = None,
 ) -> int:
-    """Compute bytes/token budget for combined target+draft KV pools (DFLASH).
+    """计算 DFLASH 目标+草稿 KV 池合并后的每 token 字节预算。
 
-    DFLASH runs a separate draft runner with its own KV pool. The target runner's
-    token capacity must fit both pools in aggregate.
+    DFLASH 运行独立的草稿 runner，拥有自己的 KV 池。目标 runner 的
+    token 容量必须容纳两个池的总量。
 
-    Returns:
-        Approximate per-token bytes for (target KV + draft KV), expressed as a
-        scaled version of `target_cell_size_per_token`, unless an explicit
-        `draft_cell_size_per_token` is provided (in which case we sum them).
+    参数：
+        target_cell_size_per_token: 目标模型每 token KV 字节数
+        target_num_layers:          目标模型层数
+        draft_num_layers:           草稿模型层数
+        draft_cell_size_per_token:  草稿模型每 token KV 字节数（可选）
+
+    返回：合并后的每 token 字节预算
+
+    示例：
+        >>> # 目标 32 层 × 128B/token，草稿 4 层
+        >>> scale_kv_cell_size_per_token_for_dflash(
+        ...     target_cell_size_per_token=128, target_num_layers=32,
+        ...     draft_num_layers=4)
+        144  # 128 * 36 / 32 = 144
     """
     if target_cell_size_per_token <= 0:
         raise ValueError(
@@ -128,6 +192,18 @@ def scale_kv_cell_size_per_token_for_dflash(
 
 
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
+    """确定 DFLASH 验证时是否需要 custom mask。
+
+    遍历 attn_backend 的 full_attn_backend 链（最多 4 层），
+    判断后端是否在跳过列表中。
+
+    参数：
+        attn_backend: 注意力后端实例
+
+    返回：(backend_name, needs_custom_mask)
+        - backend_name:       后端类名
+        - needs_custom_mask:  True 表示需要 custom mask
+    """
     backend = attn_backend
     for _ in range(4):
         full_backend = getattr(backend, "full_attn_backend", None)
@@ -144,11 +220,16 @@ def apply_dflash_verify_logits_adjustments(
     sampling_info: Any,
     draft_token_num: int,
 ) -> None:
-    """Apply sampling-time logit adjustments for DFlash verify in place.
+    """对 DFlash 验证的 logits 原地应用采样时调整。
 
-    This keeps v1 and v2 verify semantics aligned while letting overlap scheduling
-    use the cheaper precomputed `acc_linear_penalties` path instead of allocating a
-    repeated `[bs * draft_token_num, vocab]` penalty tensor every step.
+    保持 v1 和 v2 验证语义一致，同时让 overlap 调度使用更便宜的
+    预计算 acc_linear_penalties 路径，避免每步分配
+    [bs * draft_token_num, vocab] 的惩罚张量。
+
+    参数：
+        next_token_logits: 验证 logits [bs * draft_token_num, vocab]
+        sampling_info:     采样信息对象
+        draft_token_num:   每请求草稿 token 数
     """
     if sampling_info is None:
         return
@@ -187,9 +268,9 @@ def apply_dflash_verify_logits_adjustments(
             logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
         return logits_3d
 
-    # Dense fallback only when we need live penalizer application or a vocab mask.
-    # In overlap scheduling the common path is `acc_linear_penalties`, which can be
-    # broadcast over the verify block without materializing a repeated buffer.
+    # 仅在需要实时 penalizer 应用或 vocab mask 时使用密集回退。
+    # overlap 调度中常见路径是 acc_linear_penalties，可以直接在验证 block
+    # 上广播，无需物化重复缓冲区。
     if (
         penalizer is not None and penalizer.is_required and acc_linear_penalties is None
     ) or vocab_mask is not None:
@@ -235,6 +316,19 @@ def _get_or_create_chain_verify_buffers(
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
+    """获取或创建链式验证所需的缓冲区（带缓存）。
+
+    按 (device_index, draft_token_num) 缓存 buffer，按需增长容量。
+    DFLASH 验证是线性的（topk=1），所以 retrieve_next_sibling 全为 -1。
+
+    参数：
+        bs:               batch size
+        draft_token_num:  每请求草稿 token 数
+        device:           目标设备
+
+    返回：(retrieve_index, retrieve_next_token, retrieve_next_sibling,
+          predicts, accept_index, accept_token_num)
+    """
     key = (device.index, int(draft_token_num))
     cached = _DFLASH_CHAIN_VERIFY_BUFFERS.get(key)
     cap_bs = 0 if cached is None else int(cached["cap_bs"])
@@ -287,19 +381,20 @@ def _get_or_create_chain_verify_buffers(
 
 
 def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> List[int]:
-    """Select target layer indices used to build DFlash context features.
+    """选择用于构建 DFlash 上下文特征的目标层索引。
 
-    Args:
-        num_target_layers: Number of transformer layers in the runtime target model.
-        num_draft_layers: Number of layers in the DFlash draft model.
+    DFlash 使用每个选定目标层之后的隐藏状态（HF 风格）。
+    SGLang 捕获「layer i 之前」，所以 model hook 通常 +1 映射到捕获点。
 
-    Returns:
-        A list of 0-based target layer indices of length `num_draft_layers`.
+    参数：
+        num_target_layers: 目标模型 transformer 层数
+        num_draft_layers:  草稿模型层数
 
-    Notes:
-        - DFlash uses hidden states after each selected target layer (HF-style).
-        - SGLang captures "before layer i", so the model hook will typically add +1
-          when mapping to capture points.
+    返回：长度为 num_draft_layers 的 0-based 目标层索引列表
+
+    示例：
+        >>> build_target_layer_ids(32, 4)  # 32 层目标，4 层草稿
+        [1, 11, 21, 28]  # 均匀分布在 [1, 28] 范围内
     """
     if num_target_layers <= 0:
         raise ValueError(
@@ -327,6 +422,13 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
 
 
 def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
+    """从模型配置中获取 layer_types（如 attention / sliding_attention）。
+
+    参数：
+        config: 模型配置对象或字典
+
+    返回：layer_types 序列或 None
+    """
     text_config = _get_text_config(config)
     layer_types = _cfg_get(text_config, "layer_types", _cfg_get(config, "layer_types"))
     if layer_types is None:
@@ -339,6 +441,16 @@ def get_dflash_layer_types(config: Any) -> Optional[Sequence[str]]:
 
 
 def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
+    """获取 DFLASH 滑动注意力窗口大小。
+
+    HF 的 sliding_window 包含当前 token，SGLang 存储 window_left，
+    所以返回 sliding_window - 1。
+
+    参数：
+        config: 模型配置
+
+    返回：窗口大小（int）或 None（无滑动注意力层时）
+    """
     layer_types = get_dflash_layer_types(config)
     if layer_types is None or "sliding_attention" not in layer_types:
         return None
@@ -357,12 +469,14 @@ def get_dflash_attention_sliding_window_size(config: Any) -> Optional[int]:
 
 
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
+    """兼容 dict 和对象的配置字段获取。"""
     if isinstance(config, dict):
         return config.get(key, default)
     return getattr(config, key, default)
 
 
 def _get_text_config(config: Any) -> Any:
+    """从模型配置中提取 text_config（处理多模态模型的嵌套配置）。"""
     if config is None:
         return None
     if isinstance(config, dict):
@@ -382,6 +496,7 @@ def _get_text_config(config: Any) -> Any:
 
 
 def _get_dflash_config(config: Any) -> dict:
+    """从模型配置中提取 dflash_config 子配置。"""
     if isinstance(config, dict):
         cfg = config.get("dflash_config", None)
     else:
@@ -403,6 +518,7 @@ def _parse_optional_int(
     field_name: str,
     min_value: Optional[int] = None,
 ) -> Optional[int]:
+    """解析可选的整数值，带范围校验。"""
     if value is None:
         return None
     try:
@@ -417,6 +533,26 @@ def _parse_optional_int(
 
 @dataclass(frozen=True)
 class DFlashDraftConfig:
+    """DFLASH 草稿模型配置。
+
+    属性：
+        num_hidden_layers:   草稿模型隐藏层数
+        num_target_layers:   目标模型层数
+        block_size:          DFLASH 验证 block 大小
+        target_layer_ids:    选用的目标层索引列表（可选，未配置时自动均匀选择）
+        mask_token:          mask token 字符串，默认 "<|MASK|>"
+        mask_token_id:       mask token 的 id（可选）
+
+    示例：
+        >>> cfg = DFlashDraftConfig(
+        ...     num_hidden_layers=4, num_target_layers=32, block_size=5,
+        ...     target_layer_ids=None, mask_token="<|MASK|>", mask_token_id=None)
+        >>> cfg.resolve_target_layer_ids(target_num_layers=32)
+        [1, 11, 21, 28]
+        >>> cfg.resolve_block_size(default=4)
+        5
+    """
+
     num_hidden_layers: Optional[int]
     num_target_layers: Optional[int]
     block_size: Optional[int]
@@ -425,6 +561,7 @@ class DFlashDraftConfig:
     mask_token_id: Optional[int]
 
     def require_num_layers(self) -> int:
+        """返回草稿模型层数，如果未配置则报错。"""
         if self.num_hidden_layers is None:
             raise ValueError(
                 "DFLASH requires draft num_hidden_layers in config. "
@@ -433,6 +570,7 @@ class DFlashDraftConfig:
         return int(self.num_hidden_layers)
 
     def resolve_block_size(self, *, default: Optional[int] = None) -> Optional[int]:
+        """解析 block_size，使用配置值或默认值。"""
         return self.block_size if self.block_size is not None else default
 
     def resolve_target_layer_ids(
@@ -441,6 +579,14 @@ class DFlashDraftConfig:
         target_num_layers: int,
         draft_num_layers: Optional[int] = None,
     ) -> List[int]:
+        """解析目标层索引，未配置时自动均匀选择。
+
+        参数：
+            target_num_layers: 目标模型层数
+            draft_num_layers:  草稿模型层数（可选，默认从配置获取）
+
+        返回：目标层索引列表
+        """
         target_num_layers = int(target_num_layers)
         if target_num_layers <= 0:
             raise ValueError(
@@ -468,7 +614,13 @@ class DFlashDraftConfig:
 
 
 def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
-    """Parse and validate DFLASH draft config fields from HF config/dict."""
+    """从 HF 配置/字典解析并校验 DFLASH 草稿配置字段。
+
+    参数：
+        draft_hf_config: 草稿模型的 HF 配置对象或字典
+
+    返回：DFlashDraftConfig 实例
+    """
     dflash_cfg = _get_dflash_config(draft_hf_config)
     draft_text_config = _get_text_config(draft_hf_config)
 
@@ -487,7 +639,7 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
         min_value=1,
     )
 
-    # Keep support for current checkpoints where block_size is top-level.
+    # 保留对当前 checkpoint 中 block_size 在顶层时的支持
     raw_block_size = dflash_cfg.get(
         "block_size",
         _cfg_get(draft_hf_config, "block_size", None),
@@ -552,7 +704,13 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
 
 
 def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
-    """Validate whether DFlash can slice KV weights from a fused QKV linear layer."""
+    """检查 DFlash 是否可以从融合 QKV 线性层中切分 KV 权重。
+
+    参数：
+        qkv_proj: QKV 投影层对象
+
+    返回：(can_slice, reason) can_slice 为 True 时 reason 为空
+    """
     quant_method = getattr(qkv_proj, "quant_method", None)
     if not isinstance(quant_method, UnquantizedLinearMethod):
         return (
@@ -566,7 +724,13 @@ def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
 
 
 def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
-    """Validate whether a QKV layer is eligible for DFlash fused KV materialization."""
+    """检查 QKV 层是否适用于 DFlash 融合 KV 物化。
+
+    参数：
+        qkv_proj: QKV 投影层对象
+
+    返回：(eligible, reason) eligible 为 True 时 reason 为空
+    """
     eligible, reason = can_dflash_slice_qkv_weight(qkv_proj)
     if not eligible:
         return False, reason
@@ -580,21 +744,27 @@ def compute_dflash_correct_drafts_and_bonus(
     candidates: torch.Tensor,
     target_predict: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute DFlash accept lengths and bonus tokens (greedy verify rule).
+    """计算 DFlash 贪心验证的接受长度和 bonus token。
 
-    Args:
-        candidates: Token ids proposed by the DFlash draft, including the current token.
-            Shape: [bs, block_size]. candidates[:, 0] is the current token.
-        target_predict: Token ids predicted by the target model for each position in the block.
-            Shape: [bs, block_size]. target_predict[:, t] corresponds to argmax at position t.
+    规则：从 candidates[:, 1:] 与 target_predict[:, :-1] 逐位比较，
+    连续匹配的长度即为接受长度。bonus 为 target_predict[correct_len]。
 
-    Returns:
-        correct_len: int32 tensor [bs], number of accepted *draft* tokens (excluding current token and bonus token).
-        bonus: int64 tensor [bs], the target-predicted token at index correct_len (the "bonus" token to append).
+    参数：
+        candidates:      草稿提议的 token id [bs, block_size]，
+                         candidates[:, 0] 是当前 token
+        target_predict:  目标模型预测的 token id [bs, block_size]
 
-    Notes:
-        Matches the reference implementation rule:
-          accept while candidates[:, 1:] == target_predict[:, :-1] consecutively.
+    返回：(correct_len, bonus)
+        - correct_len: int32 [bs]，接受的草稿 token 数（不含当前 token 和 bonus）
+        - bonus:      int64 [bs]，bonus token
+
+    示例：
+        >>> candidates = torch.tensor([[5, 10, 20, 30]])  # 草稿提议
+        >>> target = torch.tensor([[10, 20, 25, 35]])      # 目标预测
+        >>> correct, bonus = compute_dflash_correct_drafts_and_bonus(
+        ...     candidates=candidates, target_predict=target)
+        >>> # correct = tensor([2], dtype=int32)  # 10==10, 20==20, 30!=25
+        >>> # bonus = tensor([25])  # target_predict[0, 2] = 25
     """
     if candidates.ndim != 2:
         raise ValueError(f"candidates must be 2D, got shape={tuple(candidates.shape)}")
@@ -629,12 +799,28 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
     use_sparse_topk: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
+    """计算 DFlash 非贪心采样验证的接受长度和 bonus token。
 
-    This is a chain-specialized variant of speculative target-only verification:
-      - DFlash proposals are linear (topk == 1), so each verify level has at most one candidate.
-      - When a candidate is rejected at a level, the final token is sampled from
-        `relu(q - p)` where `p` has only the rejected candidate mass.
+    这是投机解码 target-only 验证的链式特化变体：
+      - DFlash 提议是线性的（topk == 1），每个验证层最多一个候选
+      - 当候选在某层被拒绝时，最终 token 从 relu(q - p) 采样，
+        其中 p 只包含被拒候选的质量
+
+    参数：
+        candidates:      草稿提议的 token id [bs, draft_token_num]
+        next_token_logits: 目标模型 logits [bs * draft_token_num, vocab]
+        sampling_info:   采样信息对象
+        max_top_k:       最大 top_k 值
+        uniform_top_k_value: 统一 top_k 值
+        threshold_single: 单步接受阈值
+        threshold_acc:    累积接受阈值
+        uniform_samples:  均匀随机采样 [bs, draft_token_num]
+        uniform_samples_for_final_sampling: 最终采样随机数 [bs]
+        use_sparse_topk:  是否使用稀疏 topk 优化
+
+    返回：(correct_len, bonus)
+        - correct_len: int32 [bs]
+        - bonus:      int64 [bs]
     """
     if not _DFLASH_SAMPLING_VERIFY_AVAILABLE:
         raise RuntimeError(
@@ -706,7 +892,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
 
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
-    # Build target distribution once over all verify rows.
+    # 构建所有验证行的目标分布
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
     )
@@ -728,7 +914,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         elif max_top_k > vocab_size:
             max_top_k = vocab_size
 
-        # Sparse exact path for top-k/top-p (top-k-first semantics), then scatter to dense.
+        # top-k/top-p 的稀疏精确路径（top-k-first 语义），然后 scatter 到密集
         if 0 < max_top_k < vocab_size:
             topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
             if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
@@ -784,7 +970,7 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
         accept_index=accept_index,
         accept_token_num=accept_token_num,
         candidates=candidates_i64,
-        # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+        # kwarg 左侧保留为 `retrive_*` 以匹配 sgl_kernel op schema
         retrive_index=retrieve_index,
         retrive_next_token=retrieve_next_token,
         retrive_next_sibling=retrieve_next_sibling,
@@ -805,6 +991,14 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
 
 
 def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+    """校验 DFLASH 请求是否支持所请求的特性。
+
+    参数：
+        req:            请求对象
+        enable_overlap: 是否启用 overlap 调度
+
+    返回：错误信息字符串（不支持时），或 None（支持时）
+    """
     if req.return_logprob:
         return "DFLASH speculative decoding does not support return_logprob yet."
 

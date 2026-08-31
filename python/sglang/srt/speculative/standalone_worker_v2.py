@@ -27,6 +27,23 @@ SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPRO
 def _get_plan_stream(
     device: str,
 ) -> Tuple[any, contextlib.AbstractContextManager]:
+    """获取调度计划流的上下文管理器。
+
+    输入:
+        device: 设备字符串，如 "cuda" 或 "cuda:0"
+
+    输出:
+        (plan_stream, plan_stream_ctx) 元组:
+        - plan_stream: CUDA Stream 对象（启用时）或 None
+        - plan_stream_ctx: 上下文管理器，用于进入该流
+
+    示例::
+
+        >>> stream, ctx = _get_plan_stream("cuda")
+        >>> with ctx:
+        ...     # 在 plan stream 上执行调度逻辑
+        ...     pass
+    """
     if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
         plan_stream = torch.get_device_module(device).Stream()
         plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
@@ -36,7 +53,21 @@ def _get_plan_stream(
 
 
 class StandaloneDraftWorker(EagleDraftWorker):
-    """Custom EagleDraftWorker that doesn't share embeddings/lm_head with target model."""
+    """不与目标模型共享 embedding/lm_head 的独立草稿 Worker。
+
+    与标准 EAGLE 草稿 Worker 的区别：
+    - 草稿模型使用自己的 embedding 层和 lm_head 层
+    - 不从目标模型复制权重，而是独立加载草稿模型权重
+    - 适用于草稿模型与目标模型架构不同的情况
+
+    示例::
+
+        >>> # 当草稿模型和目标模型词汇表不同时使用
+        >>> draft_worker = StandaloneDraftWorker(
+        ...     server_args, gpu_id=0, tp_rank=0, dp_rank=None,
+        ...     moe_ep_rank=0, attn_cp_rank=0, moe_dp_rank=0,
+        ...     nccl_port=29500, target_worker=target)
+    """
 
     def __init__(
         self,
@@ -50,7 +81,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        # copy args
+        # 复制参数
         self.server_args = server_args
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
@@ -61,7 +92,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.attn_cp_rank = attn_cp_rank
         self.moe_dp_rank = moe_dp_rank
 
-        # Args for easy access
+        # 便捷访问参数
         self.device = server_args.device
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
@@ -70,25 +101,25 @@ class StandaloneDraftWorker(EagleDraftWorker):
             server_args.speculative_algorithm
         )
 
-        # Pre-allocated constants for the topk=1 chain fast path in draft_forward.
+        # 为 topk=1 链式快速路径预分配常量张量
         self._topk1_parents_prealloc = None
         self._topk1_score_indices_prealloc = None
         self._rebuild_topk1_chain_buffers()
 
-        # Set constant
+        # 设置常量
         from sglang.srt.speculative.eagle_info import EagleDraftInput
 
         EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
             self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
         )
 
-        # Load draft model weights only.
+        # 仅加载草稿模型权重（不共享目标模型的 embedding/lm_head）
         with empty_context():
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
                 tp_rank=tp_rank,
-                pp_rank=0,  # spec workers don't support pipeline parallelism
+                pp_rank=0,  # spec worker 不支持流水线并行
                 dp_rank=dp_rank,
                 moe_ep_rank=moe_ep_rank,
                 attn_cp_rank=attn_cp_rank,
@@ -97,7 +128,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
                 is_draft_worker=True,
             )
 
-        # Alias for better readability
+        # 别名，提高可读性
         self.draft_runner = self.draft_worker.model_runner
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
@@ -111,7 +142,16 @@ class StandaloneDraftWorker(EagleDraftWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
-        """Standalone: allocate pools without sharing embeddings."""
+        """分配内存池（Standalone 模式：不共享 embedding）。
+
+        输入:
+            memory_pool_config: 内存池配置
+            req_to_token_pool: 请求到 token 映射池
+            token_to_kv_pool_allocator: KV cache 分配器
+
+        输出:
+            None（原地初始化各池和映射表）
+        """
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.draft_worker.alloc_memory_pool(
@@ -123,19 +163,39 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self.init_lm_head()
 
     def init_backends(self):
+        """初始化后端，使用草稿 TP 上下文和投机 MoE 后端上下文。"""
         with self.draft_tp_context(
             self.draft_runner.tp_group
         ), speculative_moe_backend_context():
             super().init_backends()
 
     def init_lm_head(self):
-        """Override to prevent sharing embeddings and lm_head with target model."""
-        # For standalone worker, we don't share embeddings and lm_head
-        # The draft model uses its own embeddings and lm_head
+        """覆盖父类方法，阻止与目标模型共享 embedding 和 lm_head。
+
+        Standalone 模式下，草稿模型使用自己的 embedding 和 lm_head，
+        因此此方法为空操作（pass）。
+        """
+        # 对于 standalone worker，不共享 embedding 和 lm_head
+        # 草稿模型使用自己的 embedding 和 lm_head
         pass
 
 
 class StandaloneWorkerV2(EAGLEWorkerV2):
+    """Standalone V2 投机 Worker。
+
+    继承 EAGLEWorkerV2，使用独立草稿模型（不与目标模型共享 embedding/lm_head）。
+    适用于草稿模型架构与目标模型不同的场景。
+
+    示例::
+
+        >>> worker = StandaloneWorkerV2(
+        ...     server_args, gpu_id=0, tp_rank=0, dp_rank=None,
+        ...     moe_ep_rank=0, attn_cp_rank=0, moe_dp_rank=0,
+        ...     nccl_port=29500, target_worker=target)
+        >>> # worker 的 draft_worker 是 StandaloneDraftWorker
+        >>> type(worker.draft_worker).__name__
+        'StandaloneDraftWorker'
+    """
 
     def __init__(
         self,
@@ -149,7 +209,7 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        # Parse arguments
+        # 解析参数
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
@@ -162,10 +222,10 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
             server_args.speculative_algorithm
         )
 
-        # Override the context length of the draft model to be the same as the target model.
+        # 将草稿模型的上下文长度覆盖为目标模型的上下文长度
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
-        # Create our custom draft worker that doesn't share embeddings/lm_head
+        # 创建不共享 embedding/lm_head 的独立草稿 worker
         self._draft_worker = StandaloneDraftWorker(
             server_args,
             gpu_id,
@@ -178,7 +238,7 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
             target_worker,
         )
 
-        # Some dummy tensors
+        # 哑张量（用于 CUDA Graph 捕获时的占位）
         self.num_new_pages_per_topk = torch.empty(
             (), dtype=torch.int64, device=self.device
         )
@@ -186,5 +246,5 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
-        # TODO: Adaptive speculative
+        # TODO: 自适应投机解码
         self.adaptive_controller: Optional[AdaptiveController] = None

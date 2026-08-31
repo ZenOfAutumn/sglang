@@ -450,6 +450,43 @@ $$
 - **复杂情形（top-k / top-p / min-p）**：先对概率排序、按阈值做掩码置零并重归一化，再对处理后的 `probs_sort` 调 `torch.multinomial`，最后用 `torch.gather` 把排序下标映射回真实 token id。
 - **确定性采样开关**：当请求带 `sampling_seed` 时，对应分支改走 `multinomial_with_seed`（Gumbel-Max），与 `torch.multinomial` 在分布上等价，但**不依赖全局 RNG**，从而可复现。
 
+## CUDA stream（CUDA 流）
+
+**CUDA stream** 是一条 GPU 上的**有序任务队列**。所有 kernel 启动、显存拷贝等 GPU 操作都必须提交到某条 stream 上；**同一条 stream 内的操作严格按提交顺序串行执行，不同 stream 之间则没有任何顺序保证，可以并发**。它是 CUDA 编程模型里表达「并发」与「依赖」的基本单位。
+
+### 异步：CPU 提交 ≠ GPU 执行完
+
+向 stream 提交操作是**异步**的：CPU 把任务入队后立刻返回，继续往下跑 Python 代码，GPU 在后台按队列消费。这带来两个直接后果：
+
+- **CPU 与 GPU 天然重叠**。CPU 端可以一边准备下一批数据，一边让 GPU 跑当前批的前向——SGLang 的重叠调度正是建立在这个性质上。
+- **计时和读取结果必须显式同步**。直接用 CPU 时钟给一段 GPU 代码计时只会量到「提交耗时」；把 GPU 张量搬回 CPU（`.cpu()` / `.item()`）会隐式同步，因此它既是正确性保证，也是性能陷阱。
+
+### 默认流与多流并发
+
+不显式指定时，所有操作都进默认流（`torch.cuda.current_stream()`），全部串行——这也是绝大多数模型代码的实际情形。只有当**两段工作彼此独立、且单独任何一段都喂不饱 GPU** 时，把它们放到不同 stream 才有意义：一段的空闲时隙可以被另一段填上（既包括 SM 算力，也包括与拷贝引擎并行的 H2D/D2H 传输）。反之，如果每段本身已经把 GPU 占满，多流只会带来调度开销。
+
+### 表达跨流依赖：event 与 wait
+
+多流的代价是要**手工维护依赖**。两个基本原语：
+
+- `stream_a.wait_stream(stream_b)`：让 `stream_a` 后续入队的操作，排在 `stream_b` 当前已入队的全部操作之后。
+- `event.record(stream_b)` + `stream_a.wait_event(event)`：更细粒度的版本，只等到 `stream_b` 上的某个具体时间点，而非它队列里的全部内容。
+
+关键点是**这两者都只阻塞 GPU、不阻塞 CPU**——它们往队列里插入一个等待标记，CPU 立刻返回。真正阻塞 CPU 的是 `synchronize()`，应尽量避免。
+
+还有一个容易踩的坑：一块显存如果在 A 流上分配、却拿到 B 流上使用，PyTorch 的缓存分配器并不知情，可能在 A 流看来「已释放」时把它复用给别人，而 B 流还在读。`tensor.record_stream(...)` 就是用来向分配器登记这层跨流使用关系的。
+
+### 与 CUDA graph 的关系
+
+CUDA graph 的捕获本身就是在一条 stream 上进行的：捕获期间提交到该流的操作不真正执行，而是被记录成一张依赖图，之后整图一次性重放，从而省掉逐个 kernel 的启动开销。因此「捕获流」的选择、以及捕获期间不能有跨流同步或 CPU 同步，是 CUDA graph 使用上的硬约束。
+
+### 在 SGLang 中的典型用法
+
+- **重叠调度**：`schedule_stream`（调度产生的 GPU 操作）与前向流并发，跨流顺序由下一条「WAR 屏障」维护。
+- **KV cache 分层搬运**：`cache_controller.py` 里的专用 `write_stream` / `load_stream` 让 L1↔L2 的显存搬运与前向计算并行。
+- **模型内双流**：部分 MoE 模型（如 `qwen2_moe.py`）用 `alt_stream` 把共享专家与路由专家的计算拆到两条流上并发。
+- **PD 复用（pdmux）**：为 prefill 与 decode 各分配一组 stream，让两类负载在同一张卡上共存。
+
 ## WAR 屏障（Write-After-Read Barrier，写后读屏障）
 
 **WAR 屏障**是 SGLang 重叠调度（`event_loop_overlap`）中用来防止**「写后读」数据竞争（Write-After-Read hazard）**的一个 CUDA stream 间同步点。它确保「本轮调度对某块共享 GPU 缓冲的**写入**」一定发生在「上一轮前向对同一块缓冲的**读取**完成之后」。

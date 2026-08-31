@@ -1,3 +1,37 @@
+"""EAGLE V2 投机解码 Worker 实现。
+
+本模块包含两个核心类：
+
+    1. EagleDraftWorker  — 草稿模型 Worker，负责多步草稿前向（draft_forward）、
+       草稿扩展（draft_extend）、树形 mask 构建等。
+    2. EAGLEWorkerV2     — 顶层投机解码 Worker，协调目标模型验证与草稿模型推理，
+      实现完整的「草稿→验证→接受→草稿扩展」循环。
+
+一轮完整 decode 流程（forward_batch_generation 的 else 分支）：
+
+    ┌─ 1. Draft ──────────────────────────────────────────┐
+    │   草稿模型多步前向（speculative_num_steps 步），       │
+    │   每步产生 topk 个候选，构建草稿树                     │
+    │   → EagleDraftWorker.draft()                         │
+    └──────────────────────────────────────────────────────┘
+                            ↓
+    ┌─ 2. Target Verify ──────────────────────────────────┐
+    │   目标模型一次前向验证整棵草稿树                       │
+    │   → EAGLEWorkerV2.verify()                           │
+    │   → eagle_sample() 沿树路径贪心/拒绝采样               │
+    └──────────────────────────────────────────────────────┘
+                            ↓
+    ┌─ 3. Draft Extend ───────────────────────────────────┐
+    │   用验证接受结果喂给草稿模型做一次 extend，              │
+    │   产生下一轮 draft 需要的 hidden states 和 topk       │
+    │   → EagleDraftWorker._draft_extend_for_decode()      │
+    └──────────────────────────────────────────────────────┘
+
+extend/prefill 流程（forward_batch_generation 的 if 分支）：
+    目标模型 prefill → 草稿模型 _draft_extend_for_prefill
+    （prefill 阶段不投机，只填充草稿模型 KV cache）
+"""
+
 import contextlib
 import logging
 import time
@@ -111,6 +145,18 @@ logger = logging.getLogger(__name__)
 def _get_plan_stream(
     device: str,
 ) -> Tuple[any, contextlib.AbstractContextManager]:
+    """获取用于 overlap plan 的 CUDA stream 及其上下文管理器。
+
+    当启用 SGLANG_ENABLE_OVERLAP_PLAN_STREAM 环境变量时，创建一个独立的
+    CUDA stream 用于计划阶段的计算与主计算流重叠；否则返回 None 和空上下文。
+
+    参数：
+        device: 设备字符串，如 "cuda:0"
+
+    返回：(plan_stream, plan_stream_ctx)
+        plan_stream:     CUDA stream 对象，或 None
+        plan_stream_ctx: 对应的 stream 上下文管理器
+    """
     if envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
         plan_stream = torch.get_device_module(device).Stream()
         plan_stream_ctx = torch.get_device_module(device).stream(plan_stream)
@@ -120,6 +166,23 @@ def _get_plan_stream(
 
 
 class EagleDraftWorker(EagleDraftWorkerBase):
+    """EAGLE 草稿模型 Worker，负责草稿模型的多步前向推理和草稿树构建。
+
+    核心职责：
+        1. 加载和管理草稿模型权重
+        2. 多步草稿前向（draft_forward）：每步产生 topk 个候选 token
+        3. 草稿扩展（draft_extend）：用验证结果更新草稿模型状态
+        4. 构建草稿树（通过 build_tree_kernel_efficient）
+
+    属性说明：
+        topk:                       每步每请求的候选数
+        speculative_num_steps:      草稿推理步数
+        speculative_num_draft_tokens: 草稿 token 总数（含 bonus）
+        hot_token_id:               热门 token 映射（EAGLE3 中用于缩减词表）
+        tree_mask_mode:             树形注意力 mask 模式
+        cuda_graph_runner:          草稿 decode 的 CUDA Graph runner
+        cuda_graph_runner_for_draft_extend: 草稿 extend 的 CUDA Graph runner
+    """
     def __init__(
         self,
         server_args: ServerArgs,
@@ -201,7 +264,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
-        """Allocate draft KV cache pools (called by scheduler)."""
+        """分配草稿模型的 KV cache 池（由调度器调用）。
+
+        参数：
+            memory_pool_config:         内存池配置
+            req_to_token_pool:          请求→token 位置映射池
+            token_to_kv_pool_allocator: token→KV cache 位置分配器
+        """
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.draft_worker.alloc_memory_pool(
@@ -213,6 +282,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.init_lm_head()
 
     def init_backends(self):
+        """初始化草稿模型的所有后端：注意力后端、CUDA Graph 等。
+
+        流程：
+            1. 初始化草稿 worker 的模型后端（禁用 CUDA Graph）
+            2. 初始化多步注意力后端
+            3. 如启用 breakable prefill CUDA Graph，初始化 prefill graph
+            4. 捕获 decode 和 extend 的 CUDA Graph
+        """
         with self.draft_tp_context(
             self.draft_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -226,9 +303,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             c.mark_init_finished()
 
     def _rebuild_topk1_chain_buffers(self) -> None:
-        # For topk=1 the draft tree degenerates to a chain, so parent_list and
-        # top_scores_index are runtime-invariant. Must be rebuilt after any
-        # change to speculative_num_steps / speculative_num_draft_tokens.
+        """重建 topk=1 链式快速路径的预分配缓冲区。
+
+        topk=1 时草稿树退化为一条链（每个节点只有一个子节点），
+        parent_list 和 top_scores_index 是运行时常量，可以预分配。
+
+        必须在 speculative_num_steps / speculative_num_draft_tokens 变化后调用。
+
+        断言：topk=1 时 speculative_num_draft_tokens == speculative_num_steps + 1
+        （因为链的节点数 = 步数 + 1 个 bonus）
+        """
+        # topk=1 时草稿树退化为链，parent_list 和 top_scores_index 是运行时常量
         if self.topk != 1:
             return
         # _override_worker_state can set both directly, bypassing the hook that
@@ -260,7 +345,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         ).repeat(max_bs, 1)
 
     def init_token_map(self):
-        # Load hot token ids
+        """加载热门 token 映射表（用于缩减草稿模型的词表大小）。
+
+        EAGLE3 模型自带 hot token id，忽略外部指定的 token map。
+        非 EAGLE3 模型如果指定了 --speculative-token-map，则加载并用于
+        将草稿模型的输出从热门子集映射回完整词表。
+        """
+        # 加载热门 token id
         if self.speculative_algorithm.is_eagle3():
             if self.server_args.speculative_token_map is not None:
                 logger.warning(
@@ -276,6 +367,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
 
     def init_lm_head(self):
+        """初始化草稿模型的 embedding 和 lm_head。
+
+        EAGLE3：大多数情况不共享 lm_head，但某些模型（如 nvidia/gpt-oss-120b-Eagle3）
+        会共享。如果草稿模型的 load_lm_head_from_target 为 True，则从目标模型复制。
+
+        非 EAGLE3：共享目标模型的 embedding 和 lm_head。如果有 hot_token_id，
+        则只保留热门 token 对应的行。
+        """
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         if self.speculative_algorithm.is_eagle3():
             # most cases EAGLE3 models don't share lm_head
@@ -304,7 +403,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.model.set_embed_and_head(embed, head)
 
     def init_attention_backend(self):
-        # Create multi-step attn backends and cuda graph runners
+        """初始化多步注意力后端和草稿扩展后端。
+
+        创建两类后端：
+            1. draft_attn_backend:         decode 阶段的多步注意力后端
+            2. draft_extend_attn_backend:  extend 阶段的注意力后端
+        """
+        # 创建多步注意力后端和 CUDA Graph runner
 
         self.draft_extend_attn_backend = None
 
@@ -329,7 +434,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
     def init_cuda_graphs(self):
-        """Capture cuda graphs."""
+        """捕获草稿模型 decode 和 extend 的 CUDA Graph。
+
+        仅当 speculative_num_steps > 1 时捕获 decode graph
+        （单步草稿不需要 graph，draft_forward 只做采样）。
+
+        extend graph 仅在特定注意力后端（Triton/TRTLLM/Tokenspeed）下捕获。
+        """
         self.cuda_graph_runner = None
         self.cuda_graph_runner_for_draft_extend = None
 
@@ -409,6 +520,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
 
     def draft(self, batch: ScheduleBatch):
+        """草稿前向：用草稿模型预测下一批候选 token，构建草稿树。
+
+        参数：
+            batch: 当前调度 batch，需已带上一轮的 spec_info（EagleDraftInput）
+
+        返回：EagleVerifyInput，包含草稿 token、树形 mask、位置和检索索引
+
+        流程：
+            1. prepare_for_draft: 准备 ForwardBatch
+            2. CUDA Graph replay 或 draft_forward: 多步草稿推理
+            3. build_tree_kernel_efficient: 构建草稿树
+
+        示例（bs=2, topk=4, num_steps=4, num_draft_tokens=17）：
+            >>> # 草稿模型 4 步推理，每步每请求 4 个候选
+            >>> # 拼接后 16 个草稿 + 1 个 bonus = 17 个验证 token
+            >>> # 返回 EagleVerifyInput(draft_token=shape[34], ...)
+        """
         draft_input: EagleDraftInput = batch.spec_info
         forward_batch, can_cuda_graph = self.prepare_for_draft(
             draft_input,
@@ -514,7 +642,28 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
 
     def draft_forward(self, forward_batch: ForwardBatch):
-        # Parse args
+        """多步草稿前向推理的核心实现。
+
+        参数：
+            forward_batch: 包含 spec_info（EagleDraftInput）的 ForwardBatch
+
+        返回 (parent_list, top_scores_index, draft_tokens)：
+            parent_list:      各候选的父节点下标
+            top_scores_index: 被选中候选的列下标
+            draft_tokens:     草稿 token id，shape [bs, num_draft_tokens - 1]
+
+        流程：
+            1. 解析 spec_info 中的 topk_p、topk_index、hidden_states
+            2. 循环 speculative_num_steps 步：
+               a. select_top_k_tokens: 选出当前步的输入 token
+               b. 草稿模型前向 → logits
+               c. softmax + topk → 下一步的候选
+               d. 位置 +1
+            3. organize_draft_results: 整理多步结果
+
+        topk=1 快速路径：链式拓扑下 parent 和 index 是常量，直接用预分配缓冲区。
+        """
+        # 解析参数
         spec_info: EagleDraftInput = forward_batch.spec_info
         out_cache_loc = forward_batch.out_cache_loc
         topk_p, topk_index, hidden_states = (
@@ -639,15 +788,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         next_token_ids: torch.Tensor,
         mm_input_embeds: Optional[torch.Tensor] = None,
     ):
-        """
-        Run draft model extend to correctly fill the KV cache.
+        """prefill 后的草稿扩展：正确填充草稿模型的 KV cache。
 
-        Args:
-            batch: The batch to run.
-            target_hidden_states: Hidden states from the target model forward
-            next_token_ids: Next token ids generated from the target forward.
+        参数：
+            batch:               当前调度 batch
+            target_hidden_states: 目标模型前向的隐藏状态
+            next_token_ids:      目标模型生成的下一 token id
+            mm_input_embeds:     多模态输入嵌入（可选）
+
+        返回：EagleDraftInput，包含 topk_p、topk_index、hidden_states、bonus_tokens
+
+        流程：
+            1. 构造输入 ids（分块 prefill 感知的尾 token 旋转）
+            2. 设置 spec_info 为 EagleDraftExtendInput
+            3. 草稿模型前向（capture_hidden_mode=LAST）
+            4. softmax + topk → 下一轮 draft 输入
         """
-        # Construct input_ids
+        # 构造 input_ids
         if not batch.forward_mode.is_idle():
             # Chunked-prefill-aware tail tokens (see PR #26329).
             tail_tokens = _eagle_prefill_tail_tokens(batch, next_token_ids)
@@ -713,7 +870,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
-        # Batch 2: Draft extend
+        """decode 后的草稿扩展：用验证接受结果更新草稿模型状态。
+
+        参数：
+            batch:        当前调度 batch
+            batch_result: 验证阶段的 GenerationBatchResult
+
+        无返回值，直接修改 batch_result.next_draft_input 的字段。
+
+        流程：
+            1. 构造 EagleDraftExtendInput（含接受长度信息）
+            2. prepare_for_draft_extend: 准备 ForwardBatch
+            3. CUDA Graph replay 或草稿模型前向
+            4. 按 select_index 提取有效行
+            5. softmax + topk → 下一轮 draft 的 topk_p/topk_index/hidden_states
+        """
+        # Batch 2: 草稿扩展
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
@@ -819,6 +991,26 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
+    """EAGLE V2 顶层投机解码 Worker，协调目标模型与草稿模型。
+
+    继承 BaseSpecWorker，实现完整的「草稿→验证→接受→草稿扩展」循环。
+
+    核心属性：
+        _target_worker:       目标模型 worker
+        _draft_worker:        草稿模型 worker（EagleDraftWorker）
+        adaptive_controller:  自适应投机解码控制器（可选）
+        topk:                 每步每请求的候选数
+        speculative_num_steps:      草稿推理步数
+        speculative_num_draft_tokens: 草稿 token 总数（含 bonus）
+
+    示例：
+        >>> # 初始化：server_args 指定 EAGLE3 算法
+        >>> worker = EAGLEWorkerV2(server_args, gpu_id=0, tp_rank=0, ...)
+        >>> # 每轮 decode：
+        >>> result = worker.forward_batch_generation(batch)
+        >>> # result.next_token_ids = 接受的 token
+        >>> # result.accept_lens = tensor([3, 1, 5])  各请求接受长度
+    """
     def __init__(
         self,
         server_args: ServerArgs,
@@ -831,7 +1023,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
-        # Parse arguments
+        # 解析参数
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
@@ -845,9 +1037,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             server_args.speculative_algorithm
         )
 
-        # Override the context length of the draft model to be the same as the target model.
+        # 将草稿模型的上下文长度覆盖为目标模型的上下文长度
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
+        # 创建草稿 worker
         self._draft_worker = EagleDraftWorker(
             server_args,
             gpu_id,
@@ -860,7 +1053,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             target_worker,
         )
 
-        # Adaptive speculative
+        # 自适应投机解码控制器（可选）
         self.adaptive_controller: Optional[AdaptiveController] = None
         if server_args.speculative_adaptive:
             self.adaptive_controller = AdaptiveController(
@@ -868,18 +1061,23 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 config_path=server_args.speculative_adaptive_config,
             )
 
-        # Some dummy tensors
+        # 预分配的 dummy tensor（用于 CUDA Graph 静态输入）
         self.num_new_pages_per_topk = torch.empty(
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
+        # 获取 overlap plan 用的 CUDA stream
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
-        # Every attn backend a spec_v2 forward touches; consumed by
-        # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
+        """返回 spec_v2 前向涉及的所有注意力后端。
+
+        被 decide_needs_cpu_seq_lens 用于决定是否需要将 seq_lens 从 D2H 传到 CPU。
+
+        返回：(target_attn_backend, draft_attn_backend, draft_extend_attn_backend)
+        """
         return (
             self._target_worker.model_runner.attn_backend,
             self._draft_worker.draft_attn_backend,
@@ -893,6 +1091,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
+        """分配 KV cache 内存池。
+
+        草稿模型与目标模型共享 KV cache 池。
+        """
         self._draft_worker.alloc_memory_pool(
             memory_pool_config, req_to_token_pool, token_to_kv_pool_allocator
         )
@@ -900,8 +1102,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
 
     def init_backends(self):
+        """初始化所有后端：草稿模型后端、自适应控制器运行时状态。"""
         self._draft_worker.init_backends()
-        # Build adaptive runtime states after target and draft backends exist.
+        # 在目标模型和草稿模型后端都就绪后，构建自适应运行时状态
         if self.adaptive_controller is not None:
             with (
                 self._draft_worker.draft_tp_context(
@@ -932,19 +1135,47 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
     @property
     def target_worker(self):
+        """返回目标模型 worker。"""
         return self._target_worker
 
     @property
     def draft_worker(self):
+        """返回草稿模型 worker。"""
         return self._draft_worker
 
     def clear_cache_pool(self):
-        # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
+        """清空 KV cache 池（空操作，由调度器统一清空共享池）。"""
+        # 分配器和 KV cache 池与目标模型共享，由调度器统一清空
         pass
 
     def forward_batch_generation(self, batch: ScheduleBatch, on_publish=None):
+        """前向生成入口：根据 forward_mode 分为 extend/prefill 和 decode 两条路径。
+
+        参数：
+            batch:      当前调度 batch
+            on_publish: 回调函数，在目标模型前向完成后发布 new_seq_lens
+
+        返回：GenerationBatchResult
+
+        extend/prefill 路径（if 分支）：
+            1. 目标模型 prefill（capture_hidden_mode=FULL）
+            2. 草稿模型 _draft_extend_for_prefill（填充草稿 KV cache）
+
+        decode 路径（else 分支）：
+            1. 草稿模型 draft（多步草稿推理 + 树构建）
+            2. 目标模型 verify（验证草稿树 + 采样接受）
+            3. 草稿模型 _draft_extend_for_decode（用接受结果扩展草稿状态）
+
+        示例：
+            >>> # decode 路径：
+            >>> result = worker.forward_batch_generation(batch)
+            >>> # result.next_token_ids shape = [bs, spec_steps + 1]
+            >>> # result.accept_lens = tensor([3, 1, 5])  各请求接受长度
+            >>> # result.next_draft_input = EagleDraftInput(bonus_tokens=...)
+        """
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            # Target prefill
+            # ---- extend/prefill 路径 ----
+            # 目标模型 prefill，捕获全部隐藏状态（FULL）
             target_capture_mode = (
                 CaptureHiddenMode.NULL
                 if self.speculative_algorithm.is_standalone()
@@ -953,14 +1184,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch.capture_hidden_mode = target_capture_mode
             batch_output = self.target_worker.forward_batch_generation(batch)
 
-            # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
-            # Extend processed L prompt tokens; next verify iter expects same L.
+            # spec_v2 约定：batch.seq_lens = 本次迭代前的长度。
+            # Extend 处理了 L 个 prompt token；下一轮 verify 期望相同的 L。
             batch_output.new_seq_lens = batch.seq_lens
-            # Publish before draft_extend so the fence is at target-end.
+            # 在 draft_extend 之前发布，使 fence 位于 target-end
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
 
-            # Draft prefill
+            # 草稿模型 prefill 扩展
             with (
                 self.draft_worker.draft_tp_context(
                     self.draft_worker.draft_runner.tp_group
@@ -979,8 +1210,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
                 return batch_output
         else:
+            # ---- decode 路径 ----
+            # 自适应：根据 batch size 激活合适的步数配置
             self.activate_step_by_batch(batch.seq_lens.shape[0])
 
+            # 首轮 decode 时 spec_info 为 None，创建 idle 输入
             if batch.spec_info is None:
                 capture_mode = (
                     CaptureHiddenMode.NULL
@@ -994,6 +1228,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=capture_mode,
                 )
+
+            # 步骤 1: 草稿前向（多步推理 + 草稿树构建）
             with (
                 self.draft_worker.draft_tp_context(
                     self.draft_worker.draft_runner.tp_group
@@ -1005,10 +1241,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
+
+            # 步骤 2: 目标模型验证（一次前向验证整棵草稿树 + 采样接受）
             batch_output = self.verify(batch)
-            # Publish before draft_extend so the fence is at verify-end.
+
+            # 在 draft_extend 之前发布，使 fence 位于 verify-end
             if on_publish is not None:
                 on_publish(batch_output.new_seq_lens)
+
+            # 步骤 3: 草稿扩展（用接受结果更新草稿模型状态）
             with (
                 self.draft_worker.draft_tp_context(
                     self.draft_worker.draft_runner.tp_group
@@ -1024,16 +1265,27 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
     ) -> None:
+        """验证完成后 CPU 侧回调：通知自适应控制器更新统计。
+
+        参数：
+            num_correct_drafts_per_req: 每个请求接受的草稿 token 数列表
+            batch_size:                 当前 batch 大小
+        """
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(
                 num_correct_drafts_per_req, batch_size=batch_size
             )
 
     def activate_step_by_batch(self, batch_size: int) -> None:
+        """根据 batch size 激活自适应投机步数配置。
+
+        参数：
+            batch_size: 当前 batch 大小
+        """
         if self.adaptive_controller is not None:
             self.adaptive_controller.activate_step_by_batch(batch_size)
 
-    # -- Adaptive speculative decoding protocol --
+    # -- 自适应投机解码协议 --
 
     def build_adaptive_runtime_state(
         self,
@@ -1041,7 +1293,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
         speculative_num_draft_tokens: int,
         cuda_graph_bs=None,
     ) -> SpecRuntimeState:
-        """Build a SpecRuntimeState for the given step configuration."""
+        """为给定步数配置构建 SpecRuntimeState。
+
+        参数：
+            speculative_num_steps:       草稿推理步数
+            speculative_num_draft_tokens: 草稿 token 总数
+            cuda_graph_bs:               CUDA Graph 支持的 batch size 列表
+
+        返回：SpecRuntimeState，包含该步数配置下的所有后端和 graph runner
+
+        流程：
+            1. 临时覆盖 worker 的步数参数
+            2. 重新初始化草稿注意力后端和 CUDA Graph
+            3. 构建目标模型注意力后端和 CUDA Graph runner
+            4. 组装 SpecRuntimeState
+        """
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
 
@@ -1053,7 +1319,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self._draft_worker.init_attention_backend()
             self._draft_worker.init_cuda_graphs()
 
-            # Build target attention backend and CUDA graph runner
+            # 构建目标模型的注意力后端和 CUDA Graph runner
             target_model_runner = self._target_worker.model_runner
             backup_init = target_model_runner.init_new_workspace
             try:
@@ -1097,23 +1363,33 @@ class EAGLEWorkerV2(BaseSpecWorker):
         return state
 
     def apply_runtime_state(self, state: SpecRuntimeState) -> None:
-        """Apply a pre-built runtime state to this worker."""
+        """将预构建的运行时状态应用到当前 worker。
+
+        参数：
+            state: 要应用的 SpecRuntimeState
+
+        流程：
+            1. 如果步数相同则跳过
+            2. 更新顶层和草稿侧的步数参数、注意力后端、CUDA Graph runner
+            3. 更新目标侧的注意力后端和 CUDA Graph runner
+            4. 同步 server_args
+        """
         if self.speculative_num_steps == state.speculative_num_steps:
             return
 
         log_info_on_rank0(
             logger,
-            "Switch adaptive runtime state: "
+            "切换自适应运行时状态: "
             f"steps {self.speculative_num_steps} -> {state.speculative_num_steps}, "
             f"draft_tokens {self.speculative_num_draft_tokens} -> "
             f"{state.speculative_num_draft_tokens}",
         )
 
-        # Top-level
+        # 顶层参数
         self.speculative_num_steps = state.speculative_num_steps
         self.speculative_num_draft_tokens = state.speculative_num_draft_tokens
 
-        # Draft side
+        # 草稿侧
         dw = self._draft_worker
         dw.speculative_num_steps = state.speculative_num_steps
         dw.speculative_num_draft_tokens = state.speculative_num_draft_tokens
@@ -1121,22 +1397,22 @@ class EAGLEWorkerV2(BaseSpecWorker):
         dw.draft_runner.draft_attn_backend = state.draft_attn_backend
         dw.cuda_graph_runner = state.cuda_graph_runner
         dw.draft_extend_attn_backend = state.draft_extend_attn_backend
-        # Keep the runner's attn_backend in step with the active draft-extend
-        # backend (the draft-extend forward reads draft_runner.attn_backend);
-        # mirrors init_attention_backend. When None, the runner keeps its
-        # initialized backend (consistent across step configs).
+        # 保持 runner 的 attn_backend 与活跃的 draft-extend 后端同步
+        # （draft-extend 前向读取 draft_runner.attn_backend）；
+        # 与 init_attention_backend 保持一致。当为 None 时，runner 保持
+        # 已初始化的后端（在各步数配置间保持一致）。
         if state.draft_extend_attn_backend is not None:
             dw.draft_runner.attn_backend = state.draft_extend_attn_backend
         dw.cuda_graph_runner_for_draft_extend = state.cuda_graph_runner_for_draft_extend
         dw._rebuild_topk1_chain_buffers()
 
-        # Target side
+        # 目标侧
         self._target_worker.model_runner.attn_backend = state.target_attn_backend
         self._target_worker.model_runner.decode_cuda_graph_runner = (
             state.target_graph_runner
         )
 
-        # Sync server_args
+        # 同步 server_args
         self.server_args.speculative_num_steps = state.speculative_num_steps
         self.server_args.speculative_num_draft_tokens = (
             state.speculative_num_draft_tokens
@@ -1149,7 +1425,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
         speculative_num_draft_tokens: int,
         cuda_graph_bs: list[int] | None = None,
     ):
-        """Temporarily override server_args and worker attributes for graph capture."""
+        """临时覆盖 server_args 和 worker 属性，用于 CUDA Graph 捕获。
+
+        参数：
+            speculative_num_steps:       临时步数
+            speculative_num_draft_tokens: 临时草稿 token 数
+            cuda_graph_bs:               CUDA Graph batch size 列表
+
+        用法：
+            >>> with worker._override_worker_state(steps=4, draft_tokens=17):
+            ...     # 在此作用域内，worker 的步数参数被临时修改
+            ...     worker._draft_worker.init_cuda_graphs()
+            >>> # 退出后自动恢复
+        """
         sa = self.server_args
         dw = self._draft_worker
         backup = (
@@ -1177,10 +1465,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
         sa.speculative_num_draft_tokens = speculative_num_draft_tokens
         if cuda_graph_bs is not None:
             sa.cuda_graph_bs_decode = cuda_graph_bs
-            # BS-aware adaptive spec may prune cuda_graph_bs to an empty list
-            # for steps that no BS range uses (e.g. step=1). Disable graph
-            # capture for those steps; restore in finally so subsequent steps
-            # are not affected.
+            # BS 感知的自适应投机可能将 cuda_graph_bs 裁剪为空列表
+            # （例如 step=1 没有使用该 BS 范围）。对这些步数禁用 graph
+            # 捕获；在 finally 中恢复，以免影响后续步数。
             if not cuda_graph_bs:
                 sa.disable_cuda_graph = True
         dw._rebuild_topk1_chain_buffers()
@@ -1207,6 +1494,31 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw._rebuild_topk1_chain_buffers()
 
     def verify(self, batch: ScheduleBatch):
+        """目标模型验证：一次前向验证整棵草稿树，采样并接受匹配的 token。
+
+        参数：
+            batch: 当前调度 batch，spec_info 为 EagleVerifyInput
+
+        返回：GenerationBatchResult
+            - next_token_ids:    接受的 token（shape [bs, spec_steps+1]）
+            - accept_lens:       每个请求的接受长度（含 bonus）
+            - new_seq_lens:      更新后的序列长度
+            - next_draft_input:  下一轮草稿输入（含 bonus_tokens）
+
+        流程：
+            1. eagle_prepare_for_verify: 准备验证 ForwardBatch
+            2. 目标模型前向验证整棵草稿树
+            3. eagle_sample: 沿树路径贪心/拒绝采样，得到 accept_lens
+            4. commit_mamba_states_after_verify: 更新 Mamba 状态
+            5. fill_bonus_tokens: 提取每请求的 bonus token
+            6. topk > 1 时压缩接受路径到前端
+
+        示例：
+            >>> # 假设 bs=2, topk=4, spec_steps=4, num_draft_tokens=17
+            >>> result = worker.verify(batch)
+            >>> # result.next_token_ids shape = [2, 5]  (spec_steps + 1)
+            >>> # result.accept_lens = tensor([3, 5])  各请求接受长度
+        """
         fwd_stream = torch.get_device_module(self.device).current_stream()
         verify_input: EagleVerifyInput = batch.spec_info
         record_stream_for_v2_verify(batch, verify_input, fwd_stream)
@@ -1214,8 +1526,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_input.num_tokens_per_req = self.speculative_num_steps + 1
         bs = len(batch.seq_lens)
 
-        # Batch 1: Target verify
-        # Prepare for target verify in a separate stream
+        # 批次 1: 目标模型验证
+        # 在独立的 plan stream 中准备验证数据
         with self.plan_stream_ctx:
             verify_forward_batch, can_run_cuda_graph = eagle_prepare_for_verify(
                 verify_input,
@@ -1224,10 +1536,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self.target_worker,
             )
 
-        # Cover post-prepare rebinds: draft_token, plan_stream-allocated out_cache_loc.
+        # 覆盖 post-prepare 的重绑定：draft_token、plan_stream 分配的 out_cache_loc
         record_stream_each((batch.input_ids, batch.out_cache_loc), fwd_stream)
 
-        # Correct some buffers due to the overlap plan
+        # 修正 overlap plan 导致的 buffer 问题
         if self.plan_stream:
             torch.get_device_module(self.device).current_stream().wait_stream(
                 self.plan_stream
@@ -1239,15 +1551,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 and getattr(batch.spec_info, "positions", None) is not None
                 and not batch.forward_mode.is_idle()
             ):
-                # mrope_position depends on draft output in default stream and is computed in plan stream,
-                # causing errors. Compute it here for correct values.
+                # mrope_position 依赖默认 stream 中的草稿输出，但在 plan stream
+                # 中计算会导致错误。在此重新计算正确值。
                 verify_forward_batch.compute_spec_mrope_positions(
                     self._target_worker.model_runner, batch
                 )
 
-            # Some values such as custom_mask and position depend on the output of draft,
-            # so the previous plan step used the wrong values. Here, we need to run the related
-            # computation again to update them to the correct values.
+            # custom_mask 和 position 等值依赖草稿输出，
+            # 之前的 plan 步骤使用了错误值。在此重新运行相关计算以更新。
             self.target_worker.model_runner.attn_backend.update_verify_buffers_to_fill_after_draft(
                 verify_input,
                 (
@@ -1257,7 +1568,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
             )
 
-        # Prepare grammar data on CPU if needed
+        # 如果需要语法约束，在 CPU 上准备 grammar 数据
         if batch.has_grammar:
             retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
             retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
@@ -1265,11 +1576,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 verify_input.retrieve_next_token.shape
             ).cpu()
 
-        # Run target verify batch in the main compute stream (GPU compute).
-        # Metadata init is skipped iff cuda-graph already ran replay_prepare —
-        # eagle_prepare_for_verify marked the batch in exactly that case; the
-        # non-cuda-graph path stays unmarked and gets forward_extend's init
-        # (post-pad).
+        # 在主计算 stream 中运行目标模型验证（GPU 计算）
+        # 当且仅当 cuda-graph 已运行 replay_prepare 时跳过元数据初始化——
+        # eagle_prepare_for_verify 正好在那种情况下标记了 batch；
+        # 非 cuda-graph 路径保持未标记，走 forward_extend 的初始化（pad 后）。
         forward_batch_output = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -1277,10 +1587,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
         logits_output = forward_batch_output.logits_output
 
-        # Generate vocab mask for constrained decoding
+        # 生成约束解码的 vocab mask
         vocab_mask = None
         if batch.has_grammar:
-            # Generate the logit mask for structured output.
+            # 为结构化输出生成 logit mask
             vocab_mask = generate_token_bitmask(
                 batch.reqs,
                 verify_input,
@@ -1293,11 +1603,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if vocab_mask is not None:
                 assert verify_input.grammar is not None
                 vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
-                # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
-                # and will be applied to produce wrong results
+                # 注意：否则此 vocab mask 会是上一个 extend 阶段的，
+                # 应用后会产生错误结果
                 batch.sampling_info.vocab_mask = None
 
-        # Sample
+        # 采样：沿草稿树路径贪心/拒绝采样
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
         (
@@ -1307,7 +1617,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
-        # Update mamba state for hybrid GDN models after verification
+        # 验证后更新混合 GDN 模型的 Mamba 状态
         commit_mamba_states_after_verify(
             self.target_worker,
             batch,
@@ -1319,8 +1629,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         if not batch.forward_mode.is_idle():
             accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
-            # stride = accept_tokens per-req width = accept_index.shape[1]
-            # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
+            # stride = accept_tokens 每请求宽度 = accept_index.shape[1]
+            # （spec_steps + 1）；不是 num_draft_tokens，对 topk > 1 的树不对。
             fill_bonus_tokens[(bs,)](
                 accept_tokens,
                 accept_lens,
@@ -1330,24 +1640,26 @@ class EAGLEWorkerV2(BaseSpecWorker):
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
+        # 计算对数概率（如果请求了 logprob）
         if batch.return_logprob and not batch.forward_mode.is_idle():
             compute_spec_v2_logprobs(
                 batch, logits_output, predict, accept_index, self.speculative_num_steps
             )
 
+        # topk > 1 时压缩接受路径到前端
         if not batch.forward_mode.is_idle() and self.topk > 1:
-            # topk == 1 needs nothing here: the accepted path is already the front
-            # chain, so the whole compaction is an identity transform.
+            # topk == 1 不需要处理：接受路径已经是前端的链，
+            # 整个压缩操作是恒等变换。
             predict = self._finalize_accept_tree_path(
                 batch, accept_index, accept_lens, predict, logits_output, bs
             )
 
         next_draft_input = EagleDraftInput(bonus_tokens=bonus_tokens)
 
-        # verify_forward_batch transitively holds verify-time GPU tensors
-        # (draft_token / out_cache_loc / ...) that must outlive the imminent
-        # batch.input_ids rebind in prepare_for_draft_extend.
-        # Scheduler pins it in batch_record_buf for the 2-iter window.
+        # verify_forward_batch 间接持有验证时 GPU tensor
+        # （draft_token / out_cache_loc / ...），必须存活到即将到来的
+        # prepare_for_draft_extend 中的 batch.input_ids 重绑定。
+        # 调度器将其固定在 batch_record_buf 中维持 2 迭代窗口。
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
@@ -1370,11 +1682,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
         logits_output,
         bs: int,
     ) -> torch.Tensor:
-        """Tree drafting (topk > 1): move the accepted path -- KV slots, predict,
-        hidden_states -- to the contiguous front of each per-req block, which the
-        downstream chain-layout code (draft-extend select_index, committed-KV reads)
-        assumes. Returns compacted predict; mutates logits_output.hidden_states
-        (moved only when present)."""
+        """树形草稿（topk > 1）：将接受路径移到每个请求块的前端。
+
+        将 KV 槽位、predict、hidden_states 移到每个请求 per-req 块的连续前端，
+        下游链式布局代码（draft-extend select_index、committed-KV 读取）依赖此布局。
+
+        参数：
+            batch:         当前调度 batch
+            accept_index:  接受路径的节点索引 [bs, spec_steps + 1]
+            accept_lens:   每请求接受长度 [bs]
+            predict:       预测 token [bs * num_draft_tokens, ...]
+            logits_output: logits 输出（hidden_states 会被原地修改）
+            bs:            batch size
+
+        返回：压缩后的 predict tensor
+        """
         move_accept_tokens_to_target_kvcache(
             batch, accept_index, accept_lens - 1, self.token_to_kv_pool_allocator
         )
@@ -1388,12 +1710,19 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def _compact_accept_to_front(
         self, x: torch.Tensor, accept_index: torch.Tensor, bs: int
     ) -> torch.Tensor:
-        """Gather the accepted tree path to the front of each per-req block.
+        """将接受的树路径 gather 到每个 per-req 块的前端。
 
-        ``x`` is node-indexed over the whole tree (``[bs * num_draft_tokens, ...]``),
-        ``accept_index`` is ``[bs, spec_steps + 1]`` global node indices (-1 padded).
-        Padded entries clamp to node 0 but land past accept_lens (never read);
-        trailing unaccepted slots stay and are freed as overshoot.
+        ``x`` 是整个树的节点索引 (``[bs * num_draft_tokens, ...]``)，
+        ``accept_index`` 是 ``[bs, spec_steps + 1]`` 的全局节点索引 (-1 填充)。
+        填充项 clamp 到节点 0 但落在 accept_lens 之后（不会被读取）；
+        尾部未接受槽位保留，作为 overshoot 释放。
+
+        参数：
+            x:            待压缩的 tensor [bs * num_draft_tokens, ...]
+            accept_index: 接受路径索引 [bs, spec_steps + 1]
+            bs:           batch size
+
+        返回：压缩后的 tensor，接受路径在每请求块前端
         """
         nd = self.speculative_num_draft_tokens
         s1 = accept_index.shape[1]  # spec_steps + 1
@@ -1404,6 +1733,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         return out
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        """从磁盘更新草稿模型权重。
+
+        参数：
+            recv_req: 包含模型路径和加载格式的请求
+
+        返回：(success: bool, message: str)
+        """
         success, message = self._draft_worker.draft_runner.update_weights_from_disk(
             recv_req.model_path,
             recv_req.load_format,
@@ -1414,6 +1750,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         return True, "Succeeded to update model weights."
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+        """从 IPC 更新草稿模型权重。
+
+        参数：
+            recv_req: IPC 更新请求
+
+        返回：(success: bool, message: str)
+        """
         success, message = self._draft_worker.draft_runner.update_weights_from_ipc(
             recv_req
         )
@@ -1422,6 +1765,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
         return True, "Succeeded to update model weights."
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+        """从 tensor 更新草稿模型和目标模型权重。
+
+        参数：
+            recv_req: 包含序列化 tensor 的请求
+
+        返回：(success: bool, message: str)
+
+        流程：
+            1. 反序列化 named_tensors
+            2. 更新草稿模型权重
+            3. 更新目标模型权重
+        """
         monkey_patch_torch_reductions()
         named_tensors = MultiprocessingSerializer.deserialize(
             recv_req.serialized_named_tensors[self.tp_rank]

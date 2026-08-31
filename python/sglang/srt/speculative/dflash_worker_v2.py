@@ -1,3 +1,26 @@
+"""DFLASH V2 投机解码 Worker 模块。
+
+本模块实现 DFLASH（Draft-FLash）投机解码的 spec-v2 逻辑，
+包括草稿模型的块级前向、目标验证、KV cache 物化等。
+
+DFLASH 的核心思想：
+    - 草稿模型以固定块大小（block_size）生成一组候选 token
+    - 目标模型验证这组 token，接受正确的前缀
+    - 草稿 KV cache 从目标模型的隐藏状态物化而来
+    - 支持 compact draft cache（滑动窗口模式）
+
+主要类：
+    - DFlashWorkerV2: DFLASH V2 顶层 Worker，继承 BaseSpecWorker
+
+示例流程（decode 阶段）：
+    1. 从 verified_id 构建含 mask_token 的 draft block
+    2. 草稿模型前向，生成 draft hidden states
+    3. 贪心采样得到 draft tokens
+    4. 目标模型验证 draft tokens
+    5. 计算接受长度和 bonus token
+    6. 物化已接受的 token 到 draft KV cache
+"""
+
 import logging
 import math
 from copy import deepcopy
@@ -47,10 +70,19 @@ _is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
+# 融合 KV 物化辅助类的延迟加载缓存
 _FusedKVMaterializeHelper = None
 
 
 def _get_fused_kv_materialize_helper():
+    """延迟加载并缓存 FusedKVMaterializeHelper 类。
+
+    返回：FusedKVMaterializeHelper 类
+
+    示例：
+        >>> helper_cls = _get_fused_kv_materialize_helper()
+        >>> helper = helper_cls(layers=model.layers, ...)
+    """
     global _FusedKVMaterializeHelper
     if _FusedKVMaterializeHelper is None:
         from sglang.srt.speculative.triton_ops.fused_kv_materialize import (
@@ -62,10 +94,25 @@ def _get_fused_kv_materialize_helper():
 
 
 class DFlashWorkerV2(BaseSpecWorker):
-    """DFLASH speculative decoding worker (spec-v2).
+    """DFLASH 投机解码 Worker（spec-v2）。
 
-    Drives both overlap and non-overlap scheduling, same as EAGLE: the
-    scheduler runs it synchronously when overlap is disabled.
+    同时驱动 overlap 和 non-overlap 调度，与 EAGLE 相同：
+    当 overlap 被禁用时，scheduler 同步运行此 worker。
+
+    核心属性：
+        _target_worker:       目标模型 worker
+        _draft_worker:        草稿模型 worker（普通 TpModelWorker）
+        block_size:           草稿块大小（候选 token 数）
+        draft_window_size:    草稿滑动窗口大小（None 表示无窗口）
+        use_compact_draft_cache: 是否使用紧凑草稿缓存
+        _mask_token_id:       mask token 的 id
+        _fused_kv_helper:     融合 KV 物化辅助器
+
+    示例：
+        >>> worker = DFlashWorkerV2(server_args, 0, 0, 0, 0, 0, 0, port, target_worker)
+        >>> result = worker.forward_batch_generation(batch)
+        >>> # result.next_token_ids = 验证后的输出 token
+        >>> # result.accept_lens = 各请求接受长度
     """
 
     def __init__(
@@ -80,6 +127,19 @@ class DFlashWorkerV2(BaseSpecWorker):
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        """初始化 DFLASH V2 worker。
+
+        参数：
+            server_args:   服务器参数
+            gpu_id:        GPU ID
+            tp_rank:       张量并行 rank
+            dp_rank:       数据并行 rank（可选）
+            moe_ep_rank:   MoE 专家并行 rank
+            attn_cp_rank:  注意力上下文并行 rank
+            moe_dp_rank:   MoE 数据并行 rank
+            nccl_port:     NCCL 通信端口
+            target_worker: 目标模型 worker
+        """
         self.server_args = server_args
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
@@ -91,7 +151,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.page_size = server_args.page_size
-        # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
+        # 草稿窗口大小（在 arg_groups.speculative_hook 中规范化）
         self.draft_window_size: Optional[int] = (
             server_args.speculative_draft_window_size
         )
@@ -101,7 +161,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
 
-        # Draft runner (separate KV cache + attention backend).
+        # 草稿 runner（独立的 KV cache + 注意力后端）
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
         draft_backend = draft_server_args.speculative_draft_attention_backend
@@ -109,7 +169,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if draft_backend is None:
             draft_backend, _ = draft_server_args.get_attention_backends()
         if draft_backend is None:
-            # Use triton on ROCm (no FlashInfer), flashinfer on CUDA
+            # ROCm 无 FlashInfer，使用 triton；CUDA 使用 flashinfer
             import torch as _torch
 
             draft_backend = "triton" if _torch.version.hip else "flashinfer"
@@ -136,12 +196,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 _fb,
             )
             draft_backend = _fb
-        # Make the draft worker backend explicit and self-contained (no further overrides).
+        # 使草稿 worker 后端明确且自包含（不再进一步覆盖）
         draft_server_args.speculative_draft_attention_backend = None
         draft_server_args.prefill_attention_backend = None
         draft_server_args.decode_attention_backend = None
         draft_server_args.attention_backend = draft_backend
-        # Keep draft context length aligned with the target.
+        # 草稿上下文长度与目标模型保持一致
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
         )
@@ -160,14 +220,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self._draft_worker.model_runner
-        # Keep the same alias that other spec-v2 workers expose.
+        # 与其他 spec-v2 worker 保持一致的别名
         self._draft_worker.draft_runner = self.draft_model_runner
         self.draft_model = self.draft_model_runner.model
+        # 解析 DFLASH 草稿配置
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
         if server_args.speculative_num_draft_tokens is None:
-            # Should not happen (ServerArgs should have inferred it), but keep a fallback.
+            # 不应发生（ServerArgs 应已推断），但保留 fallback
             self.block_size = int(draft_config.resolve_block_size(default=16))
         else:
             self.block_size = int(server_args.speculative_num_draft_tokens)
@@ -206,21 +267,23 @@ class DFlashWorkerV2(BaseSpecWorker):
                 self._mask_token_id_override,
             )
 
+        # 块内位置偏移常量 [0, 1, ..., block_size-1]
         self._block_pos_offsets = torch.arange(
             self.block_size, device=self.device, dtype=torch.int64
         )
-        self._draft_block_ids_buf: Optional[torch.Tensor] = None  # [cap_bs, block_size]
+        # 以下为可复用的 GPU 缓冲区，按需扩容
+        self._draft_block_ids_buf: Optional[torch.Tensor] = None  # [cap_bs, block_size] 块 token ids
         self._draft_block_positions_buf: Optional[torch.Tensor] = (
-            None  # [cap_bs, block_size]
+            None  # [cap_bs, block_size] 块位置
         )
         self._draft_block_tokens_buf: Optional[torch.Tensor] = (
-            None  # [cap_bs, block_size]
+            None  # [cap_bs, block_size] 草稿输出 token
         )
         self._draft_verify_out_cache_loc_buf: Optional[torch.Tensor] = (
-            None  # [cap_bs, block_size]
+            None  # [cap_bs, block_size] 验证阶段 cache loc
         )
-        self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
-        self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
+        self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs] 块结束位置
+        self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] CPU 上的 seq_lens
         self._draft_block_spec_info = DFlashVerifyInput(
             draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
             positions=torch.empty((0,), dtype=torch.int64, device=self.device),
@@ -228,6 +291,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        # 贪心采样 TP 跨 rank 聚合的缓冲区
         self._draft_greedy_gathered_max_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gathered_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_gather_cap: int = 0
@@ -238,14 +302,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
+        # 融合 KV 物化（仅 CUDA / HIP 支持）
         self._use_fused_kv_materialize = is_cuda() or is_hip()
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
 
+        # Triton kernel 可用性
         supports_gpu_triton = is_cuda() or is_hip()
         self._use_triton_prepare_block = supports_gpu_triton
         self._use_triton_accept_bonus = supports_gpu_triton
+        # accept/bonus 双缓冲（用于 overlap 调度）
         self._accept_bonus_buffer_cap: int = 0
         self._accept_bonus_buffer_slot: int = 0
         self._accept_len_buf: Optional[torch.Tensor] = None
@@ -256,19 +323,27 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     @property
     def target_worker(self) -> TpModelWorker:
+        """返回目标模型 worker。"""
         return self._target_worker
 
     @property
     def draft_worker(self):
-        # DFLASH drives the draft model through a plain TpModelWorker: the
-        # draft KV is materialized from target hidden states, so there is no
-        # EagleDraftWorkerBase draft/draft_extend split to wrap it in.
+        """返回草稿模型 worker。
+
+        DFLASH 通过普通 TpModelWorker 驱动草稿模型：
+        草稿 KV 从目标隐藏状态物化而来，
+        因此不需要 EagleDraftWorkerBase 的 draft/draft_extend 拆分。
+        """
         return self._draft_worker
 
     @property
     def spec_v2_attn_backends(self) -> tuple:
-        # Every attn backend a spec_v2 forward touches; consumed by
-        # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
+        """返回 spec_v2 前向涉及的所有注意力后端元组。
+
+        被 decide_needs_cpu_seq_lens 消费，用于控制 seq_lens_cpu 的 D2H 传输。
+
+        返回：(target_attn_backend, draft_attn_backend)
+        """
         return (
             self._target_worker.model_runner.attn_backend,
             self.draft_model_runner.attn_backend,
@@ -280,11 +355,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
     ):
-        # Without draft windowing, the draft worker aliases the target
-        # request->token mapping and allocation state. With draft windowing
-        # enabled, the draft worker keeps a private compact req->token table
-        # over the same global KV index space, so radix-cache/prefix-hit KV
-        # remains reusable while draft attention sees only the recent window.
+        """分配 KV cache 内存池。
+
+        无草稿窗口时，草稿 worker 别名目标模型的 req->token 映射。
+        有草稿窗口时，草稿 worker 维护私有紧凑 req->token 表，
+        复用全局 KV 索引空间，使 radix-cache/prefix-hit KV 仍可重用，
+        而草稿注意力只看到最近窗口。
+
+        参数：
+            memory_pool_config:         内存池配置
+            req_to_token_pool:          请求→token 映射池
+            token_to_kv_pool_allocator: KV cache 池分配器
+        """
         self._draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=(
@@ -294,6 +376,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_backends(self):
+        """初始化草稿 worker 的后端。
+
+        在 CUDA 上检查可用显存，不足 1GB 时禁用 CUDA Graph。
+        """
         disable_cuda_graph = False
         if is_cuda() and not self.server_args.disable_cuda_graph:
             available_mem = get_available_gpu_memory(self.device, self.gpu_id)
@@ -307,7 +393,20 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_worker.init_backends(disable_cuda_graph=disable_cuda_graph)
 
     def _init_fused_kv_helper(self) -> None:
-        """Initialize the fused KV materialization helper with pre-stacked weights."""
+        """初始化融合 KV 物化辅助器。
+
+        检查所有层的 qkv_proj 是否满足融合条件（无非单位缩放、neox RoPE 等），
+        如满足则创建 FusedKVMaterializeHelper，否则回退到逐层路径。
+
+        示例：
+            >>> worker._init_fused_kv_helper()
+            >>> # 成功时：
+            >>> worker._fused_kv_helper is not None
+            True
+            >>> # 不满足条件时：
+            >>> worker._use_fused_kv_materialize
+            False
+        """
         try:
             layers = self.draft_model.layers
             fused_disable_reason: Optional[str] = None
@@ -388,6 +487,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._fused_kv_helper = None
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
+        """确保草稿块缓冲区容量足够。
+
+        按需扩容所有 [cap_bs, block_size] 形状的 GPU 缓冲区。
+
+        参数：
+            bs: 当前批次大小
+        """
         cap = (
             0
             if self._draft_block_ids_buf is None
@@ -419,18 +525,21 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def __getattr__(self, name):
-        # Delegate anything not implemented yet to the target worker. Guard
-        # the backing field so a lookup before __init__ sets it raises
-        # AttributeError instead of recursing through the property.
+        """将未实现的方法/属性委托给目标 worker。
+
+        保护 _target_worker 字段，防止 __init__ 前查找时递归。
+        """
         if name == "_target_worker":
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
     def clear_cache_pool(self):
-        # The target worker owns the shared KV allocator/cache. For the compact
-        # sliding-window path, the draft req->token view is rebuilt from committed
-        # target state before each draft forward, so there is nothing persistent
-        # to flush here.
+        """清空 KV cache 池（空实现）。
+
+        目标 worker 拥有共享 KV 分配器/缓存。
+        紧凑滑动窗口路径在每次草稿前向前重建 req->token 视图，
+        无需在此刷新。
+        """
         pass
 
     def _gather_req_to_token_masked(
@@ -442,6 +551,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         mask: torch.Tensor,
         context: str,
     ) -> torch.Tensor:
+        """带掩码地从 req_to_token 表中收集 KV cache 位置。
+
+        参数：
+            req_to_token:     [num_reqs, max_seq_len] 请求→token 映射表
+            req_pool_indices: [bs] 请求池索引
+            pos2d:            [bs, max_len] 2D 位置
+            mask:             [bs, max_len] 布尔掩码
+            context:          错误信息上下文字符串
+
+        返回：[num_valid] 有效位置的 KV cache loc
+        """
         if pos2d.ndim != 2:
             raise RuntimeError(
                 f"{context} expected 2D positions, got shape={tuple(pos2d.shape)}."
@@ -478,6 +598,26 @@ class DFlashWorkerV2(BaseSpecWorker):
         start: torch.Tensor | None,
         lengths: torch.Tensor,
     ) -> torch.Tensor:
+        """按段收集 KV cache 位置。
+
+        参数：
+            req_to_token:     请求→token 映射表
+            req_pool_indices: [bs] 请求池索引
+            start:            [bs] 段起始位置（None 表示从 0 开始）
+            lengths:          [bs] 段长度
+
+        返回：[total_len] 所有有效段的 KV cache loc
+
+        示例：
+            >>> locs = worker._gather_req_to_token_segments(
+            ...     req_to_token=table,
+            ...     req_pool_indices=indices,
+            ...     start=torch.tensor([0, 5]),
+            ...     lengths=torch.tensor([3, 2]),
+            ... )
+            >>> locs.shape
+            torch.Size([5])
+        """
         lengths = lengths.to(torch.int64)
         if lengths.numel() == 0:
             return torch.empty((0,), dtype=torch.int64, device=self.device)
@@ -504,6 +644,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def _compute_compact_draft_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
+        """计算紧凑草稿模式下的可见序列长度。
+
+        将序列长度截断到 draft_window_size，并按 page_size 对齐起始位置。
+
+        参数：
+            seq_lens: [bs] 原始序列长度
+
+        返回：[bs] 紧凑模式下的可见长度
+        """
         assert self.draft_window_size is not None
         visible_lens = torch.clamp(
             seq_lens.to(dtype=torch.int32, device=self.device),
@@ -524,6 +673,21 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
     ) -> int:
+        """解析 DFLASH mask token 的 ID。
+
+        优先使用配置中的 mask_token_id，其次从 tokenizer 词表查找，
+        最后将 mask token 添加为 special token。
+
+        参数：
+            mask_token:    mask token 字符串（如 '<mask>'）
+            mask_token_id: 可选的显式 ID
+
+        返回：mask token 的整数 ID
+
+        异常：
+            ValueError: mask_token 为空或 ID 超出词表范围
+            RuntimeError: 需要 tokenizer 但未初始化
+        """
         if not isinstance(mask_token, str) or not mask_token:
             raise ValueError(
                 f"DFLASH mask_token must be a non-empty string, got {mask_token!r}."
@@ -610,11 +774,26 @@ class DFlashWorkerV2(BaseSpecWorker):
         lm_head,
         chunk_size: int = 256,
     ) -> torch.Tensor:
-        """Greedy argmax over the target LM head in a TP-safe way.
+        """在 TP 并行的 LM head 上执行贪心 argmax 采样。
 
-        We cannot materialize full logits for large vocabularies efficiently, and with
-        TP>1 each rank only owns a shard of the LM head weight. This computes the
-        per-rank max, gathers candidates across TP ranks, and selects the global max.
+        无法高效地物化大词表的完整 logits，且 TP>1 时每个 rank 只拥有
+        LM head 权重的一个分片。此方法计算每个 rank 的局部 max，
+        跨 TP rank 聚合候选，然后选择全局 max。
+
+        参数：
+            hidden_states: [num_tokens, hidden] 隐藏状态
+            lm_head:        词表并行 LM head 模块
+            chunk_size:     分块处理大小
+
+        返回：[num_tokens] 贪心采样的全局 token ID
+
+        示例：
+            >>> ids = worker._greedy_sample_from_vocab_parallel_head(
+            ...     hidden_states=hs,  # [128, 4096]
+            ...     lm_head=model.lm_head,
+            ... )
+            >>> ids.shape
+            torch.Size([128])
         """
 
         if hidden_states.numel() == 0:
@@ -822,11 +1001,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
     ) -> None:
-        """Materialize target context features into the draft KV cache at explicit slots.
+        """将目标上下文特征物化到草稿 KV cache 的指定位置。
 
-        For the spec-v2 overlap path, callers can pass dense `[bs, block_size]`
-        `cache_loc_2d` plus `commit_lens`; the prefix-valid writer then commits
-        only the live prefix rows without constructing masked/packed index tensors.
+        对于 spec-v2 overlap 路径，调用者可传入密集的 [bs, block_size]
+        cache_loc_2d 和 commit_lens；前缀有效写入器只提交有效前缀行，
+        无需构造掩码/打包索引张量。
+
+        参数：
+            target_hidden: [num_tokens, hidden] 目标模型隐藏状态
+            cache_loc:     [num_tokens] KV cache 位置（1D）
+            positions:     [num_tokens] 位置 ID
+            cache_loc_2d:  可选的 [bs, block_size] 2D cache loc
+            commit_lens:   可选的 [bs] 提交长度
         """
         if target_hidden is None:
             raise RuntimeError("DFLASH missing target hidden context features.")
@@ -973,6 +1159,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
     ) -> None:
+        """逐层物化上下文隐藏状态到草稿 KV cache。
+
+        参数：
+            ctx_hidden:    [num_tokens, hidden] 投影后的上下文隐藏状态
+            ctx_positions: [num_tokens] 位置 ID
+            ctx_cache_loc: [num_tokens] KV cache 位置
+        """
         for layer in self.draft_model.layers:
             attn = layer.self_attn
             if _is_npu:
@@ -1000,7 +1193,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         ctx_cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
     ) -> None:
-        """Fused KV materialization using batched projection + Triton kernel."""
+        """融合 KV 物化：批置投影 + Triton kernel。
+
+        参数：
+            ctx_hidden:    [num_tokens, hidden] 上下文隐藏状态
+            ctx_positions: [num_tokens] 位置 ID
+            ctx_cache_loc: [num_tokens] 1D KV cache 位置
+            ctx_cache_loc_2d: 可选 2D cache loc
+            commit_lens:   可选提交长度
+        """
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
         if self._fused_kv_helper is None:
             raise RuntimeError("DFLASH fused KV helper is not initialized.")
@@ -1044,11 +1245,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_pre_verify: torch.Tensor,
         commit_lens: torch.Tensor,
     ) -> None:
-        """Commit Mamba intermediate states for accepted verify steps.
+        """提交 Mamba 中间状态用于已接受的验证步骤。
 
-        During TARGET_VERIFY, Mamba kernels run with `disable_state_update=True` and
-        cache per-step intermediate states. After acceptance, we need to commit the
-        state corresponding to each request's last accepted step.
+        在 TARGET_VERIFY 期间，Mamba kernel 以 disable_state_update=True 运行，
+        并缓存每步中间状态。接受后需要提交每个请求最后一步对应的 Mamba 状态。
+
+        参数：
+            batch:               调度批次
+            seq_lens_pre_verify: 验证前的序列长度
+            commit_lens:         [bs] 提交长度
         """
         attn_backend = self.target_worker.model_runner.attn_backend
         if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
@@ -1084,6 +1289,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:
+        """确保 accept/bonus 双缓冲区容量足够。
+
+        参数：
+            bs: 当前批次大小
+        """
         if self._accept_bonus_buffer_cap >= int(bs):
             return
 
@@ -1120,6 +1330,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         torch.Tensor,
         torch.Tensor,
     ]:
+        """获取下一组 accept/bonus 双缓冲区。
+
+        双缓冲区用于 overlap 调度，交替使用两个 slot。
+
+        参数：
+            bs: 当前批次大小
+
+        返回：(accept_len, commit_lens, bonus, out_tokens, new_seq_lens) 五个张量
+        """
         self._ensure_accept_bonus_buffers(bs)
         assert self._accept_len_buf is not None
         slot = self._accept_bonus_buffer_slot
@@ -1135,6 +1354,13 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _validate_phase1_sampling_support(
         self, model_worker_batch: ScheduleBatch
     ) -> None:
+        """验证 Phase 1 采样支持。
+
+        如果采样非全贪心且采样验证不可用，发出警告并回退到贪心。
+
+        参数：
+            model_worker_batch: 调度批次
+        """
         sampling_info = model_worker_batch.sampling_info
         if sampling_info is None or sampling_info.is_all_greedy:
             return
@@ -1158,6 +1384,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_done: Optional[torch.cuda.Event] = None,
         cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> DFlashDraftInputV2:
+        """为 prefill 阶段构造下一轮草稿输入。
+
+        参数：
+            verified_id: [bs] 验证后的 token ID
+            seq_lens:    [bs] 序列长度
+            verify_done: 可选的 CUDA 事件（标记验证完成）
+            cur_allocated_seq_lens_cpu: 可选的 CPU 侧已分配序列长度
+
+        返回：DFlashDraftInputV2
+        """
         bs = int(seq_lens.numel())
         device = verified_id.device
         return DFlashDraftInputV2(
@@ -1178,6 +1414,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_done: Optional[torch.cuda.Event] = None,
         cur_allocated_seq_lens_cpu: Optional[torch.Tensor] = None,
     ) -> DFlashDraftInputV2:
+        """为 decode 阶段构造下一轮草稿输入。
+
+        参数：
+            verified_id: [bs] 验证后的 token ID（bonus token）
+            new_seq_lens: [bs] 新序列长度
+            verify_done: 可选的 CUDA 事件
+            cur_allocated_seq_lens_cpu: 可选的 CPU 侧已分配序列长度
+
+        返回：DFlashDraftInputV2
+        """
         bs = int(new_seq_lens.numel())
         device = verified_id.device
         return DFlashDraftInputV2(
@@ -1195,6 +1441,25 @@ class DFlashWorkerV2(BaseSpecWorker):
         model_worker_batch: ScheduleBatch,
         on_publish=None,
     ) -> GenerationBatchResult:
+        """处理一个前向批次（prefill 或 decode）。
+
+        prefill 阶段：
+            1. 目标模型 prefill，捕获 DFlash 辅助隐藏状态
+            2. 将 prompt token 物化到草稿 KV cache
+
+        decode 阶段：
+            1. 从 verified_id 构建含 mask_token 的 draft block
+            2. 草稿模型前向，贪心采样得到 draft tokens
+            3. 目标模型验证 draft tokens
+            4. 计算接受长度和 bonus token
+            5. 物化已接受的 token 到草稿 KV cache
+
+        参数：
+            model_worker_batch: 调度批次
+            on_publish:         回调函数，在新序列长度可用时调用
+
+        返回：GenerationBatchResult
+        """
         if getattr(model_worker_batch, "return_logprob", False):
             raise ValueError(
                 "DFLASH speculative decoding does not support return_logprob yet."

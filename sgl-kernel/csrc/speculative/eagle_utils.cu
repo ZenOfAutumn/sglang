@@ -268,6 +268,35 @@ void build_tree_kernel_efficient(
   }
 }
 
+// 树形草稿的贪心验证 kernel（全 greedy 采样时使用；带温度的走拒绝采样路径
+// tree_speculative_sampling_target_only）。
+//
+// 要做的事：从草稿树的根出发，沿着「目标模型认可」的方向一路往下走，走多远算多远。
+// greedy 下目标分布是 one-hot，接受判据退化为整数相等：
+// 草稿给的 token id == 目标模型在该位置的 argmax，就接受。
+//
+// 并行策略：**一个 block 负责一个请求，且 block 内只有 1 个线程**
+//（launch 处 grid(batch_size) / block(1)）。这里没有并行度可挖——「能接受到第几层」
+// 是链式依赖，第 j 层的判定必须等第 j-1 层出结果。好在整个 kernel 只有整数比较和
+// 指针跳转，相对目标模型的一次前向可以忽略不计。
+//
+// 树的表示是「左孩子 + 右兄弟」：任意度数的树只需两个 [bs, num_draft_tokens] 的整型数组。
+//   retrive_next_token[i]   → 节点 i 的第一个子节点（无子节点为 -1）
+//   retrive_next_sibling[i] → 节点 i 的下一个兄弟（无兄弟为 -1）
+// 于是「遍历某节点的全部子节点」= 先跳到左孩子，再沿兄弟链横扫。
+//
+// 参数（bs = batch_size，D = num_draft_tokens，S = num_speculative_tokens 即最大树深）：
+//   predicts              [bs*D]   输出。在「被接受路径经过的位置」上写入实际采纳的 token
+//   accept_index          [bs, S]  输出。接受路径依次经过的节点（全局下标），未填满留 -1
+//   accept_token_num      [bs]     输出。命中的草稿数，**不含 bonus**
+//   candidates            [bs, D]  输入。草稿树各节点的 token id
+//   retrive_index         [bs, D]  输入。树内局部下标 → predicts / KV 里的全局下标
+//   retrive_next_token    [bs, D]  输入。左孩子
+//   retrive_next_sibling  [bs, D]  输入。右兄弟
+//   target_predict        [bs, D]  输入。目标模型在各节点**之后**的 argmax
+//
+// 关键的一位错开：target_predict[i] 是「走到节点 i 之后」的预测，
+// 所以它要拿去比 i 的**子节点**，而不是比节点 i 自己。
 template <typename IdType, typename IdType2>
 __global__ void VerifyTreeGreedy(
     IdType* predicts,
@@ -281,34 +310,52 @@ __global__ void VerifyTreeGreedy(
     uint32_t batch_size,
     uint32_t num_speculative_tokens,
     uint32_t num_draft_tokens) {
-  uint32_t bx = blockIdx.x;
+  uint32_t bx = blockIdx.x;  // 一个 block 一个请求
 
+  // 树根（树内局部下标恒为 0）对应的全局下标。根是上一轮已经确定下来的真实 token，
+  // 不需要验证，直接算已接受，占据 accept_index 的第 0 列。
   IdType2 last_accepted_retrive_idx = retrive_index[bx * num_draft_tokens];
   accept_index[bx * num_speculative_tokens] = last_accepted_retrive_idx;
   uint32_t num_accepted_tokens = 0;
-  IdType2 cur_index = 0;
+  IdType2 cur_index = 0;  // 当前所在节点的树内局部下标（根 = 0）
 
+  // 外层：每轮往下走一层，最多走到最大树深
   for (uint32_t j = 1; j < num_speculative_tokens; ++j) {
+    // 下降一层：跳到当前节点的第一个子节点
     cur_index = retrive_next_token[bx * num_draft_tokens + cur_index];
+    // 内层：横扫这一层的兄弟，看有没有哪个分支能被目标模型认可
     while (cur_index != -1) {
       IdType2 draft_index = retrive_index[bx * num_draft_tokens + cur_index];
       IdType2 draft_token_id = candidates[bx * num_draft_tokens + cur_index];
+      // 注意读的是 last_accepted 位置的预测，不是 cur_index 的——即上面说的错开一位
       IdType2 target_token_id = target_predict[last_accepted_retrive_idx];
 
       if (draft_token_id == target_token_id) {
         // accept token
+        // 命中：父位置实际采纳的就是这个 token；记录路径，并把「已接受尾巴」前移到此节点。
+        // break 后回外层继续下降——兄弟链上剩下的分支不必再看，
+        // 因为 greedy 下目标模型只认可唯一一个 token，不可能有第二个兄弟也相等。
         predicts[last_accepted_retrive_idx] = target_token_id;
         ++num_accepted_tokens;
         accept_index[bx * num_speculative_tokens + num_accepted_tokens] = draft_index;
         last_accepted_retrive_idx = draft_index;
         break;
       } else {
+        // 这个兄弟不匹配，换下一个继续试。
+        // 树形草稿的价值正在于此：同一层备了多个候选，某个猜错还有别的可试；
+        // 链式草稿（topk=1）每层只有一个兄弟，一错就到头。
         cur_index = retrive_next_sibling[bx * num_draft_tokens + cur_index];
       }
     }
+    // cur_index == -1 有两种成因，结果都是停止：
+    //   1) 这一层所有兄弟都不匹配 —— 草稿在此失配；
+    //   2) 上一步下降时就取到 -1 —— 已经走到叶子，树里没有更多东西可验。
     if (cur_index == -1) break;
   }
   accept_token_num[bx] = num_accepted_tokens;
+  // bonus token：不管上面接受了几个（哪怕 0 个），最后那个被接受位置的目标模型预测
+  // 总是有效的——它是在一段**真实前缀**下算出来的，等价于普通 decode 的输出，白送一个 token。
+  // 这就是接受长度下界为 1 而非 0 的来源，也是 Python 侧返回时要 +1 的原因。
   predicts[last_accepted_retrive_idx] = target_predict[last_accepted_retrive_idx];
 }
 

@@ -1,4 +1,15 @@
-"""DFLASH spec-v2 overlap scheduling data structures."""
+"""DFLASH spec-v2 overlap 调度数据结构模块。
+
+本模块定义 DFlashDraftInputV2，用于 DFLASH V2 算法草稿侧的 overlap 调度。
+DFLASH V2 采用「预分配」策略：提前预留未来 KV 槽位，使 worker 可以直接
+从 req_to_token 获取 out_cache_loc，无需分配器 backup/restore。
+
+关键概念：
+    - committed_len:  目标模型已确认的 KV 长度（滞后一轮）
+    - planning_len:   committed_len + block_size，本步草稿规划长度
+    - reserved_len:   max(cur_alloc, committed + 2*block_size)，预留上界
+    - CPU 元数据滞后一轮，与 GPU 预留上界分开维护
+"""
 
 import contextlib
 from dataclasses import dataclass
@@ -18,13 +29,32 @@ from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils.common import is_pin_memory_available
 
+# 每设备缓存一个 plan stream，用于 overlap 调度的 prep kernel
 _OVERLAP_PLAN_STREAMS: dict[str, torch.cuda.Stream] = {}
 
 
 def _get_overlap_plan_stream(
     device: torch.device | str,
 ) -> tuple[Optional[torch.cuda.Stream], contextlib.AbstractContextManager]:
-    """Return an optional plan stream/context for overlap scheduling prep kernels."""
+    """返回 overlap 调度 prep kernel 的可选 plan stream 和上下文。
+
+    当 SGLANG_ENABLE_OVERLAP_PLAN_STREAM 启用时，返回一个专用 stream
+    用于执行 prepare_for_decode 中的预分配 kernel，使其与前向计算重叠。
+    未启用时返回 (None, nullcontext)。
+
+    参数：
+        device: 目标设备
+
+    返回：(stream, context_manager)
+        - stream: CUDA stream 或 None
+        - context_manager: 用于切换 stream 的上下文
+
+    示例：
+        >>> stream, ctx = _get_overlap_plan_stream("cuda:0")
+        >>> with ctx:
+        ...     # 在 plan stream 上执行 prep kernel
+        ...     prepare_kernels()
+    """
     if not envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get():
         return None, contextlib.nullcontext()
 
@@ -38,11 +68,42 @@ def _get_overlap_plan_stream(
 
 @dataclass
 class DFlashDraftInputV2(SpecInput):
-    """Draft-side state carried across overlap iterations (spec-v2)."""
+    """DFLASH V2 草稿侧状态，在 overlap 迭代间传递（spec-v2）。
 
-    # Legacy Eagle-shaped fields kept only for dataclass compatibility. DFLASH
-    # overlap carries new_seq_lens / verified_id directly in the common
-    # no-shape-change path; FutureMap remains the fallback for filter/merge.
+    保留了 Eagle 兼容的字段（topk_p / topk_index），但 DFLASH overlap
+    在常见无形状变化路径中直接携带 new_seq_lens / verified_id；
+    FutureMap 作为 filter/merge 的回退方案。
+
+    核心属性：
+        topk_p / topk_index:  Eagle 兼容字段（DFLASH 中实际未使用树形选择）
+        verified_id:          上轮验证接受的 token id
+        new_seq_lens:         新序列长度
+        hidden_states:        隐藏状态
+        verify_done:          验证完成事件（用于同步）
+        max_top_k:            最大 top_k 值
+        uniform_top_k_value:  统一 top_k 值（所有请求相同时）
+        cur_allocated_seq_lens_cpu: 当前已分配 KV 长度（CPU）
+        planning_seq_lens_cpu: 规划 KV 长度（CPU）
+        reserved_seq_lens_cpu: 预留 KV 长度上界（CPU）
+        direct_carry_valid:   是否可直接携带状态（filter/merge 后置 False）
+        future_indices:       调度器分派后填充的索引
+
+    示例：
+        >>> # 正常创建
+        >>> draft_input = DFlashDraftInputV2(
+        ...     topk_p=torch.tensor([[0.5]]),
+        ...     topk_index=torch.tensor([[42]]),
+        ...     verified_id=torch.tensor([42]),
+        ...     new_seq_lens=torch.tensor([10]),
+        ...     hidden_states=torch.zeros(1, 4096),
+        ... )
+        >>> # idle 创建
+        >>> idle_input = DFlashDraftInputV2.create_idle_device(torch.device("cuda"))
+    """
+
+    # Eagle 兼容字段，仅为了 dataclass 兼容性保留。
+    # DFLASH overlap 在常见无形状变化路径中直接携带 new_seq_lens / verified_id；
+    # FutureMap 作为 filter/merge 的回退方案。
     topk_p: torch.Tensor
     topk_index: torch.Tensor
     verified_id: torch.Tensor
@@ -57,6 +118,7 @@ class DFlashDraftInputV2(SpecInput):
     reserved_seq_lens_cpu: Optional[torch.Tensor] = None
     reserved_seq_lens_sum: Optional[int] = None
     direct_carry_valid: bool = True
+    # prepare_for_decode 使用的 CPU/GPU 缓冲区（按需增长）
     _prepare_committed_kv_lens_cpu_buf: Optional[torch.Tensor] = None
     _prepare_planning_kv_lens_cpu_buf: Optional[torch.Tensor] = None
     _prepare_batch_seq_lens_cpu_buf: Optional[torch.Tensor] = None
@@ -65,19 +127,35 @@ class DFlashDraftInputV2(SpecInput):
     _prepare_cur_kv_lens_gpu_buf: Optional[torch.Tensor] = None
     _prepare_nxt_kv_lens_gpu_buf: Optional[torch.Tensor] = None
 
-    # Filled by scheduler after dispatch.
+    # 调度器分派后填充的索引。
     future_indices: Optional[torch.Tensor] = None
 
     def __post_init__(self):
+        """初始化后处理：设置 spec_input_type 为 DFLASH_DRAFT。"""
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
-        # Spec v2 draft state itself does not change token accounting.
+        """返回投机 token 调整系数。
+
+        Spec v2 草稿状态本身不改变 token 计数。
+
+        返回：(1, 1)
+        """
+        # Spec v2 草稿状态本身不改变 token 计数。
         return (1, 1)
 
     def _ensure_prepare_length_buffers(
         self, bs: int, device: torch.device | str
     ) -> None:
+        """确保 prepare_for_decode 使用的 CPU/GPU 长度缓冲区足够大。
+
+        按需增长策略：新容量 = max(bs, 32, current * 2)。
+        CPU 缓冲区考虑 pin_memory，GPU 缓冲区确保在正确设备上。
+
+        参数：
+            bs:     batch size
+            device: 目标设备
+        """
         pin_memory = is_pin_memory_available(device)
 
         def needs_cpu_alloc(buf: Optional[torch.Tensor]) -> bool:
@@ -119,6 +197,17 @@ class DFlashDraftInputV2(SpecInput):
 
     @classmethod
     def create_idle_input(cls, device: torch.device) -> "DFlashDraftInputV2":
+        """创建一个空的 idle 输入（用于无请求时的占位）。
+
+        参数：
+            device: 目标设备
+
+        返回：空的 DFlashDraftInputV2
+
+        示例：
+            >>> idle = DFlashDraftInputV2.create_idle_input(torch.device("cuda"))
+            >>> # idle.verified_id.numel() == 0
+        """
         return cls(
             topk_p=torch.empty((0, 0), device=device, dtype=torch.float32),
             topk_index=torch.empty((0, 0), device=device, dtype=torch.int64),
@@ -129,17 +218,31 @@ class DFlashDraftInputV2(SpecInput):
         )
 
     def prepare_for_decode(self, batch: ScheduleBatch):
-        """Allocate headroom in the shared req_to_token pool for the next DFLASH step.
+        """为下一个 DFLASH 步骤在共享 req_to_token 池中预分配 KV 槽位。
 
-        DFLASH spec-v2 uses overlap scheduling's "over-allocation" approach: we reserve
-        future KV slots ahead of time so the worker can gather `out_cache_loc` directly
-        from `req_to_token` without allocator backup/restore. CPU metadata intentionally
-        lags by one iteration; keep it separate from the reserved upper bound that backs
-        the overallocated mapping.
+        DFLASH spec-v2 使用 overlap 调度的「预分配」策略：提前预留
+        未来 KV 槽位，使 worker 可以直接从 req_to_token 获取 out_cache_loc，
+        无需分配器 backup/restore。CPU 元数据有意滞后一轮，与支持
+        预分配映射的预留上界分开维护。
+
+        核心流程：
+            1. 计算每个请求的 committed/planning/reserved 长度
+            2. 在 plan stream 或同步模式下分配 KV 槽位
+            3. 更新 req_to_token 映射表
+            4. 更新请求的 kv_allocated_len 高水位标记
+
+        参数：
+            batch: 当前调度 batch
+
+        示例：
+            >>> # batch 有 2 个请求，block_size=4
+            >>> draft_input.prepare_for_decode(batch)
+            >>> # batch.req_to_token 中已预填充了未来 KV 槽位
+            >>> # draft_input.reserved_seq_lens_cpu = tensor([14, 18])
         """
         plan_stream, plan_stream_ctx = _get_overlap_plan_stream(batch.device)
         if plan_stream is None and self.verify_done is not None:
-            # Ensure previous forward is completed before mutating shared buffers.
+            # 确保前一个前向完成后再修改共享缓冲区。
             self.verify_done.synchronize()
 
         bs = batch.batch_size()
@@ -159,7 +262,7 @@ class DFlashDraftInputV2(SpecInput):
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
         cur_allocated_seq_lens_cpu = self.cur_allocated_seq_lens_cpu
 
-        # For DFLASH, each decode step needs a fixed-size verify block.
+        # DFLASH 每步需要一个固定大小的验证 block。
         block_size = int(get_global_server_args().speculative_num_draft_tokens)
         if block_size <= 0:
             raise ValueError(
@@ -213,9 +316,9 @@ class DFlashDraftInputV2(SpecInput):
 
         with plan_stream_ctx:
             if plan_stream is not None and caller_stream is not None:
-                # `batch.seq_lens`, `batch.req_pool_indices`, and related tensors may
-                # have just been rebuilt on the scheduler stream by filter/merge ops.
-                # The plan stream must wait for those writes before reading them.
+                # `batch.seq_lens`、`batch.req_pool_indices` 等张量可能刚在
+                # 调度器 stream 上被 filter/merge 重建。plan stream 必须等待
+                # 这些写入完成后才能读取。
                 plan_stream.wait_stream(caller_stream)
 
             if plan_stream is not None and self.verify_done is not None:
@@ -247,8 +350,8 @@ class DFlashDraftInputV2(SpecInput):
                         num_needed_tokens,
                     )
 
-                # Updating req_to_token is a write to a shared tensor: it must not overlap
-                # with the previous batch's forward, which also reads req_to_token.
+                # 更新 req_to_token 是对共享张量的写入：不能与前一个 batch
+                # 的前向（同样读取 req_to_token）重叠。
                 assign_req_to_token_pool_func(
                     batch.req_pool_indices,
                     batch.req_to_token_pool.req_to_token,
@@ -258,20 +361,18 @@ class DFlashDraftInputV2(SpecInput):
                     bs,
                 )
         if caller_stream is not None:
-            # Enqueue the dependency on the caller's stream, not inside the
-            # plan-stream context, so forward work cannot observe partially
-            # prepared req_to_token / KV allocation state.
+            # 在调用方 stream 上排队依赖，而不是在 plan-stream 上下文内，
+            # 这样前向工作不会观察到部分准备的 req_to_token / KV 分配状态。
             caller_stream.wait_stream(plan_stream)
 
-        # This request-side high-water mark is what release_kv_cache() uses to
-        # reclaim any DFLASH over-allocation if the request finishes later.
+        # 请求侧的高水位标记用于 release_kv_cache() 在请求结束后
+        # 回收 DFLASH 预分配的空间。
         for i, req in enumerate(batch.reqs):
             req.kv_allocated_len = max(req.kv_allocated_len, int(nxt_kv_lens_cpu_t[i]))
 
-        # Preserve the lagging committed CPU view on the batch and carry the
-        # tighter host-side planning bound separately from the full reserved
-        # allocator upper bound. Overlap scheduling only drifts by at most one
-        # DFlash block on the committed prefix lengths.
+        # 保留滞后的 committed CPU 视图，并单独维护更紧凑的 planning 上界，
+        # 与完整的预留分配器上界分开。Overlap 调度在 committed 前缀长度上
+        # 最多漂移一个 DFlash block。
         batch.seq_lens_cpu = batch_seq_lens_cpu_t
         batch.seq_lens_sum = committed_seq_lens_sum
         self.planning_seq_lens_cpu = planning_kv_lens_cpu_t
@@ -280,6 +381,12 @@ class DFlashDraftInputV2(SpecInput):
         self.reserved_seq_lens_sum = reserved_seq_lens_sum
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        """过滤 batch：根据 new_indices 索引保留对应请求的状态。
+
+        参数：
+            new_indices:         要保留的请求索引
+            has_been_filtered:   是否已被过滤过
+        """
         if self.cur_allocated_seq_lens_cpu is not None:
             self.cur_allocated_seq_lens_cpu = self.cur_allocated_seq_lens_cpu[
                 new_indices.cpu()
@@ -303,6 +410,13 @@ class DFlashDraftInputV2(SpecInput):
         self.hidden_states = self.hidden_states[new_indices]
 
     def merge_batch(self, spec_info: "DFlashDraftInputV2"):
+        """合并两个 batch 的草稿状态。
+
+        将 spec_info 中的所有状态张量拼接到 self 中。
+
+        参数：
+            spec_info: 要合并的另一个 DFlashDraftInputV2
+        """
         if self.cur_allocated_seq_lens_cpu is not None:
             assert spec_info.cur_allocated_seq_lens_cpu is not None
             self.cur_allocated_seq_lens_cpu = torch.cat(
