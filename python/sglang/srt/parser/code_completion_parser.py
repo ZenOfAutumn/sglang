@@ -68,9 +68,9 @@ completion_templates: dict[str, CompletionTemplate] = {}
 def register_completion_template(template: CompletionTemplate, override: bool = False):
     """注册一个补全模板；默认不允许重复注册（override=True 可覆盖）。"""
     if not override:
-        assert (
-            template.name not in completion_templates
-        ), f"{template.name} has been registered."
+        assert template.name not in completion_templates, (
+            f"{template.name} has been registered."
+        )
 
     completion_templates[template.name] = template
 
