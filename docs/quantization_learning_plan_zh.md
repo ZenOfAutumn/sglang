@@ -39,6 +39,84 @@ $$
 | per-group | 每 group_size（如 128）个权重一个 | GPTQ/AWQ/W4A16 |
 | block-wise（如 128×128） | 每个块一个 | DeepSeek 风格 block FP8 |
 
+### 1.2.1 数值示例（INT8）：对称 vs 非对称
+
+统一取一组已标定的数据（per-tensor 粒度）：
+
+$$
+x = [-2.5,\ 1.0,\ 3.0,\ -1.5,\ 0.5]
+$$
+
+#### （1）对称量化：int8，$q \in [-128,\ 127]$
+
+$$
+s = \frac{\max|x|}{q_{\max}} = \frac{3.0}{127} \approx 0.023622, \qquad z \equiv 0
+$$
+
+| $x$ | $x / s$ | $x_q = \mathrm{round}(x/s)$ | $\hat{x} = s \cdot x_q$ | 误差 $\hat{x} - x$ |
+| --- | --- | --- | --- | --- |
+| -2.5 | -105.833 | **-106** | -2.503937 | -0.003937 |
+| 1.0 | 42.333 | **42** | 0.992126 | -0.007874 |
+| 3.0 | 127.000 | **127** | 3.000000 | 0.000000 |
+| -1.5 | -63.500 | **-64** | -1.511811 | -0.011811 |
+| 0.5 | 21.167 | **21** | 0.496063 | -0.003937 |
+
+最大绝对误差 $0.0118 \approx s/2$，符合量化误差上界。
+
+#### （2）非对称量化：uint8，$q \in [0,\ 255]$
+
+$$
+s = \frac{x_{\max} - x_{\min}}{q_{\max} - q_{\min}} = \frac{3.0 - (-2.5)}{255 - 0} \approx 0.021569
+$$
+
+$$
+z = \mathrm{round}\!\left(q_{\min} - \frac{x_{\min}}{s}\right) = \mathrm{round}\!\left(0 + \frac{2.5}{0.021569}\right) = \mathrm{round}(115.909) = 116
+$$
+
+| $x$ | $x / s$ | $x_q = \mathrm{clip}(\mathrm{round}(x/s) + z)$ | $\hat{x} = s \cdot (x_q - z)$ | 误差 $\hat{x} - x$ |
+| --- | --- | --- | --- | --- |
+| -2.5 | -115.909 | **0** | -2.501961 | -0.001961 |
+| 1.0 | 46.364 | **162** | 0.992157 | -0.007843 |
+| 3.0 | 139.091 | **255** | 2.998039 | -0.001961 |
+| -1.5 | -69.545 | **46** | -1.509804 | -0.009804 |
+| 0.5 | 23.182 | **139** | 0.496078 | -0.003922 |
+
+注意 $x_q$ 是**无符号整数**，$x_{\min}$ 映射到码字 0、$x_{\max}$ 映射到码字 255——区间被完整铺满。
+
+#### （3）两者对比
+
+| 指标 | 对称 int8 | 非对称 uint8 |
+| --- | --- | --- |
+| 码字范围 | $[-128, 127]$ | $[0, 255]$ |
+| scale $s$ | 0.023622 | 0.021569 |
+| zero-point $z$ | 0（恒为 0） | 116 |
+| 本例最大绝对误差 | 0.0118 | 0.0098 |
+| GEMM 计算 | $\hat{Y} = s_x s_w (X_q W_q^\top)$ | 需额外 zero-point 修正项 |
+| 硬件内核友好度 | 高（INT8 张量核 / dp4a 直接可用） | 较低（需 correction） |
+
+非对称的 $s$ 略小（分辨率更细）且几乎无偏，代价是计算时要补一项：
+
+$$
+Y = s_x s_w \Big( X_q W_q^\top - z_x \textstyle\sum W_q - z_w \sum X_q + n\, z_x z_w \Big)
+$$
+
+#### （4）为什么偏斜分布必须用非对称
+
+把数据换成 ReLU 之后的激活（全非负、长尾），体会"对称会浪费一半码字"：
+
+$$
+x = [0.0,\ 0.05,\ 0.2,\ 1.0,\ 3.0]
+$$
+
+| 方案 | $s$ | 实际用到的码字 | $s/2$（误差上界） | 0.05 的量化结果 |
+| --- | --- | --- | --- | --- |
+| 对称 int8 | $3.0/127 = 0.023622$ | 仅 $[0, 127]$（半个区间） | 0.0118 | $2 \times s = 0.047$，相对误差 ≈ 6% |
+| 非对称 uint8 | $3.0/255 = 0.011765$ | 全部 $[0, 255]$ | 0.0059 | $4 \times s = 0.047$，但分辨率提升近 2× |
+
+**结论**：分布关于 0 大致对称时（如权重、部分激活），对称量化损失小、计算最省；分布明显偏斜（全正激活、含长尾/离群点时），非对称能把 $[x_{\min}, x_{\max}]$ 完整铺满 255 个码字，精度更高。
+
+> 这也解释了 SGLang 中的实现差异：FP8（e4m3）本身带符号、天然对称，`fp8.py` 的公式里没有 zero-point；而 `w8a8_int8.py` / `blockwise_int8.py` 的 INT8 路径必须显式处理 zero-point 及其 GEMM 修正项。此外现代内核多按 group / block 共享 scale，本质上就是把"非对称贴合分布"的能力下沉到更细粒度。
+
 ### 1.3 常见量化范式（按位宽组合命名）
 
 约定 **WxAy = 权重 x bit、激活 y bit**：
@@ -133,23 +211,72 @@ QuantizeMethodBase
 
 ### 2.3 端到端调用链（最重要的一条链）
 
-```
-启动
- 1. ModelConfig 解析 config.json 的 quantization_config 字段
- 2. __init__.py: get_quantization_config(quant_config)
-      └─ 在 BASE_QUANTIZATION_METHODS 按名字查 Config 类（平台相关的在此按 is_npu()/is_cuda() 增删）
- 3. 每个 nn.Linear 构造时：linear.py:191
-      self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
-      └─ 非目标层（embedding、lm_head、norm）返回 None → 走 unquant.py
- 4. create_weights(layer) 创建低精度参数
- 5. model_loader/loader.py: 权重载入 → quant_method.process_weights_after_loading(module)
-前向
- 6. linear.py forward → self.quant_method.apply(layer, x, bias)
-      └─ 例 Fp8LinearMethod.apply: 动态量化 x → per-128-block w8a8 GEMM → 乘 scale
-MoE
- 7. FusedMoE.forward → FusedMoEMethodBase.apply(layer, dispatch_output) → MoeRunner
-KV cache
- 8. RadixAttention 初始化 → BaseKVCacheMethod.create_weights 注入 k_scale/v_scale
+```mermaid
+sequenceDiagram
+    autonumber
+    participant MC as ModelConfig
+    participant QR as quantization/__init__.py
+    participant QC as QuantizationConfig
+    participant L as Linear / FusedMoE
+    participant QM as QuantizeMethod
+    participant Loader as model_loader/loader.py
+    participant Attn as RadixAttention
+    participant Runner as GEMM / MoeRunner
+
+    rect rgb(240, 248, 255)
+        Note over MC,Runner: 启动与模型构建
+        MC->>MC: 解析 config.json 中的 quantization_config
+        MC->>QR: get_quantization_config(quant_config)
+        QR->>QR: 按名称查询 BASE_QUANTIZATION_METHODS<br/>并根据 is_npu() / is_cuda() 调整注册项
+        QR-->>MC: 返回对应的 Config 类
+        MC->>QC: from_config(...) 构造量化配置
+
+        loop 构造每个 Linear / FusedMoE 层
+            L->>QC: get_quant_method(layer, prefix)
+            alt 命中量化规则
+                QC-->>L: 返回 LinearMethod / FusedMoEMethod
+                L->>QM: create_weights(layer, ...)
+                QM-->>L: 创建低精度权重与 scale 参数
+            else 跳过层或无需量化
+                QC-->>L: 返回 None / UnquantizedLinearMethod
+                Note right of L: embedding、lm_head、norm 等走非量化路径
+            end
+        end
+
+        opt 初始化量化 KV Cache
+            Attn->>QC: get_quant_method(attention_layer, prefix)
+            QC-->>Attn: 返回 BaseKVCacheMethod
+            Attn->>QM: create_weights(attention_layer)
+            QM-->>Attn: 注入 k_scale / v_scale
+        end
+    end
+
+    rect rgb(255, 248, 240)
+        Note over Loader,QM: Checkpoint 加载与一次性后处理
+        Loader->>L: 将 checkpoint 权重加载到模块
+        Loader->>QM: process_weights_after_loading(module)
+        QM->>QM: 转置、重打包、合并 scale 或替换参数
+        QM-->>Loader: 权重转换为内核所需布局
+    end
+
+    rect rgb(240, 255, 244)
+        Note over L,Runner: 每次前向执行
+        alt Linear 前向
+            L->>QM: apply(layer, x, bias)
+            opt 以 Fp8LinearMethod 为例
+                QM->>QM: 动态量化 x 并计算激活 scale
+                QM->>Runner: 调用 per-128-block W8A8 GEMM
+                Runner-->>QM: 返回低精度计算结果
+                QM->>QM: 乘权重与激活 scale
+            end
+            QM-->>L: 返回输出张量
+        else MoE 前向
+            L->>QM: apply(layer, dispatch_output)
+            QM->>Runner: 构造 MoeQuantInfo 并调用 MoeRunner
+            Runner-->>QM: 返回专家计算结果
+            QM-->>L: 返回 combine 前的输出
+        end
+    end
 ```
 
 ---
@@ -323,7 +450,7 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V2-Lite-Chat \
 
 | 术语 | 含义 |
 | --- | --- |
-| scale / zero-point | 缩放因子 / 非对称零点，见式 (1)(2) |
+| scale / zero-point | 缩放因子 / 非对称零点，见式 (1)(2) 与 §1.2.1 数值示例 |
 | granularity | per-tensor / per-token / per-channel / per-group / block |
 | WxAy | 权重 x bit、激活 y bit |
 | online quant | 前向时动态计算激活 scale |
