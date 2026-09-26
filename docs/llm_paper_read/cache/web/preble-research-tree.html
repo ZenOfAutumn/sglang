@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Preble 之后的研究演进树</title>
+<style>
+  :root {
+    --text-primary: #1a1a18;
+    --text-secondary: #5f5e5a;
+    --text-tertiary: #88877f;
+    --bg-primary: #ffffff;
+    --bg-secondary: #f6f5f0;
+    --bg-tertiary: #eeedeb;
+    --border: rgba(0,0,0,0.15);
+    --border-hover: rgba(0,0,0,0.3);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --text-primary: #e8e6de;
+      --text-secondary: #b4b2a9;
+      --text-tertiary: #888780;
+      --bg-primary: #1a1a18;
+      --bg-secondary: #2c2c2a;
+      --bg-tertiary: #3d3d3a;
+      --border: rgba(255,255,255,0.15);
+      --border-hover: rgba(255,255,255,0.3);
+    }
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background: var(--bg-tertiary);
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    min-height: 100vh;
+    padding: 40px 20px;
+  }
+  .card {
+    background: var(--bg-primary);
+    border-radius: 16px;
+    padding: 32px;
+    max-width: 780px;
+    width: 100%;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+  h1 {
+    font-size: 18px;
+    font-weight: 500;
+    color: var(--text-primary);
+    margin-bottom: 8px;
+  }
+  .subtitle {
+    font-size: 13px;
+    color: var(--text-tertiary);
+    margin-bottom: 24px;
+  }
+  svg { width: 100%; height: auto; }
+
+  .t  { font-family: system-ui, -apple-system, sans-serif; font-size: 14px; fill: var(--text-primary); }
+  .ts { font-family: system-ui, -apple-system, sans-serif; font-size: 12px; fill: var(--text-secondary); }
+  .th { font-family: system-ui, -apple-system, sans-serif; font-size: 14px; fill: var(--text-primary); font-weight: 500; }
+
+  .box { fill: var(--bg-secondary); stroke: var(--border); stroke-width: 0.5px; }
+  .arr { stroke: var(--text-secondary); stroke-width: 1.5px; fill: none; }
+  .leader { stroke: var(--text-tertiary); stroke-width: 0.5px; stroke-dasharray: 4 3; fill: none; }
+  .node { cursor: pointer; transition: opacity 0.15s; }
+  .node:hover { opacity: 0.82; }
+
+  .c-purple > rect, .c-purple > circle, .c-purple > ellipse { fill: #EEEDFE; stroke: #534AB7; }
+  .c-purple > .th, .c-purple > text.th { fill: #3C3489; }
+  .c-purple > .ts, .c-purple > text.ts { fill: #534AB7; }
+  .c-purple > .t,  .c-purple > text.t  { fill: #3C3489; }
+
+  .c-teal > rect, .c-teal > circle, .c-teal > ellipse { fill: #E1F5EE; stroke: #0F6E56; }
+  .c-teal > .th, .c-teal > text.th { fill: #085041; }
+  .c-teal > .ts, .c-teal > text.ts { fill: #0F6E56; }
+  .c-teal > .t,  .c-teal > text.t  { fill: #085041; }
+
+  .c-coral > rect, .c-coral > circle, .c-coral > ellipse { fill: #FAECE7; stroke: #993C1D; }
+  .c-coral > .th, .c-coral > text.th { fill: #712B13; }
+  .c-coral > .ts, .c-coral > text.ts { fill: #993C1D; }
+  .c-coral > .t,  .c-coral > text.t  { fill: #712B13; }
+
+  .c-pink > rect, .c-pink > circle, .c-pink > ellipse { fill: #FBEAF0; stroke: #993556; }
+  .c-pink > .th, .c-pink > text.th { fill: #72243E; }
+  .c-pink > .ts, .c-pink > text.ts { fill: #993556; }
+  .c-pink > .t,  .c-pink > text.t  { fill: #72243E; }
+
+  .c-gray > rect, .c-gray > circle, .c-gray > ellipse { fill: #F1EFE8; stroke: #5F5E5A; }
+  .c-gray > .th, .c-gray > text.th { fill: #444441; }
+  .c-gray > .ts, .c-gray > text.ts { fill: #5F5E5A; }
+  .c-gray > .t,  .c-gray > text.t  { fill: #444441; }
+
+  .c-blue > rect, .c-blue > circle, .c-blue > ellipse { fill: #E6F1FB; stroke: #185FA5; }
+  .c-blue > .th, .c-blue > text.th { fill: #0C447C; }
+  .c-blue > .ts, .c-blue > text.ts { fill: #185FA5; }
+  .c-blue > .t,  .c-blue > text.t  { fill: #0C447C; }
+
+  .c-green > rect, .c-green > circle, .c-green > ellipse { fill: #EAF3DE; stroke: #3B6D11; }
+  .c-green > .th, .c-green > text.th { fill: #27500A; }
+  .c-green > .ts, .c-green > text.ts { fill: #3B6D11; }
+  .c-green > .t,  .c-green > text.t  { fill: #27500A; }
+
+  .c-amber > rect, .c-amber > circle, .c-amber > ellipse { fill: #FAEEDA; stroke: #854F0B; }
+  .c-amber > .th, .c-amber > text.th { fill: #633806; }
+  .c-amber > .ts, .c-amber > text.ts { fill: #854F0B; }
+  .c-amber > .t,  .c-amber > text.t  { fill: #633806; }
+
+  .c-red > rect, .c-red > circle, .c-red > ellipse { fill: #FCEBEB; stroke: #A32D2D; }
+  .c-red > .th, .c-red > text.th { fill: #791F1F; }
+  .c-red > .ts, .c-red > text.ts { fill: #A32D2D; }
+  .c-red > .t,  .c-red > text.t  { fill: #791F1F; }
+
+  @media (prefers-color-scheme: dark) {
+    .c-purple > rect, .c-purple > circle, .c-purple > ellipse { fill: #3C3489; stroke: #AFA9EC; }
+    .c-purple > .th, .c-purple > text.th { fill: #CECBF6; }
+    .c-purple > .ts, .c-purple > text.ts { fill: #AFA9EC; }
+
+    .c-teal > rect, .c-teal > circle, .c-teal > ellipse { fill: #085041; stroke: #5DCAA5; }
+    .c-teal > .th, .c-teal > text.th { fill: #9FE1CB; }
+    .c-teal > .ts, .c-teal > text.ts { fill: #5DCAA5; }
+
+    .c-coral > rect, .c-coral > circle, .c-coral > ellipse { fill: #712B13; stroke: #F0997B; }
+    .c-coral > .th, .c-coral > text.th { fill: #F5C4B3; }
+    .c-coral > .ts, .c-coral > text.ts { fill: #F0997B; }
+
+    .c-pink > rect, .c-pink > circle, .c-pink > ellipse { fill: #72243E; stroke: #ED93B1; }
+    .c-pink > .th, .c-pink > text.th { fill: #F4C0D1; }
+    .c-pink > .ts, .c-pink > text.ts { fill: #ED93B1; }
+
+    .c-gray > rect, .c-gray > circle, .c-gray > ellipse { fill: #444441; stroke: #B4B2A9; }
+    .c-gray > .th, .c-gray > text.th { fill: #D3D1C7; }
+    .c-gray > .ts, .c-gray > text.ts { fill: #B4B2A9; }
+
+    .c-blue > rect, .c-blue > circle, .c-blue > ellipse { fill: #0C447C; stroke: #85B7EB; }
+    .c-blue > .th, .c-blue > text.th { fill: #B5D4F4; }
+    .c-blue > .ts, .c-blue > text.ts { fill: #85B7EB; }
+
+    .c-green > rect, .c-green > circle, .c-green > ellipse { fill: #27500A; stroke: #97C459; }
+    .c-green > .th, .c-green > text.th { fill: #C0DD97; }
+    .c-green > .ts, .c-green > text.ts { fill: #97C459; }
+
+    .c-amber > rect, .c-amber > circle, .c-amber > ellipse { fill: #633806; stroke: #EF9F27; }
+    .c-amber > .th, .c-amber > text.th { fill: #FAC775; }
+    .c-amber > .ts, .c-amber > text.ts { fill: #EF9F27; }
+
+    .c-red > rect, .c-red > circle, .c-red > ellipse { fill: #791F1F; stroke: #F09595; }
+    .c-red > .th, .c-red > text.th { fill: #F7C1C1; }
+    .c-red > .ts, .c-red > text.ts { fill: #F09595; }
+  }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Preble 之后的研究演进树</h1>
+  <p class="subtitle">基于 Semantic Scholar 引用图谱（92 条引用，去重后约 86 篇，截至 2026-09）梳理的六条分支 · 点击任意节点跳转论文原文</p>
+
+<svg width="100%" viewBox="0 0 680 1760" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5"
+            markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M2 1L8 5L2 9" fill="none" stroke="context-stroke"
+            stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+
+  <!-- ===== 根节点 ===== -->
+  <a href="https://arxiv.org/abs/2407.00023" target="_blank" rel="noopener"><g class="node c-gray">
+    <rect x="150" y="20" width="380" height="60" rx="8" stroke-width="0.5"/>
+    <text class="th" x="340" y="42" text-anchor="middle" dominant-baseline="central">Preble · ICLR 2025 · arXiv 2407.00023</text>
+    <text class="ts" x="340" y="62" text-anchor="middle" dominant-baseline="central">分布式前缀感知调度：缓存局部性 × 计算负载均衡的联合优化</text>
+  </g></a>
+
+  <!-- ===== 主干 ===== -->
+  <path d="M340 80 L340 100 L62 100 L62 1574" class="arr" fill="none"/>
+
+  <!-- ============ 分支 1 ============ -->
+  <line x1="62" y1="150" x2="88" y2="150" class="arr"/>
+  <rect x="88" y="120" width="552" height="174" rx="16" class="box"/>
+  <text class="th" x="110" y="144" dominant-baseline="central">① 调度算法：从缓存命中率转向公平性与 SLO</text>
+  <text class="ts" x="110" y="164" dominant-baseline="central">承认 E2 只优化命中率的偏置，补上公平共享、尾延迟与输出长度预测</text>
+
+  <a href="https://arxiv.org/abs/2501.14312" target="_blank" rel="noopener"><g class="node c-purple">
+    <rect x="110" y="182" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="196" dominant-baseline="central">DLPM / D²LPM 局部性公平</text>
+    <text class="ts" x="124" y="212" dominant-baseline="central">arXiv 2501.14312 · UCB + LMSYS</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2608.06557" target="_blank" rel="noopener"><g class="node c-purple">
+    <rect x="376" y="182" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="196" dominant-baseline="central">Cascade SLO 延迟预算</text>
+    <text class="ts" x="390" y="212" dominant-baseline="central">arXiv 2608.06557</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2606.18431" target="_blank" rel="noopener"><g class="node c-purple">
+    <rect x="110" y="234" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="248" dominant-baseline="central">Tail-Aware 尾延迟调度</text>
+    <text class="ts" x="124" y="264" dominant-baseline="central">arXiv 2606.18431</text>
+  </g></a>
+  <a href="http://minlanyu.seas.harvard.edu/writeup/sllm25-length.pdf" target="_blank" rel="noopener"><g class="node c-purple">
+    <rect x="376" y="234" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="248" dominant-baseline="central">前缀 + 输出长度感知调度</text>
+    <text class="ts" x="390" y="264" dominant-baseline="central">Harvard SLLM 2025 workshop</text>
+  </g></a>
+
+  <!-- ============ 分支 2 ============ -->
+  <line x1="62" y1="344" x2="88" y2="344" class="arr"/>
+  <rect x="88" y="314" width="552" height="226" rx="16" class="box"/>
+  <text class="th" x="110" y="338" dominant-baseline="central">② 路由拓扑：从单集群扩到跨域与生产网关</text>
+  <text class="ts" x="110" y="358" dominant-baseline="central">前缀亲和成为生产路由器的标准打分维度；映射空间与控制面开销成新瓶颈</text>
+
+  <a href="https://arxiv.org/abs/2602.06502" target="_blank" rel="noopener"><g class="node c-blue">
+    <rect x="110" y="376" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="390" dominant-baseline="central">DualMap 亲和 × 均衡双映射</text>
+    <text class="ts" x="124" y="406" dominant-baseline="central">arXiv 2602.06502</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2608.19677" target="_blank" rel="noopener"><g class="node c-blue">
+    <rect x="376" y="376" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="390" dominant-baseline="central">CacheRoute 前缀亲和路由</text>
+    <text class="ts" x="390" y="406" dominant-baseline="central">arXiv 2608.19677</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2602.11688" target="_blank" rel="noopener"><g class="node c-blue">
+    <rect x="110" y="428" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="442" dominant-baseline="central">GORGO 跨地域网络感知</text>
+    <text class="ts" x="124" y="458" dominant-baseline="central">arXiv 2602.11688</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2505.24095" target="_blank" rel="noopener"><g class="node c-blue">
+    <rect x="376" y="428" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="442" dominant-baseline="central">SkyWalker 跨区负载均衡</text>
+    <text class="ts" x="390" y="458" dominant-baseline="central">arXiv 2505.24095</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2504.20101" target="_blank" rel="noopener"><g class="node c-blue">
+    <rect x="110" y="480" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="494" dominant-baseline="central">PlanetServe 去中心化覆盖网</text>
+    <text class="ts" x="124" y="510" dominant-baseline="central">arXiv 2504.20101</text>
+  </g></a>
+  <a href="https://llm-d.ai/blog/kvcache-wins-you-can-see" target="_blank" rel="noopener"><g class="node c-blue">
+    <rect x="376" y="480" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="494" dominant-baseline="central">生产化：Dynamo / llm-d</text>
+    <text class="ts" x="390" y="510" dominant-baseline="central">+ AIBrix / SGLang Router / IGW</text>
+  </g></a>
+
+  <!-- ============ 分支 3 ============ -->
+  <line x1="62" y1="590" x2="88" y2="590" class="arr"/>
+  <rect x="88" y="560" width="552" height="226" rx="16" class="box"/>
+  <text class="th" x="110" y="584" dominant-baseline="central">③ 与 PD 分离合流：调度粒度下沉到阶段与实例</text>
+  <text class="ts" x="110" y="604" dominant-baseline="central">前缀命中长度直接写进分离式架构的全局代价函数，阶段划分本身也变成可调量</text>
+
+  <a href="https://arxiv.org/abs/2407.00079" target="_blank" rel="noopener"><g class="node c-teal">
+    <rect x="110" y="622" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="636" dominant-baseline="central">Mooncake KVCache 中心架构</text>
+    <text class="ts" x="124" y="652" dominant-baseline="central">arXiv 2407.00079 · FAST 2025</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2507.06608" target="_blank" rel="noopener"><g class="node c-teal">
+    <rect x="376" y="622" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="636" dominant-baseline="central">Nexus GPU 内主动分离</text>
+    <text class="ts" x="390" y="652" dominant-baseline="central">arXiv 2507.06608</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2505.11916" target="_blank" rel="noopener"><g class="node c-teal">
+    <rect x="110" y="674" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="688" dominant-baseline="central">Arrow 自适应 PD 调度</text>
+    <text class="ts" x="124" y="704" dominant-baseline="central">arXiv 2505.11916</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2607.28150" target="_blank" rel="noopener"><g class="node c-teal">
+    <rect x="376" y="674" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="688" dominant-baseline="central">SmartGen 选择性 KV 传输</text>
+    <text class="ts" x="390" y="704" dominant-baseline="central">arXiv 2607.28150</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2607.00466" target="_blank" rel="noopener"><g class="node c-teal">
+    <rect x="110" y="726" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="740" dominant-baseline="central">ELDR MoE 专家局部性路由</text>
+    <text class="ts" x="124" y="756" dominant-baseline="central">arXiv 2607.00466</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2512.18194" target="_blank" rel="noopener"><g class="node c-teal">
+    <rect x="376" y="726" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="740" dominant-baseline="central">TraCT CXL 机架级共享</text>
+    <text class="ts" x="390" y="756" dominant-baseline="central">arXiv 2512.18194</text>
+  </g></a>
+
+  <!-- ============ 分支 4 ============ -->
+  <line x1="62" y1="836" x2="88" y2="836" class="arr"/>
+  <rect x="88" y="806" width="552" height="226" rx="16" class="box"/>
+  <text class="th" x="110" y="830" dominant-baseline="central">④ KV 缓存下沉为独立存储层</text>
+  <text class="ts" x="110" y="850" dominant-baseline="central">GPU / DRAM / SSD / 远端四级池化，瓶颈从显存容量转移到 I/O 与网络带宽</text>
+
+  <a href="https://arxiv.org/abs/2510.09665" target="_blank" rel="noopener"><g class="node c-coral">
+    <rect x="110" y="868" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="882" dominant-baseline="central">LMCache 四级分层缓存</text>
+    <text class="ts" x="124" y="898" dominant-baseline="central">arXiv 2510.09665 · 事实标准底座</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2508.17219" target="_blank" rel="noopener"><g class="node c-coral">
+    <rect x="376" y="868" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="882" dominant-baseline="central">TokenLake 段级缓存池</text>
+    <text class="ts" x="390" y="898" dominant-baseline="central">arXiv 2508.17219</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2509.16857" target="_blank" rel="noopener"><g class="node c-coral">
+    <rect x="110" y="920" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="934" dominant-baseline="central">ShadowServe SmartNIC 卸载</text>
+    <text class="ts" x="124" y="950" dominant-baseline="central">arXiv 2509.16857</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2608.01655" target="_blank" rel="noopener"><g class="node c-coral">
+    <rect x="376" y="920" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="934" dominant-baseline="central">PrefixPlace 可证明放置</text>
+    <text class="ts" x="390" y="950" dominant-baseline="central">arXiv 2608.01655</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2602.09725" target="_blank" rel="noopener"><g class="node c-coral">
+    <rect x="110" y="972" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="986" dominant-baseline="central">GPU 视频编解码远程复用</text>
+    <text class="ts" x="124" y="1002" dominant-baseline="central">arXiv 2602.09725</text>
+  </g></a>
+
+  <!-- ============ 分支 5 ============ -->
+  <line x1="62" y1="1082" x2="88" y2="1082" class="arr"/>
+  <rect x="88" y="1052" width="552" height="226" rx="16" class="box"/>
+  <text class="th" x="110" y="1076" dominant-baseline="central">⑤ 复用语义泛化：从精确前缀到位置无关</text>
+  <text class="ts" x="110" y="1096" dominant-baseline="central">打破前缀顺序约束，并向语义淘汰、批内去重、非 Transformer 架构外溢</text>
+
+  <a href="https://arxiv.org/abs/2405.16444" target="_blank" rel="noopener"><g class="node c-pink">
+    <rect x="110" y="1114" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="1128" dominant-baseline="central">CacheBlend 位置无关复用</text>
+    <text class="ts" x="124" y="1144" dominant-baseline="central">arXiv 2405.16444 · EuroSys 2025</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2410.15332" target="_blank" rel="noopener"><g class="node c-pink">
+    <rect x="376" y="1114" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="1128" dominant-baseline="central">EPIC 分块位置无关缓存</text>
+    <text class="ts" x="390" y="1144" dominant-baseline="central">arXiv 2410.15332 · ICML 2025</text>
+  </g></a>
+  <a href="https://doi.org/10.1145/3805652" target="_blank" rel="noopener"><g class="node c-pink">
+    <rect x="110" y="1166" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="1180" dominant-baseline="central">UniCache 统一前缀淘汰</text>
+    <text class="ts" x="124" y="1196" dominant-baseline="central">SIGMOD 2026 · 10.1145/3805652</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2605.18825" target="_blank" rel="noopener"><g class="node c-pink">
+    <rect x="376" y="1166" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="1180" dominant-baseline="central">SAECache 语义感知淘汰</text>
+    <text class="ts" x="390" y="1196" dominant-baseline="central">arXiv 2605.18825</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2601.15013" target="_blank" rel="noopener"><g class="node c-pink">
+    <rect x="110" y="1218" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="1232" dominant-baseline="central">RadixMLP 批内前缀去重</text>
+    <text class="ts" x="124" y="1248" dominant-baseline="central">arXiv 2601.15013</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2606.07571" target="_blank" rel="noopener"><g class="node c-pink">
+    <rect x="376" y="1218" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="1232" dominant-baseline="central">扩散 / 混合架构前缀缓存</text>
+    <text class="ts" x="390" y="1248" dominant-baseline="central">arXiv 2606.07571 · 2605.05219</text>
+  </g></a>
+
+  <!-- ============ 分支 6 ============ -->
+  <line x1="62" y1="1328" x2="88" y2="1328" class="arr"/>
+  <rect x="88" y="1298" width="552" height="226" rx="16" class="box"/>
+  <text class="th" x="110" y="1322" dominant-baseline="central">⑥ Agentic 负载专项：2025-2026 增速最快的分支</text>
+  <text class="ts" x="110" y="1342" dominant-baseline="central">以 agent 程序与工作流语义重新参数化调度和驱逐，并配套真实负载刻画基准</text>
+
+  <a href="https://arxiv.org/abs/2502.13965" target="_blank" rel="noopener"><g class="node c-amber">
+    <rect x="110" y="1360" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="1374" dominant-baseline="central">Agentix（原 Autellix）</text>
+    <text class="ts" x="124" y="1390" dominant-baseline="central">arXiv 2502.13965 · NSDI 2026</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2507.07400" target="_blank" rel="noopener"><g class="node c-amber">
+    <rect x="376" y="1360" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="1374" dominant-baseline="central">KVFlow Agent Step Graph</text>
+    <text class="ts" x="390" y="1390" dominant-baseline="central">arXiv 2507.07400 · NeurIPS 2025</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2511.02230" target="_blank" rel="noopener"><g class="node c-amber">
+    <rect x="110" y="1412" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="1426" dominant-baseline="central">Continuum KV TTL 驻留</text>
+    <text class="ts" x="124" y="1442" dominant-baseline="central">arXiv 2511.02230</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2608.25523" target="_blank" rel="noopener"><g class="node c-amber">
+    <rect x="376" y="1412" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="1426" dominant-baseline="central">TOPAS 工作流前缀驻留</text>
+    <text class="ts" x="390" y="1442" dominant-baseline="central">arXiv 2608.25523</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2608.15584" target="_blank" rel="noopener"><g class="node c-amber">
+    <rect x="110" y="1464" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="1478" dominant-baseline="central">GraniKV 非对称粒度分页</text>
+    <text class="ts" x="124" y="1494" dominant-baseline="central">arXiv 2608.15584</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2606.30560" target="_blank" rel="noopener"><g class="node c-amber">
+    <rect x="376" y="1464" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="1478" dominant-baseline="central">TraceLab / XPerf 负载刻画</text>
+    <text class="ts" x="390" y="1494" dominant-baseline="central">arXiv 2606.30560 · 2608.20370</text>
+  </g></a>
+
+  <!-- ============ 收敛层 ============ -->
+  <line x1="62" y1="1574" x2="88" y2="1574" class="arr"/>
+  <rect x="88" y="1544" width="552" height="174" rx="16" class="box"/>
+  <text class="th" x="110" y="1568" dominant-baseline="central">⑦ 综述与收敛：方向开始被系统性归纳</text>
+  <text class="ts" x="110" y="1588" dominant-baseline="central">2607.02574 把前缀复用列为顶层分类轴；2412.19442 另设前缀调度专章（未引 Preble）</text>
+
+  <a href="https://arxiv.org/abs/2607.08057" target="_blank" rel="noopener"><g class="node c-green">
+    <rect x="110" y="1606" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="1620" dominant-baseline="central">System-Aware KV 优化综述</text>
+    <text class="ts" x="124" y="1636" dominant-baseline="central">arXiv 2607.08057 · ACL 2026</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2607.02574" target="_blank" rel="noopener"><g class="node c-green">
+    <rect x="376" y="1606" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="1620" dominant-baseline="central">分布式 KV 内存层级综述</text>
+    <text class="ts" x="390" y="1636" dominant-baseline="central">arXiv 2607.02574</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2504.19720" target="_blank" rel="noopener"><g class="node c-green">
+    <rect x="110" y="1658" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="124" y="1672" dominant-baseline="central">Taming the Titans 综述</text>
+    <text class="ts" x="124" y="1688" dominant-baseline="central">arXiv 2504.19720</text>
+  </g></a>
+  <a href="https://arxiv.org/abs/2412.19442" target="_blank" rel="noopener"><g class="node c-green">
+    <rect x="376" y="1658" width="250" height="42" rx="8" stroke-width="0.5"/>
+    <text class="th" x="390" y="1672" dominant-baseline="central">KV Cache 管理综述</text>
+    <text class="ts" x="390" y="1688" dominant-baseline="central">arXiv 2412.19442 · 前缀调度专章</text>
+  </g></a>
+</svg>
+</div>
+</body>
+</html>
