@@ -296,7 +296,7 @@ sequenceDiagram
 | ★ | `base_scheme.py` | scheme 抽象与 `requires_weight_loader_v2` |
 | ★ | `unquant.py` | 最简单的参考实现（UnquantizedLinearMethod） |
 | ★ | `../linear.py:150-260` | `quant_method` 的注入与 forward 分发 |
-| ☆ | `../model_loader/loader.py:780-830` | `process_weights_after_loading` 的调用时机 |
+| ☆ | `../model_loader/loader.py:936-1038` | `process_weights_after_loading` 的调用时机 |
 | ☆ | `utils.py` | 标量类型工具、`replace_parameter`、层跳过判断 |
 
 **自检问题**：

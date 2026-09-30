@@ -73,6 +73,9 @@ if TYPE_CHECKING:
 class RadixKey:
     """前缀缓存的键，封装一段 token 序列及其命名空间信息。
 
+    is_bigram=True: token_ids holds raw tokens (N+1 for N bigrams); slices share one boundary token.
+    """
+
     __slots__ = ("token_ids", "extra_key", "cache_salt", "is_bigram", "limit")
 
     def __init__(

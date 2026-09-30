@@ -1,4 +1,4 @@
-# Copyright 2023-2024 SGLang Team
+﻿# Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -81,10 +81,13 @@ else:
     # 中译：所有「批次」类消息的基类。与 BaseReq 对应，但字段是复数列表形式：
 logger = logging.getLogger(__name__)
 
+
 class BaseReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     """Base for single-request IPC payloads."""
+
     rid: Optional[str] = None
     http_worker_ipc: Optional[str] = None
+
     @classmethod
     def __get_pydantic_core_schema__(cls, source, handler):
         return msgspec_struct_pydantic_core_schema(cls, handler)
@@ -106,17 +109,25 @@ class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     @classmethod
     def __get_pydantic_core_schema__(cls, source, handler):
         return msgspec_struct_pydantic_core_schema(cls, handler)
+
+
 class BeamSearchOutput(BaseBatchReq, kw_only=True):
     sequences: List[BeamSearchSequence]
+
+
 class PickleWrapper(msgspec.Struct, tag=True, array_like=True):
     """Wraps an arbitrary Python object as pickle-serialized bytes for msgpack IPC.
+
     In msgpack mode, fields that carry opaque or non-msgspec-typed payloads
     (e.g. multimodal inputs, time stats, customized info) are stored as
     PickleWrapper so the outer struct can still be msgpack-encoded.  In pickle
     mode (_USE_PICKLE_IPC=True), wrap_as_pickle / unwrap_from_pickle are no-ops
     and this class is not used on the wire.
     """
+
     data: bytes
+
+
 # Parameters for a session
 class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     # The session identifier. Used by the scheduler to look up or create the
@@ -292,6 +303,7 @@ class GenerateReqInput:
     bootstrap_room: Optional[Union[List[Optional[int]], int]] = None
     bootstrap_pair_key: Optional[Union[List[Optional[str]], str]] = None
     decode_tp_size: Optional[Union[List[Optional[int]], int]] = None
+
     # For DP routing — external router assigns a specific DP worker
     # 中译：DP 路由——由外部路由器指定本请求应分配到哪个 DP（数据并行）worker。
     routed_dp_rank: Optional[int] = None
@@ -327,6 +339,7 @@ class GenerateReqInput:
     priority: Optional[int] = None
     # Extra cache key for caller-defined request classification.
     extra_key: Optional[Union[List[str], str]] = None
+
     # Whether to disallow logging for this request (e.g. due to ZDR)
     # 中译：是否禁止对本请求记日志（如出于零数据保留 ZDR 合规要求）。
     no_logs: bool = False
@@ -1108,10 +1121,14 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Cache namespace used to isolate otherwise-identical prefixes.
     cache_salt: Optional[str] = None
+
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
+
     def unwrap_pickle_fields(self):
         self.time_stats = unwrap_from_pickle(self.time_stats)
+
+
 class BatchTokenizedGenerateReqInput(BaseBatchReq, kw_only=True):
     # The batch of tokenized requests
     # Routing for request i is batch[i].http_worker_ipc, not http_worker_ipcs[i].
@@ -1437,6 +1454,7 @@ CachedTokensDetails = Dict[str, Union[int, str]]
 # Serialized form of BaseFinishReason.to_json() — all values are primitives.
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
 
+
 def build_flat_input_top_logprobs_arrays(
     input_top_logprobs_val: List[Optional[List[float]]],
     input_top_logprobs_idx: List[Optional[List[int]]],
@@ -1444,6 +1462,7 @@ def build_flat_input_top_logprobs_arrays(
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """Convert nested per-position prompt top logprob rows into the flat
     arrays of the `return_flat_raw_top_logprobs` response format.
+
     Returns (float32 values [rows, k], int32 token ids [rows, k],
     null_prefix). The leading null rows are counted into null_prefix and
     excluded from the arrays. Raises ValueError when the rows are not
@@ -1467,6 +1486,8 @@ def build_flat_input_top_logprobs_arrays(
     val_arr = np.asarray(val_rows, dtype=np.float32).reshape(len(val_rows), k)
     idx_arr = np.asarray(idx_rows, dtype=np.int32).reshape(len(idx_rows), k)
     return val_arr, idx_arr, null_prefix
+
+
 class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
@@ -1541,25 +1562,32 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
+
     # Per-item beam carrier; None entries are non-beam items in a mixed
     # batch (the whole field is None when the batch has no beam item).
     beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
+
     weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
+
     # Customized info
     customized_info: Optional[PickleWrapper] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
+
     # For observability
     # Pickled Optional[List[SchedulerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None
     audio_tokens: Optional[List[int]] = None
     video_tokens: Optional[List[int]] = None
+
     # Verify count: number of verification forward passes
     spec_verify_ct: Optional[List[int]] = None
     # Accepted drafts
@@ -1569,6 +1597,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Acceptance histogram
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
     spec_cap_lens_histogram: Optional[List[List[int]]] = None
+
     # Scheduler-side flat assembly of prompt top logprobs for requests with
     # return_flat_raw_top_logprobs: float32 / int32 [rows, k] arrays plus the
     # leading-null count (see build_flat_input_top_logprobs_arrays). For such
@@ -1577,6 +1606,8 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+
 class BatchStrOutput(BaseBatchReq, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
@@ -1631,25 +1662,32 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
+
     # Per-item beam carrier; None entries are non-beam items in a mixed
     # batch (the whole field is None when the batch has no beam item).
     beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
+
     weight_versions: Optional[List[Optional[WeightVersionSpans]]] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
+
     # Customized info
     customized_info: Optional[PickleWrapper] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
     # DP rank of the scheduler that processed each request
     dp_ranks: Optional[List[Optional[int]]] = None
+
     # For observability
     # Pickled Optional[List[SchedulerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+
     # Multimodal prompt token counts (image/audio/video). None when not applicable.
     image_tokens: Optional[List[int]] = None
     audio_tokens: Optional[List[int]] = None
     video_tokens: Optional[List[int]] = None
+
     # Verify count: number of verification forward passes
     spec_verify_ct: Optional[List[int]] = None
     # Accepted drafts
@@ -1659,11 +1697,14 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # Acceptance histogram
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
     spec_cap_lens_histogram: Optional[List[List[int]]] = None
+
     # Detokenizer pass-through for the scheduler-side flat prompt top logprob
     # arrays; see BatchTokenIDOutput.input_top_logprobs_val_flat.
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     # The finish reason
     finished_reasons: List[Optional[FinishReasonDict]]
@@ -1685,20 +1726,30 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     retraction_counts: Optional[List[int]] = None
     # Detailed breakdown of cached tokens by source (device/host/storage)
     cached_tokens_details: Optional[List[Optional[CachedTokensDetails]]] = None
+
     # For observability
     # Pickled Optional[List[SchedulerReqTimeStats]]
     time_stats: Optional[PickleWrapper] = None
+
     # Optional pooled hidden states (pre-head transformer output).
     # Two IPC formats, disambiguated by len vs len(rids):
     #   Stacked:     [stacked_tensor(N, ...)] — len 1, reduces pickle overhead
     #   Non-stacked: [t0, t1, ..., tN]       — len N, when shapes differ or None entries exist
     pooled_hidden_states: Optional[List[Optional[torch.Tensor]]] = None
+
+
 class ClearHiCacheReqInput(BaseReq, kw_only=True):
     pass
+
+
 class ClearHiCacheReqOutput(BaseReq, kw_only=True):
     success: bool
+
+
 class FlushCacheReqInput(BaseReq, kw_only=True):
     timeout_s: Optional[float] = None
+
+
 class FlushCacheReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
@@ -1712,6 +1763,7 @@ class AddExternalCorpusReqInput(BaseReq, kw_only=True):
     documents: Optional[List[str]] = None
     token_chunks: Optional[List[List[int]]] = None
 
+
 class AddExternalCorpusReqOutput(BaseReq, kw_only=True):
     success: bool
     corpus_id: str = ""
@@ -1724,6 +1776,7 @@ class AddExternalCorpusReqOutput(BaseReq, kw_only=True):
 class RemoveExternalCorpusReqInput(BaseReq, kw_only=True):
     corpus_id: str
 
+
 class RemoveExternalCorpusReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
@@ -1733,6 +1786,7 @@ class RemoveExternalCorpusReqOutput(BaseReq, kw_only=True):
     # 中译：列出外部语料的应答，corpus_token_counts 为各语料 id 到其 token 数的映射。
 class ListExternalCorporaReqInput(BaseReq, kw_only=True):
     pass
+
 
 class ListExternalCorporaReqOutput(BaseReq, kw_only=True):
     success: bool
@@ -1816,7 +1870,7 @@ class ContinueGenerationReqInput(BaseReq, kw_only=True):
 
 
 class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
-    """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
+    """Sent by each TokenizerWorker on startup to register its IPC name with the router.
 
     中译：多 tokenizer 模式下，每个 TokenizerWorker 启动时向路由器注册自己 IPC 名的消息。
     """
@@ -1825,7 +1879,7 @@ class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
 
 
 class PauseContinueBroadcastReq(BaseReq, kw_only=True):
-    """Broadcast from router to all workers to set is_pause state."""
+    """Broadcast from router to all workers to set is_pause state.
 
     中译：路由器向所有 worker 广播暂停/恢复状态的消息。
     """
@@ -1858,11 +1912,14 @@ class UpdateWeightFromDiskReqInput(BaseReq, kw_only=True):
     # Tensor metadata from the JSON request body, so it is already msgpack-native.
     manifest: Optional[Dict[str, Any]] = None
 
+
 class UpdateWeightFromDiskReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
     # Number of paused requests during weight sync.
     num_paused_requests: int = 0
+
+
 class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     names: List[str]
     dtypes: List[str]
@@ -1976,17 +2033,22 @@ class SendWeightsToRemoteInstanceReqOutput(BaseReq, kw_only=True):
 class UpdateExpertBackupReq(BaseReq, kw_only=True):
     pass
 
+
 class ExpertWeightPointer(msgspec.Struct, kw_only=True, array_like=True):
     # One expert weight's pointer + byte length in the DRAM backup buffer.
     # array_like: the map has tens of thousands of entries, so positional
     # encoding drops the repeated field names from the wire.
     weight_ptr: int
     byte_size: int
+
+
 class BackupDramReq(BaseReq, kw_only=True):
     rank: int
     weight_pointer_map: Dict[str, ExpertWeightPointer]
     session_id: str
     buffer_size: int
+
+
 class InitWeightsUpdateGroupReqInput(BaseReq, kw_only=True):
     # The master address
     master_address: str
@@ -2013,6 +2075,7 @@ class InitWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
 class DestroyWeightsUpdateGroupReqInput(BaseReq, kw_only=True):
     group_name: str = "weight_update_group"
 
+
 class DestroyWeightsUpdateGroupReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
@@ -2031,9 +2094,12 @@ class UpdateWeightVersionReqInput(BaseReq, kw_only=True):
 class UpdateWeightVersionReqOutput(BaseReq, kw_only=True):
     pass
 
+
 class GetWeightsByNameReqInput(BaseReq, kw_only=True):
     name: str
     truncate_size: int = 100
+
+
 class GetWeightsByNameReqOutput(BaseReq, kw_only=True):
     # A flat List[float] or a per-row List[List[float]]. The union is on the
     # element: Union[List[float], List[List[float]]] is invalid msgspec.
@@ -2065,6 +2131,7 @@ class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
 class ResumeMemoryOccupationReqOutput(BaseReq, kw_only=True):
     pass
 
+
 class CheckWeightsReqInput(BaseReq, kw_only=True):
     action: str = "checksum"
     allow_quant_error: bool = False
@@ -2084,10 +2151,13 @@ class ParallelismInfo(msgspec.Struct, kw_only=True):
     rank: int
     size: int
 
+
 class ChecksumInfo(msgspec.Struct, kw_only=True):
     checksums: Dict[str, str]
     per_gpu_checksum: str
     parallelism_info: ParallelismInfo
+
+
 class CheckWeightsReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
@@ -2101,8 +2171,11 @@ class CheckWeightsReqOutput(BaseReq, kw_only=True):
 class SlowDownReqInput(BaseReq, kw_only=True):
     forward_sleep_time: Optional[float]
 
+
 class SlowDownReqOutput(BaseReq, kw_only=True):
     pass
+
+
 class AbortReq(BaseReq, kw_only=True):
     # Whether to abort all requests
     abort_all: bool = False
@@ -2126,32 +2199,48 @@ class AbortReq(BaseReq, kw_only=True):
 class ActiveRanksOutput(BaseReq, kw_only=True):
     status: List[bool]
 
+
 class ElasticScaleUpdateReq(BaseReq, kw_only=True):
     """Report asynchronous Elastic EP scale completion or failure."""
+
     success: bool
     effective_ep_size: int
     slot_offset: int = 0
     slot_count: int = 0
     error: Optional[str] = None
+
+
 class ScaleElasticEPReqInput(BaseReq, kw_only=True):
     """Request to scale EP by changing the effective EP size (dp_attention mode)."""
+
     new_ep_size: int
+
+
 class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
+    success: bool
     message: str
     old_ep_size: int = 0
     new_ep_size: int = 0
     pending_ep_size: Optional[int] = None
     scale_phase: str = "idle"
+
+
 class GetInternalStateReq(BaseReq, kw_only=True):
     pass
+
+
 class GetInternalStateReqOutput(BaseReq, kw_only=True):
     # A vars() dump of ServerArgs, left untyped because a struct would drift. The
     # producer sanitizes it with msgspec_to_builtins so every value is
     # msgpack-native.
     internal_state: Dict[str, Any]
+
+
 class SetInternalStateReq(BaseReq, kw_only=True):
     # Only numeric scheduler knobs are accepted (see Scheduler.set_internal_state).
     server_args: Dict[str, Union[int, float]]
+
+
 class SetInternalStateReqOutput(BaseReq, kw_only=True):
     updated: bool
 
@@ -2193,6 +2282,7 @@ class ProfileReq(BaseReq, kw_only=True):
     # Add iteration-level annotations (KV / request aggregates) for roofline-style analysis
     detailed_annotations: bool = False
 
+
 class ProfileReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
@@ -2205,9 +2295,13 @@ class ProfileReqOutput(BaseReq, kw_only=True):
 class FreezeGCReq(BaseReq, kw_only=True):
     pass
 
+
 class ShutdownReq(BaseReq, kw_only=True):
     # Broadcast across TP ranks via the normal recv path, so all ranks break
     # the scheduler loop on the same iteration.
+    pass
+
+
 class ConfigureLoggingReq(BaseReq, kw_only=True):
     log_requests: Optional[bool] = None
     log_requests_level: Optional[int] = None
@@ -2217,13 +2311,19 @@ class ConfigureLoggingReq(BaseReq, kw_only=True):
     dump_requests_threshold: Optional[int] = None
     crash_dump_folder: Optional[str] = None
     dump_requests_exclude_meta_keys: Optional[List[str]] = None
+
+
 class OpenSessionReqInput(BaseReq, kw_only=True):
     capacity_of_str_len: int
     session_id: Optional[str] = None
     streaming: Optional[bool] = None
     timeout: Optional[float] = None
+
+
 class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
+
+
 class OpenSessionReqOutput(BaseReq, kw_only=True):
     session_id: Optional[str]
     success: bool
@@ -2248,15 +2348,21 @@ class ExpertDistributionReqType(Enum):
 class ExpertDistributionReq(BaseReq, kw_only=True):
     action: ExpertDistributionReqType
 
+
 class ExpertDistributionReqOutput(BaseReq, kw_only=True):
     pass
+
+
 class Function(msgspec.Struct, kw_only=True, array_like=True):
     description: Optional[str] = None
     name: Optional[str] = None
     parameters: Optional[Dict[str, Any]] = None
+
     @classmethod
     def __get_pydantic_core_schema__(cls, source, handler):
         return msgspec_struct_pydantic_core_schema(cls, handler)
+
+
 class Tool(msgspec.Struct, kw_only=True, array_like=True):
     function: Function
     type: str = "function"
@@ -2293,6 +2399,7 @@ class VertexGenerateReqInput(BaseReq, kw_only=True):
     # msgpack-native.
     instances: List[Dict[str, Any]]
     parameters: Optional[Dict[str, Any]] = None
+
 
 class RpcReqInput(BaseReq, kw_only=True):
     method: str
@@ -2408,11 +2515,19 @@ class BlockReqType(Enum):
 class BlockReqInput(BaseReq, kw_only=True):
     req_type: BlockReqType
 
+
 class SetInjectDumpMetadataReqOutput(BaseReq, kw_only=True):
     success: bool
+
+
 class LazyDumpTensorsReqInput(BaseReq, kw_only=True):
     pass
+
+
 class LazyDumpTensorsReqOutput(BaseReq, kw_only=True):
+    success: bool
+
+
 class DumperControlReqInput(BaseReq, kw_only=True):
     method: str
     # JSON request body (guarded to be a dict at the /dumper endpoint).

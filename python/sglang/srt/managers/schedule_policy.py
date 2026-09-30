@@ -905,12 +905,14 @@ class PrefillAdder:
     ) -> int:
         """SWA slots a request adds to its own sliding window + page slack + the
         load-back charge. Shared floor of _swa_budget_for_req and _swa_chunk_cap.
+
         The headroom is min(extend + decode, window), not a constant window: a
         request contributes only extend + decode fresh tokens to its window and
         a cached SWA prefix funds the rest. Charging a full window double-counted
         a short cached-prefix resume and livelocked admission at a ~2-window
         pool; keeping extend in the min() holds the reservation >= the prefill
         allocation so an admitted request cannot OOM."""
+        window = self.tree_cache.sliding_window_size
         headroom = min(extend_input_len + max_new_tokens, window)
         reserved = headroom + self.page_size
         if swa_host_hit_length > 0:
@@ -1043,6 +1045,7 @@ class PrefillAdder:
         )
         self.cur_rem_token_offset += (
             extend_input_len + page_overhead + mamba_gap_reserve
+        )
         # The new mamba slot also consumes one mamba-recoverable slot (gated
         # separately so full_evictable can't cover it — see __init__).
         if mamba_gap_reserve and self.rem_mamba_slots is not None:

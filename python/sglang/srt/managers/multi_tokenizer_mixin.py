@@ -526,7 +526,7 @@ class MultiTokenizerRouter:
         server_args: ServerArgs,
         port_args: PortArgs,
     ):
-        # 中译：创建 3 个 ZMQ asyncio 套接字：从 detokenizer 收结果、向 scheduler 发、从 worker 收。
+        # 中译：创建 3 个 ZMQ asyncio 套接字：向 scheduler 发、从 worker 收、从 detokenizer 收结果。
         self.server_args = server_args
         self.startup_time: Optional[Dict[str, Any]] = None
         context = zmq.asyncio.Context(3)

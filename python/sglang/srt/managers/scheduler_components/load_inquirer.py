@@ -239,6 +239,7 @@ class SchedulerLoadInquirer:
 
         totals = self.get_decode_moment_totals()
         decode_moments = list(totals) if totals[0] > 0 else None
+
         return LoadSnapshot(
             dp_rank=int(self.ps.dp_rank) if self.ps.dp_rank is not None else 0,
             timestamp=time.time(),

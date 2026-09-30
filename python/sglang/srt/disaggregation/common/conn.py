@@ -261,6 +261,7 @@ class CommonKVManager(BaseKVManager):
         hybrid_decode_pulls_all_ranks = (
             self.is_hybrid_mla_backend
             and disaggregation_mode == DisaggregationMode.DECODE
+        )
         self.enable_all_cp_ranks_for_transfer = (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
             or cp_sharded_prefill

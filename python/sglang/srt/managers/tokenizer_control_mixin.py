@@ -651,6 +651,7 @@ class TokenizerControlMixin:
         obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
             obj.serialized_named_tensors
         )
+
         async with self.is_pause_cond:
             is_paused = self.is_pause
             if is_paused:

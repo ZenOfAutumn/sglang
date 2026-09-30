@@ -235,16 +235,22 @@ class PrefillBootstrapQueue:
             # Staging slices each send into a fixed page-aligned grid, so an
             # unbounded (-1) or non-page-aligned chunk size has no valid grid.
             if cps <= 0 or cps % page_size != 0:
+                raise RuntimeError(
                     f"SGLANG_DISAGG_STAGING_BUFFER requires a positive "
                     f"chunked_prefill_size that is a multiple of page_size "
                     f"({page_size}); got {chunked_prefill_size}."
+                )
             if self.pp_size > 1 and self.transfer_backend != TransferBackend.MOONCAKE:
+                raise RuntimeError(
                     "SGLANG_DISAGG_STAGING_BUFFER with pp_size > 1 is only "
                     "supported by Mooncake."
+                )
             if get_parallel().enable_prefill_context_parallel:
                 # CP rewrites index_slice per rank, breaking the chunk grid.
+                raise RuntimeError(
                     "SGLANG_DISAGG_STAGING_BUFFER does not support "
                     "prefill context parallelism."
+                )
         self.kv_manager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> CommonKVManager:
@@ -514,12 +520,16 @@ class PrefillBootstrapQueue:
                     [self.queue[i].disagg_kv_sender for i in uncovered],
                     self.scheduler.attn_cp_cpu_group,
                     self.scheduler.attn_tp_cpu_group,
+                )
                 for i, local_poll in zip(uncovered, local_polls):
                     if local_poll == KVPoll.Failed:
                         polls[i] = KVPoll.Failed
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
                 [req.disagg_kv_sender for req in self.queue],
+                self.scheduler.attn_cp_cpu_group,
+                self.scheduler.attn_tp_cpu_group,
+            )
 
         # 中译：逐个请求依据其 poll 状态分流处理。
         for i, (req, poll) in enumerate(zip(self.queue, polls)):
@@ -614,29 +624,52 @@ class SchedulerDisaggregationPrefillMixin:
         into a running batch: aborts requests whose decode peer died, and
         finalizes optimistic requests whose bootstrap completed so they skip
         the post-forward bootstrap check.
+
+        中译：在请求被纳入 prefill 批之前，补查 waiting_queue 中请求的握手状态。
+              覆盖「已离开 bootstrap 队列、尚未进入运行批」这段窗口：
+              - decode 对端已失效（握手失败）的请求直接中止，避免白算 prefill；
+              - 乐观抢跑的请求若握手已完成，立即 finalize，从而跳过前向后的握手复查。
         """
+        # 中译：只检查尚未中止的请求；已中止的请求会在后续流程中被清理，无需再轮询。
         candidates = [req for req in self.waiting_queue if not is_aborted(req)]
+        # 中译：没有待检查的请求，直接返回，省去一次跨 rank 通信。
         if not candidates:
             return
+        # 中译：轮询各请求 KV sender 的握手状态，并在 attention CP/TP 组内汇总，
+        #       保证同组各 rank 看到一致的结果，避免不同 rank 对同一请求做出不同决定。
         polls = poll_and_all_reduce_attn_cp_tp_group(
+            # 中译：每个请求对应一个 KV sender。
             [req.disagg_kv_sender for req in candidates],
+            # 中译：attention 上下文并行（CP）组的 CPU 通信组。
             self.attn_cp_cpu_group,
+            # 中译：attention 张量并行（TP）组的 CPU 通信组。
             self.attn_tp_cpu_group,
         )
+        # 中译：记录本轮握手失败的请求，稍后统一从 waiting_queue 中移除。
         failed = set()
+        # 中译：按顺序把每个请求与其汇总后的轮询状态配对处理。
         for req, poll in zip(candidates, polls):
+            # 中译：握手失败（如 decode 对端已退出），不能再发送 KV。
             if poll == KVPoll.Failed:
+                # 中译：中止请求、释放资源并向客户端返回错误。
                 self.handle_bootstrap_failure(req)
+                # 中译：标记待移除，避免遍历 candidates 时直接修改 waiting_queue。
                 failed.add(req)
+            # 中译：握手已完成、正在等待 KV 输入，且该请求仍处于乐观（pending）状态。
             elif (
                 poll == KVPoll.WaitingForInput
                 and req.pending_bootstrap
+                # 中译：测试钩子强制走重试路径时跳过 finalize，留给前向后的检查处理。
                 and not should_force_retry(req)
             ):
                 # Optimistic requests reserved a metadata buffer when popped, so
                 # finalize cannot fail here; if it ever does, the request stays
                 # pending and the post-forward check resolves it.
+                # 中译：乐观请求出队时已预留元数据槽位，finalize 通常不会失败；
+                #       万一失败，请求保持 pending，由前向后的握手检查兜底处理。
+                # 中译：初始化 sender（计算待发送页数、绑定元数据槽位），并清除 pending 标记。
                 self.disagg_prefill_bootstrap_queue.finalize_bootstrap(req)
+        # 中译：存在失败请求时，重建 waiting_queue，把它们移出，防止被纳入后续 prefill 批。
         if failed:
             self.waiting_queue = [
                 req for req in self.waiting_queue if req not in failed
@@ -651,28 +684,40 @@ class SchedulerDisaggregationPrefillMixin:
     @scheduler_nvtx_method("scheduler.get_next_batch_to_run")
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
-        # 中译：组织 prefill 节点下一个要跑的批次。
-        # 中译 HACK (byronhsu)：prefill 节点不会进入 update_running_batch（那里会重置该标志），
-        # 中译：先处理上一轮遗留的分块（chunked）prefill（推进/发送/校验其状态）。
-        # 中译：从 waiting_queue 组一个新的 prefill 批次，并按需为 DP attention 准备 MLP 同步批。
+        # 中译：当前运行态批次；P 端不做 decode，这里主要承载分块请求等状态。
         running_batch: ScheduleBatch,
+        # 中译：上一轮执行的批次，用于衔接分块 prefill 的收尾。
         last_batch: Optional[ScheduleBatch],
     ) -> NextBatchPlan:
+        # 中译：组织 prefill 节点下一个要跑的批次；与聚合模式不同，这里不会转入 decode 选批。
+        # 中译：先处理分块请求上被延迟到安全时机执行的中止，避免带着失效状态继续组批。
         self.process_pending_chunked_abort()
 
         # HACK (byronhsu): reset the batch_is_full flag because we never enter update_running_batch which resets it
         # Otherwise, it hangs under high concurrency
+        # 中译：P 端从不进入 update_running_batch（该标志通常在那里重置），需手动清零，否则高并发下会卡死。
         running_batch.batch_is_full = False
+
+        # 中译：补查 waiting_queue 中乐观请求的握手状态：已完成的补做 finalize，失败的中止。
         self.resolve_waiting_queue_bootstrap()
+
+        # 中译：处理上一轮遗留的分块（chunked）prefill：推进进度、按需发送已完成部分的 KV、校验握手。
         self.process_prefill_chunk(last_batch=last_batch, running_batch=running_batch)
+
+        # 中译：复用通用 prefill 组批器，从 waiting_queue 按显存/token 预算攒一个新的 prefill 批。
         prefill_plan = self.get_new_batch_prefill(running_batch)
+        # 中译：取出本轮要执行的 prefill 批（可能为 None）。
         batch = prefill_plan.batch_to_run
+        # 中译：回写组批过程中可能更新的运行态批次。
         running_batch = prefill_plan.running_batch
+        # 中译：DP attention 下各 rank 需同步参与 MLP collective，必要时补 idle 批以免部分 rank 缺席。
         batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
 
+        # 中译：有批可跑时记录调度时间点，用于请求生命周期统计。
         if batch:
             set_schedule_time_batch(batch)
 
+        # 中译：返回本轮执行批与更新后的运行态批次。
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
     @torch.no_grad()
@@ -698,6 +743,7 @@ class SchedulerDisaggregationPrefillMixin:
             batch = plan.batch_to_run
             batch = self.ngram_embedding_manager.prepare_for_forward(
                 batch, chunked_req=self.chunked_req
+            )
             self.cur_batch_for_debug = batch
 
             # 中译：启动当前批次。
@@ -723,59 +769,81 @@ class SchedulerDisaggregationPrefillMixin:
         # 中译：PD 分离下 prefill 节点的「重叠」调度主循环——通过 result_queue 把「前向发起」与
         #       「上一批结果处理」错开一拍，使当前批的 GPU 前向与上一批的 CPU 侧结果处理重叠，
         #       从而提升吞吐。
+        # 中译：初始化结果队列，元素为（批次快照, 前向结果）；稳态下轮末只积压 1 批。
         self.result_queue = deque()
 
+        # 中译：调度主循环，常驻运行直到进程退出。
         while True:
-            # 中译：收请求 + 输入处理；把 bootstrap 完成的请求入 waiting_queue。
+            # 中译：从 TokenizerManager / RPC 非阻塞拉取本轮新到的请求。
             recv_reqs = self.request_receiver.recv_requests()
+            # 中译：分发处理请求；生成请求会创建 KV sender 并进入 bootstrap 队列，控制请求直接回包。
             self.process_input_requests(recv_reqs)
+            # 中译：引擎暂停（如权重更新）时只收请求，不推进组批与前向。
             if self._engine_paused:
+                # 中译：跳过本轮剩余步骤，进入下一轮。
                 continue
+            # 中译：把握手已完成（或允许乐观抢跑）的请求从 bootstrap 队列移入 waiting_queue。
             self.waiting_queue.extend(
+                # 中译：轮询各请求 sender 的握手状态，返回可参与 prefill 的请求。
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
-            # 中译：共享 GPU buffer（req_to_token_pool / SWA 映射）上的写后读（WAR）屏障：
-            # 中译：组取下一个要跑的批次。
 
             # Get the next batch to run
+            # 中译：组取下一个要跑的 prefill 批：补查乐观握手、处理遗留 chunk、攒新 prefill 批。
             plan = self.get_next_disagg_prefill_batch_to_run(
+                # 中译：传入当前运行态与上一轮批次，用于分块 prefill 的收尾衔接。
                 running_batch=self.running_batch, last_batch=self.last_batch
             )
+            # 中译：回写可能被更新的运行态批次。
             self.running_batch = plan.running_batch
+            # 中译：取出本轮真正要执行的批（可能为 None）。
             batch = plan.batch_to_run
+            # 中译：若启用 ngram embedding，为本批准备额外的前向输入；未启用时原样返回。
             batch = self.ngram_embedding_manager.prepare_for_forward(
+                # 中译：传入当前分块请求，便于处理分块场景下的输入。
                 batch, chunked_req=self.chunked_req
+            )
+            # 中译：记录当前批次，供调试 / 看门狗在异常时打印现场。
             self.cur_batch_for_debug = batch
 
-            # 中译：启动当前批次。
+            # 中译：有批可跑时，发起当前批次的前向。
             if batch:
+                # 中译：若启用 staging，提前通知 D 端为本批预分配暂存空间。
                 if self.enable_staging:
+                    # 中译：让 D 端预分配与 P 端前向计算并行，降低端到端时延。
                     self.maybe_prefetch_staging_for_batch(batch)
-                # 中译：发起当前批前向，并把（批副本, 结果）入队 result_queue，本轮先不处理它的结果，
-                #       以便与下面处理「上一批」结果重叠。
+                # 中译：在 forward_stream 上提交本批前向并返回结果对象；此时 GPU 可能尚未算完。
                 batch_result = self.run_batch(batch)
+                # 中译：WAR 屏障：让后续 schedule_stream 写入等待本批对共享缓冲的读取完成，
+                #       防止下一轮调度改写仍在被前向读取的数据；这是 stream 依赖，不阻塞 CPU。
                 self._apply_war_barrier()
+                # 中译：保存（批次快照, 结果）入队，本轮不处理，留到下一轮与下一批前向重叠。
                 self.result_queue.append((batch.copy(), batch_result))
+            # 中译：本轮无批可跑。
             else:
+                # 中译：置空结果，供后面的延迟采样判断跳过。
                 batch_result = None
 
-            # 中译：处理「上一批」的结果（与当前批的 GPU 前向重叠）；若无上一批且当前也空则空闲自检。
+            # 中译：若上一轮提交过批次，则此处处理它的结果（与本批 GPU 前向重叠）。
             if self.last_batch:
+                # 中译：按 FIFO 取出最早入队的上一批快照及结果。
                 tmp_batch, tmp_result = self.result_queue.popleft()
+                # 中译：处理上一批结果：追加首 token、缓存 KV、入在途队列并按需发送 KV。
                 self.process_batch_result(tmp_batch, tmp_result)
+            # 中译：上一批与本批都不存在，说明服务空闲。
             elif batch is None:
                 # 中译：服务空闲时做自检并重新初始化部分状态。
                 self.on_idle()
 
-            # 中译：轮询在途传输队列，回收已完成传输的请求。
+            # 中译：轮询在途传输队列：传输成功则释放 KV 并回包，失败则中止；未完成的继续保留。
             self.process_disagg_prefill_inflight_queue()
 
-            # 中译：对当前批执行采样。因其依赖上一批的结果（如 grammar 状态），故放在处理完
             # Run sample of the current batch
             # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
+            # 中译：对当前批执行延迟采样；因其依赖上一批结果（如 grammar 状态），放在上一批处理完之后。
             self.launch_batch_sample_if_needed(batch_result, batch)
 
-            # 中译：更新 last_batch。
+            # 中译：本批成为下一轮待回收的「上一批」，维持一拍错位。
             self.last_batch = batch
 
     def process_batch_result_disagg_prefill(
@@ -848,6 +916,8 @@ class SchedulerDisaggregationPrefillMixin:
             )
             if batch.spec_info.dsa_topk_indices is not None:
                 draft_dsa_topk_indices_cpu = batch.spec_info.dsa_topk_indices.to(
+                    "cpu", non_blocking=False
+                )
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue
         next_token_ids = result.next_token_ids.tolist()
         # 中译：把 logprob 相关张量搬到 CPU，供后续按请求切片、组装返回值。
@@ -908,7 +978,9 @@ class SchedulerDisaggregationPrefillMixin:
                         ].clone()
                     else:
                         req.output_dsa_topk_indices = None
+                else:
                     req.hidden_states_tensor = None
+                    req.output_dsa_topk_indices = None
                 if req.return_logprob:
                     assert extend_logprob_start_len_per_req is not None
                     assert extend_input_len_per_req is not None
@@ -1009,6 +1081,7 @@ class SchedulerDisaggregationPrefillMixin:
                 auxiliary_output,
                 auxiliary_output_starts,
             )
+
         can_run_cuda_graph = result.can_run_cuda_graph
         self.metrics_reporter.report_prefill_stats(
             batch=batch,
@@ -1248,58 +1321,83 @@ class SchedulerDisaggregationPrefillMixin:
         )
         return self.handle_pending_bootstrap(req, polls[0])
 
-        # 中译：处理分块（chunked）prefill 的遗留状态。分块 prefill 指把超长输入拆成多个
-        # 中译：chunked_req_to_exclude 收集需从上一批过滤掉的 chunked 请求（避免重复处理）。
-            # 中译：把当前 chunked 请求已完成的部分缓存入 radix tree（以便前缀复用）。
-                # 中译：bootstrap 未就绪（乐观失败），停掉当前分块 prefill。
-                # 中译：重叠模式下把本 chunk 的 KV 发送推迟到 process_batch_result_disagg_prefill，
-                # 中译：非重叠模式直接发送当前已完成 chunk 的 KV。
     def process_prefill_chunk(
         self: Scheduler,
+        # 中译：上一轮执行的批次；若是 extend 批，需从中剔除仍在分块中的请求。
         last_batch: Optional[ScheduleBatch],
+        # 中译：当前运行态批次；这里只用来复位 batch_is_full 标志。
         running_batch: ScheduleBatch,
     ) -> None:
+        # 中译：处理上一轮遗留的分块（chunked）prefill。分块 prefill 把超长输入拆成多段，
+        #       跨多轮逐段计算；每轮开始时需推进该请求、按需发送已算完部分的 KV，并校验握手。
+        # 中译：收集需要从上一批中剔除的分块请求——它们的 prefill 尚未结束，不能被当作已完成处理。
         chunked_req_to_exclude = set()
+        # 中译：存在跨轮进行中的分块请求时才需处理。
         if (req := self.chunked_req) is not None:
+            # 中译：该请求仍在分块中，稍后从上一批中剔除。
             chunked_req_to_exclude.add(req)
+            # 中译：把已算完的部分登记进 radix tree（chunked=True），既能前缀复用，也保证 KV 在后续 chunk 中被引用。
             maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
+            # 中译：乐观请求需先确认握手状态；非乐观请求直接视为已完成。
             if not self.check_bootstrap(req):
+                # 中译：握手失败导致请求已被中止。
                 if is_aborted(req):
                     # bootstrap failed
+                    # 中译：停止继续分块计算该请求。
                     self.chunked_req = None
+                # 中译：握手仍未完成，但 waiting_queue 里已有握手完成的请求在等。
                 elif self.has_bootstrapped_waiting_req():
                     # optimistic request yields to waiting requests
+                    # 中译：乐观请求让位给已就绪请求，停止分块计算。
+                    self.chunked_req = None
+                    # 中译：非重叠模式下立即释放已占用的 KV 并重新排队；
+                    #       重叠模式下上一批结果尚未处理，释放推迟到结果处理阶段。
                     if not self.enable_overlap:
                         self.optimistic_release_and_requeue(req)
                 # else: still bootstrapping, keep computing without sending
+                # 中译：否则仍在握手中且没有其他就绪请求，继续计算下一块，但暂不发送 KV。
+            # 中译：握手已完成，且处于重叠模式。
             elif self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
+                # 中译：重叠模式下上一块的前向结果尚未确认，KV 发送推迟到 process_batch_result_disagg_prefill；
+                #       这里只记录本块的结束位置，作为发送区间的右边界。
                 req.tmp_end_idx = min(
+                    # 中译：本块 extend 覆盖到的位置。
                     req.extend_range.end,
+                    # 中译：不超过原始输入长度，避免越界。
                     len(req.origin_input_ids),
                 )
+            # 中译：握手已完成，且处于非重叠模式：上一块结果已处理完，可直接发送。
             else:
+                # 中译：把 [start_send_idx, 当前已算位置) 的 KV 页发往 decode 节点。
                 self.send_kv_chunk(req)
 
+            # 中译：分块请求仍需继续计算时，复位满批标志，确保本轮还能组批跑它的下一块。
             if self.chunked_req is not None:
                 running_batch.batch_is_full = False
 
-                # 中译：在 context PP 下，最后一个 chunk 之后当前微批仍追踪着过时的 chunked_req，需丢弃它。
-            # 中译：从上一批中过滤掉上述 chunked 请求；若批大小因此变小，说明还有容量，重置 batch_is_full。
+        # 中译：上一批是 extend（prefill）批时，需把仍在分块中的请求从中剔除。
         if last_batch and last_batch.forward_mode.is_extend():
+            # 中译：上一批记录着自己的分块请求。
             if last_batch.chunked_req:
                 # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
                 # We need to discard it.
+                # 中译：context PP 下，最后一块跑完后当前 micro-batch 仍可能挂着过时的 chunked_req，一并剔除。
                 chunked_req_to_exclude.add(last_batch.chunked_req)
 
+            # 中译：记录过滤前的批大小。
             last_bs = last_batch.batch_size()
+            # 中译：剔除已完成/中止的请求以及上述分块请求。
             last_batch.filter_batch(chunked_req_to_exclude=list(chunked_req_to_exclude))
+            # 中译：批大小变小说明腾出了容量，复位满批标志，允许继续接纳新请求。
             if last_batch.batch_size() < last_bs:
                 running_batch.batch_is_full = False
+
     def maybe_send_cached_prefix_chunk(self: Scheduler, req: Req) -> None:
         if not envs.SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX.get():
             return
+
         # Staging sends into positional grid slots, so the early-send boundary
         # must stay stable across the request's batches: snapshot the at-rest
         # prefix on the first batch. Non-staging reads the live prefix.
@@ -1485,6 +1583,7 @@ class SchedulerDisaggregationPrefillMixin:
                         page_size,
                         prefix_len=req.disagg_decode_prefix_len,
                     )
+                )
             state_indices = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]
@@ -1498,17 +1597,22 @@ class SchedulerDisaggregationPrefillMixin:
                 end_idx,
                 req.disagg_decode_prefix_len,
                 staging_grid_tokens(get_schedule().chunked_prefill_size, page_size),
+            )
         else:
             segments = [(start_idx, end_idx)]
+
         for seg_start, seg_end in segments:
             is_final_segment = seg_end == end_idx
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, seg_start:seg_end
+            ]
             # Unified memory: req_to_token holds VIRTUAL ids; the transfer needs
             # physical ones. Per segment, since each is its own gather.
             kv_indices = (
                 self.token_to_kv_pool_allocator.translate_kv_indices_for_transfer(
                     kv_indices
+                )
+            )
             page_indices = kv_to_page_indices(kv_indices, page_size)
             segment_is_last = last_chunk and is_final_segment
             if not req.disagg_kv_sender.should_send_kv_chunk(
@@ -1519,6 +1623,7 @@ class SchedulerDisaggregationPrefillMixin:
                 page_indices,
                 state_indices if segment_is_last else None,
                 num_kv_tokens=seg_end - seg_start,
+            )
         req.start_send_idx = end_idx
         # A last chunk needs no entry: every `last_chunk=True` call site has
         # already put the request on `disagg_prefill_inflight_queue`.

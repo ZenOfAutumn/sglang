@@ -770,6 +770,7 @@ def get_kv_class(
     # 中译：把本地区间平移回全局页 id 空间，再用掩码取出落在该区间内的页。
     return class_mapping.get(class_type)
 
+
 def _get_cp_rank_page_bounds(
     total_pages: int, cp_rank: int, cp_size: int
 ) -> Tuple[int, int]:
@@ -796,11 +797,13 @@ def filter_kv_indices_for_cp_rank(
 
     if cp_size <= 1:
         return kv_indices, index_slice
+
     rank_start, rank_end = _get_cp_rank_page_bounds(total_pages, cp_rank, cp_size)
     chunk_start = index_slice.start if index_slice.start is not None else 0
     chunk_end = index_slice.stop if index_slice.stop is not None else total_pages
     first_pos = max(rank_start, chunk_start) - chunk_start
     last_pos = min(rank_end, chunk_end) - chunk_start
+
     if last_pos <= first_pos:
         new_kv_indices = kv_indices[:0]
         new_index_slice = slice(chunk_start, chunk_start)
@@ -1205,6 +1208,7 @@ def setup_state_kv_args(
             raise NotImplementedError(
                 "PD disaggregation for MiniMax sparse layers with index value "
                 "(index_kv_pool) is not yet supported; only K-only sparse layers are."
+            )
         if token_to_kv_pool.index_k_pool is not None:
             dp, dl, il = token_to_kv_pool.get_index_k_state_buf_infos()
             append_state_component(kv_args, StateType.MINIMAX_INDEX_K, dp, dl, il)
@@ -1264,6 +1268,7 @@ def setup_state_kv_args(
                         c128_ptrs,
                         c128_lens,
                         c128_item_lens,
+                    )
         elif isinstance(token_to_kv_pool, HybridLinearKVPool):
             dim = (
                 token_to_kv_pool.get_state_dim_per_tensor()

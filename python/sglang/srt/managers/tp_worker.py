@@ -240,6 +240,7 @@ class BaseTpWorker(ABC):
                 recv_req.group_name,
                 recv_req.load_format,
             )
+        )
         return success, message
 
     def _deserialize_own_rank(self, serialized_named_tensors):
@@ -249,6 +250,8 @@ class BaseTpWorker(ABC):
         monkey_patch_torch_reductions()
         return MultiprocessingSerializer.deserialize(
             serialized_named_tensors[self.ps.tp_rank]
+        )
+
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         success, message = self.model_runner.weight_updater.update_weights_from_tensor(
             named_tensors=self._deserialize_own_rank(recv_req.serialized_named_tensors),
@@ -328,6 +331,7 @@ class BaseTpWorker(ABC):
                 )
             logger.info(
                 f"[LORA-CHECK] rank{self.ps.tp_rank} adapter sync OK: {len(exp)}/{len(exp)} tensors match (sha256)"
+            )
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
             tensors,
@@ -662,6 +666,7 @@ class TpModelWorker(BaseTpWorker):
             dllm_algo_state,
             can_run_cuda_graph,
         ) = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
+
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,

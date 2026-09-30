@@ -188,7 +188,7 @@ Attn:  QKV(列切，按 head) ──► attention ──► O(行切) ──► 
 
 - **关键认知**：推理 DP **没有梯度同步**，正常前向时副本之间不做模型计算通信；控制面仍负责请求分发、状态与控制消息协调。所以推理 DP 的主要难点不在梯度通信，而在**负载均衡**——这与训练 DP 截然不同。
 
-- **与你已写文档的衔接**：`docs/metrics/endpoints_metrics_and_loads_zh.md` 里的 `num_total_tokens` 正是 `total_tokens` 均衡策略的决策依据：
+- **与你已写文档的衔接**：`docs/metrics/v1_loads_zh.md` 里的 `num_total_tokens` 正是 `total_tokens` 均衡策略的决策依据：
 
 $$
 \mathrm{num\_total\_tokens}
@@ -457,7 +457,7 @@ router 打分 ──► dispatch（典型为 all-to-all）──► 各卡算自
 
 - P 节点与 D 节点为什么可以配不同的 TP/DP（因为并行度是实例内部的事）；
 - KV 传输为什么必须对齐两端实际的 KV Cache 布局与并行 rank 映射：MHA/GQA 可能按 KV head 分片，而 MLA latent 在 attention-TP 子组内可能复制、在 attention-DP 维度上按请求分布；
-- `/v1/loads` 的 `disaggregation` 段那几个队列字段（`prefill_bootstrap_queue_reqs`、`decode_prealloc_queue_reqs` 等）对应 PD 状态机的哪个阶段 —— 这部分你在 `docs/metrics/endpoints_metrics_and_loads_zh.md` 已经写过。
+- `/v1/loads` 的 `disaggregation` 段那几个队列字段（`prefill_bootstrap_queue_reqs`、`decode_prealloc_queue_reqs` 等）对应 PD 状态机的哪个阶段 —— 这部分你在 `docs/metrics/v1_loads_zh.md` 已经写过。
 
 ---
 

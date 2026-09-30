@@ -408,8 +408,11 @@ class NGRAMWorker(BaseSpecWorker):
         ]
         output_tails = [
             list(req.output_ids[-self.max_trie_depth :]) for req in batch.reqs
+        ]
         base_lens = [
             len(req.origin_input_ids) + len(req.output_ids) for req in batch.reqs
+        ]
+
         if use_prev_tokens:
             prev_token_ids, prev_accept_lens = (
                 batch.spec_info.accept_tokens,
@@ -427,6 +430,7 @@ class NGRAMWorker(BaseSpecWorker):
             # _update_ngram_corpus still reads the staging; fill it empty.
             self.prev_token_ids = []
             self.prev_accept_lens = [0] * bs
+
         self.ngram_corpus.synchronize()
         batch_tokens = []
         total_lens = []
@@ -690,6 +694,7 @@ class NGRAMWorker(BaseSpecWorker):
                     device=verify_input.retrieve_next_token.device,
                     # Host corpus lookup, so NGRAM stays synchronous: nothing pending.
                     barrier=None,
+                )
 
             # 中译：采样。
             # 先做 NaN/Inf 探针——投机解码下数值异常很难排查，

@@ -624,6 +624,8 @@ class SchedulerMetricsReporter:
             return 0.0, 0.0, 0.0
         tokens = max(0, int(sum(batch.extend_lens)))
         if tokens == 0:
+            return 0.0, 0.0, 0.0
+
         context_product = self._prefill_attention_pairs(batch)
         flops = (
             tokens * self._linear_flops_per_token
@@ -995,10 +997,14 @@ class SchedulerMetricsReporter:
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
                 read_ragged_verify_mode,
+            )
 
             spec_block_accept_length = (
                 self.spec_num_block_accept_tokens / self.spec_num_forward_ct
+                if self.spec_num_forward_ct > 0
                 and read_ragged_verify_mode() is RaggedVerifyMode.CAP_ACCEPT
+                else 0
+            )
             self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
             self.spec_num_accept_tokens = self.spec_num_forward_ct = 0

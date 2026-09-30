@@ -300,8 +300,19 @@ def resolve_draft_attention_backend(
     if not is_draft_worker:
         return None
     return draft_attention_backend or get_spec().speculative_draft_attention_backend
+
+
 class ModelRunner:
     """ModelRunner runs the forward passes of the models."""
+
+    # 中译：ModelRunner = 「模型执行器」：一个进程（一个 rank）里唯一真正跑前向的对象。
+    #       它持有权重（self.model）、KV 缓存内存池、采样器、CUDA Graph runner、通信组等，
+    #       对外提供 forward / forward_batch_generation / prefill / decode 等接口。
+    #       调用链：Scheduler（调度） → TpModelWorker（管 rank / 内存池 / 权重加载） → ModelRunner（真干活）。
+    #       TpModelWorker.__init__ 里那句 `ModelRunner(...)` 就是本类的入口（见 docs/learn/run/init_tp_model_worker_zh.md 第 4 节）。
+    #
+    #       __init__ 只负责「把这个 rank 的模型准备好」，不做任何前向；
+    #       它的入参含义、产物清单与耗时口径见下方 __init__ 的 docstring（含输入/输出示例）。
 
     @property
     def sampling_observer(self) -> Optional[SamplingObserver]:
@@ -318,6 +329,8 @@ class ModelRunner:
 
     def supports_sampling_observer(self) -> bool:
         """Whether this runner's sampling path publishes observer output."""
+        # 中译：本 runner 的采样路径是否会产出观测数据。dLLM 与投机解码的采样不走通用采样器，
+        #       这两种情况下不支持挂 sampling observer（setter 会直接抛 ValueError）。
         return self.server_args.dllm_algorithm is None and self.spec_algorithm.is_none()
 
     def __init__(
@@ -328,21 +341,23 @@ class ModelRunner:
         mem_fraction_static: float,
         # 中译：本 worker 绑定的物理 GPU 编号。
         gpu_id: int,
-        # 中译：张量并行（Tensor Parallel）中当前进程的 rank（从 0 开始）。
-        # 中译：张量并行的总规模（参与 TP 的进程数）。
-        # 中译：MoE 专家并行（Expert Parallel）中当前进程的 rank。
-        # 中译：MoE 专家并行的总规模。
-        # 中译：流水线并行（Pipeline Parallel）中当前进程所处的 stage rank。
-        # 中译：流水线并行的总规模（stage 数）。
-        # 中译：用于初始化 NCCL 分布式通信组的端口号。
+        # 中译：本 rank 的并行视图（ParallelState），把各并行维度的 rank/size 收在一个对象里
+        #       （历史版本是逐个传 tp_rank / tp_size / pp_rank / ...，现已合并）：
+        #       · tp_rank / tp_size —— 张量并行（Tensor Parallel）的当前 rank 与总规模；
+        #       · pp_rank / pp_size —— 流水线并行（Pipeline Parallel）的 stage rank 与 stage 数；
+        #       · dp_rank / dp_size —— 数据并行的 rank 与规模（未启用时为 0 / 1）；
+        #       · cp_rank           —— attention 上下文并行（Context Parallel）的 rank；
+        #       · moe_ep_rank / moe_ep_size —— MoE 专家并行（Expert Parallel）的 rank 与规模；
+        #       · moe_dp_rank       —— MoE 数据并行的 rank（未启用时取默认值）。
+        #       例：TP=8 的第 3 张卡 ⇒ ps.tp_rank=3、ps.tp_size=8、ps.pp_rank=0、ps.pp_size=1。
         ps: ParallelState,
+        # 中译：用于初始化 NCCL 分布式通信组的端口号（最终传给 bootstrap.init_torch_distributed）。
         nccl_port: int,
         # 中译：全局服务端参数（ServerArgs），承载几乎所有用户可配置的运行时选项。
         server_args: ServerArgs,
-        # 中译：数据并行（Data Parallel）中当前进程的 rank；非 DP 场景为 None。
-        # 中译：注意力上下文并行（Context Parallel）中当前进程的 rank；未启用时为 None。
-        # 中译：MoE 数据并行中当前进程的 rank；未启用时为 None。
         # 中译：是否为投机解码（speculative decoding）中的草稿（draft）worker；True 表示运行的是小草稿模型。
+        #       draft runner 不加载 tokenizer / LoRA，也不会覆盖 target 已发布的配置（见下方 assert_published），
+        #       并且复用 target 的内存池与并行视图（只多一个 draft_model_idx 用来区分）。
         is_draft_worker: bool = False,
         # 中译：请求到 token 的映射内存池；为 None 时由 ModelRunner 自行分配，传入则复用（如 draft 复用 target 的池）。
         req_to_token_pool: Optional[ReqToTokenPool] = None,
@@ -352,11 +367,45 @@ class ModelRunner:
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         # 中译：草稿模型索引；在多草稿模型（如 EAGLE 多步）场景下用于区分不同的 draft 模型。
         draft_model_idx: Optional[int] = None,
+        # 中译：草稿 runner 专用的 attention 后端名；target 传 None。经下方
+        #       resolve_draft_attention_backend() 归一化：非 draft 恒为 None；draft 则取
+        #       「构建它的投机算法所解析出的后端」，否则退回 --speculative-draft-attention-backend。
+        #       注意它属于 runner 而非进程——target 与 draft 在同一个进程里并存，各自持有自己的后端。
         draft_attention_backend: Optional[str] = None,
     ):
+        """初始化一个 rank 的模型执行器：加载权重、建立通信组、备齐前向所需的一切。
+
+        【输入示例】TP=8、第 0 张卡上的 target worker：
+            model_config       = ModelConfig.from_server_args(server_args, model_path="Qwen/Qwen3-8B")
+            mem_fraction_static= 0.85      # 权重 + KV 池等静态占用 ≤ 总显存的 85%
+            gpu_id             = 0         # 绑定的物理卡
+            ps                 = ParallelState(tp_rank=0, tp_size=8, pp_rank=0, pp_size=1, dp_size=1, ...)
+            nccl_port          = 23456     # NCCL 建组端口
+            server_args        = ServerArgs(model_path="Qwen/Qwen3-8B", tp_size=8, ...)
+            is_draft_worker    = False     # 运行的是 target（主）模型
+            req_to_token_pool  = None      # None → 稍后自行分配；draft 则复用 target 的池
+            token_to_kv_pool_allocator = None
+            memory_pool_config = None
+            draft_model_idx    = None
+            draft_attention_backend = None # target 恒为 None
+
+        【输出示例】无返回值，产物全部挂在实例属性上（供 TpModelWorker 后续跑前向）：
+            runner.model                     # 已加载权重的 nn.Module（PP 下只含本 stage 的层）
+            runner.tp_group / pp_group / attention_tp_group      # NCCL 通信组
+            runner.pre_model_load_memory     # 加载权重前的可用显存（字节），供 alloc_memory_pool() 定 KV 池尺寸
+            runner.forward_stream            # overlap 调度专用的前向 CUDA stream
+            runner.sampler / weight_updater / weight_exporter    # 采样、在线权重更新与导出
+            runner.layer_info / support_pp / draft_load_format / spec_aux_config / max_running_requests
+            runner.req_to_token_pool / token_to_kv_pool_allocator  # 此处可能仍为 None（等 alloc_memory_pool()）
+            耗时口径：分钟级，主体是 self.initialize() → load_model() 读 checkpoint
+            （见 docs/learn/run/init_tp_model_worker_zh.md 第 5/7 节）。
+        """
+
         # Parse args
         # 中译：解析构造参数，将各种并行/设备/模型配置保存为实例属性。
         # mem_fraction_static：静态显存占比（权重 + KV 缓存等固定占用的显存上限比例）。
+        # 中译：下面按用途分组，把入参逐项落成实例属性。
+        #       【第 1 组 · 基本身份】显存占比 / 内存池配置 / 卡号 / 并行视图 / 模型配置 / NCCL 端口 / 服务端参数 / 是否 draft。
         self.mem_fraction_static = mem_fraction_static
         # Set on target by `_resolve_memory_pool_config`; passed in for draft
         # workers so they reuse target's resolved sizes (replaces legacy
@@ -368,17 +417,24 @@ class ModelRunner:
         self.gpu_id = gpu_id
         self.ps = ps
         self.model_config = model_config
+        # 中译：NCCL 端口另存一份为 dist_port（“dist” 指 torch 分布式），供 init_torch_distributed 使用。
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
         # The process entry published; a draft runner is not one (it must not
         # clobber the target's config), so only the target checks.
+        # 中译：校验「本进程是否已以 scheduler 角色发布过入口信息」。draft runner 不是进程入口，
+        #       不能覆盖 target 的配置，所以只有 target 才做这项检查。
         if not is_draft_worker:
             assert_published(server_args, role="scheduler")
         # Set by maybe_init_lora_manager; stays None when LoRA is off and on
         # draft runners, which serve adapters' target model unadapted.
+        # 中译：LoRA 管理器由 maybe_init_lora_manager 稍后创建；未开 LoRA 时恒为 None，
+        #       draft runner 上同样为 None（draft 服务的是未套 adapter 的 target 模型）。
         self.lora_manager: Optional[LoRAManager] = None
+        # 中译：由设备层（get_device）给出的 torch 设备对象，取值如 "cuda" / "cuda:0" / "npu" / "cpu"。
         self.device = get_device().device
+        # 中译：草稿 runner 的 attention 后端（target 恒为 None），语义见上文 resolve_draft_attention_backend()。
         self.draft_attention_backend = resolve_draft_attention_backend(
             draft_attention_backend=draft_attention_backend,
             is_draft_worker=is_draft_worker,
@@ -386,53 +442,88 @@ class ModelRunner:
         # This runner's own load format, resolved before anything keys off it:
         # the remote-instance transfer engine is initialized at the top of
         # initialize(), long before the weights are loaded.
+        # 中译：本 runner 自己解析出的 load_format（draft 用 --speculative-draft-load-format，
+        #       target 用 --load-format）。必须在任何依赖它的初始化之前定好：远程实例权重传输引擎
+        #       在 initialize() 的最开头就要用到它，远早于权重加载。
         self.draft_load_format = self._resolve_draft_load_format()
+        # 中译：【第 2 组 · 模型与算法形态】是否生成模型 / 是否多模态 / 投机算法。
+        #       is_generation=False 表示 embedding、分类等非生成任务（前向不做采样）。
         self.is_generation = model_config.is_generation
+        # 中译：设备侧计时器，默认 None（不统计）。开启 forward pass metrics 后，
+        #       由 metrics_reporter 把 DeviceTimer 注入到本属性，配合 device_timer_ctx 统计各段前向耗时。
         self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
             model_config.is_multimodal_chunked_prefill_supported
         )
+        # 中译：投机解码算法（none / EAGLE / NGRAM / ...），从 server_args 解析为枚举。
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             get_spec().speculative_algorithm
         )
+        # 中译：tail hook 列表：投机解码（如 DFlash 的 draft sampler 捕获、dspark 的 verify epilogue）
+        #       会往这里追加回调，decode CUDA Graph 每次 replay 结束后逐个调用。
         self.capture_tail_hooks = []
+        # 中译：KV 缓存 page 大小（一个 page 装多少 token），来自调度参数。
         self.page_size = get_schedule().page_size
+        # 中译：内存池与分配器：入参为 None 时先保持 None，等 alloc_memory_pool() 再创建；
+        #       draft runner 则由 TpModelWorker 传入 target 的那一套以复用。
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        # 中译：MTP（multi-token prediction）草稿模型在各卡上的内存池，默认空元组、按需填充。
         self.mtp_draft_device_pools = ()
+        # 中译：【第 3 组 · 注意力与并行形态】混合滑动窗口注意力、MLA 后端判定、attention chunk 大小。
         self.is_hybrid_swa = model_config.is_hybrid_swa
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
+        # 中译：【第 4 组 · 弹性 EP 与稀疏注意力等运行时状态】
+        #       enable_elastic_ep：是否启用弹性专家并行（elastic EP）。
         self.enable_elastic_ep = get_exec().moe.elastic_ep_backend is not None
+        # 中译：前向次数计数器（每次 forward 自增；弹性 EP 重配/恢复后会清零）。
         self.forward_pass_id = 0
+        # 中译：待生效的弹性 EP 扩缩容结果（ElasticScaleUpdateReq），供 Scheduler 轮询与上报。
         self._pending_elastic_scale_update = None
+        # 中译：是否让 attention 后端新建 workspace 缓冲区（FlashInfer 等的 workspace_buffer）；
+        #       由 _build_full_attention_backend_from_str 在构建后端时按需覆写，这里先置 False。
         self.init_new_workspace = False
+        # 中译：草稿模型索引（同一 target 上挂多份 draft 时用于区分）。
         self.draft_model_idx = draft_model_idx
+        # 中译：是否启用分层稀疏注意力（hisparse），来自内存侧配置。
         self.enable_hisparse = get_memory().enable_hisparse
+        # 中译：采样观测器（采样路径的可观测扩展点），默认关闭，由外部按需挂载。
         self._sampling_observer: Optional[SamplingObserver] = None
 
+        # 中译：启动期可观测性计数器（权重加载耗时、graph 显存/耗时字典）。
+        #       输入：无。输出：无返回值，置 self.weight_load_time=0.0、self.graph_memory_usage={}、
+        #       self.graph_time_usage={}，供后面的 load_model() / init_cuda_graphs() 累加。
         self.init_startup_observability()
 
+        # 中译：创建「远程实例权重传输器」（跨实例权重热更新，如 PD 分离/弹性场景）。
+        #       输入：get_model=lambda: self.model、ps.tp_rank、gpu_id。输出：self.remote_instance_weight_transporter。
         self.init_remote_instance_weight_transporter()
 
+        # 中译：创建 msprobe 精度调试器（昇腾提供的张量 dump 工具；未安装该组件时为 None）。
+        #       输入：无。输出：self.msprobe_debugger。
         self.init_msprobe()
 
         # auxiliary hidden capture mode. TODO: expose this to server args?
-        # 中译：辅助隐藏状态（aux hidden state）捕获模式的相关开关。用于投机采样
-            # 中译：加载草稿模型的配置，以获取其层数，用于为 KV 缓存定尺寸。
-                    # 中译：若配置中没有辅助层信息，则置为 None。
-            # 中译：选择需要捕获的主模型目标层，用于构建 DFlash 的上下文特征。
-        # 中译：若开启了耗时统计展示，则启用相应的计时输出。
-        # 中译：针对特定模型的参数调整（例如某些模型需要特殊的注意力架构/配置修正）。
-        # 中译：在调度器进程中设置全局 server_args，供后续各模块读取。
-        # 中译：（不优雅的临时做法）将 use_mla_backend 写入全局 server_args。
+        # 中译：辅助隐藏状态（aux hidden state）捕获模式的配置。投机采样（EAGLE / DFlash 等）需要
+        #       主模型在指定层额外输出 hidden_states 给 draft 模型用。这里解析出：
+        #       · 要捕获哪些层（capture layer ids）——即下面说的「主模型目标层」；
+        #       · 是否需要额外维度/偏移等开关；
+        #       · draft 侧所需的层数等信息；若模型配置里拿不到辅助层信息，则整体解析为 None（该模式关闭）。
+        #       输入：server_args + self.model_config + self.spec_algorithm + self.is_draft_worker。
+        #       输出：self.spec_aux_config（SpecAuxHiddenStateConfig 或 None）。
         self.init_spec_aux_hidden_state()
 
         # Apply the rank zero filter to logger
+        # 中译：开启全局耗时统计（只影响日志输出：开启后各阶段会打印耗时）。
         if get_observability().show_time_cost:
             enable_show_time_cost()
+
+        # 中译：MLA 后端与 chunked prefix cache 互斥：在 MLA（或 draft）下禁用 chunked prefix cache，
+        #       这里做一次全局开关联动，避免后续按「支持 chunked prefix cache」去规划分块 prefill。
+        #       输入：use_mla_backend / is_draft_worker。输出：无返回值（改全局配置）。
         misc_utils.maybe_disable_chunked_prefix_cache(
             use_mla_backend=self.use_mla_backend,
             is_draft_worker=self.is_draft_worker,
@@ -440,15 +531,20 @@ class ModelRunner:
 
         # Init OpenMP threads binding for CPU
         # 中译：在 CPU 设备上初始化 OpenMP 线程绑定（绑核），以提升 NUMA 亲和性与性能。
+        #       输入：无（读 SGLANG_CPU_OMP_THREADS_BIND 等环境变量与 self.ps）。
+        #       输出：无返回值（设置进程内 OpenMP 线程亲和性）。
         if self.device == "cpu":
             self.init_threads_binding()
 
         # Set float32 matmul precision
+        # 中译：开启 TF32 时把 float32 矩阵乘精度设为 "high"（走 TF32 张量核心，牺牲少量精度换吞吐）。
         if get_exec().features.enable_tf32_matmul:
             torch.set_float32_matmul_precision("high")
 
         # Set device early so that TransferEngine init (e.g. Ascend NPU)
         # can access the device context.
+        # 中译：尽早切到本 rank 对应的设备——后面的传输引擎（如昇腾 NPU）初始化需要设备上下文。
+        #       失败时打印 device / gpu_id / CUDA_VISIBLE_DEVICES / tp_rank / tp_size，便于定位「卡号错位」。
         try:
             torch.get_device_module(self.device).set_device(ps.gpu_id)
         except Exception:
@@ -462,54 +558,81 @@ class ModelRunner:
         # Initialize MooncakeTransferEngine BEFORE init_torch_distributed so
         # that the shared TE can be passed to the Mooncake PG backend (avoids
         # creating duplicate TransferEngines).
+        # 中译：先建共享的 Mooncake 传输引擎，再初始化 torch 分布式——这样共享的 TE 可以传给
+        #       Mooncake 的 PG（进程组）后端，避免重复创建 TransferEngine。
+        #       输入：无（用 self.gpu_id）。输出：无返回值；副作用是注册进程级共享 TE。
         self.init_shared_mooncake_transfer_engine()
 
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
-        # 中译：在加载模型之前记录可用显存（同时完成 torch 分布式初始化）。
-        # 中译：初始化共享的 Mooncake 传输引擎（用于 PD 分离/远程权重传输等场景）。
+        # 中译：在加载模型之前完成 torch 分布式初始化（建 NCCL 进程组），并记下当时的可用显存
+        #       self.pre_model_load_memory——后面 alloc_memory_pool() 用它反推 KV 池可用显存。
+        #       输入：server_args / model_config / device / ps / dist_port / nccl_port。
+        #       输出：无返回值；置 self.tp_group、self.pp_group、self.attention_tp_group、
+        #       self.pre_model_load_memory。
         self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
-        # 中译：为 overlap 调度（计算与调度重叠）创建专用的前向 CUDA stream。
+        # 中译：为 overlap 调度（调度与计算重叠）创建专用的前向 CUDA stream，
+        #       使「前向计算」与「调度/后处理」可以流水线式重叠。
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
-        # 中译：根据 server_args 创建并设置 CPU offload（将部分权重/激活卸载到 CPU）的加载器。
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.
+        # 中译：「读完成」信箱（read-done mailbox）：调度器的 WAR 屏障会去它指定的 runner 上读这个 event；
+        #       为 None 时退化为「整段前向」的粗粒度栅栏。
         self.shared_read_done_event: Optional[torch.cuda.Event] = None
 
         # CPU offload
+        # 中译：创建并安装 CPU offloader（按 --cpu-offload-* 把部分权重/激活放到 CPU）。
+        #       输入：dp_rank=self.ps.dp_rank。输出：无返回值；副作用是设置进程级 offloader。
         set_offloader(create_offloader(dp_rank=self.ps.dp_rank))
 
+        # 中译：权重检查器（供 --check-weight 或 update_weights 后的数值校验使用），此处只创建对象。
         self._weight_checker = WeightChecker(get_model=lambda: self.model, ps=self.ps)
 
+        # 中译：可选：检测「拖后腿」的 rank（环境变量 SGLANG_DETECT_SLOW_RANK），启动阶段先跑一次探测。
         if envs.SGLANG_DETECT_SLOW_RANK.get():
             slow_rank_detector.execute()
 
         # Init mindspore running environment when model impl is "mindspore"
+        # 中译：当模型实现为 MindSpore（昇腾）时初始化其分布式环境；其余情况本函数内部直接跳过。
+        #       输入：world_size / rank / local_rank(=gpu_id) / server_args / port。输出：无返回值。
         self.init_mindspore_runner()
 
         # Update deep gemm configure
+        # 中译：按当前卡更新 DeepGEMM 的 JIT 配置（SM 架构、线程数等）。
         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
             deep_gemm_wrapper.update_deep_gemm_config(gpu_id)
 
         # For hisparse (must be set before initialize() so CUDA graph capture can see it)
-        # 中译：用于 hisparse（分层稀疏注意力）。必须在 initialize() 之前设置，
-        #       以便 CUDA Graph 捕获时能看到它。
+        # 中译：hisparse（分层稀疏注意力）协调器。必须在 initialize() 之前先置 None，
+        #       以便后面的 attention 后端 / CUDA Graph 捕获阶段能读到该属性
+        #       （真正的实例在 initialize() → maybe_init_hisparse_coordinator() 里创建）。
         self.hisparse_coordinator = None
 
         # The native overlap path replaces this during load_model(). Keep the
         # no-pending-work invariant for lightweight backends that override the
         # base initialization and weight-loading flow.
+        # 中译：启动期权重加载句柄。原生 overlap 路径会在 load_model() 里替换它；
+        #       这里先置 None，保证那些重写了 initialize()/权重加载流程的轻量后端仍满足
+        #       「无待处理任务（no-pending-work）」这一不变式。
         self.startup_weight_load = None
 
         # Load model weights and configure
-        # 中译：加载模型权重并完成配置（这是 __init__ 中最重的一步）。
+        # 中译：核心初始化：加载模型权重并完成配置（__init__ 里最重的一步，分钟级耗时主要在这里）。
+        #       输入：无（用上面已就绪的通信组、内存池配置、端口等）。
+        #       输出：无返回值；置 self.model（权重）、self.dtype、self.sliding_window_size、
+        #       self.kv_cache_dtype*、self.layer_info、self.sampler、self.eplb_manager、
+        #       self.expert_location_updater、self.spec_aux_config 等。
         self.initialize()
-        # 中译：检查量化 MoE 的兼容性（例如某些量化方案与 MoE 后端是否可同时使用）。
+        # 中译：检查量化 MoE 的兼容性（某些量化方案与 MoE 后端/并行组合不能同用，提前报错）。
+        #       输入：model_config + tp_size / moe_ep_size / moe_dp_size。输出：无返回值（不兼容则抛异常）。
         self.check_quantized_moe_compatibility()
 
+        # 中译：弹性 EP（elastic EP）：若本进程是「扩容新加入者」（is_ep_scale_joiner），
+        #       则注册 cohort、加入进程组、广播专家位置元数据并重算 DP attention 规模；
+        #       常规场景本函数在开头直接 return（几乎没有开销）。
         self._initialize_elastic_ep_joiner()
 
         if self.is_multimodal:
@@ -517,20 +640,27 @@ class ModelRunner:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
 
         # Temporary cached values
-        # 中译：一些临时缓存值（例如模型 forward 是否支持流水线并行代理张量参数）。
+        # 中译：临时缓存值：判断模型 forward 的签名里是否有 pp_proxy_tensors 参数——
+        #       有才说明这个模型支持「流水线并行代理张量」传参方式。
         self.support_pp = (
             "pp_proxy_tensors" in inspect.signature(self.model.forward).parameters
         )
 
-            # 中译：开启流水线并行（PP）时，模型必须支持 PP，否则报错。
+        # 中译：开了流水线并行（pp_size > 1）但模型不支持 PP 时直接断言失败，
+        #       否则问题会拖到第一次前向才爆出来。
         if self.ps.pp_size > 1:
             assert (
                 self.support_pp
             ), "Pipeline Parallel is not compatible with this model."
 
         # For weight updates
-        # 中译：用于在线权重更新（如 RLHF rollout）的进程组句柄缓存。
+        # 中译：在线权重更新/导出（RLHF rollout、权重热更等场景用）。
+        #       输入（WeightUpdater）：tp_rank / device / gpu_id / model_config / 自定义 loader /
+        #         get_model=lambda: self.model / update_model_fields / recapture_cuda_graph。
+        #       输出：self.weight_updater。
         self.init_weight_updater()
+        # 中译：输入（WeightExporter）：tp_rank / tp_size / gpu_id / get_model_path / get_model。
+        #       输出：self.weight_exporter（把权重导出到磁盘或远程存储）。
         self.init_weight_exporter()
 
     def init_startup_observability(self) -> None:
@@ -565,7 +695,8 @@ class ModelRunner:
             )
         )
 
-        # 中译：初始化 msprobe（昂腾提供的精度调试/张量 dump 工具）。
+        # 中译：新 rank 加入扩容后的 DP attention 同步：让 joiner 参与 all-gather，
+        #       并按扩容后的规模重算 post-scale，使新旧 rank 的注意力数值口径一致。
         from sglang.srt.layers.dp_attention import (
             enable_joiner_all_gather,
             update_dp_attention_post_scale,
@@ -575,6 +706,7 @@ class ModelRunner:
         update_dp_attention_post_scale(
             new_dp_size=join_effective_ep_size,
             new_dp_rank=global_ep_rank,
+        )
         get_context().override("elastic_ep.scale_join", dp_size=join_effective_ep_size)
         if self.eplb_manager is not None:
             self.eplb_manager.disable_rebalance(
@@ -732,56 +864,81 @@ class ModelRunner:
             spec_algorithm=self.spec_algorithm,
         )
         adjust_hybrid_swa_layer_ids(
+            model_config=self.model_config,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
             is_hybrid_swa=self.is_hybrid_swa,
+        )
         self.maybe_apply_post_load_model_transforms()
         self.maybe_init_lora_manager()
         self.maybe_enable_batch_invariant_mode()
         self.configure_kv_cache_dtype()
+
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=get_exec().features.enable_memory_saver
+        )
+
     def maybe_init_remote_instance_transfer_engine(self):
         if remote_instance_transfer_engine_enabled(load_format=self.draft_load_format):
             self.remote_instance_weight_transporter.init_engine()
+
     def maybe_init_expert_location_metadata(self):
+        if self.is_draft_worker:
             return
         expert_rank = self.ps.moe_ep_rank + (
             get_parallel().ep_join_rank_offset if is_ep_scale_joiner() else 0
+        )
         set_global_expert_location_metadata(
             compute_initial_expert_location_metadata(
+                model_config=self.model_config,
                 moe_ep_rank=expert_rank,
+            )
+        )
         if self.ps.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
             logger.info(
                 "Initial expert_location_metadata:\n%s",
                 format_expert_location_layout(get_global_expert_location_metadata()),
+            )
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
                 get_global_expert_location_metadata(),
                 rank=expert_rank,
+            )
+        )
+
     def maybe_init_lplb_solvers(self):
         if get_exec().moe.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
             init_lplb_solvers(model_config=self.model_config)
+
     def maybe_init_eplb_manager(self):
         self.eplb_manager = (
             EPLBManager(
+                model_config=self.model_config,
                 ps=self.ps,
                 get_model=lambda: self.model,
                 get_expert_location_updater=lambda: self.expert_location_updater,
                 get_expert_backup_client=lambda: self.expert_backup_client,
                 get_weight_updater=lambda: self.weight_updater,
+            )
             if get_exec().moe.enable_eplb and (not self.is_draft_worker)
             else None
+        )
+
     def maybe_init_elastic_ep(self):
         if get_exec().moe.elastic_ep_backend:
             ElasticEPStateManager.init(self.server_args)
+
     def init_token_oracle(self):
         # The oracle sampler is process-wide, so a draft would overwrite the
         # target's with its own vocab -- which a DFlash draft does not have.
+        if self.is_draft_worker:
             self._token_oracle_manager = None
+            return
         self._token_oracle_manager = install_token_oracle_from_env(
             vocab_size=self.model_config.vocab_size,
+        )
+
     def maybe_init_expert_backup_client(self):
         self.expert_backup_client = (
             ExpertBackupClient(
@@ -1168,15 +1325,18 @@ class ModelRunner:
     def init_torch_distributed(self):
         result = bootstrap.init_torch_distributed(
             server_args=self.server_args,
+            model_config=self.model_config,
             device=self.device,
             ps=self.ps,
             dist_port=self.dist_port,
             is_draft_worker=self.is_draft_worker,
             local_omp_cpuid=self.local_omp_cpuid if self.device == "cpu" else None,
+        )
         self.tp_group = result.tp_group
         self.pp_group = result.pp_group
         self.attention_tp_group = result.attention_tp_group
         self.pre_model_load_memory = result.pre_model_load_memory
+
     def init_shared_mooncake_transfer_engine(self):
         maybe_init_shared_mooncake_transfer_engine(gpu_id=self.gpu_id)
 
@@ -1199,6 +1359,7 @@ class ModelRunner:
             maybe_downgrade_dtype_for_legacy_gpu(model_config=self.model_config)
 
         set_cuda_arch()
+
         draft_load_format = self.draft_load_format
         self.load_config = build_load_config(
             server_args=self.server_args,
@@ -1278,6 +1439,7 @@ class ModelRunner:
         self.prefill_aware_swa = (
             hasattr(self.model, "is_prefill_aware_swa")
             and self.model.is_prefill_aware_swa()
+        )
 
         self.dtype = self.model_config.dtype
 
@@ -1341,8 +1503,10 @@ class ModelRunner:
     def start_startup_weight_load(self) -> None:
         assert self.startup_weight_load is not None
         self.startup_weight_load.start_prefetch()
+
     def finalize_startup_weight_load(self) -> None:
         """Commit the real weights, then run the post-load barrier.
+
         The barrier moves here because ``load_model`` returns with sentinel
         values under overlap, so this is the first point at which "weights are
         loaded" is true for this rank. It follows the commit and its validation
@@ -1351,7 +1515,11 @@ class ModelRunner:
         a barrier timeout rather than a clean collective abort, which matches
         the existing startup contract for load failures.
         """
+        assert self.startup_weight_load is not None
         self.startup_weight_load.finalize()
+        dist_barrier_after_load(
+            elastic_ep_backend=get_exec().moe.elastic_ep_backend,
+            tp_rank=self.ps.tp_rank,
             is_ep_joiner=is_ep_joiner(),
         )
         self.startup_weight_load = None
@@ -1440,6 +1608,8 @@ class ModelRunner:
         if (req_to_token_pool := getattr(self, "req_to_token_pool", None)) is not None:
             return req_to_token_pool.schedulable_token_capacity(capacity)
         return capacity
+
+    @property
     def max_token_pool_size(self):
         """Return the max token pool size considering hybrid swa and hisparse settings."""
         if self.enable_hisparse:
@@ -1491,6 +1661,7 @@ class ModelRunner:
                 speculative_draft_attention_backend=self.draft_attention_backend,
                 speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
             )
+        )
         # This runner's OWN resolved dtype string (target or draft). Attention
         # backends read it directly instead of the process-global get_model()
         # bag: a draft runner does not publish its args, so the bag would carry
@@ -1499,10 +1670,12 @@ class ModelRunner:
             resolved_kv_cache_dtype
             if resolved_kv_cache_dtype is not None
             else get_model().kv_cache_dtype
+        )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
         return get_attention_backend(
             model_runner=self, init_new_workspace=init_new_workspace
+        )
 
     def _decode_cuda_graph_runner_cls(self):
         """Decode CUDA-graph runner class to construct.
@@ -1583,6 +1756,7 @@ class ModelRunner:
     def apply_torch_tp(self):
         model_parallel.apply_torch_tp(
             model=self.model, device=self.device, tp_size=self.ps.tp_size
+        )
 
     def update_decode_attn_backend(self, stream_idx: int):
         # 中译：（PDMux）按 stream 索引切换当前使用的解码注意力后端。
@@ -1595,6 +1769,7 @@ class ModelRunner:
 
     def _prepare_eager_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Pad / normalize a batch for the eager (non-cuda-graph) forward.
+
         Runs the DP/MLP-sync padding, the attn-tp num_token_non_padded
         normalization, and the hisparse-coordinator refresh that the eager
         forward path needs — the cuda-graph path does the equivalent inside the
@@ -1605,6 +1780,7 @@ class ModelRunner:
             forward_batch.prepare_mlp_sync_batch(self)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
+
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
         # The skip is scoped to DSACPLayerCommunicator-style CP (DSA, MLA): those
         # flavors already feed a zigzag-split rank-local layout whose token count
@@ -2022,7 +2198,9 @@ class ModelRunner:
                 observer=observer,
             )
         else:
+            observer_state = self._preprocess_logits(
                 logits_output, forward_batch.sampling_info
+            )
 
         # Sample the next tokens
         # 中译：调用采样器采样下一个 token。最后一个参数是「取 logits 的位置」：
@@ -2051,6 +2229,7 @@ class ModelRunner:
         self.ngram_embedding_manager.update_after_decode(
             next_token_ids=next_token_ids,
             forward_batch=forward_batch,
+        )
         return next_token_ids
 
     def compute_logprobs_only(

@@ -496,6 +496,7 @@ class Scheduler(
         )
         self.enable_overlap_mlx = (
             not get_schedule().disable_overlap_schedule and use_mlx()
+        )
         self.enable_pdmux = get_disagg().enable_pdmux
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.stream_interval = get_serving().stream_interval
@@ -759,6 +760,7 @@ class Scheduler(
 
         # 中译：所有 init_* 完成，构造结束，清除初始化标记（看门狗自此按运行态判定卡死）。
         self.init_rank_consensus_checker()
+
         self.is_initializing = False
         self.init_startup_timing_summary()
 
@@ -1993,6 +1995,7 @@ class Scheduler(
             self.cur_batch_for_debug = batch
             disable_overlap_for_batch = self.is_disable_overlap_for_batch(
                 batch, last_batch=self.last_batch
+            )
 
             # If we do not need to overlap the current batch with the last batch,
             # we can process the last batch immediately.
@@ -2988,6 +2991,7 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self._add_request_to_queue(req)
             return
+
         if recv_req.return_routed_experts:
             error_msg = None
             if recv_req.routed_experts_start_len < 0:
@@ -3060,14 +3064,18 @@ class Scheduler(
             ):
                 last_host_node = req.last_node
 
+            if (
                 tree_cache.is_backuped(last_host_node)
                 or tree_cache.is_root(last_host_node)
                 or (
+                    buffer_mode
                     and tree_cache.get_last_hash_value(last_host_node) is not None
                 )
+            ):
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 match_end = req._compute_max_prefix_len(
                     len(req.full_untruncated_fill_ids)
+                )
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
                 prefix_keys = (
                     tree_cache.get_prefix_hash_values(last_host_node)
@@ -3090,30 +3098,59 @@ class Scheduler(
         """Re-issue the availability check for queued requests whose prefetch
         missed. Pacing counts scheduling passes so TP ranks re-issue on the
         same pass; a sweep (the admission loop stops at the first
-        unschedulable request) covers the whole queue."""
+        unschedulable request) covers the whole queue.
+
+        中译：对「存储层（L3）预取未命中」的排队请求，按节奏重新发起一次可用性检查与预取。
+              背景：HiCache 分三级——L1 设备显存、L2 主机内存、L3 外部存储（如 Mooncake/3FS）。
+              请求入队时会调用 _prefetch_kvcache 尝试把 L3 中的前缀 KV 预取到 L2；但预取可能被
+              拒绝或放弃（缺失后缀太短、预取限流、staging 空间紧张等），此时 tree_cache 会记下
+              该 rid 的「miss」标记。请求在 waiting_queue 中排队期间，存储侧状态可能变化
+              （限流或 staging 压力解除；设备侧匹配被驱逐，原本太短的缺口变长、值得预取），
+              重试一次预取就可能省下一次完整的 prefill 重算。
+              节奏设计：
+              - 以「调度轮次」而非墙钟时间计数：各 TP rank 调度轮次一致，保证在同一轮重发，
+                避免 rank 间对同一请求的前缀命中长度不一致；
+              - 遍历整个 waiting_queue：组批循环遇到第一个无法调度的请求就会停，若只在组批时
+                重试，排在后面的请求永远轮不到，因此这里单独扫一遍全队列。
+        """
+        # 中译：两次重试之间需等待的调度轮数；<=0 表示关闭该功能（默认 0，即关闭）。
         interval = get_memory().hicache_storage_prefetch_retry_poll_interval
+        # 中译：功能关闭或没有排队请求时直接返回，不做任何工作。
         if interval <= 0 or not self.waiting_queue:
             return
+        # 中译：每个请求最多重试的次数（默认 4），防止对确实不存在的前缀无限重试。
         max_attempts = get_memory().hicache_storage_prefetch_retry_max_attempts
+        # 中译：扫描整个等待队列（而不只是本轮能被组批的前缀部分）。
         for req in self.waiting_queue:
+            # 中译：弹出该请求的「预取未命中」标记（弹出即清除，避免重复计入）；
+            #       UnifiedRadixCache 会记录该标记；HiRadixCache（dense 路径）不跟踪，恒返回 False。
             if self.tree_cache.pop_storage_prefetch_miss(req.rid):
+                # 中译：本轮新发生 miss，标记为「待重试」。
                 req.storage_prefetch_retry_pending = True
+                # 中译：等待计数清零，从本轮起重新计算间隔；即便之前在等，也以最新一次 miss 为准。
                 req.storage_prefetch_retry_wait_polls = 0
+            # 中译：没有待重试的 miss，或已用尽重试次数，则跳过该请求。
             if (
                 not req.storage_prefetch_retry_pending
                 or req.storage_prefetch_retry_attempts >= max_attempts
             ):
                 continue
+            # 中译：已等待的调度轮数 +1。
             req.storage_prefetch_retry_wait_polls += 1
+            # 中译：未满间隔则继续等，给存储侧状态变化留出时间，也避免高频重试压垮存储后端。
             if req.storage_prefetch_retry_wait_polls <= interval:
                 continue
+            # 中译：间隔已满，清除待重试标记；若本次重试再次 miss，tree_cache 会重新打标记。
             req.storage_prefetch_retry_pending = False
+            # 中译：累计重试次数，用于与 max_attempts 比较。
             req.storage_prefetch_retry_attempts += 1
+            # 中译：调试日志，记录请求 rid 与第几次重试。
             logger.debug(
                 "HiCache storage prefetch retry req=%s attempt=%d",
                 req.rid,
                 req.storage_prefetch_retry_attempts,
             )
+            # 中译：重新执行一次前缀匹配与 L3→L2 异步预取；结果在后续组批时经预取进度检查生效。
             self._prefetch_kvcache(req)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
@@ -3433,6 +3470,7 @@ class Scheduler(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
+
         if self.enable_fpm:
             self._fpm_batch_t0 = time.monotonic()
         # 中译：先按超时规则中止等待过久 / 运行过久的请求。
@@ -3614,6 +3652,7 @@ class Scheduler(
     ) -> int:
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
         available = self.req_to_token_pool.available_size()
+
         active_batch = running_batch or self.running_batch
         available = max(
             available - self.beam_coordinator.pending_member_rows(active_batch), 0
@@ -3745,6 +3784,7 @@ class Scheduler(
             prefill_tile_block_m = attn_backend.extend_attention_block_m
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
+
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,

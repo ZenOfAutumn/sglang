@@ -138,43 +138,51 @@ class ResponseParserProtocol(Protocol):
 
 
 class LogProbs(BaseModel):
-    text_offset: List[int] = Field(default_factory=list)
-    token_logprobs: List[Optional[float]] = Field(default_factory=list)
-    tokens: List[str] = Field(default_factory=list)
-    top_logprobs: List[Optional[Dict[str, float]]] = Field(default_factory=list)
+    """legacy/文本补全风格的 logprobs 结构（/v1/completions 返回）。"""
+
+    text_offset: List[int] = Field(default_factory=list)  # 每个 token 在原文中的字符偏移
+    token_logprobs: List[Optional[float]] = Field(default_factory=list)  # 每个生成 token 的 log 概率
+    tokens: List[str] = Field(default_factory=list)  # 生成的 token 文本列表
+    top_logprobs: List[Optional[Dict[str, float]]] = Field(
+        default_factory=list
+    )  # 每个位置上 top-k 候选 token 及其 log 概率
 
 
 class TopLogprob(BaseModel):
-    token: str
-    bytes: List[int]
-    logprob: float
+    """某个位置上候选 token 的 logprob（chat 风格 logprobs 用）。"""
+
+    token: str  # 候选 token 的文本
+    bytes: List[int]  # token 对应的 UTF-8 字节序列（便于还原非 ASCII 字符）
+    logprob: float  # 该候选 token 的 log 概率
 
 
 class ChatCompletionTokenLogprob(BaseModel):
-    token: str
-    bytes: List[int]
-    logprob: float
-    top_logprobs: List[TopLogprob]
+    """chat 风格 logprobs：单个生成 token 及其 top-k 候选（对齐 OpenAI 格式）。"""
+
+    token: str  # 实际选中的 token 文本
+    bytes: List[int]  # 实际选中 token 的 UTF-8 字节序列
+    logprob: float  # 实际选中 token 的 log 概率
+    top_logprobs: List[TopLogprob]  # 该位置上 top-k 候选 token 及其 log 概率
 
 
 class ChoiceLogprobs(BaseModel):
-    # build for v1/chat/completions response
-    content: List[ChatCompletionTokenLogprob]
+    # 用于 /v1/chat/completions 响应中的 logprobs 字段
+    content: List[ChatCompletionTokenLogprob]  # 逐生成 token 的 logprob 明细
 
 
 class CachedTokensDetails(BaseModel):
-    """Detailed breakdown of cached tokens by cache source."""
+    """命中的缓存 token 按来源的明细拆分。"""
 
-    device: int = 0  # Tokens from device cache (GPU)
-    host: int = 0  # Tokens from host cache (CPU memory)
-    # L3 storage fields are only present when storage backend is enabled
-    storage: Optional[int] = None  # Tokens from L3 storage backend
-    storage_backend: Optional[str] = None  # Type of storage backend used
+    device: int = 0  # 来自 device 缓存（GPU）的 token 数
+    host: int = 0  # 来自 host 缓存（CPU 内存）的 token 数
+    # 以下 L3 存储字段仅在开启 storage backend 时出现
+    storage: Optional[int] = None  # 来自 L3 存储后端的 token 数
+    storage_backend: Optional[str] = None  # 使用的存储后端类型
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
-        # Remove None fields so they don't appear in response when L3 is disabled
+        # 移除 None 字段，避免 L3 未开启时响应里出现冗余字段
         if self.storage is None:
             data.pop("storage", None)
         if self.storage_backend is None:
@@ -183,10 +191,10 @@ class CachedTokensDetails(BaseModel):
 
 
 class PromptTokensDetails(BaseModel):
-    """Details about prompt tokens."""
+    """输入（prompt）token 的明细。"""
 
-    cached_tokens: int = 0
-    # Multimodal prompt token counts (only populated when present in the prompt)
+    cached_tokens: int = 0  # 命中前缀缓存的 token 数
+    # 多模态 prompt token 数（仅在 prompt 中存在对应模态时填充）
     image_tokens: Optional[int] = None
     audio_tokens: Optional[int] = None
     video_tokens: Optional[int] = None
@@ -194,8 +202,7 @@ class PromptTokensDetails(BaseModel):
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
-        # Drop multimodal fields when absent so text-only/cache-only responses
-        # keep the original {"cached_tokens": N} shape.
+        # 不存在的多模态字段直接丢弃，使纯文本/纯缓存场景仍保持 {"cached_tokens": N} 的原始结构
         for key in ("image_tokens", "audio_tokens", "video_tokens"):
             if data.get(key) is None:
                 data.pop(key, None)
@@ -203,23 +210,29 @@ class PromptTokensDetails(BaseModel):
 
 
 class UsageInfo(BaseModel):
-    prompt_tokens: int = 0
-    total_tokens: int = 0
-    completion_tokens: Optional[int] = 0
-    # Used to return cached tokens info when --enable-cache-report is set
+    """token 用量统计（chat/completion 响应通用）。"""
+
+    prompt_tokens: int = 0  # 输入（prompt）token 数
+    total_tokens: int = 0  # 总 token 数 = prompt_tokens + completion_tokens
+    completion_tokens: Optional[int] = 0  # 输出（生成）token 数
+    # 开启 --enable-cache-report 时，返回命中缓存的 token 明细
     prompt_tokens_details: Optional[PromptTokensDetails] = None
-    reasoning_tokens: Optional[int] = 0
+    reasoning_tokens: Optional[int] = 0  # 输出中属于思维链（reasoning）的 token 数
 
 
 class StreamOptions(BaseModel):
-    include_usage: Optional[bool] = False
-    continuous_usage_stats: Optional[bool] = False
+    """流式请求的选项（chat/completion 的 stream_options）。"""
+
+    include_usage: Optional[bool] = False  # 是否在最后一个 chunk 中附带 usage 统计
+    continuous_usage_stats: Optional[bool] = False  # 是否每个 chunk 都持续带上累计 usage 统计
 
 
 class JsonSchemaResponseFormat(BaseModel):
-    name: str
-    description: Optional[str] = None
-    # use alias to workaround pydantic conflict
+    """response_format={"type": "json_schema"} 时的结构化输出约束。"""
+
+    name: str  # 该 schema 的名字
+    description: Optional[str] = None  # schema 描述
+    # 用 alias 规避与 pydantic BaseModel.schema 的命名冲突
     schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
     # The OpenAI wire contract accepts JSON booleans only; StrictBool rejects
     # the values lax pydantic would coerce ("yes", "on", 0, 1, ...), matching
@@ -228,22 +241,28 @@ class JsonSchemaResponseFormat(BaseModel):
 
 
 class ResponseFormat(BaseModel):
-    type: Literal["text", "json_object", "json_schema"]
-    json_schema: Optional[JsonSchemaResponseFormat] = None
+    """输出格式约束：纯文本 / JSON 对象 / 指定 JSON Schema。"""
+
+    type: Literal["text", "json_object", "json_schema"]  # 输出格式类型
+    json_schema: Optional[JsonSchemaResponseFormat] = None  # type=json_schema 时的具体 schema
 
 
 class StructuresResponseFormat(BaseModel):
-    begin: str
-    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    end: str
+    """结构化输出模板：begin/schema/end 三部分拼成完整约束。"""
+
+    begin: str  # 起始片段
+    schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)  # 中间的 JSON Schema
+    end: str  # 结束片段
 
 
-# NOTE(dark): keep this for backward compatibility
+# NOTE(dark): 保留该类以兼容旧版调用
 class LegacyStructuralTagResponseFormat(BaseModel):
-    type: Literal["structural_tag"]
-    structures: List[StructuresResponseFormat]
-    triggers: List[str]
-    at_least_one: bool = False
+    """旧版结构化标签 response_format（保留向后兼容）。"""
+
+    type: Literal["structural_tag"]  # 类型，固定为 structural_tag
+    structures: List[StructuresResponseFormat]  # 可用的结构模板列表
+    triggers: List[str]  # 触发各结构的字符串
+    at_least_one: bool = False  # 是否要求至少匹配到一个结构
 
 
 StructuralTagResponseFormat: TypeAlias = Union[
@@ -416,36 +435,36 @@ class CompletionRequest(BaseModel):
 
 
 class SpecTokensDetails(BaseModel):
-    """Per-request speculative decoding statistics."""
+    """单次请求的投机解码（speculative decoding）统计。"""
 
-    spec_accept_rate: float = 0.0
-    spec_accept_length: float = 0.0
-    spec_cap_length: float = 0.0
-    spec_block_accept_length: float = 0.0
-    spec_num_correct_drafts: int = 0
-    spec_num_proposed_drafts: int = 0
-    spec_verify_ct: int = 0
-    spec_correct_drafts_histogram: List[int] = Field(default_factory=list)
-    spec_cap_lens_histogram: List[int] = Field(default_factory=list)
+    spec_accept_rate: float = 0.0  # 投机解码接受率
+    spec_accept_length: float = 0.0  # 平均每次接受的 token 数
+    spec_cap_length: float = 0.0  # 平均每次上限内的接受长度
+    spec_block_accept_length: float = 0.0  # 块粒度下的平均接受长度
+    spec_num_correct_drafts: int = 0  # 被验证正确的 draft token 数
+    spec_num_proposed_drafts: int = 0  # 提议的 draft token 数
+    spec_verify_ct: int = 0  # 验证（verify）调用次数
+    spec_correct_drafts_histogram: List[int] = Field(default_factory=list)  # 正确 draft 数的直方图
+    spec_cap_lens_histogram: List[int] = Field(default_factory=list)  # 接受长度上限的直方图
 
 
 class SglExt(BaseModel):
-    """SGLang extension fields for OpenAI-compatible responses.
+    """OpenAI 兼容响应中的 SGLang 扩展字段容器。
 
-    Future SGLang-specific extensions to OpenAI-compatible response objects
-    should be added as fields here rather than directly on the choice object.
+    后续凡是对 OpenAI 兼容响应对象的 SGLang 专有扩展，都应新增到这里，
+    而不要直接挂在 choice 对象上。
     """
 
-    routed_experts: Optional[str] = None
-    cached_tokens_details: Optional[CachedTokensDetails] = None
+    routed_experts: Optional[str] = None  # 每个 token 路由到的专家（MoE）
+    cached_tokens_details: Optional[CachedTokensDetails] = None  # 缓存命中明细
     spec_tokens_details: Optional[Union[SpecTokensDetails, List[SpecTokensDetails]]] = (
         None
-    )
+    )  # 投机解码统计（按候选/请求维度）
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
-        # Remove None fields to keep response clean
+        # 移除 None 字段，保持响应简洁
         return {k: v for k, v in data.items() if v is not None}
 
 
@@ -529,17 +548,22 @@ class CompletionStreamResponse(BaseModel):
 
 
 class ChatCompletionMessageContentTextPart(BaseModel):
-    type: Literal["text"]
-    text: str
+    """多模态消息内容块：纯文本部分。"""
+
+    type: Literal["text"]  # 内容块类型，固定为 "text"
+    text: str  # 该块的文本内容
 
 
 class ChatCompletionMessageContentThinkingPart(BaseModel):
-    type: Literal["thinking", "reasoning"]
-    thinking: Optional[str] = None
-    text: Optional[str] = None
+    """多模态消息内容块：思维链（thinking/reasoning）部分，仅允许出现在 assistant 消息中。"""
+
+    type: Literal["thinking", "reasoning"]  # 类型标识，兼容 thinking 与 reasoning 两种叫法
+    thinking: Optional[str] = None  # 思维链内容（与 text 二选一）
+    text: Optional[str] = None  # 兼容字段：部分模型把思维链放在 text 中
 
     @model_validator(mode="after")
     def validate_payload(self):
+        # 校验：thinking 与 text 必须且只能提供一个
         if (self.thinking is None) == (self.text is None):
             raise ValueError(
                 "thinking parts require exactly one of 'thinking' or 'text'"
@@ -548,60 +572,77 @@ class ChatCompletionMessageContentThinkingPart(BaseModel):
 
 
 class ChatCompletionMessageContentImageURL(BaseModel):
-    url: str
-    detail: Optional[Literal["auto", "low", "high"]] = "auto"
-    max_dynamic_patch: Optional[int] = None
-    min_dynamic_patch: Optional[int] = None
-    content_hash: Optional[str] = None
+    """图片输入：URL 或 base64 data URI，附带清晰度与切图控制。"""
+
+    url: str  # 图片地址（http(s) URL 或 data:image/...;base64,...）
+    detail: Optional[Literal["auto", "low", "high"]] = "auto"  # OpenAI 的图片清晰度档位
+    max_dynamic_patch: Optional[int] = None  # SGLang 扩展：动态切图（patch）数量的上限
+    min_dynamic_patch: Optional[int] = None  # SGLang 扩展：动态切图（patch）数量的下限
+    content_hash: Optional[str] = None  # SGLang 扩展：图片内容哈希，用于多模态缓存命中判定
 
     @field_validator("content_hash")
     @classmethod
     def validate_content_hash(cls, value: Optional[str]) -> Optional[str]:
+        # 解析并校验 content_hash 的格式（非法格式会被拒绝/规范化）
         from sglang.srt.multimodal.cache import parse_content_hash
 
         return parse_content_hash(value)
 
 
 class ChatCompletionMessageContentVideoURL(BaseModel):
-    url: str
-    max_dynamic_patch: Optional[int] = None
-    min_dynamic_patch: Optional[int] = None
+    """视频输入：URL 或 base64 data URI，附带切图控制。"""
+
+    url: str  # 视频地址
+    max_dynamic_patch: Optional[int] = None  # 动态抽帧/切图数量的上限
+    min_dynamic_patch: Optional[int] = None  # 动态抽帧/切图数量的下限
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):
-    url: str
+    """音频输入：URL 或 base64 data URI。"""
+
+    url: str  # 音频地址
 
 
 class ChatCompletionMessageContentImagePart(BaseModel):
-    type: Literal["image_url"]
-    image_url: ChatCompletionMessageContentImageURL
-    modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
+    """多模态消息内容块：图片。"""
+
+    type: Literal["image_url"]  # 内容块类型，固定为 "image_url"
+    image_url: ChatCompletionMessageContentImageURL  # 图片地址及其参数
+    modalities: Optional[Literal["image", "multi-images", "video"]] = "image"  # 图片承载的模态语义
 
 
 class ChatCompletionMessageContentVideoPart(BaseModel):
-    type: Literal["video_url"]
-    video_url: ChatCompletionMessageContentVideoURL
+    """多模态消息内容块：视频。"""
+
+    type: Literal["video_url"]  # 内容块类型，固定为 "video_url"
+    video_url: ChatCompletionMessageContentVideoURL  # 视频地址及其参数
 
 
 class ChatCompletionMessageContentInputAudio(BaseModel):
-    data: str
-    format: Literal["wav", "mp3"]
+    """内联（base64）音频输入，对应 OpenAI 的 input_audio。"""
+
+    data: str  # base64 编码后的音频数据
+    format: Literal["wav", "mp3"]  # 音频格式
 
 
 _AUDIO_FORMAT_TO_MIME_TYPE = {
     "wav": "audio/wav",
     "mp3": "audio/mpeg",
-}
+}  # 音频格式到 MIME type 的映射，用于拼 data URI
 
 
 class ChatCompletionMessageContentAudioURLPart(BaseModel):
-    type: Literal["audio_url"]
-    audio_url: ChatCompletionMessageContentAudioURL
+    """多模态消息内容块：按引用传入的音频（音频 URL / data URI 统一形式）。"""
+
+    type: Literal["audio_url"]  # 内容块类型，固定为 "audio_url"
+    audio_url: ChatCompletionMessageContentAudioURL  # 音频地址
 
 
 class ChatCompletionMessageContentAudioInlinePart(BaseModel):
-    type: Literal["input_audio"]
-    input_audio: ChatCompletionMessageContentInputAudio
+    """多模态消息内容块：内联 base64 音频（OpenAI 的 input_audio 形式）。"""
+
+    type: Literal["input_audio"]  # 内容块类型，固定为 "input_audio"
+    input_audio: ChatCompletionMessageContentInputAudio  # 内联音频数据
 
 
 def _to_audio_url_part(
@@ -610,10 +651,11 @@ def _to_audio_url_part(
         ChatCompletionMessageContentAudioInlinePart,
     ],
 ) -> ChatCompletionMessageContentAudioURLPart:
+    # 校验辅助函数：把内联 base64 音频统一转换成 audio_url（data URI）形式
     if isinstance(part, ChatCompletionMessageContentAudioURLPart):
         return part
 
-    audio = part.input_audio
+    audio = part.input_audio  # 内联音频：data + format -> data URI
     return ChatCompletionMessageContentAudioURLPart(
         type="audio_url",
         audio_url=ChatCompletionMessageContentAudioURL(
@@ -622,9 +664,9 @@ def _to_audio_url_part(
     )
 
 
-# Audio arrives by reference as `audio_url`, holding a URL or a data URI, or
-# inline as OpenAI's `input_audio`, holding base64. Inline audio is converted to
-# the equivalent data URI as it validates.
+# 音频既可按引用以 `audio_url` 传入（URL 或 data URI），
+# 也可按 OpenAI 的 `input_audio` 内联 base64 传入；
+# 内联形式在字段校验时会被自动转换成等价的 data URI。
 ChatCompletionMessageContentAudioPart = Annotated[
     Union[
         ChatCompletionMessageContentAudioURLPart,
@@ -635,71 +677,75 @@ ChatCompletionMessageContentAudioPart = Annotated[
 
 
 class ChatCompletionMessageContentToolReferenceBlock(BaseModel):
-    # GLM-specific extension used alongside `defer_loading` tools. The chat
-    # template looks up `tools[*].function.name == tr.name` and renders the
-    # referenced tool schemas inline for the current turn. Not part of any
-    # OpenAI API; included here so Pydantic accepts the content through the
-    # Chat Completions path (the Anthropic endpoint translates its
-    # `tool_name` field to `name` before forwarding).
-    type: Literal["tool_reference"]
-    name: str
+    """工具引用块（GLM 扩展）：按名字引用已有工具的 schema，由 chat template 内联展开。"""
+
+    # GLM 特有扩展，配合 `defer_loading` 工具使用：chat template 会根据
+    # `tools[*].function.name == tr.name` 找到对应工具，并在当前轮把其 schema
+    # 内联渲染出来。不属于任何 OpenAI API；放在这里是为了让 Pydantic 能通过
+    # Chat Completions 路径接受这类 content（Anthropic 端点会在转发前把其
+    # `tool_name` 字段翻译成 `name`）。
+    type: Literal["tool_reference"]  # 内容块类型，固定为 "tool_reference"
+    name: str  # 被引用的工具名
 
 
 ChatCompletionMessageContentPart = Union[
-    ChatCompletionMessageContentTextPart,
-    ChatCompletionMessageContentThinkingPart,
-    ChatCompletionMessageContentImagePart,
-    ChatCompletionMessageContentVideoPart,
-    ChatCompletionMessageContentAudioPart,
-    ChatCompletionMessageContentToolReferenceBlock,
-]
+    ChatCompletionMessageContentTextPart,  # 文本
+    ChatCompletionMessageContentThinkingPart,  # 思维链
+    ChatCompletionMessageContentImagePart,  # 图片
+    ChatCompletionMessageContentVideoPart,  # 视频
+    ChatCompletionMessageContentAudioPart,  # 音频（URL 或内联）
+    ChatCompletionMessageContentToolReferenceBlock,  # 工具引用（GLM 扩展）
+]  # 一条消息 content 可为字符串，也可为上述内容块组成的列表
 
-# Rerank content types for multimodal reranking (e.g., Qwen3-VL-Reranker)
-# Can be a simple string (text-only) or a list of multimodal content parts
+# 多模态重排（如 Qwen3-VL-Reranker）的内容类型：既可以是纯字符串（纯文本），
+# 也可以是上述多模态内容块组成的列表
 RerankContentPart = Union[
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentVideoPart,
 ]
-RerankContent = Union[str, List[RerankContentPart]]
+RerankContent = Union[str, List[RerankContentPart]]  # 重排输入内容：纯文本或文本/图片/视频内容块列表
 
 
 class FunctionResponse(BaseModel):
-    """Function response."""
+    """工具调用的函数信息（响应侧）。"""
 
-    name: Optional[str] = None
-    arguments: Optional[str | Dict[str, Any]] = None
+    name: Optional[str] = None  # 函数名
+    arguments: Optional[str | Dict[str, Any]] = None  # 函数入参，JSON 字符串或已解析的 dict
 
 
 class ToolCall(BaseModel):
-    """Tool call response."""
+    """一次工具（函数）调用的完整描述，流式与非流式共用。"""
 
-    id: Optional[str] = None
-    index: Optional[int] = None
-    type: Literal["function"] = "function"
-    function: FunctionResponse
+    id: Optional[str] = None  # 调用 id，用于把 tool 结果回填到对应调用
+    index: Optional[int] = None  # 在同一条消息的多次调用中的序号（流式拼接用）
+    type: Literal["function"] = "function"  # 调用类型，目前仅支持 function
+    function: FunctionResponse  # 被调用的函数及其入参
 
 
 _GenericMessageRole = Literal[
     "system", "assistant", "tool", "function", "developer", "latest_reminder"
-]
+]  # 通用消息角色集合（除 user 外的角色，user 有单独定义）
 _GENERIC_MESSAGE_ROLES: Tuple[str, ...] = get_args(_GenericMessageRole)
 
 
 class ChatCompletionMessageGenericParam(BaseModel):
-    role: _GenericMessageRole
+    """通用消息（system/assistant/tool/developer 等，除 user 外的角色）。"""
+
+    role: _GenericMessageRole  # 消息角色
     content: Union[str, List[ChatCompletionMessageContentPart], None] = Field(
         default=None
-    )
-    tool_call_id: Optional[str] = None
-    name: Optional[str] = None
-    reasoning_content: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
-    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    )  # 消息内容：字符串或多模态内容块列表，允许为空
+    tool_call_id: Optional[str] = None  # role=tool 时，对应的 tool_call id
+    name: Optional[str] = None  # 参与者名字（如 function 模式下指定函数名）
+    reasoning_content: Optional[str] = None  # 历史 assistant 消息的思维链内容
+    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])  # assistant 消息中产生的工具调用
+    tools: Optional[List[Tool]] = Field(default=None, examples=[None])  # 消息级工具定义（system/developer 消息可用）
 
     @field_validator("role", mode="before")
     @classmethod
     def _normalize_role(cls, v):
+        # 角色名大小写不敏感：统一转小写并校验合法性
         if isinstance(v, str):
             v_lower = v.lower()
             if v_lower not in _GENERIC_MESSAGE_ROLES:
@@ -710,6 +756,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
 
     @model_validator(mode="after")
     def validate_thinking_parts_role(self):
+        # 校验：thinking 内容块只能出现在 assistant 消息中
         if self.role != "assistant" and isinstance(self.content, list):
             for part in self.content:
                 if isinstance(part, ChatCompletionMessageContentThinkingPart):
@@ -720,11 +767,14 @@ class ChatCompletionMessageGenericParam(BaseModel):
 
 
 class ChatCompletionMessageUserParam(BaseModel):
-    role: Literal["user"]
-    content: Union[str, List[ChatCompletionMessageContentPart]]
+    """user 角色消息，content 必填。"""
+
+    role: Literal["user"]  # 消息角色，固定为 user
+    content: Union[str, List[ChatCompletionMessageContentPart]]  # 用户消息内容（文本或多模态）
 
     @model_validator(mode="after")
     def validate_thinking_parts_role(self):
+        # 校验：user 消息中不允许出现 thinking 内容块
         if isinstance(self.content, list):
             for part in self.content:
                 if isinstance(part, ChatCompletionMessageContentThinkingPart):
@@ -734,37 +784,40 @@ class ChatCompletionMessageUserParam(BaseModel):
         return self
 
 
+# 请求中 messages 元素的类型：通用消息或 user 消息
 ChatCompletionMessageParam = Union[
     ChatCompletionMessageGenericParam, ChatCompletionMessageUserParam
 ]
 
 
 class Function(BaseModel):
-    """Function descriptions."""
+    """函数（工具）描述，供模型判断何时以及如何调用。"""
 
-    description: Optional[str] = Field(default=None, examples=[None])
-    name: str
-    parameters: Optional[object] = None
-    strict: bool = False
-    defer_loading: Optional[bool] = None
+    description: Optional[str] = Field(default=None, examples=[None])  # 函数功能描述
+    name: str  # 函数名
+    parameters: Optional[object] = None  # 入参的 JSON Schema
+    strict: bool = False  # 是否开启严格 schema 模式（严格遵循 parameters）
+    defer_loading: Optional[bool] = None  # 是否延迟加载该工具（按需展开 schema）
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        # defer_loading 为 None 时不输出该字段
         if self.defer_loading is None:
             data.pop("defer_loading", None)
         return data
 
 
 class Tool(BaseModel):
-    """Function wrapper."""
+    """工具包装体：type + function。"""
 
-    type: str = Field(default="function", examples=["function"])
-    function: Function
-    defer_loading: Optional[bool] = None
+    type: str = Field(default="function", examples=["function"])  # 工具类型，目前为 function
+    function: Function  # 具体的函数定义
+    defer_loading: Optional[bool] = None  # 是否延迟加载（会向下透传到 function）
 
     @model_validator(mode="after")
     def _propagate_defer_loading(self) -> Tool:
+        # 把外层的 defer_loading 透传到内层 function（内层未显式设置时）
         if self.defer_loading is not None and self.function.defer_loading is None:
             self.function.defer_loading = self.defer_loading
         return self
@@ -776,39 +829,39 @@ ChatCompletionMessageGenericParam.model_rebuild()
 
 
 class ToolChoiceFuncName(BaseModel):
-    """The name of tool choice function."""
+    """指定工具时使用的函数名包装。"""
 
-    name: Optional[str] = None
+    name: Optional[str] = None  # 要强制调用的函数名
 
 
 class ToolChoice(BaseModel):
-    """The tool choice definition."""
+    """tool_choice 的强指定形式：指定具体某个函数。"""
 
-    function: ToolChoiceFuncName
-    type: Literal["function"] = Field(default="function", examples=["function"])
+    function: ToolChoiceFuncName  # 目标函数
+    type: Literal["function"] = Field(default="function", examples=["function"])  # 工具类型
 
 
-# OpenAI-spec string tiers for reasoning effort (current Responses/Chat API):
-# none/minimal/low/medium/high/xhigh/max. Used as-is by /v1/responses.
+# OpenAI 规范中 reasoning effort 的字符串档位（当前 Responses/Chat API）：
+# none/minimal/low/medium/high/xhigh/max，/v1/responses 直接原样使用。
 ReasoningEffortTier = Literal[
     "none", "minimal", "low", "medium", "high", "xhigh", "max"
 ]
-# The typed /v1/responses stream events validate against OpenAI's narrower
-# ``Reasoning.effort``; echoing a tier outside this set kills the stream.
+# /v1/responses 的强类型流事件会额外校验 OpenAI 更窄的 ``Reasoning.effort``；
+# 若回显超出该集合的档位，会导致流中断。
 ECHOABLE_REASONING_EFFORTS = frozenset({"minimal", "low", "medium", "high"})
-# Chat Completions and /v1/tokenize additionally accept a fine-grained float in
-# [0.0, 0.99] as an sglang extension (not part of the OpenAI schema, so the
-# /v1/responses surface deliberately keeps the string tiers only). Single-sourced
-# so these surfaces cannot drift apart.
+# Chat Completions 与 /v1/tokenize 还额外接受 [0.0, 0.99] 的细粒度浮点数，
+# 这是 sglang 扩展（不属于 OpenAI schema，因此 /v1/responses 仅保留字符串档位）。
+# 统一在一处定义，避免多个接口之间的取值漂移。
 ReasoningEffortType = Optional[
     Union[
         ReasoningEffortTier,
-        Annotated[float, Field(ge=0.0, le=0.99, allow_inf_nan=False)],
+        Annotated[float, Field(ge=0.0, le=0.99, allow_inf_nan=False)],  # sglang 扩展：细粒度推理强度浮点值
     ]
 ]
 
 
 def _has_message_level_tools(messages: Any) -> bool:
+    # 判断 messages 中是否存在“消息级”的工具定义（system/developer 消息携带 tools）
     if not isinstance(messages, list):
         return False
     return any(
@@ -821,51 +874,57 @@ def _has_message_level_tools(messages: Any) -> bool:
 
 
 class ChatCompletionRequest(BaseModel):
-    # Ordered by official OpenAI API documentation
+    """OpenAI 兼容的 /v1/chat/completions 请求体。
+
+    字段顺序基本对齐 OpenAI 官方文档；除标准字段外还包含大量 SGLang 扩展字段
+    （采样控制、调度/PD 分离、多模态、调试返回信息等）。
+    """
+
+    # 按照 OpenAI 官方 API 文档字段顺序排列
     # https://platform.openai.com/docs/api-reference/chat/create
-    messages: List[ChatCompletionMessageParam]
+    messages: List[ChatCompletionMessageParam]  # 对话消息列表（必填），含 system/user/assistant/tool 等角色
     model: str = Field(
         default=DEFAULT_MODEL_NAME,
         description="Model name. Supports LoRA adapters via 'base-model:adapter-name' syntax.",
-    )
-    frequency_penalty: float = 0.0
-    logit_bias: Optional[Dict[str, float]] = None
-    logprobs: bool = False
-    top_logprobs: Optional[int] = None
+    )  # 模型名；支持 '基础模型:adapter名' 语法指定 LoRA 适配器
+    frequency_penalty: float = 0.0  # 频率惩罚：按 token 出现次数线性惩罚，抑制重复
+    logit_bias: Optional[Dict[str, float]] = None  # 对指定 token id 的 logit 偏置
+    logprobs: bool = False  # 是否返回输出 token 的 log 概率
+    top_logprobs: Optional[int] = None  # logprobs=true 时返回每个位置的 top-k 候选数
     max_tokens: Optional[int] = Field(
         default=None,
         deprecated="max_tokens is deprecated in favor of the max_completion_tokens field",
         description="The maximum number of tokens that can be generated in the chat completion. ",
-    )
+    )  # 已废弃：请改用 max_completion_tokens
     max_completion_tokens: Optional[int] = Field(
         default=None,
         description="The maximum number of completion tokens for a chat completion request, "
         "including visible output tokens and reasoning tokens. Input tokens are not included. ",
-    )
-    n: int = 1
-    presence_penalty: float = 0.0
-    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
-    seed: Optional[int] = None
-    stop: Optional[Union[str, List[str]]] = None
-    stream: bool = False
-    stream_options: Optional[StreamOptions] = None
-    temperature: Optional[float] = None
-    top_p: Optional[float] = None
-    user: Optional[str] = None
-    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    )  # 本次最多生成的 token 数（含思维链 token，不含输入）
+    n: int = 1  # 为每条消息生成多少个候选回复
+    presence_penalty: float = 0.0  # 存在惩罚：只要 token 已出现过就惩罚，鼓励话题多样性
+    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None  # 输出格式约束（文本/JSON/结构化标签）
+    seed: Optional[int] = None  # 随机种子，用于采样可复现
+    stop: Optional[Union[str, List[str]]] = None  # 停止字符串（生成到该串时停止）
+    stream: bool = False  # 是否流式返回（SSE）
+    stream_options: Optional[StreamOptions] = None  # 流式选项（是否返回 usage 等）
+    temperature: Optional[float] = None  # 采样温度，越大越随机（None 时回落模型默认/全局默认）
+    top_p: Optional[float] = None  # 核采样阈值（nucleus sampling）
+    user: Optional[str] = None  # 终端用户标识，便于 OpenAI 侧统计与风控
+    tools: Optional[List[Tool]] = Field(default=None, examples=[None])  # 可供模型调用的工具（函数）列表
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
-    )  # noqa
-    parallel_tool_calls: bool = True
-    return_hidden_states: Union[bool, Literal["last"]] = False
-    return_routed_experts: bool = False
-    routed_experts_start_len: int = 0
-    return_cached_tokens_details: bool = False
-    return_spec_tokens_details: bool = False
-    return_prompt_token_ids: bool = False
-    return_token_ids: bool = False
-    return_meta_info: bool = False
-    return_sampling_mask: bool = False
+    )  # noqa  # 工具选择策略：auto/required/none 或指定某个工具
+    parallel_tool_calls: bool = True  # 是否允许模型并行发起多个工具调用
+    return_hidden_states: Union[bool, Literal["last"]] = False  # 调试：返回 hidden states（True 全量 / "last" 最后一层）
+    return_routed_experts: bool = False  # 调试：返回每个 token 路由到的专家（MoE）
+    routed_experts_start_len: int = 0  # 调试：从第几个 token 位置开始记录 routed experts
+    return_cached_tokens_details: bool = False  # 调试：返回命中前缀缓存的 token 明细
+    return_spec_tokens_details: bool = False  # 调试：返回投机解码（speculative）的 token 明细
+    return_prompt_token_ids: bool = False  # 调试：返回输入的 prompt token ids
+    return_token_ids: bool = False  # 调试：返回输出的 token ids
+    return_meta_info: bool = False  # 调试：返回底层调度/采样的 meta 信息
+    return_sampling_mask: bool = False  # 调试：返回采样掩码（如约束解码时被屏蔽的 token）
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "
@@ -878,7 +937,7 @@ class ChatCompletionRequest(BaseModel):
         "'max' is an sglang extension to the OpenAI schema for "
         "models that expose a maximum-effort tier above 'high'; models that don't "
         "support it treat it the same as 'high'.",
-    )
+    )  # 推理强度：字符串档位或 [0.0, 0.99] 浮点数；'none' 关闭思考，会影响 chat_template_kwargs 中的 thinking/enable_thinking
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]
     ] = Field(
@@ -887,67 +946,66 @@ class ChatCompletionRequest(BaseModel):
         "user/developer message is treated as a single-shot classification prompt "
         "and the corresponding task special token (e.g. `<｜domain｜>`) is appended "
         "before generation. Only honored by the dsv4 chat encoder; ignored otherwise.",
-    )
+    )  # DeepSeek-V4 快捷指令任务：把最后一条 user/developer 消息当作单次分类提示，并追加对应任务特殊 token
 
-    # Extra parameters for SRT backend only and will be ignored by OpenAI models.
-    top_k: Optional[int] = None
-    min_p: Optional[float] = None
-    min_tokens: int = 0
-    regex: Optional[str] = None
-    ebnf: Optional[str] = None
-    repetition_penalty: Optional[float] = None
-    stop_token_ids: Optional[List[int]] = None
-    stop_regex: Optional[Union[str, List[str]]] = None
-    no_stop_trim: bool = False
-    ignore_eos: bool = False
-    continue_final_message: bool = False
-    skip_special_tokens: bool = True
-    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
-    session_id: Optional[str] = None
-    session_params: Optional[Dict] = None
-    separate_reasoning: bool = True
-    stream_reasoning: bool = True
-    chat_template_kwargs: Optional[Dict] = None
+    # 以下为 SRT 后端专有参数，OpenAI 模型会忽略
+    top_k: Optional[int] = None  # top-k 采样：只从概率最高的 k 个 token 中采样（-1 表示不限制）
+    min_p: Optional[float] = None  # min-p 采样：保留概率 >= min_p * 最大概率 的 token
+    min_tokens: int = 0  # 至少生成多少个 token 后才允许停止
+    regex: Optional[str] = None  # 正则约束解码：输出必须匹配该正则
+    ebnf: Optional[str] = None  # EBNF 语法约束解码
+    repetition_penalty: Optional[float] = None  # 重复惩罚系数（>1 抑制重复）
+    stop_token_ids: Optional[List[int]] = None  # 以 token id 形式指定停止符
+    stop_regex: Optional[Union[str, List[str]]] = None  # 以正则形式指定停止符
+    no_stop_trim: bool = False  # 命中停止符时是否保留停止符本身（不裁剪）
+    ignore_eos: bool = False  # 是否忽略 EOS，一直生成到 max_new_tokens
+    continue_final_message: bool = False  # 是否续写最后一条消息（不重新加 assistant 起始标记）
+    skip_special_tokens: bool = True  # 输出解码时是否跳过特殊 token
+    lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None  # LoRA 适配器路径（可批量指定多个）
+    session_id: Optional[str] = None  # 会话 id，用于多轮复用/会话级缓存
+    session_params: Optional[Dict] = None  # 会话相关参数
+    separate_reasoning: bool = True  # 是否把思维链从 content 中拆分到 reasoning_content
+    stream_reasoning: bool = True  # 流式时是否输出思维链内容
+    chat_template_kwargs: Optional[Dict] = None  # 透传给 chat template 的额外参数（如 thinking/enable_thinking）
 
-    # SGLang multimodal controls (extensions)
-    max_dynamic_patch: Optional[int] = None
-    min_dynamic_patch: Optional[int] = None
-    use_audio_in_video: bool = False
+    # SGLang 多模态控制参数（扩展）
+    max_dynamic_patch: Optional[int] = None  # 图像/视频动态切块（patch）数量上限
+    min_dynamic_patch: Optional[int] = None  # 图像/视频动态切块（patch）数量下限
+    use_audio_in_video: bool = False  # 是否从视频中提取并使用音轨
 
-    images_config: Optional[Dict] = None
-    video_config: Optional[Dict] = None
+    images_config: Optional[Dict] = None  # 图片处理配置
+    video_config: Optional[Dict] = None  # 视频处理配置
 
-    # Custom logit processor for advanced sampling control
-    custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
-    custom_params: Optional[Dict] = None
+    # 自定义 logit processor，用于高级采样控制
+    custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None  # 自定义 logit 处理器（代码或路径）
+    custom_params: Optional[Dict] = None  # 传给自定义处理器/采样参数的额外参数
 
-    # Pre-computed prompt token IDs: when provided, bypasses chat template
-    # tokenization entirely.  Messages are still used to derive stop tokens
-    # and tool_call_constraint.
-    input_ids: Optional[List[int]] = None
+    # 预先算好的 prompt token ids：提供后完全跳过 chat template 分词；
+    # 但 messages 仍会用于推导停止符与 tool_call_constraint。
+    input_ids: Optional[List[int]] = None  # 预分词后的输入 token ids
 
-    # For request id
+    # 请求 id
     rid: Optional[Union[List[str], str]] = None
-    # Extra key for caller-defined request classification
+    # 调用方自定义的请求分类 key
     extra_key: Optional[Union[List[str], str]] = None
-    # Cache salt for request caching
+    # 请求缓存的盐值（cache salt）
     cache_salt: Optional[Union[List[str], str]] = None
-    # Priority for the request
+    # 请求优先级
     priority: Optional[int] = None
 
-    # For PD disaggregation
-    bootstrap_host: Optional[Union[List[str], str]] = None
-    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None
-    bootstrap_room: Optional[Union[List[int], int]] = None
+    # PD 分离（prefill/decode 分离）相关
+    bootstrap_host: Optional[Union[List[str], str]] = None  # 对端 bootstrap 服务地址
+    bootstrap_port: Optional[Union[List[Optional[int]], int]] = None  # 对端 bootstrap 端口
+    bootstrap_room: Optional[Union[List[int], int]] = None  # bootstrap 房间号（配对 prefill/decode 请求）
 
-    # For DP routing — external router assigns a specific DP worker
+    # DP 路由：由外部 router 指定具体的 DP worker
     routed_dp_rank: Optional[int] = None
-    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    # PD 分离场景：提示 decode 侧应去哪个 prefill DP worker 取 KV cache
     disagg_prefill_dp_rank: Optional[int] = None
-    # Deprecated: use routed_dp_rank instead
+    # 已废弃：请改用 routed_dp_rank
     data_parallel_rank: Optional[int] = None
 
-    # OpenAI/SGLang default sampling parameters
+    # OpenAI/SGLang 默认采样参数（用户未显式指定且模型配置缺失时的兜底值）
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
         "top_p": 1.0,
@@ -959,11 +1017,13 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
+        # 兼容已废弃的 data_parallel_rank：统一迁移到 routed_dp_rank
         return _migrate_deprecated_dp_rank(values)
 
     @model_validator(mode="before")
     @classmethod
     def set_tool_choice_default(cls, values):
+        # 未显式指定 tool_choice 时的默认值：无工具（含消息级工具）则为 "none"，否则为 "auto"
         if values.get("tool_choice") is None:
             if values.get("tools") is None and not _has_message_level_tools(
                 values.get("messages")
@@ -976,6 +1036,7 @@ class ChatCompletionRequest(BaseModel):
     @field_validator("reasoning_effort", mode="before")
     @classmethod
     def validate_reasoning_effort_type(cls, value):
+        # 布尔值会被 pydantic 宽松地当成 0/1 数字，这里显式拒绝
         if isinstance(value, bool):
             raise ValueError("reasoning_effort must not be a boolean")
         return value
@@ -983,6 +1044,10 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):
+        # 归一化两种推理开关的写法：
+        # 1) reasoning_effort（字符串档位或 [0.0,0.99] 浮点数）
+        # 2) 嵌套的 reasoning 对象（effort/reasoning_effort + enabled/enable）
+        # 最终统一转写为 reasoning_effort 与 chat_template_kwargs 中的 thinking 标志。
         r = values.get("reasoning")
         thinking = None
 
@@ -1003,8 +1068,8 @@ class ChatCompletionRequest(BaseModel):
             elif isinstance(effort, (int, float)) and not isinstance(effort, bool):
                 values["reasoning_effort"] = float(effort)
             elif isinstance(effort, str):
-                # Keep parity with the top-level reasoning_effort field, whose
-                # lax union coerces numeric strings; range checks then apply.
+                # 与顶层 reasoning_effort 字段保持一致：宽松 union 会把数字字符串
+                # 转成浮点数，后续再做范围校验。
                 try:
                     values["reasoning_effort"] = float(effort)
                 except ValueError as exc:
@@ -1016,23 +1081,23 @@ class ChatCompletionRequest(BaseModel):
                 r.get("enabled")
                 if r.get("enabled") is not None
                 else r.get("enable", False)
-            )
+            )  # 兼容 enabled 与 enable 两种写法
             if isinstance(enabled, str):
-                enabled = enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
+                enabled = enabled.strip().lower() in {"1", "true", "yes", "y", "on"}  # 字符串形式的布尔值
             if enabled:
                 thinking = True
 
         effort = values.get("reasoning_effort")
         if effort is not None:
-            thinking = effort != "none"
+            thinking = effort != "none"  # effort=none 即关闭思考
 
         if thinking is not None:
             ctk = values.get("chat_template_kwargs")
             if not isinstance(ctk, dict):
                 ctk = {}
-            # different models check different keys:
-            # - "thinking" for deepseek-v3, kimi_k2
-            # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1
+            # 不同模型检查的键不同：
+            # - "thinking"：deepseek-v3、kimi_k2
+            # - "enable_thinking"：qwen3、glm45、nemotron_3、interns1
             ctk.setdefault("thinking", thinking)
             ctk.setdefault("enable_thinking", thinking)
             values["chat_template_kwargs"] = ctk
@@ -1042,6 +1107,8 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def set_json_schema(cls, values):
+        # 兼容简写写法：response_format={"type":"json_schema", "schema": {...}}
+        # 将顶层 schema 规范化到 OpenAI 标准的 {"json_schema": {"name", "schema", "strict"}} 结构
         response_format = values.get("response_format")
         if not response_format:
             return values
@@ -1053,11 +1120,13 @@ class ChatCompletionRequest(BaseModel):
         json_schema = response_format.get("json_schema")
 
         if json_schema:
+            # 已是标准写法，无需转换
             return values
 
         if schema:
             name_ = schema.get("title", "Schema")
             strict_ = None
+            # 支持把 strict 写在 schema.properties 中作为约定的兼容写法
             if "properties" in schema and "strict" in schema["properties"]:
                 item = schema["properties"].pop("strict", None)
                 strict_ = bool(item and item.get("default", False))
@@ -1078,11 +1147,12 @@ class ChatCompletionRequest(BaseModel):
         renderer_handles_response_format: bool = False,
     ) -> Dict[str, Any]:
         """
-        Convert request to sampling parameters.
-        Priority: user value > model generation_config > OpenAI defaults
+        把请求转换成底层采样参数。
+        优先级：用户显式传值 > 模型 generation_config > OpenAI 默认值
         """
 
         def get_param(param_name: str):
+            # 取参数：用户值优先，否则回落模型配置，最后回落默认值
             value = getattr(self, param_name)
             if value is None:
                 return model_generation_config.get(
@@ -1090,41 +1160,42 @@ class ChatCompletionRequest(BaseModel):
                 )
             return value
 
-        # add per user request
+        # 特殊 token 之间是否插入空格（可通过 chat_template_kwargs 覆盖）
         spaces_between_special_tokens = (
             True
             if self.chat_template_kwargs is None
             else self.chat_template_kwargs.get("spaces_between_special_tokens", True)
         )
 
+        # 汇总采样参数（注意 max_new_tokens 优先取 max_completion_tokens，兼容旧字段 max_tokens）
         sampling_params = {
-            "temperature": get_param("temperature"),
-            "max_new_tokens": self.max_completion_tokens or self.max_tokens,
-            "min_new_tokens": self.min_tokens,
-            "stop": stop,
-            "stop_token_ids": self.stop_token_ids,
-            "stop_regex": self.stop_regex,
-            "top_p": get_param("top_p"),
-            "top_k": get_param("top_k"),
-            "min_p": get_param("min_p"),
-            "presence_penalty": self.presence_penalty,
-            "frequency_penalty": self.frequency_penalty,
-            "repetition_penalty": get_param("repetition_penalty"),
-            "regex": self.regex,
-            "ebnf": self.ebnf,
-            "n": self.n,
-            "no_stop_trim": self.no_stop_trim,
-            "ignore_eos": self.ignore_eos,
-            "skip_special_tokens": self.skip_special_tokens,
-            "logit_bias": self.logit_bias,
-            "custom_params": self.custom_params,
-            "sampling_seed": self.seed,
-            "spaces_between_special_tokens": spaces_between_special_tokens,
+            "temperature": get_param("temperature"),  # 采样温度
+            "max_new_tokens": self.max_completion_tokens or self.max_tokens,  # 最多生成 token 数
+            "min_new_tokens": self.min_tokens,  # 最少生成 token 数
+            "stop": stop,  # 停止字符串（由上层渲染/解析得到）
+            "stop_token_ids": self.stop_token_ids,  # 停止 token id
+            "stop_regex": self.stop_regex,  # 停止正则
+            "top_p": get_param("top_p"),  # 核采样
+            "top_k": get_param("top_k"),  # top-k 采样
+            "min_p": get_param("min_p"),  # min-p 采样
+            "presence_penalty": self.presence_penalty,  # 存在惩罚
+            "frequency_penalty": self.frequency_penalty,  # 频率惩罚
+            "repetition_penalty": get_param("repetition_penalty"),  # 重复惩罚
+            "regex": self.regex,  # 正则约束
+            "ebnf": self.ebnf,  # EBNF 约束
+            "n": self.n,  # 生成候选数
+            "no_stop_trim": self.no_stop_trim,  # 是否保留停止符
+            "ignore_eos": self.ignore_eos,  # 是否忽略 EOS
+            "skip_special_tokens": self.skip_special_tokens,  # 解码是否跳过特殊 token
+            "logit_bias": self.logit_bias,  # logit 偏置
+            "custom_params": self.custom_params,  # 自定义参数
+            "sampling_seed": self.seed,  # 采样随机种子
+            "spaces_between_special_tokens": spaces_between_special_tokens,  # 特殊 token 间是否加空格
         }
 
         if self.response_format and self.response_format.type == "json_schema":
-            # strict=false may only go unconstrained when the renderer forwards
-            # response_format to the model; plain chat templates never see it.
+            # strict=false 时，只有当 renderer 会把 response_format 透传给模型时才允许不加约束；
+            # 普通 chat template 根本看不到它。
             if (
                 self.response_format.json_schema.strict is not False
                 or not renderer_handles_response_format
@@ -1133,13 +1204,15 @@ class ChatCompletionRequest(BaseModel):
                     self.response_format.json_schema.schema_
                 )
         elif self.response_format and self.response_format.type == "json_object":
+            # json_object 退化为“任意 JSON 对象”约束
             sampling_params["json_schema"] = '{"type": "object"}'
         elif self.response_format and self.response_format.type == "structural_tag":
+            # 结构化标签约束（SGLang 扩展）
             sampling_params["structural_tag"] = convert_json_schema_to_str(
                 self.response_format.model_dump(by_alias=True)
             )
 
-        # Check if there are already existing output constraints
+        # 检查是否已存在输出约束（regex/ebnf/structural_tag/json_schema）
         has_existing_constraints = (
             sampling_params.get("regex")
             or sampling_params.get("ebnf")
@@ -1148,6 +1221,7 @@ class ChatCompletionRequest(BaseModel):
         )
 
         if tool_call_constraint and has_existing_constraints:
+            # 工具调用约束与输出约束互斥：required/指定工具时直接报错
             if self.tool_choice == "required" or isinstance(
                 self.tool_choice, ToolChoice
             ):
@@ -1158,6 +1232,7 @@ class ChatCompletionRequest(BaseModel):
                 )
             logger.warning("Constrained decoding is not compatible with tool calls.")
         elif tool_call_constraint:
+            # 无其他约束时，把工具调用约束转成对应的约束参数
             constraint_type, constraint_value = tool_call_constraint
             if constraint_type == "structural_tag":
                 sampling_params[constraint_type] = convert_json_schema_to_str(
@@ -1174,30 +1249,35 @@ class ChatCompletionRequest(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    role: Optional[str] = None
-    content: Optional[str] = None
-    reasoning_content: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    """响应中的完整消息（非流式）。"""
+
+    role: Optional[str] = None  # 消息角色，通常为 assistant
+    content: Optional[str] = None  # 正文内容（思维链会被拆到 reasoning_content）
+    reasoning_content: Optional[str] = None  # 思维链内容（separate_reasoning=true 时单独返回）
+    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])  # 模型产生的工具调用
 
 
 class ChatCompletionResponseChoice(BaseModel):
-    index: int
-    message: ChatMessage
-    logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
+    """非流式响应中的单个候选（一条 messages 生成一个 choice）。"""
+
+    index: int  # 候选序号（与请求的 n 对应）
+    message: ChatMessage  # 生成的消息
+    logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None  # token 级 log 概率明细
     finish_reason: Optional[
         Literal[
             "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
         ]
-    ] = None
-    matched_stop: Union[None, int, str] = None
-    hidden_states: Optional[object] = None
-    prompt_token_ids: Optional[List[int]] = None
-    response_token_ids: Optional[List[int]] = None
-    meta_info: Optional[Dict[str, Any]] = None
+    ] = None  # 结束原因：stop=命中停止符，length=达长度上限，tool_calls=触发工具调用，abort=被中断
+    matched_stop: Union[None, int, str] = None  # 实际命中的停止符（token id 或字符串）
+    hidden_states: Optional[object] = None  # 调试：hidden states
+    prompt_token_ids: Optional[List[int]] = None  # 调试：输入 token ids
+    response_token_ids: Optional[List[int]] = None  # 调试：输出 token ids
+    meta_info: Optional[Dict[str, Any]] = None  # 调试：底层调度/采样 meta 信息
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        # 调试字段为 None 时不出现在响应中，保持响应体精简
         if self.hidden_states is None:
             data.pop("hidden_states", None)
         if self.prompt_token_ids is None:
@@ -1210,29 +1290,34 @@ class ChatCompletionResponseChoice(BaseModel):
 
 
 class ChatCompletionResponse(BaseModel):
-    id: str
-    object: str = "chat.completion"
-    created: int = Field(default_factory=lambda: int(time.time()))
-    model: str
-    choices: List[ChatCompletionResponseChoice]
-    usage: UsageInfo
-    metadata: Optional[Dict[str, Any]] = None
-    sglext: Optional[SglExt] = None
+    """非流式的 /v1/chat/completions 响应体（对齐 OpenAI）。"""
+
+    id: str  # 本次 completion 的唯一 id
+    object: str = "chat.completion"  # 对象类型，固定为 chat.completion
+    created: int = Field(default_factory=lambda: int(time.time()))  # 创建时间（unix 秒）
+    model: str  # 实际使用的模型名
+    choices: List[ChatCompletionResponseChoice]  # 候选列表（对应 n）
+    usage: UsageInfo  # token 用量统计
+    metadata: Optional[Dict[str, Any]] = None  # 额外元信息
+    sglext: Optional[SglExt] = None  # SGLang 扩展字段
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        # 无扩展字段时不输出 sglext
         if self.sglext is None:
             data.pop("sglext", None)
         return data
 
 
 class DeltaMessage(BaseModel):
-    role: Optional[str] = None
-    content: Optional[str] = None
-    reasoning_content: Optional[str] = None
-    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
-    hidden_states: Optional[object] = None
+    """流式响应中的增量消息（每个 SSE chunk 携带）。"""
+
+    role: Optional[str] = None  # 首个 chunk 会带上 role
+    content: Optional[str] = None  # 本 chunk 增量正文
+    reasoning_content: Optional[str] = None  # 本 chunk 增量思维链内容
+    tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])  # 本 chunk 增量的工具调用
+    hidden_states: Optional[object] = None  # 调试：hidden states
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -1243,29 +1328,34 @@ class DeltaMessage(BaseModel):
 
 
 class ChatCompletionResponseStreamChoice(BaseModel):
-    index: int
-    delta: DeltaMessage
-    logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
+    """流式响应中的单个候选。"""
+
+    index: int  # 候选序号（与请求的 n 对应）
+    delta: DeltaMessage  # 本 chunk 的增量内容
+    logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None  # token 级 log 概率明细
     finish_reason: Optional[
         Literal[
             "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
         ]
-    ] = None
-    matched_stop: Union[None, int, str] = None
+    ] = None  # 结束原因，仅在最后一个 chunk 给出
+    matched_stop: Union[None, int, str] = None  # 实际命中的停止符
 
 
 class ChatCompletionStreamResponse(BaseModel):
-    id: str
-    object: str = "chat.completion.chunk"
-    created: int = Field(default_factory=lambda: int(time.time()))
-    model: str
-    choices: List[ChatCompletionResponseStreamChoice]
-    usage: Optional[UsageInfo] = None
-    sglext: Optional[SglExt] = None
+    """流式的 /v1/chat/completions 响应（每个 SSE chunk 一个）。"""
+
+    id: str  # 与整个流共享的 completion id
+    object: str = "chat.completion.chunk"  # 对象类型，固定为 chat.completion.chunk
+    created: int = Field(default_factory=lambda: int(time.time()))  # 创建时间（unix 秒）
+    model: str  # 实际使用的模型名
+    choices: List[ChatCompletionResponseStreamChoice]  # 候选增量列表
+    usage: Optional[UsageInfo] = None  # token 用量（仅在 include_usage=true 的最后 chunk 返回）
+    sglext: Optional[SglExt] = None  # SGLang 扩展字段
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        # 无扩展字段时不输出 sglext
         if self.sglext is None:
             data.pop("sglext", None)
         return data
@@ -1442,36 +1532,44 @@ class RerankResponse(BaseModel):
 
 
 class TokenizeRequest(BaseModel):
-    """Request schema for the /tokenize endpoint."""
+    """Request schema for the /tokenize endpoint.
 
+    /tokenize 接口的请求体：把「文本」或「对话消息」编码成 token id 序列。
+    两种输入二选一（prompt 或 messages），由下面的校验器保证。
+    """
+
+    # 允许携带额外字段（不作为请求参数校验），例如透传的模型侧自定义参数
     model_config = ConfigDict(extra="allow")
 
-    model: str = DEFAULT_MODEL_NAME
-    prompt: Optional[Union[str, List[str]]] = None
-    messages: Optional[List[ChatCompletionMessageParam]] = None
-    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    model: str = DEFAULT_MODEL_NAME  # 目标模型名，默认取全局默认模型
+    prompt: Optional[Union[str, List[str]]] = None  # 纯文本输入，支持单条或多条
+    messages: Optional[List[ChatCompletionMessageParam]] = None  # 对话消息输入，走 chat template 渲染
+    tools: Optional[List[Tool]] = Field(default=None, examples=[None])  # 工具定义，用于渲染 chat template
     tool_choice: Optional[Union[ToolChoice, Literal["auto", "required", "none"]]] = (
-        Field(default=None, examples=["auto"])
+        Field(default=None, examples=["auto"])  # 工具选择策略：auto/required/none 或指定某个工具
     )
-    reasoning_effort: ReasoningEffortType = None
-    continue_final_message: bool = False
-    chat_template_kwargs: Optional[Dict] = None
+    reasoning_effort: ReasoningEffortType = None  # 推理强度（reasoning 模型相关，影响模板渲染）
+    continue_final_message: bool = False  # 是否续写最后一条消息（不重新加 assistant 起始标记）
+    chat_template_kwargs: Optional[Dict] = None  # 透传给 chat template 的额外参数
     add_special_tokens: bool = Field(
         default=True,
         description="whether to add model-specific special tokens (e.g. BOS/EOS) during encoding.",
-    )
+    )  # 编码时是否添加模型特有特殊 token（如 BOS/EOS）
 
     @model_validator(mode="after")
     def validate_tokenize_input(self) -> TokenizeRequest:
+        # 校验：prompt 与 messages 必须且只能提供一个
         if (self.prompt is None) == (self.messages is None):
             raise ValueError("Exactly one of 'prompt' or 'messages' must be provided.")
         return self
 
     def to_chat_completion_request(self) -> ChatCompletionRequest:
+        # 把本请求转换成 ChatCompletionRequest，以便复用 chat 侧的模板渲染/编码逻辑
         data = self.model_dump(
-            exclude={"prompt", "add_special_tokens"},
+            exclude={"prompt", "add_special_tokens"},  # prompt 需转成 messages；add_special_tokens 非 chat 参数
             exclude_none=True,
         )
+        # 合并 model_config 允许的额外字段，一并透传给 ChatCompletionRequest
         extra = getattr(self, "__pydantic_extra__", None)
         if extra:
             data.update(extra)
@@ -1479,28 +1577,37 @@ class TokenizeRequest(BaseModel):
 
 
 class TokenizeResponse(BaseModel):
-    """Response schema for the /tokenize endpoint."""
+    """Response schema for the /tokenize endpoint.
 
-    tokens: Union[List[int], List[List[int]]]
-    count: Union[int, List[int]]
-    max_model_len: int
+    /tokenize 接口的响应体：返回编码后的 token id。
+    """
+
+    tokens: Union[List[int], List[List[int]]]  # token id；单条输入为 List[int]，批量输入为 List[List[int]]
+    count: Union[int, List[int]]  # 每条输入的 token 数量，形状与 tokens 对应
+    max_model_len: int  # 模型支持的最大上下文长度，便于调用方自行截断
 
 
 class DetokenizeRequest(BaseModel):
-    """Request schema for the /detokenize endpoint."""
+    """Request schema for the /detokenize endpoint.
 
-    model: str = DEFAULT_MODEL_NAME
-    tokens: Union[List[int], List[List[int]]]
+    /detokenize 接口的请求体：把 token id 序列解码回文本，是 tokenize 的逆过程。
+    """
+
+    model: str = DEFAULT_MODEL_NAME  # 目标模型名，默认取全局默认模型
+    tokens: Union[List[int], List[List[int]]]  # 待解码的 token id；单条为 List[int]，批量为 List[List[int]]
     skip_special_tokens: bool = Field(
         default=True,
         description="whether to exclude special tokens (e.g. padding or EOS) during decoding.",
-    )
+    )  # 解码时是否过滤掉特殊 token（如 padding / EOS）
 
 
 class DetokenizeResponse(BaseModel):
-    """Response schema for the /detokenize endpoint."""
+    """Response schema for the /detokenize endpoint.
 
-    text: Union[str, List[str]]
+    /detokenize 接口的响应体：返回解码后的文本。
+    """
+
+    text: Union[str, List[str]]  # 解码结果；单条输入返回 str，批量输入返回 List[str]
 
 
 OpenAIServingRequest = Union[

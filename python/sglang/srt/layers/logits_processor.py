@@ -95,6 +95,8 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
 # Skipping the LM head skips its [batch * dp_size, vocab] all-gather, which OOMs
 # under DP attention with a tight mem_fraction_static.
 _autotune_run_lm_head: Optional[bool] = None
+
+
 def _trace_e2e_logits(stage: str, **fields) -> None:
     if not envs.SGLANG_TRACE_LOGITS_E2E.get():
         return
@@ -105,8 +107,12 @@ def _trace_e2e_logits(stage: str, **fields) -> None:
         rank = "rank=unknown"
     details = " ".join(f"{key}={value}" for key, value in fields.items())
     print(f"SGLANG_TRACE_LOGITS_E2E {rank} stage={stage} {details}", flush=True)
+
+
 def _has_lm_head_runtime_attrs(lm_head, attr_names: Tuple[str, ...]) -> bool:
     return all(hasattr(lm_head, attr_name) for attr_name in attr_names)
+
+
 def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
     if (
         quant_method is None
@@ -114,8 +120,11 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
         or not callable(getattr(quant_method, "apply", None))
     ):
         return False
+
     method_name = type(quant_method).__name__
     if method_name in _UNQUANTIZED_LM_HEAD_METHODS:
+        return False
+
     # A shared target lm_head can retain the draft's stale ModelOpt method; use it
     # only when the runtime tensor layout matches that method.
     if method_name == "ModelOptFp4LinearMethod":
@@ -128,18 +137,38 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
                 "input_size_per_partition",
                 "output_size_per_partition",
             ),
+        ):
             return True
         return lm_head.weight.dtype == torch.uint8 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
                 "weight_scale_interleaved",
                 "alpha",
                 "input_scale_inv",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
         )
     if method_name == "ModelOptNvFp4A16LinearMethod":
         return lm_head.weight.dtype == torch.int32 and _has_lm_head_runtime_attrs(
+            lm_head,
+            (
+                "weight_scale",
+                "weight_global_scale",
+                "workspace",
+                "input_size_per_partition",
+                "output_size_per_partition",
+            ),
+        )
     if method_name == "ModelOptFp8LinearMethod":
         return (
             lm_head.weight.dtype == torch.float8_e4m3fn
             and _has_lm_head_runtime_attrs(lm_head, ("weight_scale", "input_scale"))
+        )
+
+    return True
+
+
 # FlashInfer autotune skips the unprofiled LM-head all-gather; its
 # [batch * dp_size, vocab] output can OOM under tight DP-attention memory.
 _in_autotune_dummy_run = False
@@ -149,6 +178,7 @@ def get_in_autotune_dummy_run() -> bool:
     # 中译：返回当前是否处于「autotune 空跑」模式。
     # 中译：上下文管理器——进入时置位「autotune 空跑」标志，退出时恢复，
     return _autotune_run_lm_head is not None
+
 
 @contextmanager
 def autotune_dummy_run_mode(*, run_lm_head: bool):
@@ -493,6 +523,7 @@ class LogitsProcessor(nn.Module):
             enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
             skip_entry_sync=True,
         )
+
         self.input_logprob_processor = InputLogprobProcessor()
 
     def forward(

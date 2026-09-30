@@ -257,13 +257,17 @@ class PrefetchAck:
 
     A sequence of PrefetchAck is sent to the scheduler thread via ack_prefetch_queue,
     indicating progress or completion of the prefetch operation.
+
     For example, a prefetch operation may results into the following sequence of PrefetchAck:
+
     1. PrefetchAck(completed_tokens = 128)
     2. PrefetchAck(completed_tokens = 256)
     3. PrefetchAck(pool_hits={INDEXER: 256})
     4. PrefetchAck(completed_req = True)
+
     The last PrefetchAck always specifies completed_req = True.
     """
+
     rid: str
     operation: PrefetchOperation
     # Number of hits in KV pool.
@@ -442,6 +446,7 @@ class HiCacheController:
         self.ack_prefetch_queue = Queue[PrefetchAck]()
         self.ack_backup_queue: Optional[Queue[StorageOperation]] = None
         self.host_mem_release_queue: Optional[Queue[torch.Tensor]] = None
+
         self.device = self.mem_pool_device.device
         self.layer_num = self.mem_pool_device.layer_num
         self.layer_done_counter = LayerDoneCounter(self.layer_num)
@@ -1105,6 +1110,7 @@ class HiCacheController:
             start_event=producer_event.start_event,
             on_layer_done=producer_event.complete,
             layer_num=self.layer_num,
+        )
 
         self.ack_load_queue.append(
             HiCacheAck(
@@ -1158,8 +1164,10 @@ class HiCacheController:
         Request to terminate a prefetch operation.
 
         Must be called in the scheduler thread.
+
         Asynchronous prefetch tasks may be running in background threads.  When all prefetch
         tasks are terminated, a PrefetchAck with completed_req=True will be sent to ack_prefetch_queue.
+        """
         operation.mark_terminate()
         return operation.completed_tokens, operation.hash_value
 

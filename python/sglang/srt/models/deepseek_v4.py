@@ -107,6 +107,7 @@ from sglang.srt.layers.utils.cp_utils import (
     cp_round_robin_input_ids,
     cp_split_and_rebuild_data,
     cp_split_and_rebuild_position,
+    prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import RadixAttention
@@ -3597,9 +3598,46 @@ class DeepseekV4ForCausalLM(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        """把 checkpoint 里的权重灌进本模块参数（DeepSeek-V4/V4.1 的主加载函数）。
+
+        【中译】这是「模型侧」的加载入口，由 ModelLoader 调（`model.load_weights(iter)`）。
+               它比 DeepSeek-V2 复杂得多，因为：① 名字体系要映射（HF 的 `layers.N.attn/ffn/w1..w3`
+               → SGLang 的 `model.layers.N.self_attn/mlp.gate_proj..`，见
+               `remap_weight_name_to_dpsk_hf_format`）；② 同一个 checkpoint 里还夹着 MTP/NextN
+               草稿层、Engram、compressor 等 V4 专属结构；③ 部分权重必须**成对融合**
+               （`compressor.wkv`+`wgate` → `wkv_gate`；`wq_a`+`wkv` → `wqkv_a`），所以要边扫边缓存、
+               成对后再提交。
+
+        它依次做四件事：
+          ① 准备映射表：`DEEPSEEK_V4_STACKED_PARAMS_MAPPING`（gate/up 合并到 gate_up_proj）、
+             `FusedMoE.make_expert_params_mapping`（专家级 gate/down/up），
+             wint4afp8/wint4a16 量化额外再加一组 input_scale 映射；
+          ② 逐权重名做过滤 + 改名（PP 范围、MTP/nextn 前缀、shared experts 融合、
+             k_scale/v_scale → attn_mqa.* 等），再分发给对应 `param.weight_loader`；
+          ③ 把「成对出现」的权重（compressor / wqkv_a）缓存并在齐后融合提交；
+          ④ 收尾：校验缓存均已清空、统计未加载参数并告警、调 `post_load_weights()` 做量化后处理，
+             非 nextn 时再 `_prewarm_mhc_kernels()` 预热 mHC kernel。
+
+        【输入示例】
+            weights = <生成器>：("layers.0.ffn.experts.0.w1.weight", tensor(fp8)),
+                               ("layers.0.ffn.experts.0.w1.scale", tensor(e8m0)),
+                               ("layers.0.attn.compressor.wkv.weight", tensor),
+                               ("layers.0.attn.compressor.wgate.weight", tensor),
+                               ("embed.weight", tensor), ("head.weight", tensor), ...
+            is_nextn = False       # True 时只挑 MTP/NextN 草稿层权重（见 deepseek_v4_nextn.py）
+        【输出】无返回值。副作用：
+            · 参数被就地写入（含量化后处理 `post_load_weights()` → `process_weights_after_loading()`）；
+            · 未被加载的参数（按 PP rank / nextn / 白名单过滤后）会打 warning；
+            · 非 nextn 时顺带完成 mHC kernel 的 JIT 预热，把编译开销挡在服务路径之外。
+        【异常】fp8 wo_a 校验失败 → ValueError；某权重与参数不匹配 → 由 `weight_loader` 抛错，
+            且异常上会附 `name=` 与 `shape=` 便于定位。
+        """
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
+        # 中译：【第 1 步】nextn（MTP 草稿层）模式下的层号推导。
+        #       当前实现只支持 1 层 nextn（num_nextn_predict_layers 必须为 1）；nextn 层 id 在
+        #       「模型只有 1 层」时是 0，否则取 num_hidden_layers（即接在最后一层之后）。
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -3612,11 +3650,17 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
+        # 中译：非 FP8 wo_a GEMM 路径下，先把 `wo_a.weight` + `wo_a.scale` 流式反量化成 BF16；
+        #       Expert Pack GGUF 权重会被原样透传给流式加载路径（见 _prepare_deepseek_v4_weights）。
         if not _FP8_WO_A_GEMM:
             weights = _prepare_deepseek_v4_weights(weights, self.quant_config)
 
+        # 中译：①普通融合映射：checkpoint 的 gate_proj / up_proj → 模型的 gate_up_proj
+        #       （按 shard_id 0/1 分别写入）。
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
 
+        # 中译：②专家级映射：把 ckpt 里按专家编号分散的 gate/down/up 权重，映射到模型侧
+        #       FusedMoE 的融合专家参数上（带 expert_id / shard_id）；专家总数 = routed + 已融合 shared。
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -3624,20 +3668,29 @@ class DeepseekV4ForCausalLM(nn.Module):
             num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
 
+        # 中译：wint4afp8 / wint4a16 量化还需要额外的 input_scale 权重映射（仅 routed 专家）。
         if is_wint4afp8_or_wint4a16_config(self.quant_config):
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )
 
+        # 中译：【第 2 步】成对融合用的缓存：
+        #       · cache_compressor_weight：缓存 compressor 的 wkv / wgate，成对后 cat 成 wkv_gate；
+        #       · cache_wqkv_a_weight：缓存 wq_a / wkv，成对后融合成 wqkv_a（需开 SGLANG_OPT_FUSE_WQA_WKV）。
         cache_compressor_weight = {}
         COMPRESSOR_PART = ".compressor.w"
 
         fuse_wqa_wkv = envs.SGLANG_OPT_FUSE_WQA_WKV.get()
         cache_wqkv_a_weight: dict[str, dict[str, torch.Tensor]] = {}
 
+        # 中译：选 weight_loader 的小助手：模块自带就用它自己的，否则用默认 default_weight_loader。
         def auto_weight_loader(module):
             return getattr(module, "weight_loader", default_weight_loader)
 
+        # 中译：nextn 权重名的两类归属（决定前缀替换成什么）：
+        #       ① 「层外」权重（shared_head / embed_tokens / e_proj / h_proj / enorm / hnorm /
+        #          hc_head_*）→ `model.layers.<nextn_layer_id>.xxx` 改写成 `model.xxx`；
+        #       ② 其余「层内」权重 → 改写成 `model.decoder.xxx`。
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
             nextn_spec_weight_names_out_of_layer = [
@@ -3653,14 +3706,19 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "hc_head_scale",
             ]
 
+        # 中译：shared experts 融合优化：把 shared_experts 当成第 n_routed_experts 号专家写进 FusedMoE。
+        #       当前只支持融合 1 个 shared expert。
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
+        # 中译：【第 3 步】主循环：用线程池并发提交 weight_loader（每个权重一个 future），
+        #       权重名随用随过滤、改名；futures 最后统一 result() 以汇集异常。
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             weight_names = []
             for name, loaded_weight in weights:
+                # 中译：开了 SGLANG_OPT_FP8_WO_A_GEMM 时必须拿 fp8 的 wo_a，否则直接报错（提示关掉该开关）。
                 if (
                     _FP8_WO_A_GEMM
                     and name.endswith(".wo_a.weight")
@@ -3674,14 +3732,17 @@ class DeepseekV4ForCausalLM(nn.Module):
                         "SGLANG_OPT_FP8_WO_A_GEMM=0."
                     )
                 try:
+                    # 中译：异步加载判定：Runai streamer 这类流式张量要走异步提交（否则会被后续读取失效）。
                     use_async_loading = should_async_load(loaded_weight)
 
+                    # 中译：把 HF/checkpoint 的名字映射成 SGLang 内部名字（embed/head/layers.N.attn→self_attn…）。
                     name = self.remap_weight_name_to_dpsk_hf_format(
                         name,
                         is_nextn=is_nextn,
                         num_hidden_layers=self.config.num_hidden_layers,
                     )
 
+                    # 中译：PP（流水线并行）过滤：不属于本 stage 的层直接丢弃（不报错）。
                     layer_id = get_layer_id(name)
                     if (
                         layer_id is not None
@@ -3692,6 +3753,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                         )
                     ):
                         continue
+                    # 中译：shared_experts 融合：把 `mlp.shared_experts.*` 改名成
+                    #       `mlp.experts.<n_routed_experts>.*`（跟在 routed 专家后面当最后一个专家）。
                     if (
                         self.num_fused_shared_experts > 0
                         and "mlp.shared_experts" in name
@@ -3701,9 +3764,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                             f"mlp.experts.{self.config.n_routed_experts}",
                         )
 
+                    # 中译：记录（改名后的）权重名，供 post_load_weights 做后处理时参考。
                     weight_names.append(name)
 
                     if not is_nextn:
+                        # 中译：主模型加载时：跳过 MTP/NextN 层的权重（它们由草稿模型单独加载）。
                         if hasattr(self.config, "num_nextn_predict_layers"):
                             num_nextn_layers = self.config.num_nextn_predict_layers
                             if num_nextn_layers > 0 and name.startswith("model.layers"):
@@ -3718,6 +3783,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                             if name.startswith("mtp"):
                                 continue
                     else:
+                        # 中译：nextn（草稿）加载时：跳过与目标模型共享的 head / embed_tokens，
+                        #       只保留 `model.layers.<nextn_layer_id>` 开头的权重，并做前缀改写：
+                        #       层外权重 → `model.*`；层内权重 → `model.decoder.*`。
                         if "shared_head.head" in name or "embed_tokens" in name:
                             continue
 
@@ -3734,13 +3802,18 @@ class DeepseekV4ForCausalLM(nn.Module):
                         if in_decoder:
                             name = name.replace(nextn_layer_prefix, "model.decoder")
 
+                    # 中译：RoPE 的 inv_freq 是运行时算出来的（不存 checkpoint），直接跳过。
                     if "rotary_emb.inv_freq" in name:
                         continue
+                    # 中译：【第 4 步·分支 A】stacked 映射：处理「一个模型参数由多个 ckpt 权重拼接」
+                    #       的情况（如 gate_up_proj），用 shard_id 告知当前权重写到哪一段。
                     for param_name, weight_name, shard_id in stacked_params_mapping:
                         if weight_name not in name:
                             continue
+                        # 中译：NPU 上参数名用 weight（ckpt 里可能叫 weight_packed）。
                         if _is_npu:
                             name = name.replace("weight_packed", "weight")
+                        # 中译：专家权重不走 stacked 映射（未物化的专家参数直接跳过）。
                         if ("mlp.experts." in name) and name not in params_dict:
                             continue
                         name = name.replace(weight_name, param_name)
@@ -3750,6 +3823,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                             break
                         param = params_dict[name]
                         weight_loader = param.weight_loader
+                        # 中译：提交到线程池：异步源（Runai streamer）走 async 分支，否则同步执行。
                         maybe_executor_submit(
                             executor=executor,
                             futures=futures,
@@ -3758,8 +3832,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                             func_args=(param, loaded_weight, shard_id),
                         )
                         loaded_params.add(name)
+                        # 中译：命中一个映射就停（stacked 映射之间互斥）。
                         break
                     else:
+                        # 中译：【第 4 步·分支 B】专家映射：把 ckpt 里按专家编号排列的 gate/down/up
+                        #       写入 FusedMoE 的融合专家参数（额外带 shard_id / expert_id）。
+                        #       若目标参数不存在，则记下 skip 标记（可能该专家未被本 rank 物化）。
                         skip_unmaterialized_expert_param = False
                         for mapping in expert_params_mapping:
                             param_name, weight_name, expert_id, shard_id = mapping
@@ -3791,25 +3869,33 @@ class DeepseekV4ForCausalLM(nn.Module):
                             loaded_params.add(resolved_name)
                             break
                         else:
+                            # 中译：专家映射没命中，且之前发现目标参数未物化（如本 rank 不该有的专家）→ 跳过。
                             if skip_unmaterialized_expert_param:
                                 continue
+                            # 中译：模型没有对应 bias 参数时（很多层是 bias-less）→ 跳过。
                             if name.endswith(".bias") and name not in params_dict:
                                 continue
+                            # 中译：PP 切分：embed_tokens 只放在第一个 stage。
                             if (
                                 ".embed_tokens." in name
                                 and not self.pp_group.is_first_rank
                             ):
                                 continue
+                            # 中译：PP 切分：最终 norm 只放在最后一个 stage。
                             if (
                                 name == "model.norm.weight"
                                 and not self.pp_group.is_last_rank
                             ):
                                 continue
+                            # 中译：PP 切分：输出头（lm_head）与 mHC 输出头只放在最后一个 stage。
                             if (
                                 name.startswith("model.hc_head_")
                                 or name == "lm_head.weight"
                             ) and not self.pp_group.is_last_rank:
                                 continue
+                            # 中译：compressor 两件套融合：`compressor.wkv.weight`（KV 投影）与
+                            #       `compressor.wgate.weight`（门控）各自到达后拼成 `compressor.wkv_gate.weight`；
+                            #       两者先后顺序不固定，所以用 cache 等齐（已融合过的 wkv_gate 不走这里）。
                             elif COMPRESSOR_PART in name and ".wkv_gate." not in name:
                                 is_kv = name.endswith(".wkv.weight")
                                 is_wgate = name.endswith(".wgate.weight")
@@ -3817,11 +3903,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 key = name.rsplit(".", 2)[0]
                                 assert key.endswith(".compressor")
                                 if key not in cache_compressor_weight:
+                                    # 中译：第一半先缓存（Runai 流式张量要先 clone，否则后续取用时会被覆盖）。
                                     cache_compressor_weight[key] = (
                                         is_kv,
                                         _clone_if_runai_streamed_tensor(loaded_weight),
                                     )
                                 else:
+                                    # 中译：第二半到齐 → 确认两半类型不同，再按 [wkv; wgate] 沿 dim=0 拼接。
                                     assert key in cache_compressor_weight
                                     cached_is_kv, cached_weight = (
                                         cache_compressor_weight[key]
@@ -3842,6 +3930,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     )
                                     loaded_params.add(param_name)
                                     cache_compressor_weight.pop(key)
+                            # 中译：SGLANG_OPT_FUSE_WQA_WKV：把 `wq_a.*` 与 `wkv.*` 按行拼成 `wqkv_a.*`
+                            #       （q 在前、kv 在后）。需要覆盖权重本体及其各种伴生名
+                            #       （weight / weight_scale_inv / qweight / qweight_type），
+                            #       所以用 bucket 分别记住 q、kv 两半，齐了再交给 `_fuse_deepseek_v4_wqkv_a_pair`。
                             elif fuse_wqa_wkv and (
                                 name.endswith(".wq_a.weight")
                                 or name.endswith(".wq_a.weight_scale_inv")
@@ -3865,6 +3957,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     loaded_weight
                                 )
                                 if len(bucket) == 2:
+                                    # 中译：两半齐了 → 融合后一次性写入，并清掉缓存（GGUF 的 qweight_type 要一致）。
                                     fused_weight = _fuse_deepseek_v4_wqkv_a_pair(
                                         param_name, bucket
                                     )
@@ -3880,6 +3973,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     loaded_params.add(param_name)
                                     cache_wqkv_a_weight.pop(param_name)
                             else:
+                                # 中译：兜底分支：既不是 stacked、也不是专家、也不需要成对融合的权重 → 单参数直接写入。
+                                # 中译：k_scale / v_scale 改名：ckpt 里写作 `k_proj.*` / `v_proj.*`，
+                                #       而模型侧把它们挂在 attn_mqa 上（`attn_mqa.k_scale / v_scale`）。
                                 if (
                                     "k_scale" in name or "v_scale" in name
                                 ) and name not in params_dict:
@@ -3890,6 +3986,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                             )
                                             break
                                 if name not in params_dict:
+                                    # 中译：参数不存在 → 跳过；mtp 前缀的名字不打警告（MTP 权重可能残留）。
                                     if not name.startswith("mtp"):
                                         logger.warning(
                                             f"{name} not found in params_dict."
@@ -3897,6 +3994,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     continue
                                 param = params_dict[name]
 
+                                # 中译：单参数写入（模块自带 weight_loader 时优先用它）。
                                 weight_loader = auto_weight_loader(param)
                                 maybe_executor_submit(
                                     executor=executor,
@@ -3907,16 +4005,24 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 )
                                 loaded_params.add(name)
                 except Exception as e:
+                    # 中译：给异常补上「哪个权重、什么形状」，方便定位形状/名字不匹配的加载失败。
                     e.add_note(f"{name=} {loaded_weight.shape=}")
                     raise
 
+            # 中译：汇集所有异步任务的结果：任一 weight_loader 抛错都会在这里冒出来（首个错误即中断）。
             for future in concurrent.futures.as_completed(futures):
                 future.result()
 
+        # 中译：【第 5 步】收尾校验：两个「成对融合」缓存在扫完后必须为空——
+        #       非空说明 checkpoint 少了配对的权重（如只有 wkv 没有 wgate），这是数据问题，直接断言失败。
         assert len(cache_compressor_weight) == 0
         assert len(cache_wqkv_a_weight) == 0, cache_wqkv_a_weight.keys()
         unloaded_params = params_dict.keys() - loaded_params
 
+        # 中译：未加载参数的白名单（这些本来就不该从 checkpoint 里来，或本来就不存在）：
+        #       k_scale/v_scale 与 blockscale_swizzled 是运行时衍生的；
+        #       embed_tokens 只属于首个 PP stage；model.norm / lm_head / hc_head_ 只属于最后一个 stage；
+        #       nextn 模式下 lm_head / embed_tokens 是与主模型共享的。
         skipped_checking_patterns = [
             "attn_mqa.k_scale",
             "attn_mqa.v_scale",
@@ -3938,12 +4044,16 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
         }
         if unloaded_params:
+            # 中译：仍有参数没从 checkpoint 初始化 → 打 warning（不报错，可能是随机初始化/后续热更新）。
             logger.warning(
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
             )
 
+        # 中译：加载后处理（由 deepseek_common 的 mixin 提供，内部会调 quant_method 的
+        #       process_weights_after_loading()，做的如算子重排、scale 折叠、compressor 结构衍生等）。
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
+        # 中译：非 nextn 时预热 mHC kernel（JIT 编译），把编译开销留在加载阶段，别落到首个请求上。
         if not is_nextn:
             self._prewarm_mhc_kernels()
 
@@ -3973,6 +4083,15 @@ EntryClass = [DeepseekV4ForCausalLM]
 
 
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """把 fp8 权重按 128×128 block scale 反量化成 bfloat16。
+
+    【中译】用于 `wo_a`（output LoRA 的 A 矩阵）这类「checkpoint 给 fp8 权重 + e8m0/float32 scale，
+           但模型侧要 bf16」的场合：先把 `(sn bn) (sk bk)` 拆成 `sn bn sk bk` 四个维度
+           （bn/bk = 每 128 个元素一个 scale），乘上 scale 后再拼回二维。
+           输入示例：weight=<[4096, 5120] fp8_e4m3fn>, scale=<[32, 40] fp8_e8m0fnu>
+           输出示例：<[4096, 5120] bfloat16>（每个 128×128 子块乘自己的 scale）
+           异常：dtype 不符 → AssertionError。
+    """
     from einops import rearrange
 
     assert (
@@ -3994,6 +4113,14 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 
 def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    """Runai 流式张量要先克隆再用（否则会被下一次预取覆盖）。
+
+    【中译】Runai streamer 是「复用同一块缓冲、边读边喂」的流式实现，张量在下一次迭代就可能失效，
+           所以凡是要**跨迭代缓存**的权重（compressor / wq_a / wkv 成对融合）都必须先 clone().detach()；
+           普通张量原样返回，避免无谓拷贝。
+           输入示例：tensor=<来自 Runai streamer 的张量> / <普通 safetensors 张量>
+           输出示例：<已克隆的张量> / <原张量（同一对象）>
+    """
     if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
         return tensor.clone().detach()
     return tensor
@@ -4002,6 +4129,18 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
 def _dequant_fp8_wo_a_streaming(
     weights: Iterable[Tuple[str, torch.Tensor]],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
+    """流式地把 `wo_a` 的 (weight, scale) 配对并反量化成 bf16。
+
+    【中译】为什么必须“流式”：checkpoint 里 `.wo_a.weight` 与 `.wo_a.scale` 不一定相邻，
+           而且总量很大（不能先 dict(weights) 全存内存）。所以这里用 pending 字典分别等两半：
+           哪一半先到就先缓存，另一半到达时立即 `_dequant_fp8()` 并 yield 出去。
+           流式张量（Runai）缓存前要 clone（见 `_clone_if_runai_streamed_tensor`）。
+
+    输入示例：weights = 依次产出 ("...wo_a.weight", fp8), ("...wo_a.scale", e8m0),
+                        ("...q_proj.weight", ...) ...
+    输出示例：("...wo_a.weight", bf16), ("...q_proj.weight", ...) …；
+            扫描结束后若还有落单的 weight/scale（checkpoint 缺失另一半），原样透传（由上层报错）。
+    """
     pending: dict[str, dict[str, torch.Tensor]] = {}
     saw_wo_a_scale = False
     emitted = False
@@ -4047,6 +4186,14 @@ def _dequant_fp8_wo_a_streaming(
 def _dequant_fp8_wo_a(
     weights: Iterable[Tuple[str, torch.Tensor]],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
+    """非流式版本的 `wo_a` 反量化：先把整个权重表收进 dict，再做配对。
+
+    【中译】与 `_dequant_fp8_wo_a_streaming` 效果相同，但需要把全部权重同时驻留内存，
+           只适合权重总量可控的场景（内存换实现简单）；每对处理完就从 dict 里弹出。
+           输入示例：weights=（全量）("...wo_a.weight", fp8), ("...wo_a.scale", e8m0), ...
+           输出示例：("...wo_a.weight", bf16) + 其余权重原样输出
+           异常：找不到配对的 `.wo_a.scale` → AssertionError。
+    """
     weights_dict = dict(weights)
 
     for name in list(weights_dict.keys()):
@@ -4067,8 +4214,14 @@ def _prepare_deepseek_v4_weights(
     weights: Iterable[Tuple[str, torch.Tensor]],
     quant_config: Optional[QuantizationConfig],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
-    """Keep Expert Pack GGUF weights on the streaming load path."""
+    """Keep Expert Pack GGUF weights on the streaming load path.
 
+    【中译】`wo_a` 反量化的统一入口：只有 Expert Pack（GGUF）量化要保持在流式加载路径上，
+           其余情况一律走流式反量化 `_dequant_fp8_wo_a_streaming`（逐对处理、不整体驻留内存）。
+
+    输入示例：weights=<权重迭代器>, quant_config=<QuantizationConfig 或 None>
+    输出示例：可直接喂给 `model.load_weights()` 的迭代器（`wo_a.weight` 已变成 bf16）
+    """
     if quant_config is not None and quant_config.get_name() == "expert_pack":
         logger.info("Keep Expert Pack GGUF weights on the streaming load path")
         return weights
@@ -4078,8 +4231,17 @@ def _prepare_deepseek_v4_weights(
 def _fuse_deepseek_v4_wqkv_a_pair(
     param_name: str, bucket: dict[str, torch.Tensor]
 ) -> torch.Tensor:
-    """Fuse Q/KV rows while preserving their common GGUF type scalar."""
+    """Fuse Q/KV rows while preserving their common GGUF type scalar.
 
+    【中译】把 `wq_a` 与 `wkv` 两半按行拼接成 `wqkv_a`（dim=0 方向，q 在前、kv 在后）。
+           特例：GGUF 的 `qweight_type` 是一个标量参量（表示量化类型），不能直接 cat，
+           必须校验 q 与 kv 的类型一致后只返回其中一份。
+
+    输入示例：param_name="model.layers.0.self_attn.wqkv_a.qweight",
+              bucket={"q": <[1280, 5120]>, "kv": <[512, 5120]>}
+    输出示例：<[1792, 5120]>（1280 + 512 = 1792 行）
+    异常：`qweight_type` 两半不一致 → ValueError。
+    """
     q = bucket["q"]
     kv = bucket["kv"]
     if param_name.endswith(".qweight_type"):

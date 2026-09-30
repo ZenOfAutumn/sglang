@@ -1212,6 +1212,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             raise ValueError("PP consensus is required when pp_size > 1")
         if is_pp_mode and rids_to_check is not None:
             raise ValueError("rids_to_check cannot be used in PP mode")
+
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
         if is_pp_mode:
@@ -2537,6 +2538,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                     release_kv_cache(decode_req.req, self.tree_cache, is_insert=False)
                     decode_req.kv_receiver.clear()
                     decode_req.kv_receiver = None
+                    indices_to_remove.add(i)
                 if self.scheduler.metrics_reporter.enable_metrics:
                     self.scheduler.metrics_collector.increment_transfer_failed_reqs()
                 continue

@@ -29,7 +29,6 @@ SGLang 是一个**高性能大模型推理服务框架**（LLM/多模态/扩散�
 | **量化**                 | FP4/FP8/INT4/AWQ/GPTQ                  | `srt/layers/quantization/`                             | ★★★★☆ | ★★★★☆ | 直接降低显存与成本、提升吞吐；难在众多 scheme（AWQ/GPTQ/compressed-tensors/FP8/FP4）与硬件/kernel 适配 |
 | **CUDA Graph**           | 捕获静态图降低 kernel launch 开销      | `srt/model_executor/runner/`（`base/decode/prefill_cuda_graph_runner.py`） | ★★★★☆ | ★★★★☆ | decode 阶段消除大量小 kernel 的 launch 开销，显著降延迟；难在静态形状捕获/重放、padding 策略与各特性（spec/PD/多模态）的专用 runner |
 | **Chunked prefill**      | 长 prompt 分块预填充                   | `srt/managers/schedule_policy.py`                      | ★★★★☆ | ★★★☆☆ | 避免长 prompt 阻塞解码、平滑显存与延迟；难在分块大小与 decode 请求的调度权衡（`--chunked-prefill-size`）及跨 chunk 的状态衔接 |
-| **多 LoRA**              | 批量 LoRA                              | `srt/lora/`                                            | ★★★☆☆ | ★★★★☆ | 一份基座服务多业务微调权重，省显存；难在同批内不同 LoRA 的批处理（SGMV 等 triton kernel）与动态加载 |
 | **结构化输出**           | JSON/正则约束解码（压缩 FSM）          | `srt/constrained/`                                     | ★★★☆☆ | ★★★☆☆ | Agent/工具调用刚需，保证输出可被程序解析；难在多 grammar 后端（xgrammar/outlines/llguidance）与采样、压缩 FSM 的对接 |
 
 ### 1.3 技术栈
@@ -202,7 +201,6 @@ Decode 节点各阶段：
 | PD 分离    | `srt/disaggregation/` | `decode.py`, `prefill`/`encode` 相关                                                             |
 | 并行       | `srt/distributed/`    | `parallel_state.py`；`layers/dp_attention.py`                                                    |
 | 结构化输出 | `srt/constrained/`    | FSM/grammar 后端                                                                                 |
-| LoRA       | `srt/lora/`           | 多 LoRA 批处理                                                                                   |
 | 前端 DSL   | `python/sglang/lang/` | `interpreter.py`, `ir.py`, `api.py`                                                              |
 
 ---
@@ -324,7 +322,6 @@ Decode 节点各阶段：
 | PD 分离        | `srt/disaggregation/decode.py`                                | `pd_disaggregation.md`                              |
 | 张量/专家并行  | `srt/distributed/parallel_state.py`, `layers/dp_attention.py` | `expert_parallelism.md`, `pipeline_parallelism.md`  |
 | 结构化输出     | `srt/constrained/`                                            | `structured_outputs.ipynb`                          |
-| 多 LoRA        | `srt/lora/`                                                   | `lora.ipynb`                                        |
 | 分层 KV 缓存   | `mem_cache/hiradix_cache.py`                                  | `hicache.rst`                                       |
 | 可观测性       | `srt/observability/`                                          | `observability.md`                                  |
 | RL 集成       | `srt/weight_sync/`, `checkpoint_engine/`                      | `sglang_for_rl.md`                                  |

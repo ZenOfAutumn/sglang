@@ -478,6 +478,7 @@ class SchedulerProfilerManager:
         if self.torch_profiler is not None:
             self.torch_profiler = None
             gc.collect()
+
         self.profile_in_progress = False
         self.profiler_start_forward_ct = None
 

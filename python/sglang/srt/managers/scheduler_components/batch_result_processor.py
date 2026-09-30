@@ -342,6 +342,7 @@ class SchedulerBatchResultProcessor:
                         ),
                     )
 
+                if (
                     req.finished() and req.inflight_middle_chunks <= 0
                 ) or req.is_retracted:
                     # Decode req in a mixed batch, or a retracted req. Keep an
@@ -368,6 +369,7 @@ class SchedulerBatchResultProcessor:
                         req.output_ids.append(next_token_id)
 
                         self._maybe_update_reasoning_tokens(req, next_token_id)
+
                         req.update_finish_state()
                     if req.finished():
                         # 中译：刚生成首 token 就触发停止：收集专家/indexer 信息并释放 KV。
@@ -668,6 +670,9 @@ class SchedulerBatchResultProcessor:
         else:
             raise ValueError(
                 f"Unexpected hidden states capture mode: {capture_hidden_mode}"
+            )
+        return hidden_state_offset
+
     @staticmethod
     def _append_decode_hidden_states(
         *,
@@ -678,6 +683,7 @@ class SchedulerBatchResultProcessor:
     ) -> None:
         if accept_len <= 0:
             return
+
         if req.return_hidden_states == "last":
             valid_accept_len = accept_len
             if req.finished_len is not None:
@@ -685,10 +691,12 @@ class SchedulerBatchResultProcessor:
                 valid_accept_len = max(
                     0,
                     min(accept_len, req.finished_len - step_start),
+                )
             if valid_accept_len > 0:
                 req.hidden_states[:] = [
                     hidden_states[start + valid_accept_len - 1].cpu().tolist()
                 ]
+        else:
             req.hidden_states.extend(
                 hidden_states[start : start + accept_len].cpu().tolist()
             )
@@ -833,18 +841,22 @@ class SchedulerBatchResultProcessor:
                     # FSM already advanced + truncated by advance_grammar_fsm; reuse
                     # the retained (grammar-legal) run instead of advancing again.
                     accept_tokens = result.grammar_retained_tokens[i]
+
                 # Commit the full accepted run (drafts + bonus).
                 num_accept_tokens = len(accept_tokens)
                 req.kv.kv_committed_len += num_accept_tokens
                 req.spec_verify_ct += 1
+
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
                 req.spec_num_correct_drafts += num_correct_drafts
                 req.update_spec_correct_drafts_histogram(num_correct_drafts)
+
                 if block_accept_lens is not None:
                     req.spec_num_block_accept_tokens += block_accept_lens[i]
                 if cap_lens is not None:
                     req.spec_num_cap_tokens += cap_lens[i]
                     req.update_spec_cap_lens_histogram(cap_lens[i])
+
             predict_tokens.append(accept_tokens)
 
         return predict_tokens
@@ -1240,6 +1252,7 @@ class SchedulerBatchResultProcessor:
                 and req.mamba_next_track_idx == req.mamba_last_track_idx
             ):
                 req.mamba_lazy_is_insert = False
+
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
         should_update = completed_mamba_boundary if lazy else known_mamba_boundary
@@ -1250,6 +1263,7 @@ class SchedulerBatchResultProcessor:
                 result,
                 i,
                 known_boundary=not lazy and known_mamba_boundary is True,
+            )
 
         if (
             get_disagg().disaggregation_decode_enable_offload_kvcache

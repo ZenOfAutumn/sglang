@@ -834,6 +834,16 @@ def general_mm_embed_routine(
                     )
                 else:
                     input_embeds, other_info = embed_mm_inputs(
+                        mm_inputs_list=mm_inputs_list,
+                        extend_prefix_lens=extend_prefix_lens,
+                        extend_seq_lens=extend_seq_lens,
+                        input_ids=input_ids,
+                        input_embedding=embed_tokens,
+                        multimodal_model=multimodal_model,
+                        data_embedding_func_mapping=data_embedding_funcs,
+                        placeholder_tokens=placeholder_tokens,
+                        use_deepstack=use_deepstack,
+                    )
 
             # add for qwen3_vl deepstack
             # 中译：Qwen3-VL 等 deepstack 模型——把 deepstack embedding 透传给语言模型前向。
@@ -1325,6 +1335,7 @@ def get_new_expanded_mm_items(original_mm_items):
                     if not _try_simple_split(item, num_items, expanded_mm_items):
                         expanded_mm_items.append(item)
                     continue
+
                 if isinstance(image_grid_thw, torch.Tensor):
                     patches_per_item = (
                         torch.prod(image_grid_thw, dim=-1).long().tolist()

@@ -203,6 +203,7 @@ def get_pp_indices(
             # 前面有 (pp_size - remainder) 个普通段（各 base_layers 层），
             # 减去它是为了扣掉「本段之前那些普通段少算的那 1 层偏移」。
             partitions_without_extra_layer = pp_size - remainder
+            # This partition gets one extra layer
             start_layer = pp_rank * (base_layers + 1) - partitions_without_extra_layer
             end_layer = start_layer + (base_layers + 1)
         else:

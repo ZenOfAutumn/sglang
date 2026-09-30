@@ -105,6 +105,7 @@ def get_mm_processor_cls(hf_config, server_args: ServerArgs, model_config=None):
     # 中译：既无专用处理器也不走 Transformers 后端——无法处理该架构，报错并列出已注册架构。
     return None
 
+
 def get_mm_processor(
     hf_config,
     server_args: ServerArgs,

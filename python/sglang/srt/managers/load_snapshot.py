@@ -170,10 +170,13 @@ def zmq_reader_owner(caller: str) -> bool:
 
 class MemoryMetrics(msgspec.Struct, array_like=True):
     """Memory breakdown metrics."""
+
     weight_gb: float
     kv_cache_gb: float
     graph_gb: float
     token_capacity: int
+
+
 class SpeculativeMetrics(msgspec.Struct, array_like=True):
     """Speculative decoding metrics."""
 
@@ -295,12 +298,15 @@ _CORE_KEYS = tuple(
     f for f in LoadSnapshot.__struct_fields__ if f not in _SECTION_FIELDS
 )
 
+
 def _enc_hook(obj):
     """Coerce numpy scalars to native Python; msgpack has no numpy types."""
     to_item = getattr(obj, "item", None)
     if to_item is not None:
         return to_item()
     raise NotImplementedError(f"cannot encode {type(obj).__name__} in load snapshot")
+
+
 snapshot_encoder = msgspec.msgpack.Encoder(enc_hook=_enc_hook)
 snapshot_decoder = msgspec.msgpack.Decoder(LoadSnapshot)
 

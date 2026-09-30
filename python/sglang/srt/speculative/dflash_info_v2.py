@@ -66,6 +66,9 @@ def _get_overlap_plan_stream(
 class DFlashDraftInputV2(SpecInput):
     """DFLASH V2 草稿侧状态，在 overlap 迭代间传递（spec-v2）。
 
+    Draft-side state carried across overlap iterations (spec-v2).
+    """
+
     # Legacy Eagle-shaped fields; DFLASH relays via FutureMap so these are unused.
     topk_p: torch.Tensor
     topk_index: torch.Tensor

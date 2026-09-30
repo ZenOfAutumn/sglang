@@ -237,6 +237,8 @@ class DataParallelController:
 
         self.dp_active: List[bool] = [True] * self.launch_dp_size + [False] * (
             self.max_dp_size - self.launch_dp_size
+        )
+
         self.dp_budget = DPBudget(get_parallel().dp_size)
         self.load_snapshot_reader = create_load_snapshot_reader(
             port_args,
@@ -318,8 +320,17 @@ class DataParallelController:
                 for i in range(self.max_dp_size)
             ]
             self._refresh_active_workers()
+            return
+        if len(ranks.status) != self.max_dp_size:
+            logger.warning(
                 "[DPC] update_active_ranks: status len=%d != max_dp_size=%d; "
+                "ignoring update",
+                len(ranks.status),
+                self.max_dp_size,
+            )
+            return
         self.status = list(ranks.status)
+
     def add_elastic_workers(self, slot_offset: int, slot_count: int):
         """Activate a range of pre-bound worker slots."""
         end = slot_offset + slot_count
@@ -328,25 +339,36 @@ class DataParallelController:
                 f"[Elastic EP] add_elastic_workers: slot_offset={slot_offset} + "
                 f"slot_count={slot_count} exceeds max_dp_size={self.max_dp_size}. "
                 f"Restart with a larger --max-ep-size."
+            )
+
         for slot in range(slot_offset, end):
             if self.dp_active[slot]:
                 logger.debug(
                     "[Elastic EP] add_elastic_workers: slot %d already active; "
                     "skipping",
                     slot,
+                )
                 continue
             assert self.workers[slot] is not None, (
                 f"[Elastic EP] add_elastic_workers: slot {slot} was not "
                 f"pre-bound at launch; expected a primary-bound PUSH socket."
+            )
             self.dp_active[slot] = True
             self.status[slot] = True
+
+        self._refresh_active_workers()
+        logger.debug(
             "[Elastic EP] DataParallelController activated slots %s "
             "(active=%d / max=%d)",
             list(range(slot_offset, end)),
             self._active_count_cache,
+            self.max_dp_size,
+        )
+
     def _refresh_active_workers(self) -> None:
         self._active_workers = [
             i for i, active in enumerate(self.dp_active) if active and self.status[i]
+        ]
         self._active_count_cache = len(self._active_workers)
 
     def refresh_load_budget(self):
@@ -823,6 +845,7 @@ class DataParallelController:
                 display_tp_rank = tp_rank + offset
                 display_moe_ep_rank = moe_ep_rank + offset
                 display_dp_rank = dp_rank + offset if dp_rank is not None else None
+
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
                     proc = mp.Process(
                         target=self.run_scheduler_process_func,

@@ -357,32 +357,68 @@ def _validate_default_loader_extra_config(
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
 
+    # 中译：=================================================================================
+    # DefaultModelLoader = 「默认权重加载器」：SGLang 里绝大多数模型的权重都由它读进来
+    #   （默认 --load-format auto；safetensors / pt / npcache / mistral / fastsafetensors
+    #    这几个格式也在本类内部处理，不是独立 loader 类）。
+    #
+    # 它负责的三件事（即 load_model() 的骨架）：
+    #   ① _prepare_weights()  —— 定位权重文件：本地还是 HF 下载、按格式选文件、去重与排序；
+    #   ② _initialize_model() —— 建出模型结构（目标设备上的空壳 + quant_config）；
+    #   ③ load_weights_and_postprocess()
+    #                        —— 逐个张量 load_weights()，再让各 quant_method 执行
+    #                           process_weights_after_loading()（重排/反量化等后处理）。
+    #
+    # 关键子对象：
+    #   · Source / ResolvedSource —— 「权重来源」：前者是待解析的来源，后者是已解析出本地
+    #     文件列表的版本（启动期 overlap 加载先 resolve，再后台预取文件）；
+    #   · counter_before/after_loading_weights —— 两个时间戳，用于统计权重加载耗时。
+    # =====================================================================================
+
     # default number of thread when enable multithread weight loading
+    # 中译：开启多线程权重加载时的默认线程数（可用 --model-loader-extra-config 的
+    #       num_threads 覆盖）。
     DEFAULT_NUM_THREADS = 8
 
+    # 中译：匹配 MTP（multi-token prediction）层的权重名，例如 model.mtp.layers.3.xxx；
+    #       供 _filter_mtp_weights 按 draft_model_idx 只保留对应的那一层。
     _MTP_PATTERN = re.compile(r"model\.mtp\.layers\.(\d+)\.")
 
     @dataclasses.dataclass
     class Source:
         """A source for weights."""
 
+        # 中译：一个「权重来源」。主模型一份；若模型声明了 secondary_weights（如多模态
+        #       视觉塔、EAGLE 额外权重），则每个来源再一份，它们共用同一套解析/迭代逻辑。
+        #
+        #       输入示例：Source(model_or_path="Qwen/Qwen3-8B", revision=None, prefix="",
+        #                        fall_back_to_pt=True, model_config=<ModelConfig>)
+        #       输出示例：交给 _get_weights_iterator() 后产出的 (权重名, 张量) 流。
+
         model_or_path: str
         """The model ID or path."""
+        # 中译：模型 ID（HF repo）或本地路径。
 
         revision: Optional[str]
         """The optional model revision."""
+        # 中译：可选的 revision（分支 / commit / tag）；None 表示默认分支。
 
         prefix: str = ""
         """A prefix to prepend to all weights."""
+        # 中译：给该来源的所有权重名加的前缀（多来源合并到同一个模型命名空间时用）。
 
         fall_back_to_pt: bool = True
         """Whether .pt weights can be used."""
+        # 中译：找不到 safetensors 时，是否允许回退到 .pt 权重。
 
         model_config: Optional[ModelConfig] = None
         """The model configuration (for checking architecture, etc)."""
+        # 中译：模型配置（用于判断架构、追加 MTP safetensors 等）。
 
         @classmethod
         def init_new(cls, model_config: ModelConfig, model):
+            # 中译：从 ModelConfig + 模型实例构造「主来源」：model_or_path / revision 取自配置；
+            #       fall_back_to_pt 看模型是否声明 fall_back_to_pt_during_load（默认允许回退 .pt）。
             return cls(
                 model_config.model_path,
                 model_config.revision,
@@ -395,15 +431,36 @@ class DefaultModelLoader(BaseModelLoader):
     class ResolvedSource:
         """A weight source whose local checkpoint files are already resolved."""
 
+        # 中译：已解析出权重文件列表的来源（frozen = 解析结果不可变）。
+        #       用途：--is-startup-weight-load-overlap 下先 resolve 出文件清单，
+        #       让后台线程提前把文件读进 page cache，再开始真正加载。
+        #       输入示例：ResolvedSource(
+        #                    source=<Source>,
+        #                    hf_folder="/data/Qwen3-8B",
+        #                    weight_files=("model-00001-of-00004.safetensors", ...),
+        #                    use_safetensors=True,
+        #                )
+
         source: DefaultModelLoader.Source
         hf_folder: str
         weight_files: Tuple[str, ...]
         use_safetensors: bool
 
+    # 中译：权重加载的两个时间戳：权重迭代器首次被消费前、加载完成后；两者之差即加载耗时口径。
     counter_before_loading_weights: float = 0.0
     counter_after_loading_weights: float = 0.0
 
     def __init__(self, load_config: LoadConfig):
+        """初始化 loader：只校验参数，不碰权重文件。
+
+        【输入示例】load_config=LoadConfig(
+                       load_format="auto",
+                       model_loader_extra_config={"enable_multithread_load": True},
+                   )
+        【输出】无返回值；副作用是校验 extra_config 的键是否被当前 load_format 支持
+               （num_threads / enable_multithread_load；fastsafetensors 额外允许 enable_gds），
+               非法键直接抛 ValueError。
+        """
         super().__init__(load_config)
         _validate_default_loader_extra_config(
             extra_config=load_config.model_loader_extra_config,
@@ -416,11 +473,21 @@ class DefaultModelLoader(BaseModelLoader):
         """Download model from ModelScope hub if SGLANG_USE_MODELSCOPE is True.
 
         Returns the path to the downloaded model, or the original model path if
-        not downloaded from ModelScope."""
+        not downloaded from ModelScope.
+
+        【中译】若环境变量 SGLANG_USE_MODELSCOPE 为真，则改从 ModelScope（国内源）下载模型，
+               返回下载后的本地目录；否则原样返回传入路径。modelscope 是懒加载 import，
+               平时不装也能正常工作。
+
+        【输入示例】model="Qwen/Qwen3-8B", revision=None（且 SGLANG_USE_MODELSCOPE=1）
+        【输出示例】"/root/.cache/modelscope/hub/models/Qwen/Qwen3-8B"  # 已下载
+                   "Qwen/Qwen3-8B"                              # 未开启该环境变量
+        """
         if get_bool_env_var("SGLANG_USE_MODELSCOPE"):
             # download model from ModelScope hub,
             # lazy import so that modelscope is not required for normal use.
             # pylint: disable=C.
+            # 中译：从 ModelScope 下载；懒加载 import，保证常规使用不必安装 modelscope。
             from modelscope.hub.snapshot_download import snapshot_download
 
             if not os.path.exists(model):
@@ -432,6 +499,7 @@ class DefaultModelLoader(BaseModelLoader):
                     ignore_file_pattern=self.load_config.ignore_patterns,
                 )
             else:
+                # 中译：路径已存在（如本来就是本地目录）→ 直接用，不再下载。
                 model_path = model
             return model_path
         return model
@@ -441,7 +509,18 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> Tuple[str, List[str], bool]:
         """Prepare weights for the model.
 
-        If the model is not local, it will be downloaded."""
+        If the model is not local, it will be downloaded.
+
+        【中译】定位/准备权重文件：根据 load_format 决定允许的文件模式和索引文件名，
+               决定要不要下载（非本地则从 HF 拉），然后过滤掉重复/不需要的文件，
+               并（可选）按环境变量做排序与跨 rank 错开，最后返回文件清单。
+
+        【输入示例】model_name_or_path="Qwen/Qwen3-8B", revision=None, fall_back_to_pt=True
+        【输出示例】("/root/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/xxx",
+                    [".../model-00001-of-00004.safetensors", ".../model-00002-of-00004.safetensors", ...],
+                    True)    # 第三个值是 use_safetensors
+        异常：所有模式都找不到文件 → RuntimeError；load_format 未知 → ValueError。
+        """
         model_name_or_path = self._maybe_download_from_modelscope(
             model_name_or_path, revision
         )
@@ -451,6 +530,12 @@ class DefaultModelLoader(BaseModelLoader):
         use_safetensors = False
         index_file = SAFE_WEIGHTS_INDEX_NAME
         # Some quantized models use .pt files for storing the weights.
+        # 中译：按 load_format 决定允许的权重文件模式（部分量化模型用 .pt 存权重，
+        #       所以下面 PT / NPCACHE 也各有分支）：
+        #       AUTO（默认）→ 先 safetensors 后 bin，两者都能接受；
+        #       SAFETENSORS / FASTSAFETENSORS → 只要 *.safetensors；
+        #       MISTRAL → 只要 consolidated*.safetensors（对应的索引名也不同）；
+        #       PT → 只要 *.pt；NPCACHE → 只要 *.bin。
         if load_format == LoadFormat.AUTO:
             allow_patterns = ["*.safetensors", "*.bin"]
         elif (
@@ -474,6 +559,7 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             raise ValueError(f"Unknown load_format: {load_format}")
 
+        # 中译：允许回退时把 *.pt 也加进候选（safetensors 找不到就用 .pt）。
         if fall_back_to_pt:
             allow_patterns += ["*.pt"]
 
@@ -489,6 +575,7 @@ class DefaultModelLoader(BaseModelLoader):
             hf_folder = model_name_or_path
 
         server_args = get_server_args()
+        # 中译：若指定了 --model-checksum，下载/定位完后先校验文件完整性，避免拿到坏权重。
         if server_args and get_model().model_checksum is not None:
             from sglang.srt.utils.model_file_verifier import verify
 
@@ -496,6 +583,8 @@ class DefaultModelLoader(BaseModelLoader):
             verify(model_path=hf_folder, checksums_source=checksums_source)
 
         hf_weights_files: List[str] = []
+        # 中译：按 allow_patterns 的优先级依次 glob，命中第一个非空模式就停下（
+        #       即 AUTO 下优先 safetensors，没有才用 bin/pt）。
         for pattern in allow_patterns:
             hf_weights_files += glob.glob(os.path.join(hf_folder, pattern))
             if len(hf_weights_files) > 0:
@@ -509,6 +598,10 @@ class DefaultModelLoader(BaseModelLoader):
             # safetensors file. Using both breaks.
             # Here, we download the `model.safetensors.index.json` and filter
             # any files not found in the index.
+            # 中译：像 Mistral-7B-Instruct-v0.3 这类模型同时存在「分片 safetensors」和
+            #       「合并版 safetensors」，两个都用会重复加载而报错。
+            #       所以这里下载索引 `model.safetensors.index.json`，
+            #       把不在索引里的文件过滤掉。
             if not is_local:
                 download_safetensors_index_file_from_hf(
                     model_name_or_path,
@@ -520,6 +613,7 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files, hf_folder, index_file
             )
         else:
+            # 中译：非 safetensors 路径下，过滤掉推理用不上/已废弃的文件。
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
         if len(hf_weights_files) == 0:
@@ -529,6 +623,9 @@ class DefaultModelLoader(BaseModelLoader):
 
         # Sort and optionally stagger weight files (see SGLANG_SORT_WEIGHT_FILES).
         # k=-1: no sort; k=0: sort only; k>0: sort + stagger by (tp_rank*k).
+        # 中译：排序并（可选）错开各卡读的文件顺序（环境变量 SGLANG_SORT_WEIGHT_FILES）：
+        #       k=-1 → 不排序；k=0 → 只排序；k>0 → 排序后再按 (tp_rank*k) 错开，
+        #       避免多卡同时读同一个分片、把存储带宽全压在少数文件上。
         k = envs.SGLANG_SORT_WEIGHT_FILES.get()
         if k >= 0:
             hf_weights_files.sort()
@@ -554,10 +651,29 @@ class DefaultModelLoader(BaseModelLoader):
         startup_prefetch_started: bool = False,
         startup_prefetch_active: bool = False,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
-        """Get an iterator for the model weights based on the load format."""
+        """Get an iterator for the model weights based on the load format.
+
+        【中译】返回一个「(权重名, 张量)」生成器，具体用哪个迭代器由 load_format 与配置决定：
+               · 先确保文件清单已解析（传了 resolved_source 就用它，否则现场 _prepare_weights）；
+               · NPCACHE → np_cache 迭代器（仅 *.bin）；safetensors → fastsafetensors（FASTSAFETENSORS
+                 时启用 GDS）/ 多线程 / 单线程三种；否则 → pt 迭代器（多线程或单线程）；
+               · 若是 draft worker（draft_model_idx 非空）→ 先过滤出该层 MTP 权重并重映射到
+                 layer 0，再给权重名加上 source.prefix。
+
+        【输入示例】source=Source(model_or_path="Qwen/Qwen3-8B", revision=None, prefix="",
+                               fall_back_to_pt=True, model_config=<ModelConfig>),
+                   resolved_source=None,
+                   startup_prefetch_started=False,
+                   startup_prefetch_active=False
+        【输出示例】生成器，逐个产出 ("model.embed_tokens.weight", tensor(...)),
+                   ("model.layers.0.self_attn.q_proj.weight", tensor(...)), ...；
+                   最后一个参数为 True 时（典型 MTP 名字）会被过滤/改名。
+        """
         extra_config = self.load_config.model_loader_extra_config
         use_multithread = extra_config.get("enable_multithread_load", True)
         if resolved_source is None:
+            # 中译：没预先解析过 → 现场解析文件清单；safetensors 且知道模型配置时，
+            #       额外把 MTP（multi-token prediction）的 safetensors 纳入候选。
             hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
                 source.model_or_path, source.revision, source.fall_back_to_pt
             )
@@ -569,12 +685,14 @@ class DefaultModelLoader(BaseModelLoader):
                     source.model_config.hf_config,
                 )
         else:
+            # 中译：已预先解析（overlap 预热路径）→ 直接用现成的文件清单，不再重复解析。
             hf_folder = resolved_source.hf_folder
             hf_weights_files = list(resolved_source.weight_files)
             use_safetensors = resolved_source.use_safetensors
 
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
+            # 中译：np_cache 目前只支持 *.bin 格式的 checkpoint（所以断言不能是 safetensors）。
             assert use_safetensors is False
             weights_iterator = np_cache_weights_iterator(
                 source.model_or_path,
@@ -606,6 +724,12 @@ class DefaultModelLoader(BaseModelLoader):
             # only by the multi-threaded iterator, so it signals intent);
             # e.g. local NVMe, where prefetch is a no-op and multi-threading
             # helps.
+            # 中译：预取与多线程加载读的是同一批分片，会在共享/网络存储上争 I/O。
+            #       因此当预取生效（mmap 路径、非 FASTSAFETENSORS）且用户没显式要求多线程时，
+            #       退回单线程加载，让预取去喂 page cache。
+            #       在 --model-loader-extra-config 里显式写 enable_multithread_load 或 num_threads
+            #       可以退出该回退（后者只被多线程迭代器消费，相当于表明意图）——
+            #       例如本地 NVMe 上预取没意义，多线程反而更快。
             if (
                 concurrent_prefetch_active
                 and not weight_loader_disable_mmap
@@ -625,6 +749,8 @@ class DefaultModelLoader(BaseModelLoader):
                 use_multithread = False
 
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
+                # 中译：fastsafetensors 路径：GDS（GPU Direct Storage）默认开，
+                #       可用 --model-loader-extra-config 的 enable_gds 关掉。
                 enable_gds = extra_config.get("enable_gds", True)
                 weights_iterator = fastsafetensors_weights_iterator(
                     hf_weights_files,
@@ -652,6 +778,7 @@ class DefaultModelLoader(BaseModelLoader):
                 )
 
         else:
+            # 中译：非 safetensors（.pt / .bin）路径：只用多线程/单线程两种 pt 迭代器。
             if use_multithread:
                 weights_iterator = multi_thread_pt_weights_iterator(
                     hf_weights_files,
@@ -663,13 +790,16 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator = pt_weights_iterator(hf_weights_files)
 
         if self.load_config.draft_model_idx is not None:
+            # 中译：draft worker → 只保留 draft_model_idx 对应的那层 MTP 权重（见 `_filter_mtp_weights`）。
             return self._filter_mtp_weights(
                 weights_iterator, source.prefix, self.load_config.draft_model_idx
             )
 
         if self.counter_before_loading_weights == 0.0:
+            # 中译：首次进入迭代时打一个时间戳，作为「权重加载开始」的起点。
             self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
+        # 中译：给权重名加上来源前缀（主来源前缀通常为空；secondary 来源才非空）。
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
     @classmethod
@@ -680,7 +810,21 @@ class DefaultModelLoader(BaseModelLoader):
         and remap it to layer 0. Yields lazily so the upstream buffered
         iterator's sliding window actually bounds CPU memory — eager
         materialization caused page-reclaim hangs on large MoE checkpoints
-        with multi-layer EAGLE."""
+        with multi-layer EAGLE.
+
+        【中译】从权重流里只保留指定 draft 层的 MTP 权重，并把它重命名成 layer 0：
+               `model.mtp.layers.<draft_model_idx>.xxx` → `model.mtp.layers.0.xxx`，
+               非 MTP 的权重原样透传。
+               这里必须「惰性产出」（yield）而不能先物化：上游 buffered 迭代器的滑动窗口
+               才能真正限制 CPU 内存占用——曾经因为提前物化，导致多层 EAGLE 的大 MoE
+               checkpoint 触发 page reclaim 挂住。
+
+        【输入示例】weights_iterator=产出 [("model.mtp.layers.3.q_proj.weight", t),
+                                        ("model.embed_tokens.weight", t), ...],
+                   prefix="", draft_model_idx=3
+        【输出示例】("model.mtp.layers.0.q_proj.weight", t)、("model.embed_tokens.weight", t)
+                   （idx != 3 的 MTP 权重被丢弃，其余名称不变）
+        """
         for name, tensor in weights_iterator:
             match = cls._MTP_PATTERN.match(name)
             if match is not None:
@@ -697,6 +841,15 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
+        """汇总一个模型的所有权重来源（主来源 + secondary 来源）。
+
+        【中译】主来源 = `Source.init_new(model_config, model)`（即 --model-path 指向的 checkpoint）；
+               若模型自己声明了 `secondary_weights`（如多模态视觉塔、额外子模型），
+               则把它们的权重也接在后面，保持顺序不变。
+
+        【输入示例】model_config=<ModelConfig(model_path="Qwen/Qwen3-8B")>, model=<LlamaForCausalLM>
+        【输出示例】生成器：先产出主 checkpoint 的 (name, tensor)，再产出 secondary 来源的。
+        """
 
         primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
         yield from self._get_weights_iterator(primary_weights)
@@ -712,7 +865,18 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         model: nn.Module,
     ) -> Tuple[ResolvedSource, ...]:
-        """Resolve all checkpoint files before background startup prefetching."""
+        """Resolve all checkpoint files before background startup prefetching.
+
+        【中译】在后台预取之前，先把所有来源的权重文件「解析到位」：对每个来源调
+               _prepare_weights()（必要时补上 MTP safetensors），封装成 ResolvedSource。
+               价值：把「网络下载/文件枚举」这段串行开销提前暴露出来，之后交给
+               start_checkpoint_prefetch() 的后台线程去喂 page cache。
+
+        【输入示例】model_config=<ModelConfig(model_path="Qwen/Qwen3-8B")>, model=<LlamaForCausalLM>
+        【输出示例】(ResolvedSource(source=<Source>, hf_folder="/data/Qwen3-8B",
+                                    weight_files=("model-00001-of-00004.safetensors", ...),
+                                    use_safetensors=True),)
+        """
         sources = [DefaultModelLoader.Source.init_new(model_config, model)]
         sources.extend(
             cast(
@@ -751,7 +915,15 @@ class DefaultModelLoader(BaseModelLoader):
         *,
         num_threads: int,
     ) -> CheckpointFilePrefetchHandle:
-        """Start CPU-only page-cache staging for already-resolved sources."""
+        """Start CPU-only page-cache staging for already-resolved sources.
+
+        【中译】对已解析好的来源启动「纯 CPU 的 page cache 预热」：后台线程把 checkpoint
+               文件读一遍（只进 page cache，不占显存），后续真正 load_weights 时就是内存命中。
+               限制：只支持 safetensors（启动 overlap 路径的硬要求，否则直接 ValueError）。
+
+        【输入示例】resolved_sources=(ResolvedSource(...),), num_threads=8
+        【输出示例】CheckpointFilePrefetchHandle（可用于等待/取消预热）
+        """
         if not all(source.use_safetensors for source in resolved_sources):
             raise ValueError(
                 "Startup weight-loading overlap requires safetensors checkpoints"
@@ -767,7 +939,14 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-        """Build the final model structure and GPU parameter storage."""
+        """Build the final model structure and GPU parameter storage.
+
+        【中译】只建「模型结构 + GPU 参数存储」，不填真实权重（overlap 模式第一步）：
+               解析 quant_config → 在目标设备与目标 dtype 下 _initialize_model()。
+
+        【输入示例】model_config=<ModelConfig>, device_config=DeviceConfig("cuda", 0)
+        【输出示例】<LlamaForCausalLM>（参数是未初始化的存储，等着 prepare/commit 填值）
+        """
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
@@ -800,6 +979,20 @@ class DefaultModelLoader(BaseModelLoader):
         tensor identity rather than idempotence. Any quantization method that
         mutates weights in place therefore has to be evaluated here before its
         configuration is added to the supported set.
+
+        【中译】把模型参数初始化成「可检测的 sentinel」，而不是随机值——这样后续
+               commit_model_weights() 能证明每一个参数都真的被真实权重替换过。
+               本方法镜像了 DummyModelLoader 的初始化后处理器顺序，但填充值不同。
+               注意两点：
+               ① 这里会对 sentinel 值先跑一次 process_weights_after_loading()，而
+                  commit_model_weights() 会再对真实权重跑一次，所以 overlap 路径比
+                  串行路径多跑一次；对当前支持的矩阵是安全的（CUDA 非量化路径是 no-op），
+                  且「存储清单」只证明张量身份（identity）而非幂等性；
+               ② 因此任何「就地修改权重的量化方法」在加入支持集合之前，必须先在这里评估。
+
+        【输入示例】model=<initialize_model_for_startup 返回的模型>, model_config=<ModelConfig>
+        【输出示例】同一个 model.eval() 实例，参数已被 sentinel 填充、已跑过一遍
+                   process_weights_after_loading（可先用于 CUDA graph 预热）。
         """
         with set_default_torch_dtype(model_config.dtype):
             initialize_capture_safe_weights(model)
@@ -825,7 +1018,20 @@ class DefaultModelLoader(BaseModelLoader):
         target_device: torch.device,
         startup_prefetch_active: bool,
     ) -> None:
-        """Load real checkpoint values into a capture-ready model."""
+        """Load real checkpoint values into a capture-ready model.
+
+        【中译】把真实权重加载进「已 capture-ready 的模型」，收尾 overlap 流程：
+               用已解析的 ResolvedSource 构造权重迭代器（告知迭代器预取已启动，不要重复启动），
+               在模型 dtype 下执行 load_weights_and_postprocess()，最后记录加载结束时间戳。
+
+        【输入示例】model=<prepare_model_for_capture 返回的模型>,
+                   model_config=<ModelConfig>,
+                   resolved_sources=(ResolvedSource(...),),
+                   target_device=torch.device("cuda:0"),
+                   startup_prefetch_active=True
+        【输出】无返回值；副作用是模型的 sentinel 全被真实权重替换，
+               并置 self.counter_after_loading_weights（权重加载耗时的终点时间戳）。
+        """
 
         def weights_iterator():
             for resolved_source in resolved_sources:
@@ -845,6 +1051,14 @@ class DefaultModelLoader(BaseModelLoader):
         self.counter_after_loading_weights = time.perf_counter()
 
     def download_model(self, model_config: ModelConfig) -> None:
+        """纯下载：把权重文件拉到本地缓存，不做加载（基类的抽象方法实现）。
+
+        【中译】调用 _prepare_weights(..., fall_back_to_pt=True) 完成定位/下载；
+               供「先下载后加载」（如启动前预热缓存）的调用方使用。
+
+        【输入示例】model_config=ModelConfig(model_path="Qwen/Qwen3-8B", revision=None)
+        【输出】无返回值；副作用是本地缓存已存在全部权重文件（找不到则抛异常）。
+        """
         self._prepare_weights(
             model_config.model_path, model_config.revision, fall_back_to_pt=True
         )
@@ -854,6 +1068,21 @@ class DefaultModelLoader(BaseModelLoader):
 
         This method handles the common model loading logic shared between
         DefaultModelLoader (conditional) and ModelOptModelLoader (dedicated).
+
+        【中译】为 ModelOpt 量化准备「基础模型」（本方法被 DefaultModelLoader 与
+               ModelOptModelLoader 共用）：
+               ① 依赖 accelerate（缺了就提示 pip install accelerate）；
+               ② 先读 HF config（失败就回退 get_config）；
+               ③ infer_auto_device_map 试算显存：若推断结果里有 cpu（装不下单卡），
+                  就打折扣限制可用显存并打警告（提醒可能会 OOM）；
+               ④ AutoModelForCausalLM.from_pretrained 真正拉模型；
+               ⑤ 决定量化类型字符串（兼容旧写法 modelopt_quant 与新写法 quantization），
+                  非字符串直接抛 TypeError。
+
+        【输入示例】model_config=ModelConfig(model_path="nvidia/Llama-3.1-8B-FP8",
+                                        quantization="modelopt_fp8")
+        【输出示例】<AutoModelForCausalLM 实例>（device_map="auto"，供后续量化流程处理）
+        异常：未装 accelerate → ImportError；量化类型不是字符串 → TypeError。
         """
         if not HAS_ACCELERATE:
             raise ImportError(
@@ -868,6 +1097,7 @@ class DefaultModelLoader(BaseModelLoader):
                 local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
         except (KeyError, ValueError):
+            # 中译：HF config 读不出来时，回退到 SGLang 自己的 get_config。
             from sglang.srt.utils.hf_transformers_utils import get_config
 
             hf_config = get_config(
@@ -887,6 +1117,8 @@ class DefaultModelLoader(BaseModelLoader):
         device_map = "auto"
 
         if on_cpu:
+            # 中译：装不下单卡时，把可用显存按系数收窄（仅用于校准阶段），
+            #       并提示：如遇 OOM 可调该系数或手动降 calibration batch_size。
             for device in max_memory.keys():
                 if isinstance(device, int):
                     max_memory[device] *= DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION
@@ -909,12 +1141,15 @@ class DefaultModelLoader(BaseModelLoader):
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
         )
         # Handle both legacy modelopt_quant and unified quantization flags
+        # 中译：同时兼容两套写法：旧的 modelopt_quant 与新的统一 quantization 字段。
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
             # Legacy approach
+            # 中译：旧写法：直接拿 modelopt_quant 当量化类型。
             quant_choice_str = model_config.modelopt_quant
             rank0_log(f"ModelOpt quantization requested (legacy): {quant_choice_str}")
         else:
             # Unified approach - extract quantization type
+            # 中译：新写法：从统一字段推导出 ModelOpt 的量化类型（如 fp8/fp4）。
             quant_choice_str = model_config._get_modelopt_quant_type()
             rank0_log(
                 f"ModelOpt quantization requested (unified): {model_config.quantization} -> {quant_choice_str}"
@@ -934,12 +1169,30 @@ class DefaultModelLoader(BaseModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
+        """默认加载入口：建模型 + 加载全部权重 + 量化后处理（这是 SGLang 的主路径）。
+
+        【中译】分两种情况：
+               ① 模型配置里声明了旧式 modelopt_quant → 转给 _load_modelopt_base_model()
+                  只加载基础模型，不做额外量化处理（完整 ModelOpt 量化请用 ModelOptModelLoader）；
+               ② 常规路径（绝大多数模型）：
+                  · 解析 quant_config（决定 fp8/awq/... 的量化行为，不改变本 loader 选择）；
+                  · 在目标设备 + 模型 dtype 下 _initialize_model() 建结构；
+                  · `load_weights_and_postprocess()` 逐个张量 load_weights() 并做完处理；
+                  · 记录 counter_after_loading_weights（加载结束时间戳）。
+
+        【输入示例】model_config=<ModelConfig(model_path="Qwen/Qwen3-8B", quantization="fp8")>,
+                   device_config=DeviceConfig("cuda", 0)
+        【输出示例】<LlamaForCausalLM>（已 eval()，权重已就位于目标设备）
+        """
 
         if hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant:
             # Load base model using shared method
+            # 中译：旧式 ModelOpt 配置：走共享的基础模型加载逻辑。
             model = self._load_modelopt_base_model(model_config)
             # Note: DefaultModelLoader doesn't do additional quantization processing
             # For full ModelOpt quantization, use ModelOptModelLoader
+            # 中译：注意：DefaultModelLoader 不做额外量化处理；
+            #       需要完整 ModelOpt 量化流程请用 ModelOptModelLoader。
             return model.eval()
 
         target_device = torch.device(device_config.device)
@@ -957,10 +1210,28 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         self.counter_after_loading_weights = time.perf_counter()
+        # 中译：eval() 关闭 dropout 等训练态行为。
         return model.eval()
 
     @staticmethod
     def load_weights_and_postprocess(model, weights, target_device):
+        """把权重写进模型，并执行量化方法的后处理（被多个 loader 复用，所以是 staticmethod）。
+
+        【中译】流程：
+               ① （调试）加载前后各记一次可用显存，便于排查显存异常；
+               ② 按 quant_config 决定加载口径：
+                  · mxfp8：把 `xxx.weight_scale` 重命名为 `xxx.weight_scale_inv`；
+                  · nvfp4 / modelopt_fp4 在线量化：在一个临时环境变量作用域内加载
+                    （只影响加载期的 FP4 量化数值口径），加载后同步并清缓存；
+                  · 其余（含普通 FP8/BF16）：直接 model.load_weights(weights)；
+               ③ 逐个 module 调 quant_method.process_weights_after_loading()（重排/反量化等），
+                  若用了 CPU offload，则用 device_loading_context 临时把参数搬到目标设备再搬回。
+
+        【输入示例】model=<LlamaForCausalLM>,
+                   weights=(生成器：("model.layers.0.self_attn.q_proj.weight", tensor), ...),
+                   target_device=torch.device("cuda:0")
+        【输出】无返回值；副作用是权重写入模型（并可能完成量化后处理）。
+        """
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
             peak_memory = torch.cuda.max_memory_allocated()
@@ -981,6 +1252,8 @@ class DefaultModelLoader(BaseModelLoader):
         )
         is_mxfp8 = quant_config is not None and quant_config.get_name() == "mxfp8"
         if is_mxfp8:
+            # 中译：mxfp8 的 scale 在 checkpoint 里叫 `xxx.weight_scale`，模型侧期望
+            #       `xxx.weight_scale_inv`，所以这里做一次惰性重命名。
             weights = (
                 (
                     f"{name}_inv" if name.endswith(".weight_scale") else name,
@@ -992,6 +1265,8 @@ class DefaultModelLoader(BaseModelLoader):
         if is_nvfp4_online or is_modelopt_fp4_online:
             # Scope exact FP4 quantization math to load-time conversion only;
             # restore the original environment before serving starts.
+            # 中译：把「精确 FP4 量化数学」限制在加载期转换阶段——这几个环境变量会在
+            #       服务开始前被还原（temp_set_env 作用域退出即恢复）。
             with temp_set_env(
                 FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
                 FLASHINFER_NVFP4_4OVER6="1",
@@ -1001,6 +1276,7 @@ class DefaultModelLoader(BaseModelLoader):
             ):
                 model.load_weights(weights)
             if target_device.type == "cuda":
+                # 中译：FP4 在线量化会临时产生不少中间张量，同步后清一下缓存。
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
         else:
@@ -1024,6 +1300,9 @@ class DefaultModelLoader(BaseModelLoader):
                 # to be on the global target device. This scope is for the
                 # case where cpu offloading is used, where we will move the
                 # parameters onto device for processing and back off after.
+                # 中译：量化方法在执行加载后处理（重排/量化等）时，期望参数在全局目标设备上。
+                #       这里的作用域就是为了 CPU offload 场景：先把参数搬到设备上做处理，
+                #       处理完再搬回 CPU。
                 with device_loading_context(module, target_device):
                     quant_method.process_weights_after_loading(module)
 

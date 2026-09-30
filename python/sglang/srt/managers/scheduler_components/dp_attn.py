@@ -423,8 +423,10 @@ def prepare_mlp_sync_batch_raw(
     breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     coordinated_prefill = breakable_prefill or check_cuda_graph_backend(
         Phase.PREFILL, Backend.FULL
+    )
     prefill_graph_runner = (
         model_runner.prefill_cuda_graph_runner if coordinated_prefill else None
+    )
     can_run_prefill_cuda_graph = _local_prefill_cuda_graph_vote(
         local_batch=local_batch,
         prefill_graph_runner=prefill_graph_runner,

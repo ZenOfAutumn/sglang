@@ -220,7 +220,10 @@ def _ragged_verify_cap_accept() -> bool:
     from sglang.srt.speculative.ragged_verify import (
         RaggedVerifyMode,
         read_ragged_verify_mode,
+    )
+
     return read_ragged_verify_mode() is RaggedVerifyMode.CAP_ACCEPT
+
 _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_token_logprobs",
     "output_top_logprobs",
@@ -903,8 +906,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # Log the request
             self.request_logger.log_received_request(obj, self.tokenizer, request)
 
-        # 中译：暂停门控——若处于暂停态，挂起在条件变量上直到 continue_generation 唤醒。
-        # 中译：持「读锁」整个生成过程。权重更新持写锁，故此处保证不会在权重更新中途用到半新半旧权重。
+            # 中译：暂停门控——若处于暂停态，挂起在条件变量上直到 continue_generation 唤醒。
+            # 中译：持「读锁」整个生成过程。权重更新持写锁，故此处保证不会在权重更新中途用到半新半旧权重。
             # 中译：单条请求：分词 -> 发给调度器 -> 逐个 yield 响应；批量请求转交 _handle_batch_request。
             async with self.is_pause_cond:
                 await self.is_pause_cond.wait_for(lambda: not self.is_pause)
@@ -922,6 +925,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         yield response
                 else:
                     async for response in self._handle_batch_request(obj, request):
+                        yield response
         except BaseException:
             # _init_req_state created a rid_to_state entry per (sub-)request up
             # front. The normal remover is the scheduler-response path

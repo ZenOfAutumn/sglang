@@ -75,6 +75,8 @@ from functools import lru_cache
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
+    Any,
+    Dict,
     List,
     Literal,
     NamedTuple,
@@ -408,14 +410,19 @@ class MultimodalDataItem(msgspec.Struct, kw_only=True, dict=True, array_like=Tru
     model_specific_data: Dict[str, MultimodalDataValue] = msgspec.field(
         default_factory=dict
     )
+
     def __post_init__(self) -> None:
         if self.hash is not None:
             msgspec.Struct.__setattr__(self, "hash", self.hash & _MM_HASH_MASK)
+
     def __getattr__(self, name: str) -> MultimodalDataValue:
         if name in self.model_specific_data:
             return self.model_specific_data[name]
+
         raise AttributeError(
             f"'{self.__class__.__name__}' object has no attribute '{name}'"
+        )
+
     def __setattr__(self, name: str, value: MultimodalDataValue) -> None:
         if name in self.__struct_fields__:
             if name == "hash" and isinstance(value, int):
@@ -1016,11 +1023,14 @@ class Req(ReqDllmMixin):
         self.input_embeds = input_embeds
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
+
         # For req-level memory management
         self.kv = ReqKvInfo()
         self.retraction_backup: Optional[RetractionBackup] = None
+
         # for cross-encoder model
         self.token_type_ids = token_type_ids
+
         # The index of the extend / decode batch
         # 中译：该请求历经的 extend / decode 批次计数（每参与一次相应阶段就 +1，用于各种调度判断）。
         self.extend_batch_idx = 0
@@ -1486,6 +1496,7 @@ class Req(ReqDllmMixin):
         if get_serving().strip_thinking_cache and self.reasoning_tokens > 0:
             return min(self.kv.kv_committed_len, len(self.origin_input_ids))
         return self.kv.kv_committed_len
+
     def update_spec_correct_drafts_histogram(self, num_correct_drafts: int):
         """Record one step accepted draft count (excludes bonus token) into the histogram."""
         if len(self.spec_correct_drafts_histogram) <= num_correct_drafts:
@@ -2056,6 +2067,8 @@ class Req(ReqDllmMixin):
                 mamba_pool.get_cpu_copy(self.mamba_pool_idx.unsqueeze(0))
                 if mamba_pool is not None and self.mamba_pool_idx is not None
                 else None
+            ),
+        )
 
     def load_kv_cache(self, req_to_token_pool, token_to_kv_pool_allocator):
         assert self.retraction_backup is not None
@@ -3640,6 +3653,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Allocate memory (DSV4-NPU c{4,128}_state alloc lens are computed inside
         # the allocator, triggered from mem_cache/common.py.)
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+
         for req in self.reqs:
             req.decode_batch_idx += 1
 

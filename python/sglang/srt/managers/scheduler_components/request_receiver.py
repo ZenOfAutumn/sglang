@@ -143,6 +143,7 @@ class SchedulerRequestReceiver:
                         self.recv_from_tokenizer.drain(self.max_recv_per_poll)
                     )
                     return recv_reqs
+
                 while True:
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):

@@ -323,10 +323,15 @@ class FutureMap:
                 (self.req_pool_size,), -1, dtype=torch.int64, device=self.device
             )
             self.new_seq_lens_buf = torch.full(
+                (self.req_pool_size,), -1, dtype=torch.int64, device=self.device
+            )
         else:
             self.output_tokens_buf = torch.empty(
                 (self.req_pool_size,), dtype=torch.int64, device=self.device
+            )
             self.new_seq_lens_buf = torch.empty(
+                (self.req_pool_size,), dtype=torch.int64, device=self.device
+            )
         # Pinned host copy of new_seq_lens_buf + private stream for fwd-prepare
         # D2H pulls (gated only on publish, off the schedule stream). CUDA-only:
         # recovers occupancy lost to the WAR barrier (also CUDA-only); other
@@ -361,10 +366,12 @@ class FutureMap:
         # ngram-only relay bufs
         self.accept_tokens_buf: Optional[torch.Tensor] = None
         self.accept_lens_buf: Optional[torch.Tensor] = None
+
         self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
         # Debug consume-once state: armed by a recording publish, consumed by
         # resolve; arm/consume strictly alternate across all batch interleavings.
         self._publish_fresh = False
+
         self.confidence_relay = ConfidenceRelay(
             device=self.device,
             req_pool_size=self.req_pool_size,
@@ -464,6 +471,7 @@ class FutureMap:
                 return
             indices = draft_input.future_indices
             if indices.shape[0] == 0:
+                return
             draft_input.accept_tokens = self.accept_tokens_buf[indices].flatten()
             draft_input.accept_lens = self.accept_lens_buf[indices]
             return

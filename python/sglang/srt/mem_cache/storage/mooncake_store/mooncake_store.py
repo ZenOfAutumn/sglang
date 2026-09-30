@@ -806,6 +806,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if host_pool is None:
             raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
 
+        # Suffix order must match get_page_buffer_meta() for one page, because
+        # Mooncake zips object keys with registered buffer pointers.
         pool_name = transfer.name
         suffixes = []
         if pool_name == PoolName.MAMBA:

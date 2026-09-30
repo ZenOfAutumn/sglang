@@ -162,6 +162,21 @@ def init_tokenizer_manager(
     port_args: PortArgs,
     TokenizerManagerClass: Optional[TokenizerManager] = None,
 ) -> Tuple[TokenizerManager, TemplateManager]:
+    """在主进程中初始化 TokenizerManager 与 TemplateManager。
+
+    TokenizerManager 使用 ``server_args``/``port_args`` 实例化，随后从模型路径
+    加载对话/续写模板。仍为 ``auto`` 的 ``--reasoning-parser``/``--tool-call-parser``
+    会根据从对话模板中检测到的解析器进行解析（检测失败时给出警告并禁用）。
+
+    Args:
+        server_args: 该引擎实例解析后的服务端参数。
+        port_args: 为 tokenizer manager 分配的 IPC 通信端口。
+        TokenizerManagerClass: 可选的 tokenizer manager 类覆盖，供自定义分词
+            逻辑的 fork 使用。默认为 ``TokenizerManager``。
+
+    Returns:
+        (tokenizer_manager, template_manager) 元组。
+    """
     # Launch tokenizer process
     TokenizerManagerClass = TokenizerManagerClass or TokenizerManager
     tokenizer_manager = TokenizerManagerClass(server_args, port_args)
@@ -336,6 +351,20 @@ class Engine(EngineScoreMixin, EngineBase):
         routed_dp_rank: Optional[int],
         data_parallel_rank: Optional[int],
     ) -> Optional[int]:
+        """校验并归一化请求的数据并行（DP）rank。
+
+        ``data_parallel_rank`` 是 ``routed_dp_rank`` 的废弃别名；传入时会触发
+        ``DeprecationWarning``，且仅当未提供 ``routed_dp_rank`` 时才生效。当
+        ``dp_size <= 1`` 且 rank 为 0 时视为“不做路由”（返回 ``None``）；其他
+        越界 rank 会抛出 ``ValueError``。
+
+        Args:
+            routed_dp_rank: 请求路由到的目标 DP rank。
+            data_parallel_rank: ``routed_dp_rank`` 的废弃别名。
+
+        Returns:
+            归一化后的路由 DP rank；无需路由时返回 ``None``。
+        """
         if data_parallel_rank is not None:
             import warnings
 
@@ -998,6 +1027,20 @@ class Engine(EngineScoreMixin, EngineBase):
         scheduler_init_result: SchedulerInitResult,
         startup_tic: float,
     ) -> None:
+        """汇总引擎启动耗时指标并挂载到 tokenizer manager 上。
+
+        将各 scheduler 上报的分阶段耗时（权重加载、KV cache 分配、CUDA graph
+        捕获等）聚合，并与基于 ``startup_tic`` 测得的 tokenizer 端到端启动耗时
+        合并，写入 tokenizer manager 并打印日志。
+
+        Args:
+            tokenizer_manager: 接收指标的本引擎 tokenizer manager（或多
+                tokenizer 路由）。
+            scheduler_init_result: 启动 scheduler 的结果，包含各 scheduler
+                上报的启动耗时。
+            startup_tic: 在启动子进程最开始处记录的 ``time.perf_counter()``，
+                用于计算 tokenizer 端到端耗时。
+        """
         startup_time = build_engine_startup_time(
             (
                 info.get("startup_time")
@@ -1045,6 +1088,7 @@ class Engine(EngineScoreMixin, EngineBase):
         startup_tic = time.perf_counter()
 
         # Configure global environment
+        # 配置全局环境
         configure_logger(server_args)
         server_args.resolve_once()
 
@@ -1052,16 +1096,23 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Defensive: ensure plugins loaded (may already be loaded by
         # Engine.__init__ or CLI entry).
+        # 防御性处理：确保插件已加载（可能已由 Engine.__init__ 或 CLI 入口加载）。
         load_plugins()
 
         # Not read-only: the LoRA checks normalize adapter paths through late
         # resolution, which a published config refuses. Hence before publish --
         # and before the parser detection below, which consumes the "auto"
         # sentinel: a record rejected here has to stay retryable.
+        # 非只读：LoRA 检查会通过延迟解析（late resolution）归一化适配器路径，
+        # 而已发布的配置会拒绝这种写入。因此必须在 publish 之前执行——同时也要
+        # 在下面的解析器检测之前执行，因为后者会消费 "auto" 哨兵值：在此处被
+        # 拒绝的记录必须保持可重试。
         server_args.check_server_args()
 
         # Needs a tokenizer and a chat template, so it cannot live in the
         # pipeline; after the plugins, which may register the parser detected.
+        # 该步骤需要 tokenizer 和对话模板，因此不能放在 pipeline 中；需在插件
+        # 之后执行，因为插件可能会注册这里检测到的解析器。
         parsers = resolving_view(server_args)
         if parsers.reasoning_parser == "auto" or parsers.tool_call_parser == "auto":
             resolve_auto_parsers(server_args)
@@ -1069,6 +1120,8 @@ class Engine(EngineScoreMixin, EngineBase):
         # This publish replaces whatever was published before it, so the
         # rollback below restores that rather than clearing the process: a
         # caller that catches the launch error still has the context it had.
+        # 这里 publish 会覆盖此前发布的上下文，因此下面的回滚是恢复旧的上下文，
+        # 而不是清空进程：捕获到启动错误的调用方仍然拥有它原本的上下文。
         context_before_publish = snapshot_context()
         publish(server_args, role="tokenizer")
 
@@ -1076,13 +1129,18 @@ class Engine(EngineScoreMixin, EngineBase):
         # caller can hand back -- but only once the publication goes with it:
         # the validation stage writes through late resolution, which refuses a
         # record that is already published.
+        # 下面还没有派生任何子进程，因此此处失败会留下一条记录，调用方可以将其
+        # 传回——但前提是本次发布也随之回滚：校验阶段会通过延迟解析写入，而它
+        # 会拒绝一条已经发布的记录。
         try:
             # Allocate ports for inter-process communications
+            # 为进程间通信分配端口
             if port_args is None:
                 port_args = PortArgs.init_new(server_args)
             logger.info(f"server_args={server_args.resolved_dict()}")
 
             # Start the engine info bootstrap server if per-rank info is needed.
+            # 如果需要按 rank 获取信息，则启动 engine info 引导服务器。
             engine_info_bootstrap_server = None
             if (
                 get_model().remote_instance_weight_loader_start_seed_via_transfer_engine
@@ -1101,6 +1159,8 @@ class Engine(EngineScoreMixin, EngineBase):
 
             # Launch daemons (daemon mode only). The handles travel back to the
             # Engine that spawned them; shutdown() reaps from there.
+            # 启动守护进程（仅 daemon 模式）。句柄会返回给派生出它们的 Engine；
+            # shutdown() 会从这里回收。
             weight_cache_daemon_procs: List = []
             if server_args.weight_cache_mode == "daemon":
                 weight_cache_daemon_procs = cls._launch_weight_cache_daemons(
@@ -1111,8 +1171,11 @@ class Engine(EngineScoreMixin, EngineBase):
             raise
 
         # Launch scheduler processes
+        # 启动 scheduler 进程
         # Passed only when there is one: this hook is an override point, and a
         # subclass written against the three-argument signature must keep working.
+        # 仅在有 placement_group 时才会传入：该 hook 是一个覆写点，针对三参数签名
+        # 编写的子类必须保持可用。
         launch_kwargs = (
             {"placement_group": placement_group} if placement_group is not None else {}
         )
@@ -1131,10 +1194,12 @@ class Engine(EngineScoreMixin, EngineBase):
 
         if server_args.node_rank >= 1:
             # Non-zero-rank nodes do not run tokenizer processes.
+            # 非 0 rank 的节点不运行 tokenizer 进程。
             scheduler_init_result.wait_for_ready()
 
             if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
                 # When using `Engine` as a Python API, we don't want to block here.
+                # 当以 Python API 方式使用 `Engine` 时，不希望在此处阻塞。
                 return (
                     None,
                     None,
@@ -1162,9 +1227,13 @@ class Engine(EngineScoreMixin, EngineBase):
         # the API server, tokenization, and detokenization. In that mode we do
         # not start the Python detokenizer subprocess(es) or tokenizer manager.
         # Do not use RayEngine with the Rust server, as it is not supported.
+        # 嵌入式 Rust 服务器（在 rank 0 的 scheduler 内启动）负责 API 服务、
+        # 分词与解码。该模式下不再启动 Python 的 detokenizer 子进程或 tokenizer
+        # manager。不要将 RayEngine 与 Rust 服务器一起使用，因为不被支持。
         if envs.SGLANG_RUST_SERVER.get():
             scheduler_init_result.wait_for_ready()
             # Set up subprocess liveness watchdog to detect crashes
+            # 设置子进程存活看门狗以检测崩溃
             processes = list(scheduler_procs or [])
             names = [f"scheduler_{i}" for i in range(len(processes))]
             subprocess_watchdog = SubprocessWatchdog(
@@ -1183,6 +1252,8 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Launch detokenizer process(es) — optionally fronted by a router when
         # detokenizer_worker_num > 1.
+        # 启动 detokenizer 进程——当 detokenizer_worker_num > 1 时，可选地在其
+        # 前面加一个路由进程。
         detoken_procs, detoken_names = cls._launch_detokenizer_subprocesses(
             server_args=server_args,
             port_args=port_args,
@@ -1192,29 +1263,35 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_init_result.all_child_pids.append(p.pid)
 
         # Init tokenizer manager first, as the bootstrap server is initialized here
+        # 先初始化 tokenizer manager，因为引导服务器在这里初始化
         if server_args.tokenizer_worker_num == 1:
             tokenizer_manager, template_manager = init_tokenizer_manager_func(
                 server_args, port_args
             )
         else:
             # Launch multi-tokenizer router
+            # 启动多 tokenizer 路由
             tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
             template_manager = None
 
         startup_complete = False
         try:
             # Wait for the model to finish loading
+            # 等待模型加载完成
             scheduler_init_result.wait_for_ready()
 
             cls._set_startup_time(tokenizer_manager, scheduler_init_result, startup_tic)
 
             # Get back some info from scheduler to tokenizer_manager
+            # 从 scheduler 回传一些信息给 tokenizer_manager
             tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[
                 0
             ]["max_req_input_len"]
 
             # Set up subprocess liveness watchdog to detect crashes
             # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
+            # 设置子进程存活看门狗以检测崩溃
+            # 注意：RayEngine 返回 scheduler_procs=None，因为它使用 Ray actor 而非 mp.Process
             processes = list(scheduler_procs or [])
             names = [f"scheduler_{i}" for i in range(len(processes))]
             processes.extend(detoken_procs)
@@ -1270,13 +1347,16 @@ class Engine(EngineScoreMixin, EngineBase):
                 self.tokenizer_manager.cuda_vmm_feature_transport.shutdown()
 
     def __enter__(self):
+        """进入上下文管理器（支持 ``with Engine(...) as engine``）。"""
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
+        """退出上下文管理器：关闭引擎，并向外传播 ``with`` 代码块内抛出的异常。"""
         self.shutdown()
         return False
 
     def flush_cache(self):
+        """刷新所有 scheduler 的 KV / 前缀缓存以释放其内存。"""
         return self.loop.run_until_complete(self.tokenizer_manager.flush_cache())
 
     def open_session(
@@ -1319,28 +1399,44 @@ class Engine(EngineScoreMixin, EngineBase):
         self.loop.run_until_complete(self.tokenizer_manager.close_session(obj, None))
 
     def start_profile(self, **kwargs):
+        """在所有 scheduler 上启动 profiling。
+
+        Args:
+            **kwargs: 透传给 ``ProfileReq`` 的额外选项（如 ``output_dir``、
+                ``num_steps``、``activities``）。
+        """
         req = ProfileReq(req_type=ProfileReqType.START_PROFILE, **kwargs)
         self.loop.run_until_complete(self.tokenizer_manager.start_profile(req))
 
     def stop_profile(self):
+        """停止所有 scheduler 上的 profiling 并导出采集到的 trace。"""
         self.loop.run_until_complete(self.tokenizer_manager.stop_profile())
 
     def start_expert_distribution_record(self):
+        """开始在所有 scheduler 上记录 MoE 专家分布统计。"""
         self.loop.run_until_complete(
             self.tokenizer_manager.start_expert_distribution_record()
         )
 
     def stop_expert_distribution_record(self):
+        """停止在所有 scheduler 上记录 MoE 专家分布统计。"""
         self.loop.run_until_complete(
             self.tokenizer_manager.stop_expert_distribution_record()
         )
 
     def dump_expert_distribution_record(self):
+        """将记录到的 MoE 专家分布统计导出到磁盘。"""
         self.loop.run_until_complete(
             self.tokenizer_manager.dump_expert_distribution_record()
         )
 
     def get_server_info(self):
+        """返回引擎的启动配置以及实时运行状态。
+
+        合并解析后的服务端参数、rank 0 scheduler 的初始化信息、已记录的启动
+        耗时、从 scheduler 拉取的当前内部状态，以及 sglang 版本。配套的
+        ``get_model_info`` 则用于返回启动后（控制面）的变更。
+        """
         internal_states = self.loop.run_until_complete(
             self.tokenizer_manager.get_internal_state()
         )
@@ -1520,6 +1616,16 @@ class Engine(EngineScoreMixin, EngineBase):
         config_dict: Dict,
         load_format: Optional[str] = None,
     ):
+        """直接从内存中的张量注册并加载 LoRA 适配器，无需重启引擎。
+
+        Args:
+            lora_name: 注册适配器使用的名称。
+            tensors: 适配器权重，可为 name->tensor 字典，或按 rank 预序列化的
+                payload 列表。
+            config_dict: LoRA 适配器配置（rank、scaling、target modules 等）。
+            load_format: 可选的加载格式提示；``flattened_bucket`` 直接使用传入
+                的 payload，其他格式会按 TP rank 重新序列化。
+        """
         serialized_named_tensors = self._serialize_tensors_per_rank(
             tensors, load_format
         )
@@ -1584,12 +1690,23 @@ class Engine(EngineScoreMixin, EngineBase):
         return await self.tokenizer_manager.unload_lora_adapter(obj, None)
 
     def release_memory_occupation(self, tags: Optional[List[str]] = None):
+        """释放 scheduler 占用的显存，供其他任务使用。
+
+        Args:
+            tags: 可选，需要释放的显存区域列表（如 ``"kv_cache"``、
+                ``"weights"``）。``None`` 表示全部释放。
+        """
         obj = ReleaseMemoryOccupationReqInput(tags=tags)
         return self.loop.run_until_complete(
             self.tokenizer_manager.release_memory_occupation(obj, None)
         )
 
     def resume_memory_occupation(self, tags: Optional[List[str]] = None):
+        """重新申请此前由 ``release_memory_occupation`` 释放的显存。
+
+        Args:
+            tags: 可选，需要恢复的显存区域列表。``None`` 表示全部恢复。
+        """
         obj = ResumeMemoryOccupationReqInput(tags=tags)
         return self.loop.run_until_complete(
             self.tokenizer_manager.resume_memory_occupation(obj, None)
@@ -1610,11 +1727,16 @@ class Engine(EngineScoreMixin, EngineBase):
 
         self.loop.run_until_complete(self.tokenizer_manager.freeze_gc())
 
-    """
-    Execute an RPC call on all scheduler processes.
-    """
-
     def collective_rpc(self, method: str, **kwargs):
+        """在全部 scheduler 进程上执行一次 RPC 调用，并阻塞直到其完成。
+
+        Args:
+            method: 要在各 scheduler 上调用的方法名。
+            **kwargs: 透传给该方法的关键字参数。
+
+        Raises:
+            AssertionError: 当 RPC 返回失败响应时抛出。
+        """
         obj = RpcReqInput(method=method, parameters=kwargs)
         sock_send(self.send_to_rpc, obj)
         recv_req = sock_recv(self.send_to_rpc, flags=zmq.BLOCKY)
@@ -1622,16 +1744,23 @@ class Engine(EngineScoreMixin, EngineBase):
         assert recv_req.success, recv_req.message
 
     def save_remote_model(self, **kwargs):
+        """通过远程路径在所有 scheduler 上保存模型（见 ``collective_rpc``）。"""
         self.collective_rpc("save_remote_model", **kwargs)
 
     def save_sharded_model(self, **kwargs):
+        """在所有 scheduler 上以分片 checkpoint 形式保存模型（见 ``collective_rpc``）。"""
         self.collective_rpc("save_sharded_model", **kwargs)
 
     # score() and async_score() are provided by EngineScoreMixin
 
 
 def _set_envs_and_config(server_args: ServerArgs):
+    """在启动子进程前设置进程级环境变量与 Python 层配置。
 
+    涵盖 NCCL/SymmMem 及 kernel 相关环境变量、run id 与 Prometheus 多进程
+    目录、``ulimit``、flashinfer/sgl-kernel 版本检查、SIGQUIT 处理函数、
+    多进程启动方式、GC 阈值，以及对旧版 kernel 缓存目录的提示。
+    """
     cfg = resolving_view(server_args)
     # Set global environments
     # MNNVL fabric (GB200/GB300) multi-node: cross-node NVLink needs NCCL's
