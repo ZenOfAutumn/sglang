@@ -1,6 +1,6 @@
 # SGLang 并行学习计划（TP / DP / EP / PP / CP）
 
-> 本文是 `docs/sglang_learning_plan_zh.md` 阶段 6「张量/专家并行」的**展开版**，专注推理侧并行。
+> 本文是 `docs/learn/sglang_learning_plan_zh.md` 阶段 6「张量/专家并行」的**展开版**，专注推理侧并行。
 > 沿用同一套「阅读 → 动手 → 自测题 → ✅ 通关标准」方法论。
 > 所有路径相对仓库根目录，核心代码在 `python/sglang/srt/`。
 
@@ -49,25 +49,25 @@ $$
 
 ## 二、仓库已有资料清单（重要：不要重复造轮子）
 
-本仓库 `docs/theory/distributed/` 下已有多篇中文原理文档，包含数值示例与手算推演。本计划的定位是**串联这些文档 + 补充源码落点 + 给出动手实验**，而不是重写原理。文档持续演进，以下行数仅作大致参考。
+本仓库 `docs/learn/distributed/` 下已有多篇中文原理文档，包含数值示例与手算推演。本计划的定位是**串联这些文档 + 补充源码落点 + 给出动手实验**，而不是重写原理。文档持续演进，以下行数仅作大致参考。
 
 | 文档 | 行数 | 内容要点 |
 | --- | --- | --- |
-| `docs/theory/distributed/TP.md` | 428 | 列/行并行、黄金组合、MLP 手算、head 切分、GQA/MQA、词表并行、通信量分析 |
-| `docs/theory/distributed/DP.md` | 479 | 训练 DP vs 推理 DP、DataParallelController、4 种负载均衡策略、GPU/rank 布局数值示例、DPBudget |
-| `docs/theory/distributed/DP_attention.md` | 约 585 | 动机、rank 布局公式、gather→MoE→scatter 数据流、MAX_LEN/SUM_LEN 两种 padding |
-| `docs/theory/distributed/EP.md` | 266 | MoE 回顾、按 expert 切分、dispatch/combine、通信量、EPLB 负载均衡 |
-| `docs/theory/distributed/PP.md` | 312 | 流水切分、气泡分析、micro-batch |
-| `docs/theory/distributed/CP.md` | 208 | 上下文并行 |
-| `docs/theory/distributed/collective_communication.md` | 918 | **9 种原语总表**、Ring All-Reduce 通信量与**通信下界证明**、关键恒等式、各并行主导原语 |
-| `docs/theory/distributed/cost_model.md` | 473 | **代价模型专题**：$\alpha\text{-}\beta$、LogP/LogGP、$\alpha\text{-}\beta\text{-}\gamma$、带宽层次、对分带宽、Roofline、BSP |
+| `docs/learn/distributed/TP.md` | 428 | 列/行并行、黄金组合、MLP 手算、head 切分、GQA/MQA、词表并行、通信量分析 |
+| `docs/learn/distributed/DP.md` | 479 | 训练 DP vs 推理 DP、DataParallelController、4 种负载均衡策略、GPU/rank 布局数值示例、DPBudget |
+| `docs/learn/distributed/DP_attention.md` | 约 585 | 动机、rank 布局公式、gather→MoE→scatter 数据流、MAX_LEN/SUM_LEN 两种 padding |
+| `docs/learn/distributed/EP.md` | 266 | MoE 回顾、按 expert 切分、dispatch/combine、通信量、EPLB 负载均衡 |
+| `docs/learn/distributed/PP.md` | 312 | 流水切分、气泡分析、micro-batch |
+| `docs/learn/distributed/CP.md` | 208 | 上下文并行 |
+| `docs/learn/distributed/collective_communication.md` | 918 | **9 种原语总表**、Ring All-Reduce 通信量与**通信下界证明**、关键恒等式、各并行主导原语 |
+| `docs/learn/distributed/cost_model.md` | 473 | **代价模型专题**：$\alpha\text{-}\beta$、LogP/LogGP、$\alpha\text{-}\beta\text{-}\gamma$、带宽层次、对分带宽、Roofline、BSP |
 | `docs/advanced_features/expert_parallelism_zh.md` | 199 | EP 部署实践 |
 | `docs/advanced_features/pipeline_parallelism_zh.md` | 116 | PP 部署实践 |
 | `python/sglang/srt/managers/README_data_parallel_controller_zh.md` | 约 418 | DP 控制器源码导读 |
 | `python/sglang/srt/distributed/README_zh.md` | 18 | distributed 目录说明 |
 | `python/sglang/srt/distributed/device_communicators/README_zh.md` | 25 | 通信后端说明 |
 
-> **阅读顺序建议**：每个阶段先读对应的 `theory/` 文档建立原理，再按本计划的「源码落点」去读实现，最后做实验验证。
+> **阅读顺序建议**：每个阶段先读对应的 `learn/` 文档建立原理，再按本计划的「源码落点」去读实现，最后做实验验证。
 
 ---
 
@@ -125,8 +125,8 @@ python/sglang/srt/
 
 **目标**：能说清文档总表中各类通信原语的语义与通信量，这是理解所有并行的前置。
 
-- **阅读**：`docs/theory/distributed/collective_communication.md` 全文（重点是 §1 总表、§12 关键恒等式；行有余力再看 §10 的通信下界证明、§8.1 Ring vs Direct）。
-- **选读**：`docs/theory/distributed/cost_model.md`——搞清楚 $\alpha\text{-}\beta$ 模型与**半带宽点 $n_{1/2}=\alpha/\beta$**（§2），这是理解“为什么 decode 阶段小消息要用 one-shot allreduce”的关键。
+- **阅读**：`docs/learn/distributed/collective_communication.md` 全文（重点是 §1 总表、§12 关键恒等式；行有余力再看 §10 的通信下界证明、§8.1 Ring vs Direct）。
+- **选读**：`docs/learn/distributed/cost_model.md`——搞清楚 $\alpha\text{-}\beta$ 模型与**半带宽点 $n_{1/2}=\alpha/\beta$**（§2），这是理解“为什么 decode 阶段小消息要用 one-shot allreduce”的关键。
 - **源码落点**：`distributed/parallel_state.py` 的 `GroupCoordinator` 类，看 `all_reduce` / `all_gather` / `reduce_scatter` 三个方法的签名。
 - **动手**：写一个 20 行的纯 PyTorch 脚本，用 `torch.distributed` 起 2 进程，分别跑一次 all-reduce 和 all-gather，打印各 rank 的输入输出。**这一步能让抽象概念立刻具象化。**
 - **自测题**：
@@ -142,11 +142,11 @@ python/sglang/srt/
 **目标**：理解权重如何切分、all-reduce 插在哪、为什么通常优先避免 TP 跨机。
 
 - **阅读顺序**：
-  1. `docs/theory/distributed/TP.md` §1–§5（原理 + MLP 手算，务必跟着算一遍 §4 的数值示例）。
+  1. `docs/learn/distributed/TP.md` §1–§5（原理 + MLP 手算，务必跟着算一遍 §4 的数值示例）。
   2. `srt/layers/linear.py`：`ColumnParallelLinear`、`RowParallelLinear`、`QKVParallelLinear`、`MergedColumnParallelLinear`。**重点看 `forward` 中 $\mathrm{tp\_size}>1$ 时的通信调用位置**。
   3. `srt/layers/vocab_parallel_embedding.py`：`VocabParallelEmbedding` / `ParallelLMHead` 的词表切分与 masked all-reduce。
   4. `srt/models/llama.py`：`LlamaMLP`、`LlamaAttention` —— 看真实模型如何组合这些并行层。
-  5. `docs/theory/distributed/TP.md` §6–§9（head 切分、GQA/MQA、通信量、源码索引）。
+  5. `docs/learn/distributed/TP.md` §6–§9（head 切分、GQA/MQA、通信量、源码索引）。
 
 - **核心心智模型（必须内化）**：
 
@@ -181,10 +181,10 @@ Attn:  QKV(列切，按 head) ──► attention ──► O(行切) ──► 
 **目标**：理解推理 DP 与训练 DP 的本质区别，以及请求如何被分流。
 
 - **阅读顺序**：
-  1. `docs/theory/distributed/DP.md` §1–§3（重点是 §3「训练 DP vs 推理 DP」这个关键区分）。
+  1. `docs/learn/distributed/DP.md` §1–§3（重点是 §3「训练 DP vs 推理 DP」这个关键区分）。
   2. `python/sglang/srt/managers/README_data_parallel_controller_zh.md`（约 418 行源码导读，篇幅以后续版本为准）。
   3. `srt/managers/data_parallel_controller.py`：`event_loop`、`launch_dp_schedulers`、负载均衡策略。
-  4. `docs/theory/distributed/DP.md` §5–§8（4 种负载均衡策略、GPU/rank 布局数值示例、DPBudget）。
+  4. `docs/learn/distributed/DP.md` §5–§8（4 种负载均衡策略、GPU/rank 布局数值示例、DPBudget）。
 
 - **关键认知**：推理 DP **没有梯度同步**，正常前向时副本之间不做模型计算通信；控制面仍负责请求分发、状态与控制消息协调。所以推理 DP 的主要难点不在梯度通信，而在**负载均衡**——这与训练 DP 截然不同。
 
@@ -219,13 +219,13 @@ $$
 - **动机（一句话）**：MLA（DeepSeek）的 KV latent 不按 head 组织，普通 TP 难以有效切分，导致同一 attention-TP 子组内复制 KV。DP Attention 沿请求/token 维把 attention 切成多个 DP 组，每组只保存自己请求的 KV；组内仍可保留较小的 attention TP，MoE 则继续走 TP/EP。
 
 - **阅读顺序**：
-  1. `docs/theory/distributed/DP_attention.md` §1–§2（动机与核心思想）。
+  1. `docs/learn/distributed/DP_attention.md` §1–§2（动机与核心思想）。
   2. `srt/layers/dp_attention.py`：
      - `compute_dp_attention_world_info()` / `initialize_dp_attention()` —— rank 布局
      - `_dp_gather_via_all_reduce()` vs `_dp_gather_via_all_gather()` —— 两种 gather 实现
      - `dp_gather_partial()` / `dp_scatter()`
      - `DpPaddingMode`（`MAX_LEN` / `SUM_LEN`）
-  3. `docs/theory/distributed/DP_attention.md` §3–§7（rank 公式、数据流、padding 模式、与普通 TP 的区别）。
+  3. `docs/learn/distributed/DP_attention.md` §3–§7（rank 公式、数据流、padding 模式、与普通 TP 的区别）。
 
 - **核心数据流**（下图用 $\mathrm{attn\_tp\_size}=1$ 的纯 attention-DP 情形简化展示；$\mathrm{attn\_tp\_size}>1$ 时每个 DP 组内还包含多个 attention-TP rank）：
 
@@ -257,10 +257,10 @@ $$
 > 详细的按小时源码路线、手算题和验收项见 `docs/distribute/expert_parallelism_learning_plan_zh.md`。
 
 - **阅读顺序**：
-  1. `docs/theory/distributed/EP.md` §1–§5（含 §5 手算一次 EP 路由，务必跟着算）。
+  1. `docs/learn/distributed/EP.md` §1–§5（含 §5 手算一次 EP 路由，务必跟着算）。
   2. `srt/layers/moe/ep_moe/`：EP MoE 层实现。
   3. `srt/layers/moe/token_dispatcher/`：all-to-all 分发后端（DeepEP 等），对照 `--moe-a2a-backend`。
-  4. `docs/theory/distributed/EP.md` §6（EPLB 负载均衡）→ `srt/eplb/`。
+  4. `docs/learn/distributed/EP.md` §6（EPLB 负载均衡）→ `srt/eplb/`。
   5. `docs/advanced_features/expert_parallelism_zh.md`（部署实践）。
 
 - **核心数据流**：
@@ -351,10 +351,10 @@ router 打分 ──► dispatch（典型为 all-to-all）──► 各卡算自
 > 这两者在推理侧使用频率低于 TP/DP/EP，**掌握动机与代价即可**，不必深挖实现。
 
 - **PP**：
-  - 阅读 `docs/theory/distributed/PP.md`（重点是气泡分析）+ `docs/advanced_features/pipeline_parallelism_zh.md`。
+  - 阅读 `docs/learn/distributed/PP.md`（重点是气泡分析）+ `docs/advanced_features/pipeline_parallelism_zh.md`。
   - 源码：`distributed/parallel_state.py` 的 `get_pp_group()`，以及 scheduler 里的 micro-batch 处理。
   - 关键认知：PP 的代价是**流水气泡**，气泡率 $\displaystyle \approx \frac{P-1}{M+P-1}$（$P$ 为 stage 数，$M$ 为 micro-batch 数）。推理场景 batch 小，气泡相对更痛，所以 PP 优先级低于 TP。
-- **CP**：阅读 `docs/theory/distributed/CP.md`，理解超长上下文下按序列维切分的动机即可。
+- **CP**：阅读 `docs/learn/distributed/CP.md`，理解超长上下文下按序列维切分的动机即可。
   - 参数注意：**没有 `--cp-size`**。实际是 `--attn-cp-size`（等价 `--attention-context-parallel-size`）与 `--enable-prefill-cp`；旧的 `--enable-prefill-context-parallel` / `--enable-dsa-prefill-context-parallel` 已标记弃用。
   - 统一的 prefill CP 路径会按模型与 `cp_strategy` 自动调整 `attn_cp_size`，当前 DSA/MLA 路径通常令其为 $\mathrm{attn\_cp\_size}=\mathrm{tp\_size}/\mathrm{dp\_size}$。该特性仍处于实验阶段；单机限制、硬件、attention backend、batch size 与并行组合约束因模型和策略而异，应以 `server_args.py` 当前校验为准（例如 DSA CP 当前限制 $\mathrm{tp\_size}\leq 8$，MLA CP 主要在 Hopper + FA3 上验证）。
 
@@ -449,7 +449,7 @@ router 打分 ──► dispatch（典型为 all-to-all）──► 各卡算自
 完成本计划后，按以下顺序进入 PD：
 
 1. `python/sglang/srt/disaggregation/README_zh.md`（架构总览）
-2. `docs/sglang_learning_plan_zh.md` §2.2.1 的 PD 时间轴（各阶段与队列的名词解释）
+2. `docs/learn/sglang_learning_plan_zh.md` §2.2.1 的 PD 时间轴（各阶段与队列的名词解释）
 3. `docs/advanced_features/pd_disaggregation_zh.md`
 4. `srt/disaggregation/prefill.py` / `decode.py`
 
@@ -463,7 +463,7 @@ router 打分 ──► dispatch（典型为 all-to-all）──► 各卡算自
 
 ## 七、参考资源
 
-- 本仓库：`docs/theory/distributed/`（原理，含数值示例）、`docs/advanced_features/`（部署实践）
+- 本仓库：`docs/learn/distributed/`（原理，含数值示例）、`docs/advanced_features/`（部署实践）
 - 官方文档：<https://docs.sglang.io/>
 - 大规模 EP 博客（强烈推荐）：<https://lmsys.org/blog/>
 - Megatron-LM 论文（TP 的理论源头）：*Efficient Large-Scale Language Model Training on GPU Clusters*

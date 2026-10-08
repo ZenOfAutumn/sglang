@@ -432,7 +432,7 @@ python -m sglang.launch_server --model deepseek-ai/DeepSeek-V2-Lite-Chat \
 
 ### 练习 5：性能验证（选做，时间紧张可跳过）
 
-用 `sglang.bench_serving` 对比同一模型 BF16 vs FP8 vs GPTQ-Int4 的 TTFT/ITL 与显存占用，画表总结；结合 `docs/theory/` 下的算子理论解释差异来源（weight-bound 的 decode 提升大，prefill 计算受限提升小甚至持平）。
+用 `sglang.bench_serving` 对比同一模型 BF16 vs FP8 vs GPTQ-Int4 的 TTFT/ITL 与显存占用，画表总结；结合 `docs/learn/` 下的算子理论解释差异来源（weight-bound 的 decode 提升大，prefill 计算受限提升小甚至持平）。
 
 ---
 

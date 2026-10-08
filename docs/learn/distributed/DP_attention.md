@@ -208,7 +208,7 @@ layer 输出        [ab]              [ab]              [cd]              [cd]  
 
 上图把 `self_attn` 当成黑盒。但对 MLA 模型，盒子里的**下投影与上投影切分方式完全不同**，这正是 DP attention 能省 KV Cache 的关键。
 
-MLA 把原本一个 $h \cdot d_k$ 的大投影拆成「先降维、再升维」两步（见 `../transformer/MLA.md` §2）。SGLang 对这两步用了**不同的 Linear 类型**：
+MLA 把原本一个 $h \cdot d_k$ 的大投影拆成「先降维、再升维」两步（见 `../arch/MLA.md` §2）。SGLang 对这两步用了**不同的 Linear 类型**：
 
 | 权重 | 层类型 | 切分 | 原因 |
 | --- | --- | --- | --- |
@@ -280,7 +280,7 @@ self.num_local_heads = num_heads // attn_tp_size     # ← 每卡负责几个 he
 
 3. **`attn_tp_size=1` 时上投影也退化为复制**。`dp_size == tp_size` 的典型配置下 `num_local_heads = num_heads`，`ColumnParallelLinear` 不再切分——**这才是 DP attention 下 attention 权重冗余的真正来源**：层的声明没变，变的是传进去的 `tp_size` 参数。
 
-> decode 路径下 `kv_b_proj` 会被拆成 `w_kc` / `w_vc` 并「吸收」进 Q 侧与输出侧（矩阵吸收，见 `../transformer/MLA.md` §4）。此时 $W^{UK}$ 不再是独立 GEMM，但**分片方式不变**，仍按 `num_local_heads` 组织。
+> decode 路径下 `kv_b_proj` 会被拆成 `w_kc` / `w_vc` 并「吸收」进 Q 侧与输出侧（矩阵吸收，见 `../arch/MLA.md` §4）。此时 $W^{UK}$ 不再是独立 GEMM，但**分片方式不变**，仍按 `num_local_heads` 组织。
 
 ### 2.5 为什么这样切能省 KV Cache
 

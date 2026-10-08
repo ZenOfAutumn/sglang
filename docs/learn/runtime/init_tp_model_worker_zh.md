@@ -1,6 +1,6 @@
 # `init_tp_model_worker` 详解
 
-> 本文是 `docs/learn/run/scheduler_subprocess_startup_zh.md` 第 4.1 节 `init_model_worker` 第一小步 `init_tp_model_worker` 的**展开版**：原文把它概括成「加载权重」，这里把「这一行里到底做了什么」展开到代码级。
+> 本文是 `docs/learn/runtime/scheduler_subprocess_startup_zh.md` 第 4.1 节 `init_model_worker` 第一小步 `init_tp_model_worker` 的**展开版**：原文把它概括成「加载权重」，这里把「这一行里到底做了什么」展开到代码级。
 >
 > 不重复的内容仍在原文：`Scheduler.__init__` 的整体编排顺序、KV cache 构建（`kv_cache_builder.build_kv_cache`）、attention 后端初始化、CUDA graph capture、握手回传等。它们都在 `init_tp_model_worker` **之后**发生。
 >

@@ -2,7 +2,7 @@
 
 > 本文是《推理请求全过程处理详解：从 POST /v1/chat/completions、POST /v1/messages 到 SSE/JSON 响应》（`docs/learn/request/chat_request_processing_zh.md`）第 4 节的独立拆出篇。小节编号保持 `4.x`，以便与原文及原文中的交叉引用对照；本文出现的「第 ③ 层」「第 ⑤ 节」等均指原文的对应章节。
 
-Scheduler 是**每 TP rank 一个的子进程**（进程划分见 `docs/learn/arch/why_three_processes_zh.md`），它把第 ③ 层经 ZMQ 送来的 `TokenizedGenerateReqInput` 真正跑成 token。一个「调度–执行」循环负责：收请求 → 选批 → 前向（GPU）→ 采样 → 出结果。
+Scheduler 是**每 TP rank 一个的子进程**（进程划分见 `docs/learn/runtime/why_three_processes_zh.md`），它把第 ③ 层经 ZMQ 送来的 `TokenizedGenerateReqInput` 真正跑成 token。一个「调度–执行」循环负责：收请求 → 选批 → 前向（GPU）→ 采样 → 出结果。
 
 本文以 **overlap（重叠调度）** 为主线讲通用主循环，再讲 **PD 分离（prefill/decode 拆成两组实例）** 下 prefill 与 decode 两侧各自的循环。整体脉络：
 

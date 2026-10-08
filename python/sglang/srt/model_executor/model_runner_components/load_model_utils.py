@@ -52,7 +52,7 @@ if TYPE_CHECKING:
 #   · load_model_with_memory_saver(...)  —— 真正加载：在 GPU_MEMORY_TYPE_WEIGHTS region 里读权重
 # 其余是旁路辅助：dtype 回退、KV scale 加载、滑窗大小解析、在线量化上报、张量 dump hook、
 # 远程实例 NCCL 发送组、跨 rank barrier 等。
-# 调用顺序与耗时口径见 docs/learn/run/init_tp_model_worker_zh.md 第 5 节。
+# 调用顺序与耗时口径见 docs/learn/runtime/init_tp_model_worker_zh.md 第 5 节。
 # =====================================================================================
 
 logger = logging.getLogger(__name__)

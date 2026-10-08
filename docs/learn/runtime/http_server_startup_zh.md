@@ -2,7 +2,7 @@
 
 本文回答一个问题：**执行 `sglang serve`（或 `python -m sglang.launch_server`）后，到 HTTP 接口可用，中间到底发生了什么？**
 
-行文只讲「运行期（run）」的调用顺序与进程编排，不重复解释「为什么要拆三类进程」这类设计动机——那部分见 `docs/learn/arch/why_three_processes_zh.md`。本文凡是与已有文档重叠的地方，一律改为引用，避免同一份内容维护两遍。
+行文只讲「运行期（run）」的调用顺序与进程编排，不重复解释「为什么要拆三类进程」这类设计动机——那部分见 `docs/learn/runtime/why_three_processes_zh.md`。本文凡是与已有文档重叠的地方，一律改为引用，避免同一份内容维护两遍。
 
 ## 0. 一张图看全流程
 
@@ -412,7 +412,7 @@ Scheduler 是唯一持有并驱动 GPU 的进程，其启动分「进程配置 �
 
 ## 4. 进程与 IPC 全景（启动完成后）
 
-> 三类进程的职责分工与「为什么必须拆进程」，见 `docs/learn/arch/why_three_processes_zh.md`；这里只给出启动装配需要记住的连接关系。
+> 三类进程的职责分工与「为什么必须拆进程」，见 `docs/learn/runtime/why_three_processes_zh.md`；这里只给出启动装配需要记住的连接关系。
 
 | 进程 | 数量 | 承载方 | 启动函数 | 主要 ZMQ 端点 |
 | --- | --- | --- | --- | --- |
@@ -649,7 +649,7 @@ The server is fired up and ready to roll!
 
 | 已有文档 | 覆盖内容 | 与本文的关系 |
 | --- | --- | --- |
-| `docs/learn/arch/why_three_processes_zh.md` | 为什么拆三类进程、GIL、ZMQ 协议、延迟/吞吐收益 | 本文第 4 节只保留启动所需的连接关系，动机部分引用该文 |
+| `docs/learn/runtime/why_three_processes_zh.md` | 为什么拆三类进程、GIL、ZMQ 协议、延迟/吞吐收益 | 本文第 4 节只保留启动所需的连接关系，动机部分引用该文 |
 | `docs/metrics/endpoints_metrics_and_loads_zh.md` | `/metrics` 与 `/v1/loads` 的请求/返回值、中间件挂载机制 | 本文只在第 6 节指出中间件装配时机 |
 | `docs/metrics/server_info_fields_zh.md` | `/server_info` 字段逐项对照 | 本文第 6 节引用其作为字段字典 |
 | `docs/metrics/v1_loads_zh.md` | `/v1/loads` 细节 | 同上，负载接口细节不在本文展开 |

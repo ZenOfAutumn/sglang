@@ -2,7 +2,7 @@
 
 > 对应源码：`python/sglang/srt/layers/dp_attention.py`
 >
-> 相关文档：`docs/theory/distributed/DP_attention.md`（原理）、`docs/theory/transformer/MLA.md`（MLA）、`python/sglang/srt/managers/README_data_parallel_controller_zh.md`（副本级 DP）
+> 相关文档：`docs/learn/distributed/DP_attention.md`（原理）、`docs/learn/arch/MLA.md`（MLA）、`python/sglang/srt/managers/README_data_parallel_controller_zh.md`（副本级 DP）
 
 ---
 
@@ -591,7 +591,7 @@ def is_enable_moe_cp_allgather() -> bool:
    └───────────────────────────────────────────────────┘
 ```
 
-调度这套流程的是 `LayerCommunicator`（见 `docs/theory/distributed/DP_attention.md`），它通过 `ScatterMode` 描述数据当前处于 `SCATTERED` / `TP_ATTN_FULL` / `FULL` 中的哪种分布状态，并在 `prepare_attn` / `prepare_mlp` / `postprocess_layer` 三个阶段插入合适的通信原语。
+调度这套流程的是 `LayerCommunicator`（见 `docs/learn/distributed/DP_attention.md`），它通过 `ScatterMode` 描述数据当前处于 `SCATTERED` / `TP_ATTN_FULL` / `FULL` 中的哪种分布状态，并在 `prepare_attn` / `prepare_mlp` / `postprocess_layer` 三个阶段插入合适的通信原语。
 
 ---
 

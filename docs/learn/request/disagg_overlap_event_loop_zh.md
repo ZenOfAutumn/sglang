@@ -123,9 +123,9 @@
 
 | 步骤 | 代码 | 作用 | 关键细节 |
 | --- | --- | --- | --- |
-| P1 | `recv_requests` + `process_input_requests` | 收新请求/控制请求 | 生成请求经 `_add_request_to_queue` 进入 `disagg_prefill_bootstrap_queue`：创建 KV sender，检查是否超出 KV 总容量，强制 `max_new_tokens=1`，并置 `pending_bootstrap=True` |
+| P1 | `recv_requests` + `process_input_requests` | 收新请求/控制请求 | 生成请求经 `_add_request_to_queue` 进入 `disagg_prefill_bootstrap_queue`：创建 KV sender，检查是否超出 KV 总容量，强制 `max_new_tokens=1`，并置 `pending_bootstrap=True`；见 §2.3 |
 | P2 | `if self._engine_paused: continue` | 引擎暂停（如权重更新期间）时不推进 | 控制请求仍会在 P1 中处理 |
-| P3 | `pop_bootstrapped()` → `waiting_queue` | 把握手已完成或允许乐观抢跑的请求放进 `waiting_queue` | 见 §2.3 |
+| P3 | `pop_bootstrapped()` → `waiting_queue` | 把握手已完成或允许乐观抢跑的请求放进 `waiting_queue` | 见 §2.4 |
 | P4 | `get_next_disagg_prefill_batch_to_run` | 组 prefill 批 | 内部依次调用 `process_pending_chunked_abort`、重置 `batch_is_full`、`resolve_waiting_queue_bootstrap`、`process_prefill_chunk`、`get_new_batch_prefill`、`maybe_prepare_mlp_sync_batch` |
 | P5 | `ngram_embedding_manager.prepare_for_forward` | ngram embedding 预处理 | 未启用时原样返回 |
 | P6 | `maybe_prefetch_staging_for_batch` → `run_batch` → `_apply_war_barrier` → 入队 | **提交本批**前向 | `run_batch` 内对每个请求调用 `maybe_send_cached_prefix_chunk`（前缀 KV 提前发送，见 §2.6） |
@@ -133,7 +133,67 @@
 | P8 | `process_disagg_prefill_inflight_queue` | 轮询在途 KV 传输 | 每轮都执行，包括空闲轮 |
 | P9 | `launch_batch_sample_if_needed` → `last_batch = batch` | 补交本批延迟采样，然后进入下一拍 | 本批需要 grammar/延迟采样时才实际执行 |
 
-### 2.3 P3：bootstrap 放行与乐观 prefill
+### 2.3 P1：收请求与进入 bootstrap 队列
+
+P1 由两个函数组成：`recv_requests` 负责**把请求拿到本 rank**，`process_input_requests` 负责**按类型处理**。
+
+#### (1) `recv_requests`：拉取并广播
+
+`RequestReceiver.recv_requests`（`scheduler_components/request_receiver.py:91-126`）依次执行：
+
+| 步骤 | 作用 |
+| --- | --- |
+| `recv_skipper` | 某些前向模式下可跳过本轮接收，直接返回空列表 |
+| `_pull_raw_reqs` | 只在 attn_tp/cp rank 0 上**非阻塞**拉取：PP 首段从 tokenizer 与 rpc 两个 ZMQ socket 拉到空为止（受 `max_recv_per_poll` 上限约束）；PP 非首段从上一段点对点接收；其余 rank 返回 `None` |
+| `input_blocker` | 需要时暂停或缓冲输入，例如权重热更新期间 |
+| `_broadcast_reqs_across_ranks` | 把 rank 0 拉到的请求广播到组内所有 rank，保证各 rank 看到**相同的请求序列**；开启 DP attention 时，工作请求与控制请求分开广播 |
+| `_apply_mm_receiver` / `_finalize_shm_features` | 接收多模态数据，并还原共享内存中的特征 |
+
+非阻塞拉取保证了 P1 不会卡住循环：没有新请求时立即返回，循环继续推进在途批次与 KV 传输。
+
+#### (2) `process_input_requests`：按类型分派
+
+`process_input_requests`（`scheduler.py:2103-2143`）先清理到期会话，然后对每个请求执行 `_request_dispatcher`，按类型路由到对应 handler：生成请求、embedding、abort、权重更新、flush cache、会话管理等。handler 有返回值时，RPC 类结果通过 `recv_from_rpc` 回传，其余通过 `send_to_tokenizer` 回传。
+
+服务繁忙时，健康检查请求不进入调度，只记录回传通道：正在执行的请求已经能证明服务存活。
+
+#### (3) 生成请求的入队路径
+
+```text
+handle_generate_request            构造 Req；PD 模式下缺 bootstrap_room 直接中止
+  └─ grammar_manager.process_req_with_grammar
+       ├─ 需要编译语法 → grammar_queue（编译完成后在 P4 组批时重新调用 _add_request_to_queue）
+       └─ 否则 → _add_request_to_queue
+                  ├─ _set_or_validate_priority     设置/校验优先级
+                  ├─ _prefetch_kvcache             开启 HiCache L3 时异步预取前缀
+                  └─ disagg_prefill_bootstrap_queue.add
+                       └─ create_sender
+                            ├─ _check_if_req_exceed_kv_capacity  输入长度 > KV 池总容量 → 中止并回包
+                            ├─ 创建 KV sender（bootstrap_addr + bootstrap_room）
+                            ├─ _process_req                      max_new_tokens = 1
+                            └─ pending_bootstrap = True
+                       └─ 入 bootstrap 队列
+```
+
+```3168:3173:python/sglang/srt/managers/scheduler.py
+        elif self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self._prefetch_kvcache(req)
+            self.disagg_prefill_bootstrap_queue.add(
+                req, self.model_config.num_key_value_heads
+            )
+            req.time_stats.set_prefill_bootstrap_queue_entry_time()
+```
+
+几个关键点：
+
+- **不直接进 `waiting_queue`**：与聚合版不同，P 端请求先进入 bootstrap 队列，由 P3 根据握手状态放行。
+- **`bootstrap_room` 必填**：P、D 两端依靠它配对同一个请求的 KV；缺失时直接以 `BAD_REQUEST` 中止（FAKE 传输后端除外）。
+- **容量检查**：只比较 `len(origin_input_ids)` 与 `max_total_num_tokens`。超限请求永远无法完成 prefill，所以入队前直接拒绝。
+- **`max_new_tokens = 1`**：P 端只生成首 token，这样 `PrefillAdder` 估算显存时不会为后续 decode 预留空间。
+- **sender 只创建、不初始化**：此时还不知道 D 端已缓存的前缀长度，`sender.init(num_pages, idx)` 要等握手完成后在 `finalize_bootstrap` 中执行。
+- **P1 本身没有 GPU 操作**：它与上一批的 GPU 前向完全重叠。
+
+### 2.4 P3：bootstrap 放行与乐观 prefill
 
 `pop_bootstrapped`（`prefill.py:483-583`）在 attn-CP/TP 组内通过 `poll_and_all_reduce_attn_cp_tp_group` 让各 rank 对握手状态达成一致，然后逐请求分流：
 
@@ -144,16 +204,56 @@
 | `Failed` | `handle_bootstrap_failure`：中止、释放资源、回包 | 不进入 |
 | metadata 槽位不足 | `continue`，下一轮再尝试 | 不进入 |
 
-乐观 prefill 的意义在于：D 端握手慢时，P 端不用干等，可以先把 prompt 算掉。代价是：如果前向完成时握手仍未完成，KV 就不能发送，只能先挂起，或者释放后重新排队。在重叠循环中，这类请求的确认和回退点更多，见 §2.5。
+乐观 prefill 的意义在于：D 端握手慢时，P 端不用干等，可以先把 prompt 算掉。代价是：如果前向完成时握手仍未完成，KV 就不能发送，只能先挂起，或者释放后重新排队。在重叠循环中，这类请求的确认和回退点更多，见 §2.7。
 
-### 2.4 P4：组批里与重叠相关的两处
+#### 补充：Metadata 槽位（`MetadataBuffers`）
+
+`MetadataBuffers` 是 PD 分离中承载「随 KV 一起搬运」的元数据的定长缓冲池，P/D 两端各一份（默认 CPU 内存）。由 `ReqToMetadataIdxAllocator` 以定长槽位池管理：每个请求在途期间占一个槽位（`metadata_buffer_index`）；P 端在 `finalize_bootstrap`（或乐观抢跑）时分配、传输成功后释放，D 端在 `pop_preallocated` 分配、`pop_transferred` 读回后释放，槽位循环复用，耗尽则请求等待而非报错。
+
+传输字段：首 token（`output_ids`）、`cached_tokens`（各级缓存命中数）、输出 token 的 logprob（`val`/`idx`）、top-logprobs、投机解码的 `topk_p`/`topk_index` 与 `hidden_states`；另有 `bootstrap_room` 用于校验槽位错乱，可选 sampling mask 与 DSA topk indices。P 端经 `set_buf` 写入，D 端 `_commit_transfer_to_req` 读回 `Req`。容量上，普通 PD 每槽约 1.6 KB，开启投机时主要由 `hidden_states` 主导（`disaggregation/utils.py:352-444`）。
+
+### 2.5 P4：组批 `get_next_disagg_prefill_batch_to_run`
+
+#### (0) 整体流程
+
+```685:721:python/sglang/srt/disaggregation/prefill.py
+    def get_next_disagg_prefill_batch_to_run(
+        self: Scheduler,
+        running_batch: ScheduleBatch,
+        last_batch: Optional[ScheduleBatch],
+    ) -> NextBatchPlan:
+        self.process_pending_chunked_abort()
+        running_batch.batch_is_full = False
+        self.resolve_waiting_queue_bootstrap()
+        self.process_prefill_chunk(last_batch=last_batch, running_batch=running_batch)
+        prefill_plan = self.get_new_batch_prefill(running_batch)
+        batch = prefill_plan.batch_to_run
+        running_batch = prefill_plan.running_batch
+        batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+        if batch:
+            set_schedule_time_batch(batch)
+        return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
+```
+
+| 顺序 | 步骤 | 作用 |
+| --- | --- | --- |
+| ① | `process_pending_chunked_abort` | 执行被延迟的分块请求 abort：`abort_request` 只做标记，这里才真正中止 `chunked_req`，包括中止 sender、释放 metadata 槽位与 KV，并置 `chunked_req=None`，使下一块不再提交 |
+| ② | `batch_is_full = False` | P 端不调用 `update_running_batch`，需要在这里手动复位，否则高并发下会一直认为批已满、卡住 |
+| ③ | `resolve_waiting_queue_bootstrap` | 入批前补查 `waiting_queue` 中请求的握手状态，见下文 (1) |
+| ④ | `process_prefill_chunk` | 收尾上一块分块 prefill，并决定 KV 是立即发送还是推迟，见下文 (2) |
+| ⑤ | `get_new_batch_prefill` | 通用 prefill 组批器：按预算从 `waiting_queue` 选请求并组成 EXTEND 批，见下文 (3) |
+| ⑥ | `maybe_prepare_mlp_sync_batch` | DP attention 下各 rank 同步批信息；本 rank 无批时补 `IDLE` 批，保证 MLP collective 不缺席 |
+| ⑦ | `set_schedule_time_batch` | 记录调度时间，用于请求生命周期统计 |
+
+与聚合版 `get_next_batch_to_run` 相比，P 端**只组 prefill 批**：不合并上一批到 `running_batch`，不调用 `update_running_batch`，也不会转入 decode。`running_batch` 在 P 端基本为空，只用来承载 `batch_is_full` 等标志。
 
 #### (1) `resolve_waiting_queue_bootstrap`：入批前的最后一次握手补查
 
-```620:676:python/sglang/srt/disaggregation/prefill.py
-    def resolve_waiting_queue_bootstrap(self: Scheduler) -> None:
-        ...
+```633:676:python/sglang/srt/disaggregation/prefill.py
         candidates = [req for req in self.waiting_queue if not is_aborted(req)]
+        if not candidates:
+            return
+        polls = poll_and_all_reduce_attn_cp_tp_group(
         ...
         for req, poll in zip(candidates, polls):
             if poll == KVPoll.Failed:
@@ -207,9 +307,86 @@
 
 原因是：重叠模式下，执行到 P4 时，上一轮提交的 chunk 前向**可能仍在 GPU 上写入 KV**，其结果也尚未被 CPU 消费。如果此时发送，RDMA 可能读到尚未写完的 KV 页；如果此时释放，前向可能还在写这些页。因此只能先记录「这一块的右边界」，等 P7 确认结果后再处理。
 
-> `get_new_batch_prefill` 每组出一个包含分块请求的批，都会执行 `chunked_req.inflight_middle_chunks += 1`（`scheduler.py:3973-3974`）。在重叠模式下，这个计数跨越「已提交但尚未处理」的批次，P7 依据它判断当前处理的是中间 chunk 还是最后一个 chunk。
+`process_prefill_chunk` 末尾还会处理上一批：如果 `last_batch` 是 extend 批，就调用 `filter_batch(chunked_req_to_exclude=...)`，剔除已完成请求和仍在分块中的请求；批变小时复位 `batch_is_full`，给新请求腾出名额（`prefill.py:1381-1395`）。
 
-### 2.5 P7：`process_batch_result_disagg_prefill` 的重叠语义
+#### (3) `get_new_batch_prefill`：按预算从 `waiting_queue` 选请求
+
+这是与聚合版共用的组批器（`scheduler.py:3668-4060`）。P 端调用时，`waiting_queue` 里只有 P3 放行的请求，里面既有握手完成的，也有乐观抢跑的。主要流程如下：
+
+```text
+_get_new_batch_prefill_raw
+  ├─ grammar 编译完成的请求 → _add_request_to_queue（P 端会重新进入 bootstrap 队列）
+  ├─ HiCache：check_hicache_events，重试未命中的存储预取
+  ├─ 提前返回 None：
+  │    ├─ (batch_is_full 或 waiting_queue 为空) 且没有 chunked_req
+  │    ├─ min_free_slots_delayer 要求延迟（有 chunked_req 时不延迟）
+  │    └─ 可分配请求名额 ≤ 0 且没有 chunked_req、未开抢占 → batch_is_full = True
+  ├─ policy.calc_priority(waiting_queue)      按 FCFS / LPM / 优先级等排序
+  ├─ 确定 chunked_prefill_size                 开启动态分块时按历史长度预测
+  ├─ 构造 PrefillAdder                         管理 token/显存/请求数等预算
+  ├─ 有 chunked_req：优先 add_chunked_req      继续算它的下一块，避免被新请求饿死
+  ├─ 遍历 waiting_queue：
+  │    ├─ LoRA 约束不满足 → 跳过
+  │    ├─ 名额已满 → batch_is_full
+  │    │    └─ P 端额外检查：已选请求数 ≥ req_to_token_pool.available_size() → batch_is_full
+  │    ├─ 批满且无法抢占 → break
+  │    ├─ HiCache 存储预取未完成 → 跳过，下一轮再调度
+  │    ├─ init_next_round_input(tree_cache)    radix 前缀匹配，确定本轮需要计算的 token
+  │    └─ adder.add_one_req                    预算不足 → 置 batch_is_full，回收 mamba 槽位，break
+  ├─ can_run_list 为空 → 返回 None
+  ├─ 从 waiting_queue 移除已选请求；被抢占的请求重新入队
+  ├─ adder.new_chunked_req → self.chunked_req  长 prompt 被截断，本轮只算第一块
+  ├─ chunked_req 存在 → inflight_middle_chunks += 1
+  └─ ScheduleBatch.init_new → prepare_for_extend  分配 KV 槽位，准备 input_ids、positions 等张量
+```
+
+P 端需要注意的几点：
+
+- **同一时间最多一个 `chunked_req`**：`assert self.chunked_req is None` 保证了这一点。长 prompt 超过 `chunked_prefill_size` 时会被截断，剩余部分在后续轮次由 `add_chunked_req` 继续计算。
+- **`max_new_tokens=1` 让预算更准**：`PrefillAdder` 估算显存时只为 1 个输出 token 预留，不会为 decode 多占 KV。
+- **额外的 `req_to_token_pool` 检查**：P 端 inflight 队列中的请求在 KV 传输完成前**仍占用 `req_to_token_pool` 槽位和 KV**，所以不能只看 `max_running_requests`，还要看池子的实际剩余量。
+- **`inflight_middle_chunks`**：每组出一个包含分块请求的批就执行 `+= 1`（`scheduler.py:3973-3974`）。在重叠模式下，这个计数跨越「已提交但尚未处理」的批次，P7 依据它判断当前处理的是中间 chunk 还是最后一个 chunk。
+- **`contains_last_prefill_chunk`**：本批只有分块请求且它还没算完时为 `False`，表示这一批不产生首 token。
+
+#### (4) 一个长 prompt 在 P4 中的多轮演进（重叠模式）
+
+假设 prompt 需要切成 3 块，握手在第一块提交前已经完成：
+
+| 轮次 | P4 中 `process_prefill_chunk` | P4 中 `get_new_batch_prefill` | P7 处理上一批 |
+| --- | --- | --- | --- |
+| k | 无 `chunked_req` | 新请求被截断，产生 `chunked_req`，组出 chunk1，`inflight_middle_chunks=1` | — |
+| k+1 | 记录 chunk1 的 `tmp_end_idx` | `add_chunked_req` 组出 chunk2，计数变为 2 | chunk1：计数减为 1，属于中间 chunk，按 `tmp_end_idx` 发送 chunk1 的 KV |
+| k+2 | 记录 chunk2 的 `tmp_end_idx` | `add_chunked_req` 组出 chunk3（最后一块，未截断，返回 `None`），`chunked_req=None`，计数保持 1 | chunk2：计数 1→0，仍是中间 chunk，发送 chunk2 的 KV |
+| k+3 | 无 `chunked_req` | 正常组新批 | chunk3：计数为 0，走「prefill 全部完成」路径，追加首 token，调用 `send_kv_chunk(last_chunk=True)` |
+
+> 计数规则是「组批时 +1，P7 处理中间块时 −1」。最后一块组批时 `add_chunked_req` 返回 `None`，`chunked_req` 被置为 `None`，所以不再 +1。因此 P7 处理到最后一块时计数恰好为 0。
+
+### 2.6 P6：前向提交与前缀 KV 提前发送
+
+`run_batch` 在 PD prefill 模式下会先对每个请求调用 `maybe_send_cached_prefix_chunk`，然后再提交前向：
+
+```4293:4296:python/sglang/srt/managers/scheduler.py
+        # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            for req in batch.reqs:
+                self.maybe_send_cached_prefix_chunk(req)
+```
+
+只有开启 `SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX` 时，这一步才会生效：它把 radix 命中的设备侧前缀 KV 先发出去，与后缀前向重叠。重叠模式下还有一个细节：
+
+```1430:1434:python/sglang/srt/disaggregation/prefill.py
+        if self.enable_overlap:
+            ev = torch.cuda.Event()
+            ev.record(self.forward_stream)
+            req.disagg_kv_sender._early_send_wait_event = ev
+        self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
+```
+
+此时**上一批的 prefill 前向可能还在 `forward_stream` 上写这些前缀页**。例如，前缀就是上一批刚算完、刚插入 radix tree 的内容。因此代码会先在 `forward_stream` 上记录一个事件，让传输线程在 RDMA 读取前等待该事件，避免读写竞争。
+
+`maybe_prefetch_staging_for_batch` 则在开启 staging 时向 D 端预发 `STAGING_REQ`，让 D 端在 P 端前向期间预先分配 staging 空间。
+
+### 2.7 P7：`process_batch_result_disagg_prefill` 的重叠语义
 
 P7 处理的是 `tmp_batch`（上一批的快照），此时**本批已经提交**。函数入口首先调用 `copy_done.synchronize()`，等待上一批的 D2H 拷贝完成；这也是 P 端 CPU 可能阻塞的主要位置。
 
@@ -235,7 +412,7 @@ P7 处理的是 `tmp_batch`（上一批的快照），此时**本批已经提交
 
 - 追加首 token，把 KV 写入 radix tree，然后放入 `disagg_prefill_inflight_queue`；
 - 握手已就绪时，立即发送最后一块 KV：`last_chunk=True` 会同时通过 `set_buf` 写入 metadata（首 token、logprob、hidden states 等），并处理 Mamba/SWA 等状态页；
-- 仍处于乐观 pending 状态时，**先挂在 inflight 队列中不发送**，由 P8 轮询到握手完成后再补发（见 §2.7）。
+- 仍处于乐观 pending 状态时，**先挂在 inflight 队列中不发送**，由 P8 轮询到握手完成后再补发（见 §2.8）。
 
 **B. 中间 chunk（`inflight_middle_chunks > 0`）**
 
@@ -265,32 +442,7 @@ P7 处理的是 `tmp_batch`（上一批的快照），此时**本批已经提交
 
 > **一句话总结**：在重叠版 P 端中，**发送 KV、释放 KV、乐观回退这三件事都只在「结果已确认」的 P7 中执行**，而非重叠版可以在 P4 中直接执行。
 
-### 2.6 P6：前向提交与前缀 KV 提前发送
-
-`run_batch` 在 PD prefill 模式下会先对每个请求调用 `maybe_send_cached_prefix_chunk`，然后再提交前向：
-
-```4293:4296:python/sglang/srt/managers/scheduler.py
-        # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            for req in batch.reqs:
-                self.maybe_send_cached_prefix_chunk(req)
-```
-
-只有开启 `SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX` 时，这一步才会生效：它把 radix 命中的设备侧前缀 KV 先发出去，与后缀前向重叠。重叠模式下还有一个细节：
-
-```1430:1434:python/sglang/srt/disaggregation/prefill.py
-        if self.enable_overlap:
-            ev = torch.cuda.Event()
-            ev.record(self.forward_stream)
-            req.disagg_kv_sender._early_send_wait_event = ev
-        self.send_kv_chunk(req, last_chunk=False, end_idx=cached_end)
-```
-
-此时**上一批的 prefill 前向可能还在 `forward_stream` 上写这些前缀页**。例如，前缀就是上一批刚算完、刚插入 radix tree 的内容。因此代码会先在 `forward_stream` 上记录一个事件，让传输线程在 RDMA 读取前等待该事件，避免读写竞争。
-
-`maybe_prefetch_staging_for_batch` 则在开启 staging 时向 D 端预发 `STAGING_REQ`，让 D 端在 P 端前向期间预先分配 staging 空间。
-
-### 2.7 P8：在途队列轮询
+### 2.8 P8：在途队列轮询
 
 `process_disagg_prefill_inflight_queue`（`prefill.py:1093-1215`）**每轮都会执行**，无论本轮是否有批次。它在组内对 poll 结果做 all-reduce，然后逐请求处理：
 
@@ -305,7 +457,7 @@ P7 处理的是 `tmp_batch`（上一批的快照），此时**本批已经提交
 
 P8 放在 P7 之后有两个好处：P7 中刚加入 inflight 队列的请求可以在同一轮就被首次轮询；而且 P8 的 CPU 工作同样会与本批 GPU 前向重叠。
 
-### 2.8 P 端单轮时序图
+### 2.9 P 端单轮时序图
 
 ```text
 第 k 轮（上一轮已提交批次 N；本轮提交批次 N+1）
@@ -321,7 +473,7 @@ GPU: |=================== G[N]（extend） ================|=========== G[N+1]�
 
 与聚合版重叠循环一样，`G[N]` 期间 CPU 可以完成 P1~P6；`G[N+1]` 期间 CPU 可以完成 P7~P9。**KV 发送是异步的**：`send_kv_chunk` 只把任务交给传输后端，由后台线程执行 RDMA，不阻塞调度线程。
 
-### 2.9 与聚合版 `event_loop_overlap` 的差异
+### 2.10 与聚合版 `event_loop_overlap` 的差异
 
 | 项目 | 聚合版 `event_loop_overlap` | P 端 `event_loop_overlap_disagg_prefill` |
 | --- | --- | --- |

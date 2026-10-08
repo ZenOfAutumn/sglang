@@ -3650,16 +3650,30 @@ class Scheduler(
         beam_width: Optional[int] = None,
         running_batch: Optional[ScheduleBatch] = None,
     ) -> int:
+        # 中译：计算本轮还能再接纳多少个新请求进入 prefill 批（请求个数名额，不是 token 数）。
+        #       结果取「单个 micro-batch 的请求数预算」与「req_to_token_pool 剩余槽位」的较小值；
+        #       组批时 len(adder.can_run_list) 达到该值即视为批已满（batch_is_full）。
+        #       running_bs：当前 running batch 中的请求数；
+        #       beam_width：候选请求为 beam search 时的束宽，一个请求在 decode 时要占 beam_width 行；
+        #       running_batch：用于统计 beam 待占行数的批，缺省用 self.running_batch。
+        # 中译：请求数预算 = 每个 micro-batch 的最大请求数 - 已在运行的请求数。
+        #       pp_max_micro_batch_size 未配置时默认为 max_running_requests // pp_size（非 PP 时即 max_running_requests）。
         pp_budget = get_parallel().pp_max_micro_batch_size - running_bs
+        # 中译：req_to_token_pool 的剩余槽位数。每个在途请求占一个槽位（req_pool_idx）；
+        #       PD prefill 端 inflight 队列中等待 KV 传输完成的请求也仍占着槽位。
         available = self.req_to_token_pool.available_size()
 
+        # 中译：扣除 beam search 已接纳、但成员行尚未展开的组将要占用的槽位
+        #       （每组还需 beam_width - 1 行），避免槽位被超额承诺；结果不低于 0。
         active_batch = running_batch or self.running_batch
         available = max(
             available - self.beam_coordinator.pending_member_rows(active_batch), 0
         )
+        # 中译：两类约束取较小值。
         res = min(pp_budget, available)
         if beam_width is not None:
             # A beam candidate owns beam_width rows once decoding.
+            # 中译：beam 候选请求进入 decode 后要占 beam_width 行，因此可接纳数还要除以束宽。
             res = min(res, available // beam_width)
 
         return res

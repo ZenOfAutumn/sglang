@@ -1078,10 +1078,10 @@ flowchart LR
 ## 六、延伸阅读
 
 - **理论文档**：
-  - `docs/theory/op/speculative_decoding.md`：投机解码原理
-  - `docs/theory/op/mtp_vs_eagle1.md`：MTP vs EAGLE 对比
-  - `docs/theory/op/mtp.md`：MTP 详细原理
-  - `docs/theory/op/dspark.md`：DFlash/DSpark 原理
+  - `docs/learn/speculative/speculative_decoding.md`：投机解码原理
+  - `docs/learn/speculative/mtp_vs_eagle1.md`：MTP vs EAGLE 对比
+  - `docs/learn/speculative/mtp.md`：MTP 详细原理
+  - `docs/learn/speculative/dspark.md`：DFlash/DSpark 原理
 
 - **论文**：
   - EAGLE: [Speculative Sampling](https://arxiv.org/abs/2401.15077)

@@ -1,11 +1,11 @@
 # LLM 量化综述：数值格式、方法族谱与生产选型
 
-> 本文是 `docs/theory/quantization/` 下的**总览性**文档，回答三个问题：
+> 本文是 `docs/learn/quantization/` 下的**总览性**文档，回答三个问题：
 > **① 量化到底在优化什么**（收益来源与上限）；**② 目前有哪几类方法、各自解决什么问题**；
 > **③ 面对一个具体模型和一张具体卡，选哪条路线**。
 >
 > 各方法的深入推导见同目录的分篇：GPTQ 的完整数学推导见 [gptq.md](./gptq.md)；
-> 工程接口（Config / Method / apply 生命周期）见 [量化子系统学习计划](../../quantization_learning_plan_zh.md)；
+> 工程接口（Config / Method / apply 生命周期）见 [量化子系统学习计划](quantization_learning_plan_zh.md)；
 > 启动参数与平台支持矩阵见 [Quantization 使用文档](../../advanced_features/quantization_zh.md)
 > 与 [KV Cache 量化](../../advanced_features/quantized_kv_cache_zh.md)。
 
@@ -566,7 +566,7 @@ Q5  是 MoE？ → 优先 W4A8 / FP8；注意跳过 gate，专家 kernel 尺寸�
 ### 13.3 延伸阅读
 
 - 方法级数学推导：[gptq.md](./gptq.md)
-- 子系统代码结构与分阶段学习：[quantization_learning_plan_zh.md](../../quantization_learning_plan_zh.md)
+- 子系统代码结构与分阶段学习：[quantization_learning_plan_zh.md](quantization_learning_plan_zh.md)
 - 使用与平台支持矩阵：[advanced_features/quantization_zh.md](../../advanced_features/quantization_zh.md)
 - KV cache 量化：[advanced_features/quantized_kv_cache_zh.md](../../advanced_features/quantized_kv_cache_zh.md)
 

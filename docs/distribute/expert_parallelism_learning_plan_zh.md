@@ -119,7 +119,7 @@ $$
 
 | 时间 | 学习主题 | 代码主入口 | 实践产出 |
 | --- | --- | --- | --- |
-| 第 1 天 0:00–0:45 | MoE/EP 原理与路由手算 | `docs/theory/distributed/EP.md` | 路由手算表 |
+| 第 1 天 0:00–0:45 | MoE/EP 原理与路由手算 | `docs/learn/distributed/EP.md` | 路由手算表 |
 | 第 1 天 0:45–1:30 | EP/TP/DP rank 拓扑 | `distributed/parallel_state.py` | 8 卡 rank 图 |
 | 第 1 天 1:30–2:15 | Router、Top-K 与逻辑/物理专家映射 | `moe/router.py`、`moe/topk.py`、`eplb/expert_location_dispatch.py` | `TopKOutput` shape 表 |
 | 第 1 天 2:15–3:15 | Dispatcher 协议与 Standard/DeepEP | `token_dispatcher/base.py`、`standard.py`、`deepep.py` | dispatch/combine 协议图 |
@@ -150,7 +150,7 @@ $$
 
 #### 阅读
 
-1. `docs/theory/distributed/EP.md` §1–§5；
+1. `docs/learn/distributed/EP.md` §1–§5；
 2. 重点理解 `topk_ids`、`topk_weights`、logical expert、physical expert、local expert。
 
 #### 手算实践
@@ -687,7 +687,7 @@ dispatch 已生成 [local_expert, capacity, hidden]
 
 #### 阅读顺序
 
-1. `docs/theory/distributed/EP.md` §6；
+1. `docs/learn/distributed/EP.md` §6；
 2. `python/sglang/srt/eplb/expert_distribution.py`：负载记录与 balancedness；
 3. `eplb/eplb_manager.py`：`on_forward_pass_end`、`rebalance`；
 4. `eplb/expert_location.py`：logical/physical 映射；
@@ -1002,5 +1002,5 @@ $$
 3. `python/sglang/srt/layers/moe/token_dispatcher/README_zh.md`：后端目录导航；
 4. `python/sglang/srt/layers/moe/moe_runner/base.py` 与 `runner.py`：理解格式适配和融合注册，再深入当前硬件的 grouped GEMM；
 5. `python/sglang/srt/eplb/eplb_simulator/`：离线分析和重排模拟；
-6. `docs/theory/distributed/DP_attention.md`：理解 Attention DP 与 EP 的 token gather/scatter 衔接；
+6. `docs/learn/distributed/DP_attention.md`：理解 Attention DP 与 EP 的 token gather/scatter 衔接；
 7. Two-Batch Overlap / Single-Batch Overlap：研究通信计算重叠与共享专家融合。

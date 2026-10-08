@@ -117,7 +117,7 @@ FlashInfer 采样 kernel 内部使用 **GPU 全局 RNG**，不接受外部传入
                 ), "Sampling seed is not supported for flashinfer backend"
 ```
 
-需要可复现的确定性采样时，应改用 pytorch 后端（`top_k_top_p_min_p_sampling_from_probs_torch` + `multinomial_with_seed` 的 Gumbel-Max 路径，见 `docs/theory/Glossary.md` 的「随机种子」「torch.multinomial」条目）。
+需要可复现的确定性采样时，应改用 pytorch 后端（`top_k_top_p_min_p_sampling_from_probs_torch` + `multinomial_with_seed` 的 Gumbel-Max 路径，见 `docs/learn/glossary.md` 的「随机种子」「torch.multinomial」条目）。
 
 ## 4. 与 pytorch 回退实现的对比
 

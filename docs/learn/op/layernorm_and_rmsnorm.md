@@ -99,7 +99,7 @@ $$
 **对 LLM 而言，归一化都是逐 token 独立的**——这一点非常重要，它意味着：
 
 - 归一化**不需要任何跨卡通信**（这解释了为什么 TP 中 LayerNorm/RMSNorm 在每张卡上冗余计算，
-  见 `docs/theory/distributed/TP.md`）；
+  见 `docs/learn/distributed/TP.md`）；
 - 归一化对 batch 组成不敏感，天然满足 serving 的确定性要求。
 
 ---
@@ -266,7 +266,7 @@ x (H,)
 | block 内同步 | 2 次 | 1 次 | 50% |
 
 > **为什么归约次数比 FLOPs 更重要**：归一化是**访存密集型（memory-bound）**算子，
-> 不是算力密集型。用 §9 的 Roofline 视角看（参见 `docs/theory/distributed/cost_model.md`），
+> 不是算力密集型。用 §9 的 Roofline 视角看（参见 `docs/learn/distributed/cost_model.md`），
 > 它的算术强度极低，瓶颈在 HBM 带宽与同步开销，而不是浮点运算。
 > 因此「少一次全维归约、少一次同步」带来的收益远大于 FLOPs 数字的减少。
 
@@ -818,7 +818,7 @@ A：Zhang & Sennrich (2019) 的消融实验证明 re-scaling 是稳定训练的�
 A：归一化需要沿 **hidden 维**做全维归约。若按 hidden 维切分，每张卡只有部分维度，
 求 RMS 就需要一次 all-reduce。而归一化本身的计算量极小（相比 GEMM 可忽略），
 **为省这点计算而增加一次通信完全不划算**。所以每张卡冗余计算完整的归一化。
-详见 `docs/theory/distributed/TP.md`。
+详见 `docs/learn/distributed/TP.md`。
 
 **Q3：$\epsilon$ 取多少？**
 A：常见 $10^{-5}$（LLaMA）或 $10^{-6}$（Gemma、多数新模型）。
@@ -831,7 +831,7 @@ $\mathbb{E}[x^2]$（均方），只有在 $\mu=0$ 时才等于方差。命名有
 **Q5：归一化是 compute-bound 还是 memory-bound？**
 A：**memory-bound**。每个元素只做几次浮点运算，但要完整读写一遍张量，算术强度极低。
 所以优化方向是**减少 HBM 往返**（kernel 融合），而不是减少 FLOPs。
-参见 `docs/theory/distributed/cost_model.md` §9 的 Roofline 分析。
+参见 `docs/learn/distributed/cost_model.md` §9 的 Roofline 分析。
 
 **Q6：为什么要把残差加法融进归一化 kernel？**
 A：Pre-Norm 下每层都是「加残差 → 归一化」，融合后 HBM 往返从 4 次降到 2 次。
@@ -857,9 +857,9 @@ batch 大小改变，而浮点加法不满足结合律。需要严格可复现�
   Xiong et al., *On Layer Normalization in the Transformer Architecture*（ICML 2020）；
   Wang et al., *DeepNet: Scaling Transformers to 1,000 Layers*（2022）。
 - **本仓库相关文档**：
-  `docs/theory/distributed/TP.md`（为什么归一化层不切分）；
-  `docs/theory/distributed/cost_model.md` §9（Roofline，理解 memory-bound）；
-  `docs/theory/op/`（其他算子原理文档）。
+  `docs/learn/distributed/TP.md`（为什么归一化层不切分）；
+  `docs/learn/distributed/cost_model.md` §9（Roofline，理解 memory-bound）；
+  `docs/learn/op/`（其他算子原理文档）。
 - **相关代码**：
   `python/sglang/srt/layers/layernorm.py`（全部归一化类）；
   `python/sglang/srt/batch_invariant_ops/`（批不变实现）；

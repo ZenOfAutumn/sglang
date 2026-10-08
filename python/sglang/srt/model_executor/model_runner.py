@@ -309,7 +309,7 @@ class ModelRunner:
     #       它持有权重（self.model）、KV 缓存内存池、采样器、CUDA Graph runner、通信组等，
     #       对外提供 forward / forward_batch_generation / prefill / decode 等接口。
     #       调用链：Scheduler（调度） → TpModelWorker（管 rank / 内存池 / 权重加载） → ModelRunner（真干活）。
-    #       TpModelWorker.__init__ 里那句 `ModelRunner(...)` 就是本类的入口（见 docs/learn/run/init_tp_model_worker_zh.md 第 4 节）。
+    #       TpModelWorker.__init__ 里那句 `ModelRunner(...)` 就是本类的入口（见 docs/learn/runtime/init_tp_model_worker_zh.md 第 4 节）。
     #
     #       __init__ 只负责「把这个 rank 的模型准备好」，不做任何前向；
     #       它的入参含义、产物清单与耗时口径见下方 __init__ 的 docstring（含输入/输出示例）。
@@ -398,7 +398,7 @@ class ModelRunner:
             runner.layer_info / support_pp / draft_load_format / spec_aux_config / max_running_requests
             runner.req_to_token_pool / token_to_kv_pool_allocator  # 此处可能仍为 None（等 alloc_memory_pool()）
             耗时口径：分钟级，主体是 self.initialize() → load_model() 读 checkpoint
-            （见 docs/learn/run/init_tp_model_worker_zh.md 第 5/7 节）。
+            （见 docs/learn/runtime/init_tp_model_worker_zh.md 第 5/7 节）。
         """
 
         # Parse args

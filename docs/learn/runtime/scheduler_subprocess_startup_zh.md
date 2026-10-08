@@ -1,6 +1,6 @@
 # Scheduler 子进程启动详解
 
-> 本文是 `docs/learn/run/http_server_startup_zh.md` 第 3.2 节「Scheduler 子进程内部启动」的**展开版**：原文只保留启动链路上的必要顺序，这里把每个环节展开到代码级细节。
+> 本文是 `docs/learn/runtime/http_server_startup_zh.md` 第 3.2 节「Scheduler 子进程内部启动」的**展开版**：原文只保留启动链路上的必要顺序，这里把每个环节展开到代码级细节。
 >
 > 不重复的内容仍在原文：父进程侧的进程编排（`_launch_subprocesses` / `SubprocessWatchdog`）、Detokenizer/TokenizerManager 启动、HTTP 装配（`_setup_and_run_http_server` / `lifespan`）、预热与就绪判定（`_wait_and_warmup` / `/health`）。
 >

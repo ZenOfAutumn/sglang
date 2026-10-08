@@ -7,7 +7,7 @@
 - **OpenAI 兼容**：`POST /v1/chat/completions`（`OpenAIServingChat`）；
 - **Anthropic 兼容**：`POST /v1/messages`（`AnthropicServing`，先把 Anthropic 请求翻译成 OpenAI 请求，复用 `OpenAIServingChat`，再把响应翻译回 Anthropic 形状）。
 
-本文只讲「一次推理请求（request）」的处理链路，即 HTTP 接入 → 协议转换 → 分词 → 调度 → 生成 → 回程 → 响应组装。进程如何启动、三类进程如何划分，见 `docs/learn/run/http_server_startup_zh.md` 与 `docs/learn/arch/why_three_processes_zh.md`，本文不重复。
+本文只讲「一次推理请求（request）」的处理链路，即 HTTP 接入 → 协议转换 → 分词 → 调度 → 生成 → 回程 → 响应组装。进程如何启动、三类进程如何划分，见 `docs/learn/runtime/http_server_startup_zh.md` 与 `docs/learn/runtime/why_three_processes_zh.md`，本文不重复。
 
 ## 0. 一张图看全流程
 

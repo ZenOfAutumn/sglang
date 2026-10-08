@@ -49,7 +49,7 @@
 
 本路线面向想吃透 `srt/layers` 的工程师，按**数据流顺序**（嵌入 → 线性/归一化/激活 → 注意力 → 输出 logits → 采样）拆成 6 个阶段，每阶段含「阅读清单 / 动手任务 / 自检问题」。建议先通读 `srt/models/llama.py` 的 `forward`，建立"一个模型如何把这些层串起来"的整体印象，再逐层深入。
 
-> 前置：先理解张量并行（TP）基本概念（列并行/行并行），因为 layers 里大量层都是 TP 感知的。可参考 `docs/sglang_learning_plan_zh.md` 的并行小节。
+> 前置：先理解张量并行（TP）基本概念（列并行/行并行），因为 layers 里大量层都是 TP 感知的。可参考 `docs/learn/sglang_learning_plan_zh.md` 的并行小节。
 
 ### 阶段 L0：建立全景（0.5 天）
 
@@ -99,7 +99,7 @@
 - **阅读**：
   1. `sampler.py`：`Sampler` 主流程，简单情形（直接 multinomial）与复杂情形（top-k/top-p/min-p 截断）的分叉；确定性采样 `multinomial_with_seed` 的 Gumbel-Max 实现。
   2. `fused_sampling.py`：温度缩放 + softmax 的融合 Triton kernel。
-  3. 配套理论：`docs/theory/Glossary.md` 的「torch.multinomial」「随机种子」「Gumbel-Max」「PRNG」条目，以及 `docs/theory/op/flashinfer_top_k_top_p_sampling_from_probs.md`。
+  3. 配套理论：`docs/learn/glossary.md` 的「torch.multinomial」「随机种子」「Gumbel-Max」「PRNG」条目，以及 `docs/learn/op/flashinfer_top_k_top_p_sampling_from_probs.md`。
 - **动手**：固定 `sampling_seed` 发两次相同请求验证可复现；对比 flashinfer 与 pytorch 采样后端的延迟。
 - **自检**：top-k/top-p/min-p 的执行顺序是怎样的？为什么 flashinfer 后端不支持逐请求确定性采样？
 
@@ -114,4 +114,4 @@
 1. **顺数据流读**：始终沿 `embedding → linear/norm/act → attention → logits → sampler` 这条线，不要孤立看单个文件。
 2. **对照一个真实模型**：以 `llama.py` 为锚点，每学一层就回到模型里找它的调用点。
 3. **融合算子重在"为什么融合"**：`elementwise.py` / `fused_sampling.py` 的价值是减少 kernel 启动与显存往返，理解动机比抠 Triton 细节更重要。
-4. **理论与代码互证**：采样、logits 部分配合 `docs/theory/` 下的 Glossary 与 op 文档一起看。
+4. **理论与代码互证**：采样、logits 部分配合 `docs/learn/` 下的 Glossary 与 op 文档一起看。

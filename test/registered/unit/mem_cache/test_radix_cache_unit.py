@@ -15,6 +15,35 @@ Usage:
     python test_radix_cache_unit.py
     python -m pytest test_radix_cache_unit.py -v
     python -m pytest test_radix_cache_unit.py::TestRadixCache::test_insert_basic
+
+测试用例总览（按类）：
+- TestKVCacheEventQueue：KVCacheEventRecorder 的事件合并规则（哪些能合并、哪些必须断开）
+- TestRadixKey：键的长度/迭代/切片、match() 的前缀长度与页对齐、bigram 视图、命名空间携带
+- TestTreeNode：字段默认值、evicted/backuped 派生属性、host 引用计数、哈希前缀拼接
+- TestRadixCache：插入/匹配、淘汰与锁计数账本、页对齐边界、节点分裂、extra_key/cache_salt
+  隔离、KV 事件（store/remove/哈希切分）、大规模插入的内存占用量级
+
+约定：RadixCache 用例统一用 RadixCache.create_simulated(...) 构造不接真实显存的仿真树
+（device 断言为 cpu）；需要验证 slot 归还时注入 mock allocator；涉及加速器显存的只有
+TestRadixCache.test_memory_allocated，因此整份文件挂在单卡 GPU CI 下。
+
+运行方式（在仓库根目录 /home/sankuai/sglang 下）::
+
+    # 标准方式（CI 同款，推荐）
+    python -m pytest test/registered/unit/mem_cache/test_radix_cache_unit.py -v
+
+    # 直接跑文件也可以（文件末尾有 unittest.main()）
+    cd python && python3 ../test/registered/unit/mem_cache/test_radix_cache_unit.py -v
+
+本机开发容器的额外说明（与 test_req_to_token_pool_unit.py 相同）：site-packages 里的
+``deep_gemm`` 版本过旧（缺少新代码需要的 ``deep_gemm.utils.layout``），且设置
+``PYTHONPATH`` 会导致 ``numpy`` 找不到（``/usr/local/lib/packages`` 不在路径里）。
+因此需要先 ``cd`` 到 ``python/`` 让 ``import sglang`` 命中工作区源码，再把匹配的
+DeepGEMM 插到 ``sys.path`` 前面::
+
+    cd /home/sankuai/sglang/python && python3 -c "import sys; sys.path.insert(0,'/home/sankuai/tb4.0/dsv41-pd/DeepGEMM/build'); import pytest; sys.exit(pytest.main(['/home/sankuai/sglang/test/registered/unit/mem_cache/test_radix_cache_unit.py','-q']))"
+
+本机实测：39 passed（含 test_memory_allocated，需要可用 GPU）。
 """
 
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -56,6 +85,13 @@ DEFAULT_PAGE_SIZE = 4
 
 
 class TestKVCacheEventQueue(unittest.TestCase):
+    """KVCacheEventRecorder 的入队合并（coalesce）行为。
+
+    事件会被 router 用来重建缓存索引，因此“相邻且兼容的事件合并成一条”
+    可以显著压低事件量；但合并条件必须严格：medium / lora_id / block_size /
+    parent 链 / cache_salt 任一不同，都不能合并，否则外部索引会串味。
+    """
+
     @staticmethod
     def _store(
         block_hash: int,
@@ -66,6 +102,7 @@ class TestKVCacheEventQueue(unittest.TestCase):
         lora_id: int | None = None,
         cache_salt: str | None = None,
     ) -> BlockStored:
+        """构造单块 BlockStored 的测试小工具；带 cache_salt 时改用 BlockStoredWithMetadata。"""
         event_args = dict(
             block_hashes=[block_hash],
             parent_block_hash=parent_block_hash,
@@ -82,6 +119,14 @@ class TestKVCacheEventQueue(unittest.TestCase):
         )
 
     def test_enqueue_coalesces_compatible_stores(self):
+        """相邻且兼容的 BlockStored 应合并为一条事件。
+
+        构造：先入队父块（hash=1, parent=None），再入队子块（hash=2, parent=1）；
+        两者 medium/block_size/lora_id 一致，且后者的 parent 正好是前者的 hash。
+        断言：只产出 1 条事件；block_hashes 顺序拼接为 [1, 2]；
+        合并后 parent 取第一块的 parent（None），不会变成中间块的哈希；
+        token_ids 一并拼接（每块 2 个 token）→ [1, 2, 2, 3]。
+        """
         queue = KVCacheEventRecorder(enabled=True, page_size=DEFAULT_PAGE_SIZE)
         queue.enqueue(self._store(1, None))
         queue.enqueue(self._store(2, 1))
@@ -93,6 +138,11 @@ class TestKVCacheEventQueue(unittest.TestCase):
         self.assertEqual(events[0].token_ids, [1, 2, 2, 3])
 
     def test_enqueue_coalesces_compatible_removes(self):
+        """相邻的 BlockRemoved 应合并为一条（批量上报淘汰）。
+
+        构造：入队 [1]，再入队 [2, 3]，medium 相同。
+        断言：合并成 1 条 BlockRemoved，block_hashes = [1, 2, 3]。
+        """
         queue = KVCacheEventRecorder(enabled=True, page_size=DEFAULT_PAGE_SIZE)
         queue.enqueue(BlockRemoved(block_hashes=[1], medium=StorageMedium.GPU))
         queue.enqueue(BlockRemoved(block_hashes=[2, 3], medium=StorageMedium.GPU))
@@ -103,6 +153,15 @@ class TestKVCacheEventQueue(unittest.TestCase):
         self.assertEqual(events[0].block_hashes, [1, 2, 3])
 
     def test_enqueue_preserves_fusion_boundaries(self):
+        """不兼容的事件必须保持为独立事件（合并边界不能被越过）。
+
+        四组“相邻但不兼容”的 store，每组都应产出 2 条事件：
+        medium 不同（GPU/CPU）、lora_id 不同（None/1）、block_size 不同（2/1）、
+        父哈希不连续（第二块 parent=None，无法与第一块串成链）。
+        另外三组边界：store/remove/AllBlocksCleared/store 交替 → 4 条
+        （清空事件必须打断合并）；两条 remove 但 medium 不同 → 2 条；
+        两条 store 但 cache_salt 不同（tenant-a/tenant-b）→ 2 条。
+        """
         incompatible_stores = [
             self._store(2, 1, medium=StorageMedium.CPU),
             self._store(3, 1, lora_id=1),
@@ -134,10 +193,17 @@ class TestKVCacheEventQueue(unittest.TestCase):
 
 
 class TestRadixKey(unittest.TestCase):
-    """Test cases for RadixKey class."""
+    """RadixKey 的键语义：长度/迭代/切片、match() 的公共前缀长度、bigram 视图与命名空间。
+
+    纯 CPU、纯数据结构测试，不依赖 RadixCache；`_assert_match` 是通用的
+    “给定两段 token + page_size → 断言公共前缀长度” 小工具。
+    """
 
     def test_init_with_extra_key(self):
-        """Test initialization with extra_key."""
+        """构造时 token_ids 与 extra_key 被原样保存。
+
+        断言 token_ids 转回 list 后等于输入，extra_key 可原样读回。
+        """
         token_ids = [1, 2, 3]
         extra_key = "test_key"
         key = RadixKey(array("q", token_ids), extra_key)
@@ -145,7 +211,10 @@ class TestRadixKey(unittest.TestCase):
         self.assertEqual(key.extra_key, extra_key)
 
     def test_len_and_iter(self):
-        """Test __len__ and __iter__ methods."""
+        """__len__ 返回 token 个数，__iter__ 逐个产出 token。
+
+        参数化覆盖：普通序列 [1,2,3]→3、空序列→0、单元素→1。
+        """
         test_cases = [
             ([1, 2, 3], 3),
             ([], 0),
@@ -159,7 +228,11 @@ class TestRadixKey(unittest.TestCase):
                 self.assertEqual(list(key), tokens)
 
     def test_getitem_int(self):
-        """Test __getitem__ with int index."""
+        """整数下标返回长度为 1 的 RadixKey（而不是单个 int）。
+
+        覆盖 0、负索引 -1（应换算成最后一个）、末尾索引 2，
+        并断言返回类型仍是 RadixKey（保证后续能继续做切片/匹配）。
+        """
         test_cases = [
             ([10, 20, 30], 0, [10]),
             ([10, 20, 30], -1, [30]),
@@ -174,7 +247,11 @@ class TestRadixKey(unittest.TestCase):
                 self.assertEqual(list(result.token_ids), expected)
 
     def test_getitem_slice(self):
-        """Test __getitem__ with slice and edge cases."""
+        """切片返回新的 RadixKey，继承 extra_key；边界切片不报错。
+
+        key[1:4] → [2,3,4] 且 extra_key 仍为 "extra"；
+        key[2:2] → 空切片；key[:] → 完整拷贝。
+        """
         key = RadixKey(array("q", [1, 2, 3, 4, 5]), "extra")
 
         # Basic slice
@@ -188,6 +265,11 @@ class TestRadixKey(unittest.TestCase):
         self.assertEqual(list(key[:].token_ids), [1, 2, 3, 4, 5])  # Full slice
 
     def test_cache_salt_is_preserved_by_slicing(self):
+        """回归保护：切片必须同时保留 extra_key 与 cache_salt。
+
+        树在分裂/匹配时会对 key 做切片；若切片丢掉命名空间字段，
+        不同 salt 的缓存就可能被错误共享，因此这里显式断言两者都被带下去。
+        """
         key = RadixKey(
             array("q", [1, 2, 3, 4]),
             extra_key="classification",
@@ -198,18 +280,27 @@ class TestRadixKey(unittest.TestCase):
         self.assertEqual(sliced.cache_salt, "tenant-a")
 
     def test_getitem_invalid_index(self):
-        """Test __getitem__ with invalid indices."""
+        """越界下标必须抛 IndexError（而不是静默返回空）。
+
+        调用方依赖“越界即报错”来发现长度计算错误，静默返回空会被
+        误当成“正常但无命中”。
+        """
         key = RadixKey(array("q", [1, 2, 3]))
         with self.assertRaises(IndexError):
             _ = key[10]  # Out of bounds
 
     def _assert_match(self, a, b, page_size, expected, is_bigram=False):
+        """测试小工具：构造两个 RadixKey 并断言 match() 返回的公共前缀长度。"""
         key_a = RadixKey(array("q", a), is_bigram=is_bigram)
         key_b = RadixKey(array("q", b), is_bigram=is_bigram)
         self.assertEqual(key_a.match(key_b, page_size=page_size), expected)
 
     def test_match_page_size_1(self):
-        """match() with page_size=1: full, partial, none, prefix, and empty keys."""
+        """page_size=1 时 match() 返回精确的公共前缀长度（不做页对齐）。
+
+        覆盖 7 种形态：完全相同(4)、第 2 个 token 分叉(2)、首位就分叉(0)、
+        对方是自己的前缀(3)、自身为空(0)、对方为空(0)、双方为空(0)。
+        """
         self._assert_match([1, 2, 3, 4], [1, 2, 3, 4], 1, 4)  # identical
         self._assert_match([1, 2, 3, 4], [1, 2, 9, 9], 1, 2)  # diverge at index 2
         self._assert_match([9, 2, 3], [1, 2, 3], 1, 0)  # diverge at index 0
@@ -219,7 +310,11 @@ class TestRadixKey(unittest.TestCase):
         self._assert_match([], [], 1, 0)  # both empty
 
     def test_match_page_size_gt_1_rounds_down(self):
-        """match() with page_size>1 rounds the shared length down to a page."""
+        """page_size>1 时公共前缀长度向下取整到页的整数倍。
+
+        覆盖：第 7 个 token 才分叉(→4，不足一页丢掉)、首页内部就分叉(→0)、
+        第 5 个 token 分叉(→4)、完全相同(→8)、序列总长不足一页(→0)。
+        """
         self._assert_match([1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4, 5, 6, 9, 8], 4, 4)
         self._assert_match(
             [1, 2, 3, 4], [1, 9, 3, 4], 4, 0
@@ -229,10 +324,13 @@ class TestRadixKey(unittest.TestCase):
         self._assert_match([1, 2, 3], [1, 2, 3], 4, 0)  # shorter than one page
 
     def test_match_long_keys_exponential_search(self):
-        """Deep divergences exercise the doubling gallop windows + binary search.
+        """长 key 上的匹配正确性，专门覆盖“倍增窗口 + 二分”那条快路径。
 
-        ``base`` has distinct values, so flipping one position diverges the prefix
-        exactly there; the shared length is that index rounded down to the page.
+        base = [0..1999] 各位置取值互不相同，把 b 在 div 处置成 -1 后，
+        两者必然恰好在 div 处首次分叉，期望公共长度 = div 向下取整到页。
+        div 取值刻意压在倍增窗口的边界上：1、2、63/64/65、127/128、
+        511/512/513，以及靠末尾的 1234、1999；page_size 取 1/4/64。
+        最后补一个“完整匹配”用例，确保 gallop 能一直推进到序列末尾。
         """
         base = list(range(2000))
         for div in (1, 2, 63, 64, 65, 127, 128, 511, 512, 513, 1234, 1999):
@@ -247,7 +345,11 @@ class TestRadixKey(unittest.TestCase):
         self._assert_match(base, base[:], 64, (2000 // 64) * 64)
 
     def test_match_bigram(self):
-        """is_bigram: L matching raw tokens imply L-1 matching bigrams."""
+        """bigram 视图下：L 个原始 token 相同 ⇒ L-1 个二元组相同。
+
+        覆盖：第 3 个 token 分叉(→2)、完全相同(5 token → 4)、
+        仅 2 个 token(→1)、长序列第 70 个 token 分叉(69 个 bigram 按页 64 取整 → 64)。
+        """
         self._assert_match([1, 2, 3, 4, 5], [1, 2, 3, 9, 5], 1, 2, is_bigram=True)
         self._assert_match([1, 2, 3, 4, 5], [1, 2, 3, 4, 5], 1, 4, is_bigram=True)
         self._assert_match([1, 2], [1, 2], 1, 1, is_bigram=True)
@@ -259,14 +361,22 @@ class TestRadixKey(unittest.TestCase):
 
 
 class TestTreeNode(unittest.TestCase):
-    """Test cases for TreeNode class."""
+    """TreeNode 的字段默认值、evicted/backuped 派生状态、host 引用计数与哈希拼接。
+
+    setUp 里重置 TreeNode.counter，使 id 相关断言与用例执行顺序无关
+    （counter 是跨用例的全局自增计数器）。
+    """
 
     def setUp(self):
         """Reset the counter before each test."""
         TreeNode.counter = 0
 
     def test_init_basic(self):
-        """Test basic initialization of TreeNode."""
+        """新节点的字段默认值（setUp 已把 counter 归零，故 id 从 0 开始）。
+
+        断言：children 为空、parent/key/value 为 None、
+        lock_ref/hit_count/host_ref_counter 为 0、host_value/hash_value 为 None。
+        """
         node = TreeNode()
         self.assertEqual(node.id, 0)
         self.assertEqual(len(node.children), 0)
@@ -280,14 +390,24 @@ class TestTreeNode(unittest.TestCase):
         self.assertIsNone(node.hash_value)
 
     def test_init_with_id(self):
-        """Test initialization with custom ID."""
+        """显式传入 id 时只用指定值，不额外消耗计数器语义上的“期望值”。
+
+        传 id=42 后节点 id 即 42；紧接着新建的节点拿到 1，
+        说明显式 id 只覆盖本节点，全局计数器仍按自己的节奏自增。
+        """
         node = TreeNode(id=42)
         self.assertEqual(node.id, 42)
         node2 = TreeNode()
         self.assertEqual(node2.id, 1)  # Counter was incremented
 
     def test_evicted_backuped_properties(self):
-        """Test evicted and backuped properties."""
+        """evicted / backuped 只由 value / host_value 是否存在决定。
+
+        参数化四组组合（有 device value × 有 host value）：
+        evicted = (value is None)、backuped = (host_value is not None)。
+        其中“已淘汰但 host 有备份”（value 缺失 + host_value 存在）
+        对应 HiCache 可回载而无需重算的场景。
+        """
         test_cases = [
             (False, False, True, False),
             (True, False, False, False),
@@ -313,7 +433,11 @@ class TestTreeNode(unittest.TestCase):
                 self.assertEqual(node.backuped, expected_backuped)
 
     def test_protect_release_host(self):
-        """Test protect_host and release_host methods."""
+        """protect_host / release_host 维护 host_ref_counter。
+
+        加一次 → 1，释放一次 → 0；计数已为 0 时再释放必须抛 RuntimeError，
+        用来暴露 host 侧加解锁不配对的逻辑错误。
+        """
         node = TreeNode()
         self.assertEqual(node.host_ref_counter, 0)
 
@@ -328,7 +452,7 @@ class TestTreeNode(unittest.TestCase):
             node.release_host()
 
     def test_get_last_hash_value(self):
-        """Test get_last_hash_value method."""
+        """get_last_hash_value 取哈希列表的最后一项；尚未计算哈希时返回 None。"""
         node = TreeNode()
         self.assertIsNone(node.get_last_hash_value())
 
@@ -336,7 +460,15 @@ class TestTreeNode(unittest.TestCase):
         self.assertEqual(node.get_last_hash_value(), "hash3")
 
     def test_get_prefix_hash_values_not_shared_across_calls(self):
-        """Regression guard for cached mutable prefix hash lists."""
+        """回归保护：get_prefix_hash_values 返回的列表不得跨调用共享同一对象。
+
+        背景：下游存储代码会在处理每一页时 **就地** extend 这个返回的列表；
+        若实现把结果缓存并直接返回同一个 list，下一次调用就会读到被污染的数据。
+
+        构造 root→n1→n2→n3 链，对 (TreeNode, MambaTreeNode) 两种实现分别验证：
+        第一次调用返回 ["h1","h2"]；就地追加 ["h3"] 后，第二次调用仍返回
+        ["h1","h2"] 且不是同一个对象；更深的节点能拼出完整前缀 ["h1","h2","h3"]。
+        """
         for node_cls in (TreeNode, MambaTreeNode):
             with self.subTest(node_cls=node_cls.__module__):
                 root = node_cls()
@@ -369,14 +501,24 @@ class TestTreeNode(unittest.TestCase):
 
 
 class TestRadixCache(unittest.TestCase):
-    """Test cases for RadixCache class."""
+    """RadixCache 的核心行为：插入/匹配、淘汰、锁计数账本、页对齐、分裂、隔离与事件。
+
+    统一用 RadixCache.create_simulated(...) 构造不接真实显存的仿真树
+    （用例断言 cache.device == cpu）；需要检查 slot 归还/释放时再注入
+    mock allocator。setUp 重置 TreeNode.counter。
+    """
 
     def setUp(self):
         """Set up test fixtures."""
         TreeNode.counter = 0
 
     def test_init_variations(self):
-        """Test cache initialization with different parameters."""
+        """三种构造参数组合下字段是否按入参落位。
+
+        组合 (page_size, disable, enable_events) = (1,F,F) / (4,F,T) / (1,T,F)。
+        断言 page_size / disable / kv_events.enabled 与入参一致、device 为 cpu、
+        根节点存在且根 key 长度为 0（根是空 key 的哨兵节点）。
+        """
         test_cases = [
             (1, False, False),
             (4, False, True),
@@ -401,7 +543,11 @@ class TestRadixCache(unittest.TestCase):
                 self.assertEqual(len(cache.root_node.key), 0)
 
     def test_reset(self):
-        """Test reset method."""
+        """reset() 清空整棵树与两个账本。
+
+        先插入 3 个 token 让 total_size > 0，再 reset；
+        断言 total_size / evictable_size / protected_size 全部归零。
+        """
         cache = RadixCache.create_simulated()
 
         # Insert some data
@@ -420,7 +566,15 @@ class TestRadixCache(unittest.TestCase):
         self.assertEqual(cache.protected_size(), 0)
 
     def test_insert_and_match_basic(self):
-        """Test basic insert and match operations."""
+        """最基本的 insert → match_prefix 流程，并覆盖 disable 分支。
+
+        对 disable_cache ∈ {False, True} 各跑一遍：
+        - disable=True：insert 返回 prefix_len=0 且不建树（total_size 仍为 0）；
+        - disable=False：首次插入无可复用前缀（prefix_len=0），
+          total_size 与 evictable_size 都等于 3；
+          用等长 key 匹配取回全部 3 个 slot，且与写入值一致；
+          用更短的 key [1,2] 匹配只返回前 2 个 slot（前缀匹配语义）。
+        """
         for disable_cache in [False, True]:
             with self.subTest(disable_cache=disable_cache):
                 cache = RadixCache.create_simulated(disable=disable_cache)
@@ -456,7 +610,11 @@ class TestRadixCache(unittest.TestCase):
                 )
 
     def test_insert_with_none_value(self):
-        """Test insert with None value (should use token_ids as list)."""
+        """value=None 时的兜底路径：直接用 token_ids 充当 slot 索引。
+
+        只关心“不崩且计入树大小”，故断言 prefix_len=0、total_size=3。
+        该分支主要服务调试/测试（见 radix_cache.insert 里的兜底实现）。
+        """
         cache = RadixCache.create_simulated()
 
         key = RadixKey(array("q", [1, 2, 3]))
@@ -468,7 +626,11 @@ class TestRadixCache(unittest.TestCase):
         self.assertEqual(cache.total_size(), 3)
 
     def test_total_size(self):
-        """Test total_size calculation."""
+        """total_size 累计树中所有在册 token 数。
+
+        空树为 0；插入 3 token 后为 3；再插入一条与之**无公共前缀**的
+        2 token 序列后为 5（两条分支的 token 数相加）。
+        """
         cache = RadixCache.create_simulated()
 
         self.assertEqual(cache.total_size(), 0)
@@ -490,6 +652,20 @@ class TestRadixCache(unittest.TestCase):
         self.assertEqual(cache.total_size(), 5)
 
     def test_cache_unfinished_req_deferred_free_owns_original_indices(self):
+        """回归保护：cache_unfinished_req 的“重复段延迟释放 + 索引回写”语义。
+
+        场景：KV 池里同时存在两份内容相同的 slot——
+        tree_indices 已被树持有，request_indices 是当前请求自己分配的。
+
+        步骤：先以 tree_indices 把该段 token 插入树；再让缓存重新匹配同一 key
+        （命中树）→ 请求应改用树持有的 tree_indices，并在 free_group 内
+        延迟释放自己那份 request_indices。
+
+        断言：allocator 可用量恰好增加 request_indices 的数量；free_pages 末尾
+        就是被归还的 request_indices（顺序一致）；req_to_token[0] 被改写为
+        tree_indices，即请求后续与树共用同一批 slot（不重复占显存）。
+        """
+
         class ReqToTokenPool:
             def __init__(self, row):
                 self.req_to_token = row.unsqueeze(0)
@@ -541,7 +717,14 @@ class TestRadixCache(unittest.TestCase):
         )
 
     def test_kv_cache_events(self):
-        """Test KV cache events functionality."""
+        """KV 事件开关与事件字段自洽性。
+
+        对 (page_size, enable_events) = (1,T) / (2,T) / (1,F) 各跑一遍：
+        - 开启时插入后能取到 ≥1 条事件，且其中包含 BlockStored；
+        - 每条 BlockStored 满足 block_size ≤ page_size、
+          len(token_ids) == block_size × len(block_hashes)（字段自洽，router 可据此还原块）；
+        - 关闭时 take_events() 返回空列表。
+        """
         test_cases = [
             (1, True),
             (2, True),
@@ -579,7 +762,13 @@ class TestRadixCache(unittest.TestCase):
                     self.assertEqual(len(events), 0)
 
     def test_kv_cache_events_with_eviction(self):
-        """Test KV cache events include removal events."""
+        """淘汰会产生 BlockRemoved，且其哈希与先前的 BlockStored 对应。
+
+        page_size=2、4 个 token → 2 个块。先插入再 evict 全部，断言：
+        淘汰量 ≥ 序列长度；事件里既有 BlockStored 也有 BlockRemoved；
+        stored 的块哈希恰好 2 个，且 remove 的 block_hashes 与它们完全一致
+        ——说明上报“删掉的块”就是先前“存过的块”，router 侧可按哈希抵消。
+        """
         mock_allocator = unittest.mock.Mock()
         mock_allocator.device = torch.device("cpu")
 
@@ -627,7 +816,12 @@ class TestRadixCache(unittest.TestCase):
         self.assertEqual(remove_events[0].block_hashes, stored_hashes)
 
     def test_extra_key_isolation(self):
-        """Test that keys with different extra_key values are isolated."""
+        """不同 extra_key 下的相同 token 序列必须互相隔离，绝不共享节点。
+
+        同一段 [1,2,3] 分别以 extra_key = "key1" / "key2" / None 插入（值不同）。
+        断言：三次 match 各自只命中自己的那组 slot；用不存在的 extra_key
+        （"nonexistent"）匹配返回 0 长度，不会“串门”命中别人的缓存。
+        """
         cache = RadixCache.create_simulated()
 
         # Insert same token sequence with different extra keys
@@ -684,6 +878,13 @@ class TestRadixCache(unittest.TestCase):
         self.assertEqual(len(result4.device_indices), 0)
 
     def test_cache_salt_isolation_is_independent_of_extra_key(self):
+        """extra_key 与 cache_salt 是两维独立命名空间，不能拼接后互相错配。
+
+        刻意构造极易混淆的一对：
+        (extra_key="bc", cache_salt="a") 与 (extra_key="c", cache_salt="ab")。
+        若实现把两者简单拼成一个字符串，这两组会塌缩成同一命名空间；
+        正确实现下各自命中自己的值（[10,20,30] 与 [40,50,60]）。
+        """
         cache = RadixCache.create_simulated()
         tokens = array("q", [1, 2, 3])
 
@@ -714,6 +915,15 @@ class TestRadixCache(unittest.TestCase):
         )
 
     def test_cache_salt_is_included_in_store_and_remove_events(self):
+        """cache_salt 参与事件哈希；同一 salt 下 store/remove 的哈希必须一致。
+
+        带 salt="tenant-a" 插入 4 个 token（page_size=2 → 2 块）后全部淘汰：
+        - 只有 1 条 BlockStored，其 metadata.cache_salt="tenant-a"、
+          parent_block_hash=None、含 2 个块哈希；
+        - BlockRemoved 的块哈希与 BlockStored 完全一致（同 salt 可对应抵消）；
+        对照：不带 salt 插入同一段 token，得到的块哈希与带 salt 的不同，
+        说明 salt 确实进入了哈希计算（外部 KV 存储层面同样隔离）。
+        """
         mock_allocator = unittest.mock.Mock()
         mock_allocator.device = torch.device("cpu")
         cache = RadixCache.create_simulated(
@@ -750,6 +960,13 @@ class TestRadixCache(unittest.TestCase):
         self.assertNotEqual(unsalted_hashes, stored[0].block_hashes)
 
     def test_cache_salt_event_hashes_are_preserved_across_node_split(self):
+        """节点分裂前后，事件哈希按页切分后拼接必须与原来完全一致。
+
+        先插入 [1,2,3,4]（salt=tenant-a）并记录末节点的 event_hash_value；
+        再插入 [1,2,9,10] 触发在 [1,2] 之后分裂。断言：
+        parent.event_hash_value + child.event_hash_value == 原来的哈希序列。
+        意义：分裂只改变树的形状，不能让外部 KV 事件的“块身份”发生变化。
+        """
         cache = RadixCache.create_simulated(page_size=2, enable_kv_cache_events=True)
         original = RadixKey(array("q", [1, 2, 3, 4]), cache_salt="tenant-a")
         cache.insert(
@@ -780,7 +997,11 @@ class TestRadixCache(unittest.TestCase):
         )
 
     def test_lock_ref_operations(self):
-        """Test lock reference counting operations."""
+        """inc_lock_ref / dec_lock_ref 在 evictable 与 protected 两个账本之间搬运 token。
+
+        插入 3 个 token 后取末节点：加锁 → protected +3、evictable -3
+        （锁的是“根到该节点”的整条路径）；解锁 → 两个账本回到原值。
+        """
         cache = RadixCache.create_simulated()
 
         # Insert sequence
@@ -811,7 +1032,12 @@ class TestRadixCache(unittest.TestCase):
         self.assertEqual(cache.evictable_size(), initial_evictable)
 
     def test_evict_functionality(self):
-        """Test eviction functionality."""
+        """evict 会真正调用 allocator 释放 slot，并缩小树。
+
+        用 mock allocator 插入两条互不共享前缀的 2-token 序列，请求淘汰 2 个 token：
+        断言返回 EvictResult 且 num_tokens_evicted ≥ 2；free_segment 被调用过；
+        total_size 变小。
+        """
         mock_allocator = unittest.mock.Mock()
         mock_allocator.device = torch.device("cpu")
 
@@ -847,7 +1073,11 @@ class TestRadixCache(unittest.TestCase):
         self.assertLess(cache.total_size(), initial_size)
 
     def test_page_alignment_boundary(self):
-        """Test page alignment with different sizes."""
+        """命中长度必须按页对齐，不足一页的尾部不能进树。
+
+        三组 (page_size, seq_len) = (1,5) / (2,5) / (4,6)，长度都刻意不是页的整数倍。
+        断言：插入后匹配能命中（长度 > 0），且 match_len % page_size == 0。
+        """
         test_cases = [
             (1, 5),
             (2, 5),
@@ -877,7 +1107,17 @@ class TestRadixCache(unittest.TestCase):
                 self.assertEqual(match_len % page_size, 0)
 
     def test_advanced_prefix_match_with_node_splits(self):
-        """Advanced prefix matching: splits inside nodes and across pages."""
+        """匹配过程中触发节点分裂时的正确性，以及“分裂只切索引、不增数据”不变式。
+
+        page_size ∈ {1, 2} 各跑一遍：
+        1. 先插入长序列 seq1（8 token，值 = token×10），再插入分叉序列 seq2=[1,2,9,10]，
+           树中形成内部节点，此时 total_size 应为 10（8 + 2）；
+        2. 用 [1,2,3,4,999,1000] 匹配 → 在原节点内部第 4 个 token 处分裂，
+           断言返回 val1[:4]，且 total_size 不变（不搬 KV、不新增数据）；
+        3. 再完整匹配 seq1，仍能取回全部 8 个 slot；
+        4. 用 [1,2,3,4,5,6,777,888] 触发一次更深的分裂，返回 val1[:6]，total_size 仍不变；
+        5. 匹配短分支 seq2 返回它自己的 val2。
+        """
         for page_size in [1, 2]:
             with self.subTest(page_size=page_size):
                 cache = RadixCache.create_simulated(page_size=page_size)
@@ -928,7 +1168,12 @@ class TestRadixCache(unittest.TestCase):
                 torch.testing.assert_close(result_branch.device_indices, val2)
 
     def test_hash_value_storage(self):
-        """Test that hash_value is stored correctly after insert operations."""
+        """hash_value 惰性计算：插入时不算，事件发射时才生成，并按页切分。
+
+        page_size=4、8 个 token → 2 页（2 个哈希）。插入后调用 take_events()
+        触发事件（哈希在此惰性计算），再沿 children 找到该节点，
+        断言 hash_value 非 None 且长度为 2。
+        """
         cache = RadixCache.create_simulated(
             page_size=4,
             enable_kv_cache_events=True,
@@ -956,7 +1201,14 @@ class TestRadixCache(unittest.TestCase):
         self.assertEqual(len(node.hash_value), 2)
 
     def test_hash_value_repeating_tokens(self):
-        """Test that repeating token patterns get different hash values."""
+        """重复 token 模式必须得到不同的“位置感知”哈希。
+
+        插入 [1,2,3,4,1,2,3,4]（page_size=4 → 两页内容完全相同）：
+        - 两个块合并为 1 条 BlockStored，含 2 个块哈希；
+        - 但两个块哈希必须不同——哈希带序列位置（前缀链），否则不同位置的
+          同内容块会被外部 KV 存储错误复用；
+        - 合并后仍保留最初的 parent_block_hash（None）。
+        """
         cache = RadixCache.create_simulated(
             page_size=4,
             enable_kv_cache_events=True,
@@ -989,7 +1241,13 @@ class TestRadixCache(unittest.TestCase):
         self.assertIsNone(block_stored_events[0].parent_block_hash)
 
     def test_hash_value_split(self):
-        """Test that hash_value is split correctly when nodes are split."""
+        """节点分裂后 hash_value 按页正确切分。
+
+        page_size=2：先插入 [1,2,3,4] 并 take_events() 让哈希先算出来，
+        再插入 [1,2,5,6] 在 [1,2] 之后分裂。断言 [1,2] 那个节点的
+        hash_value 非 None 且只有 1 页（长度 1）。
+        （若分裂前哈希尚未计算，事件阶段会惰性补齐，两条路径都应满足该断言。）
+        """
         cache = RadixCache.create_simulated(
             page_size=2,
             enable_kv_cache_events=True,
@@ -1017,6 +1275,15 @@ class TestRadixCache(unittest.TestCase):
             self.assertEqual(len(node.hash_value), 1)
 
     def test_memory_allocated(self):
+        """大规模插入下的内存占用量级回归（防意外拷贝/泄漏）。
+
+        数据：10000 条序列 = 10000 token 公共前缀 + 100 token 各不相同后缀，
+        值张量放在 get_device() 上；插入前记录 memory_allocated 基线。
+        断言：插入导致的显存增量 < total_size() × 4 字节 × 2
+        （4 字节 = int32 索引元素大小）；若树实现出现整段拷贝或泄漏，
+        增量会远超该上界。
+        注：本用例依赖加速器的 memory_allocated()，所以整份文件挂在单卡 GPU CI。
+        """
         keys, values = [], []
 
         num_seqs = 10000

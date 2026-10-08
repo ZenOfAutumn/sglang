@@ -2036,22 +2036,74 @@ class MHATokenToKVPool(KVCache):
         return not isinstance(self.quant_method, UnquantizedKVCacheMethod)
 
     def _create_buffers(self):
+        """创建本池的 K/V 存储，并建立描述布局与地址的元数据。
+
+        这是构造函数中的「存储初始化入口」：调用前已经确定容量、存储 dtype、
+        K/V 头数和维度、物理布局及量化策略；这里选择具体分配路径，不分配
+        token 槽位编号（空闲槽位账本由 TokenToKVPoolAllocator 管理）。
+
+        三条路径最终都要提供 k_buffer / v_buffer，每个列表元素对应本池的一层。
+        例如普通 NHD 池 size=8、page_size=2、head_num=2、head_dim=8、
+        v_head_dim=4 时，每层 K 为 [10, 2, 8]，V 为 [10, 2, 4]。
+        两者最后一维可以不同，不能假设 K/V 同形状或占用相同字节数。
+        额外的 page_size 容量用于 padding；分页分配器保留的是第 0 页。
+
+        注意：post-capture 路径创建的是具有稳定虚拟地址的张量，并不代表
+        张量声明的整个容量此刻都已经映射了物理显存。
+        """
+        # 1. 先判断是否由专用量化策略管理存储（例如 FP4 的打包数据与块级 scale）。
+        #    此属性检查 quant_method 是否为 UnquantizedKVCacheMethod，而非检查
+        #    dtype 是不是低精度。因此，普通 FP8 池即使 store_dtype 为 uint8，
+        #    只要没有专用量化策略，仍走下面的 else 分支，通过 view 重解释字节。
         if self.is_quantized_kv_cache:
+            # 当前不支持「专用量化存储 + capture 后补齐物理显存」的组合。
+            # 在分配前显式拒绝，不能仅给打包 K/V 建立 backing，却遗漏 scale
+            # 或反量化 workspace 等由策略管理的缓冲。
             if self.post_capture_active:
                 raise NotImplementedError(
                     "Post-capture KV backing is not supported for quantized KV cache."
                 )
+            # 策略决定打包后的形状、scale/workspace 是否需要以及 store_dtype。
+            # 此辅助方法接收并挂载这些缓冲，且校验 workspace 与策略声明一致；
+            # 不能按普通 [slots, heads, dim] 布局直接替策略分配。
             self._create_quantized_buffers()
         else:
+            # 2. 普通存储路径没有专用量化策略附带的缓冲，显式用 None 表示缺席。
+            #    k/v_scale_buffer：随缓存保存的量化 scale，不是写入接口的临时参数。
+            #    dq_k/v_buffer：反量化后的临时工作区，不是原始 KV 的另一份常驻副本。
+            #    后续读取、内存统计和清理路径据此判断是否存在这些可选存储。
             self.k_scale_buffer = None
             self.v_scale_buffer = None
             self.dq_k_buffer = None
             self.dq_v_buffer = None
             if self.post_capture_active:
+                # 2a. CUDA VMM 路径：按容量上界预留虚拟地址，交由
+                #     _post_capture_owner 管理，并把 owner 的张量映射到 K/V 列表。
+                #     初始仅保证 padding 页有物理 backing（按 VMM 粒度对齐），
+                #     供 CUDA Graph capture 的 dummy 写入使用；未映射尾部不可访问。
+                #     capture 后通过 finalize_backing 按最终容量补齐物理显存，
+                #     保持 data_ptr 不变，避免破坏已捕获图中的地址。
                 self._alloc_post_capture_buffers()
             else:
+                # 2b. 常规路径：在 self.device 上直接为全部层创建零初始化缓冲。
+                #     使用 store_dtype；布局可以是 NHD、HND 或 AITER vectorized_5d。
+                #     NHD 的 K/V 分别使用 head_dim / v_head_dim，因此支持非对称 KV。
+                #     memory-saver region 与可选 custom mem pool 由辅助方法包裹。
                 self._create_buffers_normal()
+
+        # 3. 缓冲确定后再生成布局描述符（顺序为全部 K 层，然后全部 V 层）。
+        #    每项记录 shape、row_bytes、tokens_per_row：NHD 的一行是一个槽位，
+        #    HND / vectorized_5d 的一行覆盖一页，不能都当成单 token 的字节跨度。
+        #    描述符供 VMM backing 和 PD 传输计算字节范围，本身不存储 KV 数据。
+        #    VMM 分配前也会按预计形状调用描述符构建方法；这里统一保存最终描述符。
         self._kv_buffer_descs = self._build_kv_buffer_descs()
+
+        # 4. 从已经创建的张量提取设备侧指针表与字节跨度表，供底层拷贝内核使用。
+        #    k_data_ptrs / v_data_ptrs 分别记录各层 K/V 的首地址；data_ptrs 先列
+        #    全部 K、全部 V，若有 scale 缓冲则追加全部 K-scale、全部 V-scale，
+        #    使槽位搬运可以连同量化 scale 一起移动（dq workspace 不参与）。
+        #    data_strides 与上述顺序一一对应，单位是字节，不是元素个数；
+        #    这里只建元数据，不拷贝 KV 内容，也不在此处执行拷贝内核 warmup。
         self._init_data_ptrs_and_strides()
 
     def _create_quantized_buffers(self):
@@ -2163,19 +2215,51 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers_normal(self):
+        """按已选物理布局，为每个本地层直接分配并清零 K/V 缓冲。
+
+        「normal」指不走专用量化策略分配、也不走 post-capture VMM 延迟
+        backing；并非只支持 NHD 布局或 FP16/BF16。普通 FP8 池也可走这里，
+        但使用 store_dtype=uint8 保存位模式，读写接口再将其 view 为 FP8。
+
+        k_buffer / v_buffer 都是长度为 layer_num 的 Python 列表，各层张量
+        分别创建；层不是单个大张量中的一个维度，也不保证各层地址相邻。
+        列表下标为本地层号，全局 layer_id 到本地层号的偏移由读写方法处理。
+        零层池的两个列表均为空，不分配 K/V 张量。
+
+        本方法只建立存储，不维护空闲槽位，也不生成指针表或布局描述符；
+        这些元数据由调用方 _create_buffers 在张量创建后统一初始化。
+        """
+        # 外层：把这段分配归入 KV-cache 标签，便于 memory saver 按类别管理。
+        # region 不是另一份 KV 存储，也不改变张量布局；关闭 memory saver 时，
+        # adapter 返回 no-op 上下文，仍正常执行下面的分配。
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            # 内层：启用自定义 CUDA 内存池时，将本段 CUDA 分配路由到该池；
+            # 未启用则 nullcontext 不做任何切换，沿用设备默认分配器。
+            # 内存池决定「从哪里分配」，每个 torch.zeros 的 device/dtype
+            # 则决定「张量放在哪个设备、按什么存储类型解释」。
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                # The padded page (slot 0's page) absorbs dummy padded-token writes.
+                # 实际容量均包含 size + page_size 个槽位：多一页用于 padding。
+                # 分页分配器保留第 0 页（含 slot 0），不是把最后一页当 padding。
+                # torch.zeros 将整个缓冲清零；这里尚未写入任何真实 token 的 K/V。
                 if self.kv_cache_layout == "vectorized_5d":
-                    # AITER SHUFFLE 5D 布局：按页分块组织。
+                    # AITER 的 SHUFFLE 5D 物理布局：在页内进一步拆分维度，
+                    # 使最内层连续的 x 个存储元素组成一个 16 字节向量。
+                    # 构造函数已为该布局校验容量按页对齐、page_size 及 K/V
+                    # head_dim 满足 x 的整除条件；这里不额外补齐或截断数据。
                     total_slots = self.size + self.page_size
-                    num_blocks = total_slots // self.page_size
+                    num_blocks = total_slots // self.page_size  # 含 padding 页的总页数
+                    # x = 16 // store_dtype.itemsize，取决于存储而非计算 dtype：
+                    # FP16/BF16 每元素 2 字节，x=8；FP8 按 uint8 存储，x=16。
                     x = self._kv_vector_x
-                    # K: (num_blocks, H, D_k // X, page, X)
+                    # K: [页, head, K维度分组, 页内token, 组内K维度]。
+                    # 将 D_k 拆成 (D_k // x, x)，页内 token 维位于两者之间。
+                    # 逻辑位置 (page, head, offset, d) 对应物理索引
+                    # [page, head, d // x, offset, d % x]。
+                    # 元素总数不变，只调整物理排列；这不是进一步压缩或量化。
                     self.k_buffer = [
                         torch.zeros(
                             (
@@ -2190,7 +2274,12 @@ class MHATokenToKVPool(KVCache):
                         )
                         for _ in range(self.layer_num)
                     ]
-                    # V: (num_blocks, H, page // X, D_v, X)
+                    # V: [页, head, 页内token分组, V维度, 组内token]。
+                    # 与 K 不同，这里拆的是 page_size，而非 V 的 head_dim；
+                    # 逻辑位置 (page, head, offset, d) 对应物理索引
+                    # [page, head, offset // x, d, offset % x]。
+                    # K/V 排列不同是 AITER 内核的布局约定；「非对称 KV」则指
+                    # head_dim != v_head_dim，两者不是同一个概念。
                     self.v_buffer = [
                         torch.zeros(
                             (
@@ -2206,6 +2295,14 @@ class MHATokenToKVPool(KVCache):
                         for _ in range(self.layer_num)
                     ]
                 else:
+                    # NHD / HND 的形状交给 _kv_buffer_shapes 按 use_hnd 决定：
+                    #   NHD：K [size+page_size, head_num, head_dim]，
+                    #        V [size+page_size, head_num, v_head_dim]；
+                    #   HND：K [num_pages, head_num, page_size, head_dim]，
+                    #        V [num_pages, head_num, page_size, v_head_dim]。
+                    # NHD 中一个 token 的所有 head 在同一连续行；HND 中要用
+                    # [slot // page_size, :, slot % page_size, :] 定位该 token。
+                    # 分开取 K/V 形状，避免非对称 KV 被错误地分配成相同宽度。
                     k_shape, v_shape = self._kv_buffer_shapes()
                     self.k_buffer = [
                         torch.zeros(k_shape, dtype=self.store_dtype, device=self.device)
@@ -2314,25 +2411,97 @@ class MHATokenToKVPool(KVCache):
             v_size_bytes += get_tensor_size_bytes(self.dq_v_buffer)
         return k_size_bytes, v_size_bytes
 
-    # for disagg
+    # ---------- PD（prefill-decode 分离）KV 传输注册 ----------
+
     def _pd_registerable_tensors(self):
-        """Buffers to register for PD KV transfer, in ``_kv_buffer_descs`` order.
-        Override when the registerable storage differs from k/v_buffer."""
+        """返回需要为 PD KV 传输注册的张量列表，顺序必须与
+        ``self._kv_buffer_descs`` 逐项对应（默认：先全部 K 层，再全部 V 层）。
+
+        默认实现只注册 ``k_buffer + v_buffer``。当「需要传输的存储」与
+        k/v_buffer 不一致时，子类应覆盖本方法，例如量化池还要额外传输
+        per-block scale、或存在独立的打包缓冲。
+
+        约束：返回的张量数量与顺序必须和描述符完全一致，否则
+        ``get_contiguous_buf_infos`` 给出的 ptrs 与 lens 会整体错位
+        （表现为传输到错误地址或长度不匹配）。
+        """
         return self.k_buffer + self.v_buffer
 
     def get_contiguous_buf_infos(self):
-        """(ptrs, lens, item_lens) for PD KV transfer, derived from the descriptors.
-        ``lens`` is the final span at the CURRENT serving size -- for a post-capture
-        pool that is the physically-backed span, not the reserved VA upper bound."""
+        """返回 PD 分离场景下 KV 显存注册所需的「地址 / 长度」清单。
+
+        用途：PD 分离时，decode 侧需要绕过 Python/Tensor 对象，直接按裸设备地址
+        读写 prefill 侧的 KV 显存；这里把每个可传输缓冲的「首地址 + 有效字节数 +
+        单页字节数」交给上层，由上层填入 ``kv_args.kv_data_ptrs /
+        kv_data_lens / kv_item_lens`` 并交给 RDMA 等传输后端注册
+        （见 ``disaggregation/prefill.py``、``disaggregation/decode.py``）。
+
+        返回 ``(ptrs, lens, item_lens)`` 三个**等长**列表，顺序与
+        ``self._kv_buffer_descs`` 完全一致，默认即::
+
+            [k0, k1, ..., k(L-1), v0, v1, ..., v(L-1)]   # L = layer_num
+
+        - ``ptrs[i]``：第 i 个缓冲首元素的设备地址，来自 ``tensor.data_ptr()``，
+          类型是 Python ``int``。注意这是**虚拟地址**（CUDA 上是设备虚拟地址），
+          不是物理地址，也不是底层 storage 的起始地址（当前实现取的是整张缓冲，
+          因此二者一致；若将来注册 view/切片则只代表该 view 的首元素）。
+        - ``lens[i]``：第 i 个缓冲在**当前服务容量**下需要传输的字节数，由
+          ``KvBufferDesc.final_span_bytes(self.size, self.page_size)`` 按
+          「``self.size`` + 一页 padding」计算。post-capture 池在
+          ``finalize_backing`` 之后 ``self.size`` 会收缩为最终容量，因此这里给的是
+          **已映射物理显存**的真实跨度，而不是预留虚拟地址的上界（上界可能远大于
+          实际可访问内存，直接照上界传输会踩到未映射地址）。
+        - ``item_lens[i]``：第 i 个缓冲**一页**对应的字节数
+          （``KvBufferDesc.item_len_bytes``），是传输后端做分块/对齐的粒度，
+          通常用于按页拼接请求级别的传输描述。
+
+        长度关系：``len(ptrs) == len(lens) == len(item_lens) ==
+        len(self._kv_buffer_descs)``。NHD 布局下等于 ``2 * layer_num``。
+
+        前提与限制：HND 布局把 ``(page, head)`` 折叠进索引，一行是整页而非单个
+        token 槽位，与 PD 传输「按 token 槽位寻址」的假设不兼容，因此直接断言
+        拒绝，而不是返回一套语义错误的地址。
+
+        输入（本方法读取的池状态，无显式入参）示例::
+
+            size=8, page_size=2, layer_num=2, dtype=torch.float16   # NHD
+            head_num=2, head_dim=8, v_head_dim=4
+            => tokens_per_row = 1
+               K 每行字节 row_bytes = head_num * head_dim   * itemsize = 2*8*2 = 32
+               V 每行字节 row_bytes = head_num * v_head_dim * itemsize = 2*4*2 = 16
+               每个缓冲行数 = size + page_size = 10
+            => len = 2 * layer_num = 4  （k0, k1, v0, v1）
+
+        输出示例（地址是运行期真实值，这里仅示意）::
+
+            ptrs      = [0x7f0a_0000, 0x7f0a_1000, 0x7f0a_2000, 0x7f0a_3000]
+            lens      = [320, 320, 160, 160]   # K: 10*32；V: 10*16
+            item_lens = [64, 64, 32, 32]       # K: 2*32； V: 2*16
+
+        补充：NHD 且非 post-capture 时，``lens[i]`` 恰好等于该缓冲张量的
+        ``numel() * element_size``（因为 tokens_per_row == 1，且张量首维就是
+        ``size + page_size``）。等宽 K/V 时 K、V 的 ``lens`` 相等；非对称 KV
+        （``head_dim != v_head_dim``）时 V 的 ``lens`` 更小，因此不能假设 K/V
+        长度相同。
+        """
+        # HND 的物理布局里「一行 = 一整页」，且 (page, head) 已被折叠进索引，
+        # 与 PD 传输假设的 NHD「一行 = 一个 token 槽位」不兼容。
+        # 这里直接拒绝，避免返回语义错误的地址 / 长度。（断言文案保持英文，
+        # 属于对外可见的运行时诊断信息，可能有调用方/测试依赖其关键字。）
         assert not self.use_hnd, (
             "PD-disaggregation KV transfer assumes NHD slot-row layout; "
             "HND KV cache (SGLANG_USE_HND_KVCACHE) is not supported with disagg yet."
         )
+        # 待注册张量：默认 k_buffer + v_buffer（先 K 后 V），与描述符同序。
+        # 子类可覆盖 _pd_registerable_tensors 以追加 scale 等缓冲。
         tensors = self._pd_registerable_tensors()
+        # 只取地址，不做任何数据拷贝、同步或张量物化。
         ptrs = [t.data_ptr() for t in tensors]
+        # 每个缓冲在当前容量下的有效字节跨度（含末尾 padding 页）。
         lens = [
             d.final_span_bytes(self.size, self.page_size) for d in self._kv_buffer_descs
         ]
+        # 每个缓冲「一页」的字节数，作为传输后端的分块粒度。
         item_lens = [d.item_len_bytes(self.page_size) for d in self._kv_buffer_descs]
         return ptrs, lens, item_lens
 

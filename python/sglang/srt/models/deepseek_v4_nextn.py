@@ -13,7 +13,7 @@ checkpoint 的 nextn 层，无需单独的 draft checkpoint）。
        形状前向，最后由 hc_head 做可学习的门控加权求和，把 hc_mult 个
        分支收敛回一个 [n, d] 的 hidden state。
 
-术语对照（与 docs/theory/op/mtp.md 一致）：
+术语对照（与 docs/learn/speculative/mtp.md 一致）：
   - hidden state 通路（hnorm/h_proj）= 上下文通道 ①（主模型前缀摘要）；
   - decoder 层自己的 attention 回看历史 KV = 上下文通道 ②。
 """

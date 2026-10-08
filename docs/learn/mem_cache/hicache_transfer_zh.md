@@ -8,7 +8,7 @@
 > - 传输执行者：`python/sglang/srt/managers/cache_controller.py`（`HiCacheController`）
 > - 调用方 / 调度侧：`python/sglang/srt/mem_cache/hiradix_cache.py`（`HiRadixCache`）
 > - 主机侧 KV 池：`python/sglang/srt/mem_cache/memory_pool_host.py`
-> - 相关阅读：`mem_cache/README_zh.md`、`docs/theory/cache/kv_cache_capacity_zh.md`
+> - 相关阅读：`mem_cache/README_zh.md`、`docs/learn/mem_cache/kv_cache_capacity_zh.md`
 
 ---
 

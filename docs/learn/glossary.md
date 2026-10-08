@@ -583,5 +583,5 @@ class RocmDeviceMixin(CudaDeviceMixin):
 
 需要注意的是每个 `GroupCoordinator` 会同时持有**两个**通信组：`device_group`（NCCL/HCCL/XCCL 等，走加速器）和 `cpu_group`（固定为 `gloo`，走 CPU，用于对象与元数据同步）。因此即便在 NPU/HPU 上，CPU 侧同步走的仍是 gloo。
 
-关于原语本身的语义与通信量分析，参见 `docs/theory/distributed/collective_communication.md`；关于带宽层次对 TP/EP 的影响，参见 `docs/theory/distributed/cost_model.md` §7–§8。
+关于原语本身的语义与通信量分析，参见 `docs/learn/distributed/collective_communication.md`；关于带宽层次对 TP/EP 的影响，参见 `docs/learn/distributed/cost_model.md` §7–§8。
 
