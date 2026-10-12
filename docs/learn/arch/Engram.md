@@ -1241,7 +1241,7 @@ def ngram_hash(tokens, multipliers, table_sizes, n):
 | 官方演示实现 | `deepseek-ai/Engram` → `engram_demo_v1.py`（Apache-2.0） |
 | 架构图（可编辑） | `deepseek-ai/Engram` → `drawio/Engram.drawio` |
 | 生产落地 | *DeepSeek-V4.1-Flash: Pushing the Limits of KV Cache Compression*（§2.4.2、§2.5、§3.1.3、§4.2.1） |
-| 本仓库内的 V4.1 解读 | `docs/llm_paper_read/llm/DeepSeek-V4.1-Flash-论文解读.md`（§7.2、§8.2） |
+| 本仓库内的 V4.1 解读 | `docs/learn/papers/llm/DeepSeek-V4.1-Flash-论文解读.md`（§7.2、§8.2） |
 
 ### 18.2 论文关键图表索引
 

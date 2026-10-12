@@ -5,7 +5,7 @@
 > 归一化统一采用 **RMSNorm**（Pre-Norm 放置），注意力采用**最普通的多头注意力（MHA）**，
 > 结构整体对标 LLaMA 系列（去掉 GQA，退化为标准 MHA）。
 >
-> 相关阅读：`../MHA_MQA_GQA.md`（注意力家族）、`../Glossary.md`（术语表）、
+> 相关阅读：[`MHA_MQA_GQA.md`](attention/MHA_MQA_GQA.md)（注意力家族）、`../Glossary.md`（术语表）、
 > `../distributed/TP.md`（这些层如何切到多卡）。
 
 ## 目录
@@ -455,7 +455,7 @@ Decode 阶段每步的注意力打分是 $(h, 1, s_\text{ctx})$：新 token（1 
 $s_\text{ctx}$ 个 K/V 做注意力。**历史 K/V 缓存在显存里避免重算**，这就是 KV Cache。
 每 token 每层缓存 $2 \times h \times d_k = 2\,d_\text{model}$ 个元素（K 和 V），
 其显存随 $s_\text{ctx}\times L$ 线性增长——正是它撑起了并发上限，也催生了 GQA/MLA 等 KV 压缩方案
-（见 `../MHA_MQA_GQA.md`、`../MLA.md`）。
+（见 [`MHA_MQA_GQA.md`](attention/MHA_MQA_GQA.md)、[`MLA.md`](attention/MLA.md)）。
 
 ---
 
@@ -600,8 +600,8 @@ $-\infty$，从而保证采样结果一定合法。
 
 ## 8. 参考与延伸
 
-- 同目录理论文档：`../MHA_MQA_GQA.md`（本文用的是其中 $h_{kv}=h$ 的 MHA 特例）、
-  `../MLA.md`（KV Cache 压缩）、`../Glossary.md`（术语表）。
+- 注意力理论文档与术语：[`MHA_MQA_GQA.md`](attention/MHA_MQA_GQA.md)（本文用的是其中 $h_{kv}=h$ 的 MHA 特例）、
+  [`MLA.md`](attention/MLA.md)（KV Cache 压缩）、`../Glossary.md`（术语表）。
 - 并行化：`../distributed/TP.md`（这些层如何按 head / 张量维 / 词表维切到多卡）。
 - 经典论文：*Attention Is All You Need*（Vaswani et al., 2017，原始 Transformer）、
   LLaMA（Touvron et al., 2023，Pre-Norm + RMSNorm + RoPE + SwiGLU 的现代 decoder-only 范式）。

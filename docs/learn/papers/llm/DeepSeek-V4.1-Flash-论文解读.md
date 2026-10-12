@@ -66,6 +66,172 @@ DeepSeek-V4 中：全局分支维护全局 KV（main KV + indexer K），SWA 分
 
 ### 2.2 架构分层（图 3）
 
+
+**Mermaid 版本（主干）**
+
+```mermaid
+flowchart BT
+    IN["Tokenized text<br/>(T)"]:::io --> EMB["Token embedding<br/>129k → 5120"]:::io
+    EMB -- "(T, 5120) 复制为 4 路残差流" --> X0["(T, 4, 5120)"]:::io
+
+    subgraph ENC["Causal encoder（20 层）"]
+        direction BT
+        E1["SWA + MoE<br/>×2"]:::swa
+        subgraph EG["×3 组"]
+            direction BT
+            E2["CSA2(2, Full) + MoE"]:::full
+            E3["CSA2(2, Reuse) + MoE<br/>×5"]:::reuse
+            E2 --> E3
+        end
+        E1 --> E2
+    end
+
+    ENG["Engram（196B，FP8）<br/>n-gram {2,3,4} · 8 哈希头<br/>每阶嵌入 2048 · 每头约 16M 条目<br/>编码器第 2、15 层"]:::eng
+    ROPE["RoPE<br/>上下文 1M"]:::io
+    X0 -- "(T, 4, 5120)" --> E1
+    ENG -. "残差增量 Y: (T, 4, 5120)" .-> E1
+    ENG -. "残差增量 Y: (T, 4, 5120)" .-> E2
+    ROPE -.-> E1
+
+    EH["Final encoder hidden states<br/>H_{L/2}: (T, 4, 5120)"]:::io
+    E3 --> EH
+    EH ==> GKV["CED Global KV<br/>每个解码器 Full 层独立投影<br/>main KV (T, 512) FP4"]:::kv
+
+    subgraph DEC["Decoder（20 层）"]
+        direction BT
+        D1["CSA2(1, Full) + MoE"]:::full
+        D2["CSA2(1, Reuse) + MoE<br/>×3"]:::reuse
+        subgraph DG["×4 组"]
+            direction BT
+            D3["CSA2(1, Reindex) + MoE"]:::reindex
+            D4["CSA2(1, Reuse) + MoE<br/>×3"]:::reuse
+            D3 --> D4
+        end
+        D1 --> D2 --> D3
+    end
+
+    E3 -- "(T, 4, 5120)" --> D1
+    GKV ==> D1
+    D1 -- "Top-2048 块 × 8 位置" --> POOL["Candidate pool<br/>16384 个候选位置<br/>（Hierarchical sparse indexer）"]:::kv
+    POOL -- "池内选 Top-512" --> D3
+
+    D4 -- "(T, 4, 5120)" --> PM["Final pre-mix（4 → 1）"]:::io
+    PM -- "(T, 5120)" --> NORM["Final RMSNorm"]:::io
+    NORM -- "(T, 5120)" --> LM["Linear output layer<br/>5120 → 129k"]:::io
+
+    classDef io fill:#eef2ff,stroke:#6366f1,color:#1e1b4b;
+    classDef swa fill:#e0f2fe,stroke:#0284c7,color:#075985;
+    classDef full fill:#fee2e2,stroke:#ef4444,color:#7f1d1d;
+    classDef reuse fill:#f1f5f9,stroke:#94a3b8,color:#334155;
+    classDef reindex fill:#fef9c3,stroke:#ca8a04,color:#713f12;
+    classDef kv fill:#ecfdf5,stroke:#10b981,color:#064e3b;
+    classDef eng fill:#fae8ff,stroke:#c026d3,color:#701a75;
+```
+
+层数核对：编码器 \(2 + 3\times(1+5) = 20\)，解码器 \((1+3) + 4\times(1+3) = 20\)。
+
+**维度速查**（\(T\)：序列长度，\(m\)：压缩率，编码器 \(m=2\)、解码器 \(m=1\)）：
+
+| 张量 | 形状 | 精度 / 说明 |
+|---|---|---|
+| 隐状态 | \((T, 5120)\) | 子层输入，由 pre-mix 从 4 路残差流合成 |
+| mHC 残差流 | \((T, 4, 5120)\) | \(n=4\) |
+| query 潜在向量 | \((T, 1280)\) | query 压缩维 |
+| global Q | \((T, 64, 512)\) | 64 头 × head dim 512 |
+| main KV | \((T/m, 512)\) | 所有头共享一个条目，FP4（E2M1 + 每 16 通道 E4M3 scale） |
+| SWA KV | \((128, 512)\) | 每层独立，FP8 |
+| indexer Q | \((T, 32, 128)\) | FP4 |
+| indexer K | \((T/m, 128)\) | 由 main KV 投影，FP4 |
+| Top-K 索引 | \((T, 512)\) | Reuse 层直接复用 |
+| 候选池 | \(2048 \times 8 = 16384\) | 仅解码器 |
+| MoE 专家 | \(5120 \to 2304 \to 5120\) | 1 共享 + 384 路由，top-6 |
+| 全局 KV 占用 | 890 B / token | 约 V4-Flash 的 1/4 |
+
+**CSA2 注意力子层（单层）**
+
+```mermaid
+flowchart BT
+    H["h: (T, 5120)"]:::io
+    QL["W_DQ: 5120 → 1280"]:::core
+    Q["global Q: (T, 64, 512)"]:::core
+    KV["main KV: (T/m, 512)<br/>Full 层计算，其余层复用"]:::kv
+    SW["SWA KV: (128, 512)<br/>本层计算"]:::swa
+    IQ["indexer Q: (T, 32, 128)"]:::sel
+    IK["indexer K: (T/m, 128)"]:::sel
+    TOP["Top-512 索引: (T, 512)<br/>Full / Reindex 计算，Reuse 复用"]:::sel
+    ATT["注意力：每个 query 看<br/>512 个 main KV + 128 个 SWA KV"]:::attn
+    O["输出投影: (T, 64·512) → (T, 5120)"]:::core
+
+    H --> QL --> Q
+    QL --> IQ
+    H --> SW
+    H -. "Full 层" .-> KV
+    KV --> IK
+    IQ --> TOP
+    IK --> TOP
+    Q --> ATT
+    TOP --> ATT
+    KV --> ATT
+    SW --> ATT
+    ATT --> O
+
+    classDef io fill:#eef2ff,stroke:#6366f1,color:#1e1b4b;
+    classDef core fill:#fff7ed,stroke:#f97316,color:#7c2d12;
+    classDef kv fill:#ecfdf5,stroke:#10b981,color:#064e3b;
+    classDef swa fill:#e0f2fe,stroke:#0284c7,color:#075985;
+    classDef sel fill:#fef9c3,stroke:#ca8a04,color:#713f12;
+    classDef attn fill:#fee2e2,stroke:#ef4444,color:#7f1d1d;
+```
+
+> 解码器 Full 层的 main KV 来自编码器最后一层 \(H_{L/2}\)，其余输入来自本层 \(h\)。indexer Q 取自 query 潜在向量，这一点是按 V3.2/V4 的结构推断的，论文正文未明确说明。
+
+**CSA2(ratio, mode)**（CSA2 内含 SWA）：
+
+| mode | 作用 |
+|---|---|
+| Full | 构建全局 KV 和稀疏索引 |
+| Reindex | 复用 KV，经层次索引器从 candidate pool 重算稀疏索引 |
+| Reuse | 复用 KV 和稀疏索引 |
+
+**子模块：MoE 层与 Single-Pass mHC**
+
+```mermaid
+flowchart LR
+    subgraph MOE["MoE 层（1 共享 + 384 路由，激活 6 个）"]
+        direction BT
+        X["x: (T, 5120)"]:::io --> R["Router<br/>5120 → 384，取 top-6"]:::sel
+        X --> S["Shared FFN ×1"]:::ffn
+        R --> F["Routed FFN ×384<br/>每 token 激活 6 个"]:::ffn
+        S --> ADD(("+")):::io
+        F --> ADD
+        ADD --> Y["(T, 5120)"]:::io
+    end
+
+    subgraph FFN["SwiGLU FFN（单个专家）"]
+        direction BT
+        H["x: (T, 5120)"]:::io --> L1["Linear 5120 → 2304"]:::ffn --> SI["SiLU"]:::ffn
+        H --> L2["Linear 5120 → 2304"]:::ffn
+        SI --> MUL(("×")):::io
+        L2 --> MUL
+        MUL -- "(T, 2304)" --> L3["Linear 2304 → 5120"]:::ffn
+    end
+
+    subgraph MHC["Single-Pass mHC（n = 4）"]
+        direction LR
+        RS["X_l: (T, 4, 5120)"]:::io --> PRE["Pre-mix A_{l-1}: (1×4)<br/>→ (T, 5120)"]:::sel
+        PRE --> SUB["RMSNorm + 子层 F_l<br/>（Attention 或 MoE）<br/>(T, 5120)"]:::ffn
+        SUB --> POST["post C_l: (4×1)<br/>+ 残差 B_l: (4×4)"]:::sel
+        RS -- "B_l X_l" --> POST
+        POST --> RS2["X_{l+1}: (T, 4, 5120)"]:::io
+    end
+
+    classDef io fill:#eef2ff,stroke:#6366f1,color:#1e1b4b;
+    classDef sel fill:#ecfdf5,stroke:#10b981,color:#064e3b;
+    classDef ffn fill:#fff7ed,stroke:#f97316,color:#7c2d12;
+```
+
+参数与计算：552B 骨干 + 196B Engram；激活参数 prefill 8B / decode 16B。Single-Pass mHC 包裹每个 Attention（SWA 或 CSA2）子层和每个 MoE 子层，更新式为 \(X_{l+1} = B_l X_l + C_l F_l(A_{l-1} X_l)\)（见 §7.1）。
+
 - **前 2 层**：纯 SWA；
 - **18 层编码器 CSA2 层**：压缩率 $m=2$，分 3 组（每组 6 层：1 层 Full + 5 层 Reuse）；
 - **20 层解码器 CSA2 层**：压缩率 $m=1$，分 5 组（每组 4 层：第一组 1 层 Full + 3 层 Reuse；其余四组 1 层 Reindex + 3 层 Reuse）；
@@ -222,6 +388,32 @@ $$
 - 配置：两个模块共 196B 参数，放在第 1 和第 14 层（0 索引）；N-gram 阶数 {2,3,4}，8 个哈希头，每阶嵌入维 2048，每头索引约 16M 条目（素数表长）；嵌入表和 K/V 投影均为 FP8。
 - 改动：去掉短因果卷积（收益不抵推理栈复杂度）；嵌入表用动量更新 + Sinkhorn 平衡优化（见 §8）。
 - 推理优化：确定性寻址允许通过后台 RDMA 从主机内存**预取**嵌入，第一个模块的预取与第一个 Transformer 块计算重叠。
+
+**输入输出**：输入是 token id 序列与当前层隐状态 \(h_t\)；输出是一个**加到残差流上的增量** \(Y_t \in \mathbb{R}^{5120}\)，与 Attention / MoE 子层的输出同形状。Engram 本身是一个与 Attention、MoE 并列的子层。
+
+计算流程（按 Engram 原论文 *Conditional Memory via Scalable Lookup*，V4.1 去掉了短因果卷积）：
+
+1. **哈希查表**：对位置 \(t\) 的后缀 n-gram（\(n\in\{2,3,4\}\)），每阶用 8 个哈希头查表，拼接得到记忆向量 \(e_t\)（每阶 2048 维，三阶共 6144 维）。查表只依赖 token id，与隐状态无关，所以能提前预取。
+2. **投影**：\(k_t = W_K e_t,\ v_t = W_V e_t\)，均投影到 \(d=5120\)。
+3. **上下文门控**：用当前隐状态判断查到的记忆是否相关：
+
+$$
+\alpha_t = \sigma\!\left(\frac{\mathrm{RMSNorm}(h_t)^\top \mathrm{RMSNorm}(k_t)}{\sqrt d}\right),\qquad Y_t = \alpha_t\, v_t
+$$
+
+4. **残差注入**：\(H \leftarrow H + Y\)。
+
+与 mHC 结合时，4 路残差流共享嵌入表和 \(W_V\)，每路有自己的 \(W_K^{(m)}\) 和门控 \(\alpha_t^{(m)}\)，所以输出是 \((T, 4, 5120)\)，每路得到不同缩放的 \(v_t\)。
+
+| 张量 | 形状 |
+|---|---|
+| token id | \((T)\) |
+| 记忆向量 \(e_t\) | \((T, 6144)\) |
+| \(k_t^{(m)}\) / \(v_t\) | \((T, 4, 5120)\) / \((T, 5120)\) |
+| 门控 \(\alpha_t^{(m)}\) | \((T, 4)\) |
+| 输出 \(Y\) | \((T, 4, 5120)\)，加到残差流 |
+
+> 注：门控公式、mHC 分支设计和 \(e_t\) 的拼接维度来自 Engram 原论文；V4.1 报告只给出了阶数、哈希头数、每阶嵌入维等配置。
 
 ### 7.3 DSpark（投机解码）
 

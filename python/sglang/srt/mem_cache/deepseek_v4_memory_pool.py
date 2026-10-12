@@ -35,9 +35,9 @@ def get_compress_state_ring_size(
     compress_ratio: int, is_speculative: bool = False
 ) -> int:
     assert compress_ratio in [4, 128], f"Unsupported {compress_ratio = }"
-    # Online c128 keeps a single (max, sum, kv) state per index instead of a
-    # 128-slot ring buffer of raw tokens, so ring_size collapses to 1. Online
-    # is incompatible with speculative decode for now.
+    # 在线（online）C128 每个下标只保留一份 (max, sum, kv) 汇总状态，
+    # 而不是 128 槽的原始 token ring，因此 ring_size 收缩为 1。
+    # 在线模式目前与投机解码（MTP）不兼容。
     if compress_ratio == 128 and ONLINE_C128:
         if is_speculative and not envs.SGLANG_EXPERIMENTAL_ONLINE_C128_MTP.get():
             raise AssertionError("online c128 does not support MTP")
@@ -49,14 +49,89 @@ def get_compress_state_ring_size(
 
 
 def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
-    """Largest draft-token count this ring can serve; mirrors `mtp_pad` in `c_plan.cuh`
-    (the bound is derived there). Zero for a non-speculative ring, which is exactly one
-    window wide."""
+    """返回该 ring 能容纳的最大草稿（draft）token 数。
+
+    语义与 `c_plan.cuh` 中的 `mtp_pad` 一致（该上界在那里推导），供投机解码
+    预留写入空间。非投机场景下 ring 宽度恰好等于一个窗口，此时返回 0。
+
+    参数：
+        compress_ratio: 压缩率，只能是 4 或 128。
+        ring_size: 该压缩率对应的 ring 长度（见 `get_compress_state_ring_size`）。
+
+    返回：
+        可容纳的草稿 token 数（int）；ring 不足一个窗口时返回 0。
+
+    示例：
+        >>> get_compress_state_write_pad(4, 8)      # 非投机 C4：窗口 4×2 = 8
+        0
+        >>> get_compress_state_write_pad(4, 16)     # 投机 C4：16 - 8 + 2
+        10
+        >>> get_compress_state_write_pad(128, 256)  # 投机 C128：256 - 128 + 2
+        130
+    """
     window_size = compress_ratio * (2 if compress_ratio == 4 else 1)
     return ring_size - window_size + 2 if ring_size > window_size else 0
 
 
 class DeepSeekV4SingleKVPool(KVCache):
+    """DeepSeek-V4 的单一 KV 物理池：SWA / C4 / C128 三类子池共用本实现。
+
+    【定位】
+    父池 `DeepSeekV4TokenToKVPool` 按压缩率给每类层各建一个本池实例；本类只负责
+    「一块按字节紧凑打包的 K 缓冲」，不决定容量、也不负责层号换算：
+
+    - SWA 子池：页大小 `swa_page_size`（默认 256），覆盖本 stage 内的全部层；
+    - C4 子池：页大小 `page_size // 4`（默认 64），只覆盖 `compress_ratio=4` 的层；
+    - C128 子池：页大小 `page_size // 128`（默认 2），只覆盖 `compress_ratio=128` 的层。
+
+    启用 HiSparse 时，C4 子池由子类 `HiSparseC4DevicePool` 承担（额外地做
+    full 槽位 → device 热池槽位的下标翻译）。
+
+    【每 token 584 字节】缓冲以 `uint8` 承载，逐段拼接：
+
+    - nope：`qk_nope_head_dim` = 448 字节（FP8，每元素 1 字节）；
+    - rope：`qk_rope_head_dim` = 64，按 BF16 存 → 128 字节；
+    - nope FP8 scale：`448 // 64` = 7 字节（UE8M0，每 64 通道 1 个）；
+    - 对齐填充：`scale_pad` = 1 字节。
+
+    合计 448 + 128 + 7 + 1 = 584 字节；每页字节再向上取整到 `576` 的整数倍
+    （576 是 **页**级对齐单位，不是每 token 的字节数）。
+
+    【为什么没有 V 缓冲】
+    该模型的 K 与 V 是同一个「头间共享」向量，因此这里只存一份 K：
+    `get_value_buffer` / `get_kv_buffer` / `set_kv_buffer` 一律不支持，
+    注意力侧只调用 `get_key_buffer`。
+
+    【存储 dtype】
+    `dtype` 恒为 FP8，基类据此把 `store_dtype` 设为 `torch.uint8`（FP8 不支持
+    直接 `index_put`），所以缓冲实际是「字节张量」，读取时再 `view(dtype)`
+    重解释为 FP8。
+
+    参数：
+        size: 本子池槽位数（SWA 为原始 token 数；C4 / C128 为压缩后条目数）。
+        page_size: 本子池页大小（每页槽位数）。
+        dtype: KV 计算 dtype（恒为 FP8）。
+        qk_nope_head_dim: nope 维（448），FP8 存储。
+        qk_rope_head_dim: RoPE 维（64），BF16 存储。
+        layer_num: 本子池覆盖的层数（**本 stage 内**）。
+        device: 缓冲所在设备。
+        enable_memory_saver: 是否接入显存节省适配器。
+        start_layer / end_layer: 全局层区间；父池构池时不传，恒为 0 / layer_num - 1。
+
+    示例：
+        >>> pool = DeepSeekV4SingleKVPool(
+        ...     size=8192, page_size=64, dtype=torch.float8_e4m3fn,
+        ...     qk_nope_head_dim=448, qk_rope_head_dim=64,
+        ...     layer_num=4, device="cuda:0", enable_memory_saver=False,
+        ... )
+        >>> len(pool.kv_buffer)         # 每层一份缓冲
+        4
+        >>> pool.get_bytes_per_token()  # 每 token 584 字节
+        584
+        >>> pool.kv_buffer[0].shape     # [页数, 按 576 对齐后的页字节]
+        torch.Size([129, 37440])
+    """
+
     def __init__(
         self,
         size: int,
@@ -70,6 +145,23 @@ class DeepSeekV4SingleKVPool(KVCache):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
+        """构造单个 KV 子池：先让基类确定 size / page_size / store_dtype 等，再记录
+        打包布局常量并分配按字节的缓冲。
+
+        参数：见类文档字符串；其中 `layer_num` 是**本 stage 内**的层数。
+
+        返回：
+            无（返回实例本身）。
+
+        示例：
+            >>> p = DeepSeekV4SingleKVPool(
+            ...     1024, 2, torch.float8_e4m3fn, 448, 64, 1, "cuda", False
+            ... )
+            >>> p.quantize_block_size, p.rope_storage_dtype, p.scale_pad
+            (64, torch.bfloat16, 1)
+            >>> p.bytes_per_page_padded  # 2 × 584 = 1168 → 向上取整到 576 的倍数
+            1728
+        """
         super().__init__(
             size,
             page_size,
@@ -83,13 +175,36 @@ class DeepSeekV4SingleKVPool(KVCache):
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
 
-        self.scale_pad = 1
-        self.quantize_block_size = 64
-        self.rope_storage_dtype = torch.bfloat16
-        self.k_with_scale_buffer_dtype = torch.int8
+        # ---- 打包布局常量（必须与 get_bytes_per_token / create_buffer 保持一致）----
+        self.scale_pad = 1  # nope scale 之后补 1 字节，把每 token 行宽对齐到 8 的倍数
+        self.quantize_block_size = 64  # nope 每 64 通道共享 1 个 FP8 scale（448/64 = 7）
+        self.rope_storage_dtype = torch.bfloat16  # rope 恒按 BF16 存（64 → 128 字节）
+        self.k_with_scale_buffer_dtype = torch.int8  # 预留字段，本类内部未再读取
         self._create_buffers()
 
     def _create_buffers(self):
+        """按层分配 KV 字节缓冲（由 `__init__` 调用）。
+
+        每层一张 `[页数, bytes_per_page_padded]` 的 `uint8` 张量，页数取
+        `ceil((size + page_size + 1) / page_size)`：`+ page_size` 为尾部跨页写入留
+        一整页余量，末尾再 `+ 1` 保证紧跟最后一个有效槽位之后的写入不越界。
+
+        分配包在 `GPU_MEMORY_TYPE_KV_CACHE` 的 memory-saver 区域内，并在可用时
+        复用 PD + NVLink 的自定义显存池。
+
+        参数：无。
+
+        返回：
+            None（结果就地写入 `self.kv_buffer`）。
+
+        示例：
+            >>> pool.kv_buffer[0].dtype
+            torch.uint8
+            >>> len(pool.kv_buffer) == pool.layer_num
+            True
+            >>> pool.kv_buffer[0].shape
+            torch.Size([129, 37440])
+        """
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -104,6 +219,27 @@ class DeepSeekV4SingleKVPool(KVCache):
                 ]
 
     def get_bytes_per_token(self) -> int:
+        """返回「每 token 的字节数」，即本池打包布局的一行宽度（恒为 584）。
+
+        逐项相加（单位均为字节）：
+
+        - `qk_nope_head_dim` = 448：nope，FP8 每元素 1 字节；
+        - `qk_rope_head_dim × 2` = 128：rope，BF16 每元素 2 字节；
+        - `qk_nope_head_dim // quantize_block_size` = 7：nope FP8 scale；
+        - `scale_pad` = 1：对齐填充。
+
+        注意这里的 `quantize_block_size = 64` 与索引器池的 `quant_block_size = 128`
+        不同，二者不要混用。
+
+        参数：无。
+
+        返回：
+            每 token 字节数（int），当前实现恒为 584。
+
+        示例：
+            >>> pool.get_bytes_per_token()
+            584
+        """
         dim_per_token = (
             self.qk_nope_head_dim
             + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
@@ -113,15 +249,43 @@ class DeepSeekV4SingleKVPool(KVCache):
         return dim_per_token
 
     def create_buffer(self, *, num_pages: int):
+        """新建一层的 KV 字节缓冲，并顺带推导本池的字节 / 页常量。
+
+        副作用（重要）：会把 `kv_cache_total_dim`（= 每 token 字节数）与
+        `bytes_per_page_padded` 写回 `self`；HiSparse 协调器用
+        `item_size_bytes = kv_cache_total_dim × store_dtype.itemsize` 估算
+        host ↔ device 的搬运粒度。
+
+        参数：
+            num_pages: 要分配的页数（由 `_create_buffers` 依据 size / page_size 推出）。
+
+        返回：
+            `[num_pages, bytes_per_page_padded]` 的 `uint8` 全零张量。
+
+        异常：
+            AssertionError: 布局不是 584 字节 / token，或存储 dtype 不是 `uint8`
+                （即 `dtype` 不是 FP8）。
+
+        示例：
+            >>> buf = pool.create_buffer(num_pages=3)
+            >>> buf.shape, buf.dtype
+            (torch.Size([3, 37440]), torch.uint8)
+            >>> pool.kv_cache_total_dim  # 顺带写入：每 token 字节数
+            584
+        """
         bytes_per_token = self.get_bytes_per_token()
         self.kv_cache_total_dim = bytes_per_token
         bytes_per_page_non_padded = self.page_size * bytes_per_token
         self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
 
+        # 布局自检：448(FP8 nope) + 64×2(BF16 rope) + 7(FP8 scale) + 1(pad) = 584 B/token。
         assert bytes_per_token == 448 + 64 * 2 + 8, (
             "DSV4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
             "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
+            "（DSV4 KV 布局：448 字节 FP8 nope + 128 字节 BF16 rope + 7 字节 FP8 scale "
+            "+ 1 字节对齐填充 = 每 token 584 字节）"
         )
+        # FP8 不支持直接 index_put，基类会把 store_dtype 置为 uint8；此处确认这一点。
         assert self.store_dtype == torch.uint8
 
         return torch.zeros(
@@ -137,6 +301,28 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     ):
+        """把**已量化好**的三段 K 数据写入指定槽位（走 `SetKAndS` kernel）。
+
+        输入：
+            layer_id: 本 stage 内的局部层号（父池已把全局层号换算好）。
+            loc: `[T]` 的一维下标张量（int32 / int64），本批要写的槽位。
+            cache_nope_fp8_rope_bf16_pack: `NopeFp8RopeBf16Pack`，含
+                `k_nope_fp8` `[T, 448]`（FP8）、`k_rope_bf16` `[T, 64]`（BF16）、
+                `scale_k_nope_ue8m0` `[T, 7]`（uint8）。
+
+        返回：
+            None（就地写入 `self.kv_buffer[layer_id]`）。
+
+        示例：
+            >>> loc = torch.tensor([0, 1, 2], dtype=torch.int32, device="cuda")
+            >>> pack = NopeFp8RopeBf16Pack(
+            ...     k_nope_fp8=torch.zeros(3, 448, dtype=torch.float8_e4m3fn, device="cuda"),
+            ...     k_rope_bf16=torch.zeros(3, 64, dtype=torch.bfloat16, device="cuda"),
+            ...     scale_k_nope_ue8m0=torch.zeros(3, 7, dtype=torch.uint8, device="cuda"),
+            ... )
+            >>> pool.set_key_buffer(0, loc, pack) is None  # 槽位 0/1/2 被覆盖
+            True
+        """
         dsv4_index_buf_accessor.SetKAndS.execute(
             pool=self,
             buf=self.kv_buffer[layer_id],
@@ -150,6 +336,28 @@ class DeepSeekV4SingleKVPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
+        """把**未量化**的 BF16 K 一次性量化 + 打包写入（融合 kernel）。
+
+        与 `set_key_buffer` 的分工：这里输入是 BF16 原值，FP8 量化、UE8M0 scale
+        计算、rope 的 BF16 拷贝与分页落位都在 kernel 内完成；`page_size` 由池自身
+        提供，用于换算页内偏移。
+
+        输入：
+            layer_id: 本 stage 内的局部层号。
+            loc: `[T]` 的槽位下标张量。
+            cache_k: BF16 张量 `[T, qk_nope_head_dim + qk_rope_head_dim]`
+                （典型 `[T, 512]`：前 448 列 nope、后 64 列 rope），
+                必须是「已归一化、已加 RoPE、尚未量化」的 K。
+
+        返回：
+            None。
+
+        示例：
+            >>> cache_k = torch.randn(5, 512, dtype=torch.bfloat16, device="cuda")
+            >>> loc = torch.tensor([0, 1, 2, 3, 4], dtype=torch.int32, device="cuda")
+            >>> pool.set_key_buffer_fused(0, loc, cache_k) is None
+            True
+        """
         return fused_store_cache(
             input=cache_k,
             cache=self.kv_buffer[layer_id],
@@ -159,19 +367,77 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
 
     def get_key_buffer(self, layer_id: int):
+        """取出指定层的 K 缓冲（FP8 视图），供注意力 kernel 按页读取。
+
+        这里同时承担「取 K」与「取 KV」两种用途：本池只存一份共享向量，
+        基类的 `get_value_buffer` 已改为抛异常。
+
+        参数：
+            layer_id: 本 stage 内的局部层号（**不是**全局层号）。
+
+        返回：
+            `[页数, bytes_per_page_padded]` 的 FP8 张量（由 `uint8` 缓冲
+            `view(dtype)` 重解释；HUZ 平台上为 `float8_e4m3fnuz`）。
+
+        说明：
+            当前 `dtype` 恒为 FP8、`store_dtype = uint8`，两者不等，因此实际总是
+            走第一个分支；`start_layer` 缺省为 0（父池构池时未传），所以
+            `layer_id - start_layer` 与 `layer_id` 等价。两个分支的差别只在
+            子类显式传入 `start_layer` 时才体现。
+
+        示例：
+            >>> buf = pool.get_key_buffer(0)
+            >>> buf.dtype
+            torch.float8_e4m3fn
+            >>> buf.shape
+            torch.Size([129, 37440])
+        """
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
 
         return self.kv_buffer[layer_id]
 
     def set_kv_buffer(self, *args, **kwargs) -> None:
-        raise NotImplementedError()
+        """本池不支持写入 V：K 与 V 共用同一份数据，请改用 `set_key_buffer` /
+        `set_key_buffer_fused`。
+
+        参数：
+            *args / **kwargs: 仅为兼容基类签名，任意传入都会失败。
+
+        返回：
+            无返回值——直接抛 `NotImplementedError`。
+        """
+        raise NotImplementedError(
+            "DeepSeekV4SingleKVPool 不存 V（K/V 共用同一份数据），"
+            "请改用 set_key_buffer / set_key_buffer_fused。"
+        )
 
     def get_value_buffer(self, layer_id: int) -> torch.Tensor:
-        raise NotImplementedError("Use get_key_buffer instead.")
+        """本池只存 K，取 V 请改用 `get_key_buffer`。
+
+        参数：
+            layer_id: 本 stage 内局部层号（此处仅用于保持签名兼容）。
+
+        返回：
+            无返回值——直接抛 `NotImplementedError`。
+        """
+        raise NotImplementedError(
+            "本池只存 K（K/V 共用同一份数据），请改用 get_key_buffer。"
+        )
 
     def get_kv_buffer(self, layer_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        raise NotImplementedError("Use get_key_buffer instead.")
+        """本池没有独立的 (K, V) 两个缓冲，请改用 `get_key_buffer`。
+
+        参数：
+            layer_id: 本 stage 内局部层号（此处仅用于保持签名兼容）。
+
+        返回：
+            无返回值——直接抛 `NotImplementedError`。
+        """
+        raise NotImplementedError(
+            "本池没有独立的 (K, V) 缓冲（K/V 共用同一份数据），"
+            "请改用 get_key_buffer。"
+        )
 
 
 class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):

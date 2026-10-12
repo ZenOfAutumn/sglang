@@ -7,7 +7,7 @@
 >
 > 以 DeepSeek-V3 为例，图中模块名与 sglang 代码（`deepseek_v2.py`、
 > `deepseek_common/attention_forward_methods/` 等）中的变量名一致。
-> KV cache 的存储布局见 [`kv_cache_core_fields_zh.md` §4.2](../mem_cache/kv_cache_core_fields_zh.md)。
+> KV cache 的存储布局见 [`kv_cache_core_fields_zh.md` §4.2](../../mem_cache/kv_cache_core_fields_zh.md)。
 
 ## 目录
 
@@ -943,7 +943,7 @@ flowchart LR
     style GATHER fill:#ffe9a8,stroke:#d4a000,stroke-width:2px
 ```
 
-写侧直接用 slot（`out_cache_loc`）索引，读侧先把 slot 按 `PAGE_SIZE` 折成 page 下标再交给 kernel，两侧共用 `req_to_token` 这一张 token→slot 表。slot 与 page 的分配细节见 [`kv_cache_core_fields_zh.md` §3](../mem_cache/kv_cache_core_fields_zh.md)。
+写侧直接用 slot（`out_cache_loc`）索引，读侧先把 slot 按 `PAGE_SIZE` 折成 page 下标再交给 kernel，两侧共用 `req_to_token` 这一张 token→slot 表。slot 与 page 的分配细节见 [`kv_cache_core_fields_zh.md` §3](../../mem_cache/kv_cache_core_fields_zh.md)。
 
 ### 9.4 prefill（展开式）与 cache 的配合
 
@@ -999,6 +999,59 @@ decode 侧则完全不展开，直接把吸收后的 query 和整行 latent 交�
 | prefill（无 prefix 命中，ragged） | 临时张量直接算 | 不存在 | 只写 |
 | prefill（有 prefix 命中 / `mha_one_shot`） | 临时展开 | 从 cache 读 latent 再 `kv_b_proj` 展开 | 写 + 读 |
 | decode（权重吸收） | 先写入 cache，再随前缀一起读 | 从 cache 读 latent（不展开） | 写 + 读 |
+
+### 9.5 KV cache 的 FP8 量化：nope FP8 scale 的含义
+
+§4 把每个头的 Key 拆成 **nope 段**（不带位置信息）与 **rope 段**（已加 RoPE，头间共享）。
+写入 cache 的一行就是 `[nope | rope]`。为把 KV cache 再压一半，DeepSeek-V4 把 **nope 段
+量化成 FP8（E4M3，1 字节/元素）**，而 **rope 段仍按 BF16 保存**（2 字节/元素）——rope 携带
+位置旋转，量化误差会直接扰动注意力打分，故保留更高精度。为支持这种量化存储，cache 里额外
+保存一组 **nope FP8 scale**，本小节说明它的含义与来历。
+
+> 说明：本节以 DeepSeek-V4 的 KV 池为例，其 nope 头维 $d_{nope}=448$（与上文 DeepSeek-V3
+> 的 $d_{nope}=128$ 配置不同，但含义一致）。
+
+**scale 是什么。** 设某段待存数值为 $x$，其 FP8 的量化 / 反量化定义为
+
+$$
+x_{fp8} = \mathrm{round}\!\left(\frac{x}{s}\right), \qquad
+\hat{x} = x_{fp8}\cdot s
+$$
+
+这里的 $s$ 就是 **FP8 scale（缩放因子）**：量化时把 $x$ 压进 FP8 的可表示范围，反量化时再用
+它还原。$s$ 越大，可表示范围越大但分辨率越粗；$s$ 越小则反之。
+
+**为什么要分块缩放。** 潜在向量各通道的数值范围差异很大，若整段 nope 只用一个全局 $s$，
+为了让最大通道不溢出，$s$ 必须取很大，小数值通道就会被压成 0。因此采用
+**分块缩放（block scale）**：把 448 维的 nope 按每 **64** 个通道切一块（$448/64 = 7$ 块），
+**每块各自一个 $s$**，兼顾范围与精度。
+
+**scale 怎么产生（在线动态量化）。** 它**不是离线标定的权重 scale**，而是每个 token
+写入 KV 时当场算出来的（每个 token、每块各一个），步骤为：
+
+1. 取该块内最大绝对值 $m = \max_i |x_i|$；
+2. 得原始 scale $s_{raw} = \dfrac{\max(m,\ \epsilon)}{448}$（$448$ 是 E4M3 的最大可表示值）；
+3. **向上取整到 2 的幂**：$e = \lceil \log_2 s_{raw}\rceil$，即 $s = 2^{e}$；
+4. 只存**偏置指数** 1 字节：$\text{byte} = e + 127$（即 **UE8M0**：8-bit 无符号指数、无尾数）。
+
+注意力侧读出该字节即可还原：$\hat{x} = x_{fp8}\cdot 2^{\text{byte}-127}$。
+
+**两个设计要点**：
+
+- **取 2 的幂（UE8M0）**：反量化只是乘 $2^{e}$，纯指数位运算，硬件友好；这正是 MX / Blackwell
+  那套共享指数（shared-exponent）block-scale 的标准格式，1 字节即可描述整块。
+- **向上取整而非就近**：保证 $\max_i |x_i| / s \le 448$，**绝不会溢出** FP8 动态范围，
+  代价是数值略偏小、精度略有损失。
+
+**在 cache 布局中的位置。** 一个 token 的 K 落盘为
+`[nope FP8 (448 B) | rope BF16 (128 B) | nope scale (7 B) | pad (1 B)] = 584 B`：
+scale 紧跟 rope 段之后，每 token 7 字节（每块 1 字节）再加 1 字节对齐填充。
+完整字节布局与 `DeepSeekV4SingleKVPool` 的实现见
+[`kv_cache_core_fields_zh.md` §4.2](../../mem_cache/kv_cache_core_fields_zh.md)。
+
+**与权重 scale 的区别。** MLA 常规 `MLATokenToKVPool` 把 latent 按 BF16 存（$d_c + d_{rope} = 576$
+个元素，见 §3.4）；而在 §12 提到的 FP8 / FP4 量化 KV 池里，nope FP8 scale 属于**激活 / 缓存侧**的
+在线动态 scale，每个 token、每块都不同，与离线标定、按通道固定的权重 scale 完全不是一回事。
 
 ---
 

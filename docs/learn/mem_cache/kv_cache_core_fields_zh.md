@@ -1,6 +1,6 @@
 # KV Cache 核心字段详解：含义、存储结构与数值示例
 
-> 本文以标准 MHA/GQA 模型为主线，介绍 SGLang 中 KV cache 的核心数据结构和字段。MLA、SWA 等混合池在 §4 里有专门小节，Mamba、DSA 等其余变体只做简要说明。
+> 本文以标准 MHA/GQA 模型为主线，介绍 SGLang 中 KV cache 的核心数据结构和字段。MLA、SWA 等混合池，以及 Mamba 状态池、DSA / DSv4（CSA / HCA）压缩池，都在 §4 里有专门小节。
 >
 > 相关源码：
 > - `srt/mem_cache/memory_pool.py`：`ReqToTokenPool`、`KVCache`、`MHATokenToKVPool`、`MLATokenToKVPool`
@@ -378,7 +378,7 @@ $$
 
 真正持有 KV 显存的基类：按层保存 K/V 张量，对外提供 attention 的读写接口。不同模型结构对应不同子类。
 
-§4.1~§4.3 展开三条主线池（MHA、MLA、SWA）。下表是**继承 `KVCache` 的全部池类**速览（除注明 NPU 外均在 `srt/mem_cache/`；NPU 变体在 `srt/hardware_backend/npu/`）；量化、后端、共享缓冲等变体只在存储布局 / dtype / 视图上不同，接口与主线一致。
+§4.1~§4.3 展开三条主线池（MHA、MLA、SWA），§4.4 讲字节与容量账、§4.5~§4.7 分别讲 Mamba 状态池、DSA 与 DSv4（CSA / HCA）压缩池。下表是**继承 `KVCache` 的全部池类**速览（除注明 NPU 外均在 `srt/mem_cache/`；NPU 变体在 `srt/hardware_backend/npu/`）；量化、后端、共享缓冲等变体只在存储布局 / dtype / 视图上不同，接口与主线一致。
 
 | 家族 | 类 | 父类 | 源码位置 | 用途 |
 | --- | --- | --- | --- | --- |
@@ -389,7 +389,6 @@ $$
 | MHA | `PageMajorMHATokenToKVPool` | `MHATokenToKVPool` | `memory_pool.py:3257` | page-major 页粒度布局（当前不可构造，占位） |
 | MHA | `NPUMHATokenToKVPool` | `MHATokenToKVPool` | `npu/memory_pool_npu.py:57` | NPU 后端 |
 | MHA | `UnifiedMHATokenToKVPool` | `MHATokenToKVPool` | `unified_memory_pool.py:500` | 各层 buffer 是共享 byte buffer 的 view |
-| K-only | `MHATokenToKOnlyPool` | `KVCache` | `memory_pool.py:4680` | 只分配 K（MiniMax sparse 的 index 分支不读 V） |
 | MLA | `MLATokenToKVPool` | `KVCache` | `memory_pool.py:4045` | DeepSeek MLA（§4.2） |
 | MLA | `MLATokenToKVPoolFP4` | `MLATokenToKVPool` | `memory_pool.py:4327` | FP4 量化 |
 | MLA | `DSATokenToKVPool` | `MLATokenToKVPool` | `memory_pool.py:4467` | MLA + DSA indexer K cache |
@@ -404,11 +403,12 @@ $$
 | SWA | `DSV4NPUTokenToKVPool` | `DeepSeekV4TokenToKVPool` | `npu/dsv4/dsv4_memory_pool.py:225` | NPU 后端 |
 | 线性 | `HybridLinearKVPool` | `KVCache` | `memory_pool.py:3688` | full 层与线性注意力层分开建池 |
 | 线性 | `UnifiedHybridLinearKVPool` | `HybridLinearKVPool` | `unified_memory_pool.py:1064` | 共享 buffer 版本 |
-| 稀疏 | `MiniMaxSparseKVPool` | `KVCache` | `memory_pool.py:4779` | MiniMax 稀疏注意力池 |
-| 稀疏 | `NPUMiniMaxSparseKVPool` | `MiniMaxSparseKVPool` | `npu/memory_pool_npu.py:499` | NPU 后端 |
-| DSV4 | `DeepSeekV4SingleKVPool` | `KVCache` | `deepseek_v4_memory_pool.py:59` | 单池（C4 / C128 压缩状态） |
+| DSV4 | `DeepSeekV4SingleKVPool` | `KVCache` | `deepseek_v4_memory_pool.py:59` | 单路压缩 KV 池：C4 / C128 主 KV（每 slot = 1 压缩条目，§4.7） |
 | DSV4 | `NPUDeepSeekV4SingleKVPool` | `DeepSeekV4SingleKVPool` | `npu/dsv4/dsv4_memory_pool.py:33` | NPU 后端 |
+| DSV4 | `HiSparseC4DevicePool` | `DeepSeekV4SingleKVPool` | `deepseek_v4_memory_pool.py:177` | CSA 的 device 热池，带 full→hisparse 映射 |
 | DSV4 | `DeepSeekV4IndexerPool` | `KVCache` | `deepseek_v4_memory_pool.py:260` | indexer 的量化 index K + scale 池 |
+| DSV4 | `DeepSeekV4UnifiedKVPool` | —（非 `KVCache` 子类） | `deepseek_v4_memory_pool.py:398` | unified_kv 单 buffer：SWA ring + 压缩区共用一个 bf16 buffer |
+| DSV4 | `CompressStatePool` | —（非 `KVCache` 子类） | `deepseek_v4_compress_state.py:83` | c4/c128 压缩 ring 状态（kv + score），按层一份 |
 
 > 另有测试 / 占位用的 `_DummyKVCache`（`hardware_backend/mlx/model_runner_stub.py:36`），不是真实池。
 
@@ -501,7 +501,7 @@ $$
 
 MLA（Multi-head Latent Attention）不为每个头缓存 K、V，而是每个 token 只缓存一份低秩压缩的 latent 向量，再加一小段带 RoPE 的 key。所以池里只有 `kv_buffer`，没有 `k_buffer` / `v_buffer` 之分。类定义在 `srt/mem_cache/memory_pool.py:4045`，DSA 变体 `DSATokenToKVPool` 在 `memory_pool.py:4467`。
 
-> MLA 的模型结构（投影流程图、权重吸收推导、两种注意力实现）见 [`MLA.md`](../arch/MLA.md)。这里只记结论：每 token 每层只缓存 $d_c + d_h^{R} = 512 + 64 = 576$ 个元素；按 MHA 展开则需要 $128 \times (128 + 64 + 128) = 40960$ 个，约为 MLA 的 $71$ 倍。
+> MLA 的模型结构（投影流程图、权重吸收推导、两种注意力实现）见 [`MLA.md`](../arch/attention/MLA.md)。这里只记结论：每 token 每层只缓存 $d_c + d_h^{R} = 512 + 64 = 576$ 个元素；按 MHA 展开则需要 $128 \times (128 + 64 + 128) = 40960$ 个，约为 MLA 的 $71$ 倍。
 
 #### (1) 字段
 
@@ -925,7 +925,7 @@ $$
 \frac{327{,}680}{8192} \times 512 = 20{,}480 \xrightarrow{\ \operatorname{clip}\ } 4096, \qquad R = \min(4096,\ 163{,}840) = 4096
 $$
 
-### `MambaPool`（Mamba / 线性注意力状态池）
+### 4.5 `MambaPool`（Mamba / 线性注意力状态池）
 
 Mamba、GDN 等线性注意力 / 状态空间层不做全序列点积注意力，而是每层维护一份**固定大小的递归状态**（state）。因此它的显存不随序列长度增长，也不能像 KV 那样按 token 切分或复用片段。SGLang 用 `MambaPool` 存这份 state，用 `MambaSlotAllocator` 做请求级 slot 分配，并挂在 `HybridReqToTokenPool` 上。
 
@@ -980,6 +980,169 @@ Mamba、GDN 等线性注意力 / 状态空间层不做全序列点积注意力�
 **分配 / 释放路径**：`ReqToTokenPool.alloc` → `HybridReqToTokenPool.alloc` → `mamba_allocator.alloc(1)` → `req.mamba_pool_idx`；请求结束由 `release_kv_cache`（`srt/mem_cache/common.py:201`）与 mamba 感知的 `RadixCache` 处理——`HybridReqToTokenPool` 且树支持 mamba 时 state 由树持有，否则在 `free_mamba_cache` 中归还。容量由 `--mamba-full-memory-ratio` / `--max-mamba-cache-size` 控制。
 
 > HiCache 场景的 host 侧对应物是 `MambaPoolHost`（`srt/mem_cache/pool_host/mamba.py:41`）。
+
+### 4.6 `DSATokenToKVPool`（DeepSeek-V3.2 稀疏注意力）
+
+DSA（DeepSeek Sparse Attention，DeepSeek-V3.2）在 MLA 之上叠加一个**轻量 indexer**：先用 indexer Q/K 给每个历史 token 打分，再对 main KV 做 top-k 选择，注意力只算被选中的 token。它**不改变 MLA 主池结构**，只是额外挂一份 indexer K cache。类定义在 `srt/mem_cache/memory_pool.py:4636`，继承 `MLATokenToKVPool`。
+
+**(1) 结构：主池 + indexer 池**
+
+| 部分 | 内容 | 说明 |
+| --- | --- | --- |
+| 主 KV（`kv_buffer`） | MLA latent `[c_kv(512) \| k_rope(64)]` | 与 §4.2 完全一致；fp8 时按 §4.2(4) 的 656 B 布局 |
+| indexer K cache | 低维 index key + 量化 scale | 供 indexer 打分用，**不在 `kv_buffer` 中**，单独分配 |
+
+- 主池每 token 仍是 $576$（fp8 为 $656$）字节，**slot 语义不变**；
+- indexer K cache 单独一块，按页（`page_size=64`）组织，每页元素数 = `page_size × (index_head_dim + index_head_dim / quant_block_size × 4)`（见 [`sparse_attention.md` §9](../arch/attention/sparse_attention.md#9-kv-cache池布局容量与-host-池)）。
+
+**(2) 数值示例（供理解，非精确配置）**
+
+设 `index_head_dim = 128`、`page_size = 64`、`quant_block_size = 128`：
+
+$$
+\text{indexer 每页元素} = 64 \times \left(128 + \frac{128}{128} \times 4\right) = 64 \times 132 = 8448
+$$
+
+**(3) 与 radix tree 的关系**：见 §7.10——主池 slot 语义不变，树**完全复用**；indexer cache 不进树。
+
+### 4.7 `DeepSeek-V4` 的压缩池（CSA / HCA）
+
+DeepSeek-V4 把「KV 压缩」从**特征维度**扩展到**序列维度**：每 $m$ 个 token 压成 1 个条目，且同一模型里**多套页语义并存**。相关类在 `srt/mem_cache/deepseek_v4_memory_pool.py`，压缩状态在 `srt/mem_cache/deepseek_v4_compress_state.py`。
+
+| 通路 | 压缩率 | 页大小 | 代码前缀 | 说明 |
+| --- | --- | --- | --- | --- |
+| SWA | $1\times$ | `swa_page_size`（默认 256） | `swa_` / `c1_` | 局部窗口，原始 token |
+| CSA（Compressed Sparse Attention） | $4\times$ | `page_size // 4`（64） | `c4_` | 重叠窗口（步长 4、覆盖 8），带 indexer top-512/1024 |
+| HCA（Heavy Compression Attention） | $128\times$ | `page_size // 128`（2） | `c128_` | 不重叠分块、不选、全局兜底 |
+
+页大小是**按压缩率从模型级 `page_size` 推导**出来的（CUDA 下断言 `page_size == 256`，故 c4 / c128 子池页大小分别为 64 / 2）。
+
+#### (1) `DeepSeekV4TokenToKVPool`：多子池容器
+
+`DeepSeekV4TokenToKVPool`（`:463`，继承 `BaseSWAKVPool`）本身不分配 KV，而是按 `compress_ratios` **在本 PP stage 内**建好四份子池：
+
+| 字段 | 类型 | 页大小 | 层数 | 说明 |
+| --- | --- | --- | --- | --- |
+| `swa_kv_pool` | `DeepSeekV4SingleKVPool` | `swa_page_size` | `stage_layer_num`（全部层） | SWA ring，**所有层共享**（含 c4/c128 层） |
+| `c4_kv_pool` | `DeepSeekV4SingleKVPool`；HiSparse 时为 `HiSparseC4DevicePool` | `page_size // 4` | 仅 $ratio=4$ 层 | CSA 主 KV |
+| `c128_kv_pool` | `DeepSeekV4SingleKVPool` | `page_size // 128` | 仅 $ratio=128$ 层 | HCA 主 KV |
+| `c4_indexer_kv_pool` | `DeepSeekV4IndexerPool` | `page_size // 4` | 仅 $ratio=4$ 层 | indexer 的 index-K + scale |
+
+- **层 → 子池分发**：`layer_mapping: List[DeepSeekV4LayerItem]`（`compress_ratio` / `compress_layer_id` / `compress_kv_pool`）由 `_init_compressed_layer_mapping` 生成；`ratio=0` 只有 SWA，`4` 挂 `c4_kv_pool`，`128` 挂 `c128_kv_pool`。读 `get_extra_key_buffer(layer_id)`、写 `set_extra_key_buffer` 都经它换算成本 stage 内的 `compress_layer_id`。
+- **容量关系**：`c4_logical_size = c128_size × 32`（压 $4\times$ 与压 $128\times$ 的条目数差 32 倍），indexer 池即按 `c4_logical_size` 建。
+- **"full" 只是逻辑 id 空间**：`DeepSeekV4TokenToKVPool` **没有** `full_kv_pool`（`BaseSWAKVPool` 只强制 `swa_kv_pool`），所以分配器的 `full_attn_allocator` 的 `kvcache` 是 `None`：`full_max_total_num_tokens` 只提供规范 token loc 空间，物理 KV 全在 swa / c4 / c128 子池里。
+- **KV 合并存储**：`DeepSeekV4SingleKVPool` 只有 `get_key_buffer`（K = V，同一个 512 维向量），`get_value_buffer` / `set_kv_buffer` 抛 `NotImplementedError`。
+- **`HiSparseC4DevicePool`**（`:177`）是 c4 的 device 热池，多一份 `full_to_hisparse_device_index_mapping`，写入前先 `translate_loc_to_hisparse_device`。
+
+#### (2) 每 token / 每页字节
+
+`DeepSeekV4SingleKVPool`（`:59`）的布局（`store_dtype = uint8`）：
+
+| 段 | 元素数 | 说明 |
+| --- | --- | --- |
+| `qk_nope_head_dim` | 448 | nope 维，FP8 |
+| `qk_rope_head_dim` | $64 \times 2$ | RoPE 维，BF16（2 字节） |
+| nope FP8 scale | $\lceil 448 / 64 \rceil = 7$ | `quantize_block_size = 64`，每 64 通道一个 scale |
+| `scale_pad` | 1 | 对齐填充 |
+
+$$
+\text{bytes\_per\_token} = 448 + 64\times2 + 7 + 1 = 584 \ \text{B},
+\qquad
+\text{bytes\_per\_page\_padded} = \left\lceil \frac{\text{page\_size}\times 584}{576} \right\rceil \times 576 .
+$$
+
+- 主 KV 的 `quantize_block_size = 64`，**与 indexer 池的 `quant_block_size = 128` 不同**；$576$ 是**页字节**的对齐单位，不是每 token 576 B。
+- `DeepSeekV4IndexerPool`（`:260`）：`get_bytes_per_token() = index_head_dim//2 + 4 = 68`（FP4 indexer，`--enable-deepseek-v4-fp4-indexer`）或 `index_head_dim + 4 = 132`（FP8）；页字节 $= \text{page\_size} \times \text{bytes\_per\_token}$，**不再对齐 576**。写入走 `set_index_fused`（`fused_store_cache(type="indexer")`）或 `set_index_fp4`（`store_fp4_index_k_cache`）。
+
+#### (3) 压缩状态池 `CompressStatePool`
+
+压出一个条目要攒满一个窗口，未满的尾部（以及 c4 overlap 的前一组）存在**独立的 ring buffer**，不在 KV 池里：
+
+- 每个 c4/c128 层一份 `compress_state_pools[layer_id]`；indexer 另有 `indexer_compress_state_pools[layer_id]`（仅 c4）。
+- `ring_size`（`get_compress_state_ring_size`）：c4 非投机 8 / 投机 16；c128 非投机 128 / 投机 256；**online c128 塌缩为 1**（存 `max / sum / kv` 而非原始 ring，且不与 MTP 同用）。
+- buffer 形状 $[\text{size} + \text{ring\_size} + 1,\ \text{last\_dim}]$，$\text{last\_dim} = 2(1+\text{overlap})\cdot\text{head\_dim}$（offline）或 $3\cdot\text{head\_dim}$（online），其中 `overlap = (ratio == 4)`。`kv` 与 `score` 是同一 buffer 的前后两段（`KVAndScore`）。
+- c128 状态按 `req_pool_idx` 划分，故 `c128_state_pool_size = max(c128_state_pool_size, num_req_slots × ring_size)`（offline）或 `max(..., num_req_slots)`（online）；draft 层的 c128 未接收草稿还会被 `clear_unaccepted_c128_draft_states` 清理。
+
+#### (4) 可选的 unified_kv 单 buffer 布局
+
+当 `is_unified_kv_triton()` 为真时，SWA / C4 / C128 **不再是三个子池**，而是每层一个 bf16 buffer：
+
+$$
+\text{unified\_kv}[L] \in \mathbb{R}^{(\text{swa\_pages} + \text{padded\_compress\_rows}) \times \text{head\_dim}},
+$$
+
+- 行 $[0, \text{swa\_pages})$：SWA ring，按 `req_pool_idx × swa_ring_size + pos % swa_ring_size` 寻址，`swa_ring_size = sliding_window + spec_extra`；
+- 行 $[\text{swa\_pages}, \dots)$：压缩区，按 `swa_pages + page_index` 寻址；
+- `K_PER_BLOCK = {0: 0, 4: 32, 128: 1}` 是**以 `c128_size` 为基准**的条目倍增（`compress_rows = c128_size × K_PER_BLOCK[ratio]`，与 (1) 的 `c4_logical_size = c128_size × 32` 一致）；每页条目数 `rows_per_page = page_size // ratio`（c4 = 64、c128 = 2），并额外 pad 一页作 null slot。此时 `swa_kv_pool / c4_kv_pool / c128_kv_pool` 均为 `None`。
+
+该布局与 ATOM 的 unified_kv kernel 对齐（`:397` 注释）；HiCache 下用 `unified_region_buffers(ratio)` 把压缩区 reshape 成「一行一页」的 uint8 视图再交给 host 池。注意它与 `--enable-unified-memory` **无关**：DSv4 明确不支持 `--enable-unified-memory`（`kv_cache_configurator.py` 直接报错）。
+
+#### (5) 分配与容量
+
+容量由 `DSV4PoolConfigurator`（`model_executor/pool_configurator.py:756`）统一预算，以「full token 容量 $N$」为基准（`_compute_dsv4_sizes`）：
+
+$$
+\text{swa} = N \times \text{swa\_full\_tokens\_ratio},\qquad
+\text{c4} = \left\lfloor \frac{N}{4 \cdot \text{c4\_shrink\_factor}} \right\rfloor,\qquad
+\text{c128} = \left\lfloor \frac{N}{128} \right\rfloor,
+$$
+
+$$
+\text{c4\_state} = \frac{\text{swa}}{\text{window\_size}} \times \text{c4\_ring\_size},\qquad
+\text{c128\_state} = 0 \ (\text{请求级，事后按 } \texttt{max\_running\_requests} \text{ 定}).
+$$
+
+（这里 `window_size` 取 `config.window_size` = 128，即「SWA 容量容得下多少个压缩窗口」，**不要**与池的 `swa_page_size` = 256 混淆。）
+
+- 注意 `c4 = N/4`、`c128 = N/128` 恰好差 32 倍，与 (1) 的 `c4_logical_size = c128_size × 32` 互为印证；HiSparse 时 `c4_shrink_factor = host_to_device_ratio`（解析默认 2；未启用 HiSparse 时为 1），device 侧 c4 池按比例缩小；机制见 (6)。
+- **容量来源**：`c4_max_total_num_tokens` / `c128_max_total_num_tokens` / `c4_state_pool_size` / `c128_state_pool_size` 经 `MemoryPoolConfig` 传入；draft worker（MTP / EAGLE）**不持有** c4/c128/state 池，一律置 0（`_derive_pool_sizes`）。
+- **分配器**：DSv4 属于 hybrid-SWA 家族，CUDA 上复用 `SWATokenToKVPoolAllocator`（`allocator/swa.py:20`）管 full + SWA 两套 free-list；c4/c128 的条目位置由 full 位置按压缩率换算（如 `HiSparseC4DevicePool.translate_loc_from_full_to_compressed`：`(loc+1) % 4 == 0 → loc // 4`），**不是独立的 token free-list**。NPU 上由 `DSV4NPUTokenToKVPoolAllocator` 一并驱动 c4/c128 并返回 `DSV4OutCacheLoc` bundle（`allocation.py` 以 `hasattr(allocator, "c128_attn_allocator")` 判定）。DSv4 启用 HiSparse 时由 `DeepSeekV4HiSparseTokenToKVPoolAllocator` 包装原逻辑分配器，并为 C4 热池另建 device 分配器（见 (6)）；`HiSparseTokenToKVPoolAllocator` 用于 DSA 通路。
+- 与 MLA 主池的最大区别：**一个 slot 对应多个原始 token**（压缩条目），因此池的 slot 语义与 §4.2 的「一 token 一 slot」不同；「每 token 字节数」在语义上要按压缩率摊薄（`bytes_per_token / ratio`）。
+
+**与 radix tree 的关系**：见 §7.10——压缩改变了 slot 粒度，前缀匹配必须按**压缩块边界**对齐，需要专门的缓存/池配合，无法直接复用 MLA 的复用逻辑。
+
+#### (6) HiSparse：host 全量主 KV + device 热缓冲
+
+**HiSparse（Hierarchical Sparse Attention，分层稀疏注意力）不是新的 attention 公式，而是 DSA / DSv4 的 KV 存储与搬运机制**：把需要稀疏检索的全量主 KV 放在 CPU pinned memory，GPU 只保留有容量上限的热缓冲，按 indexer 的 top-k 结果换入。DSA 本身减少的是主 KV 的**读取 / 计算**；HiSparse 进一步减少这部分 KV 的**GPU 常驻存储**，代价是主机内存占用和 host→device 带宽 / 延迟。
+
+**哪些数据下放到 host？** 不应把“主 KV 全量在 host”理解成“所有 cache 都离开 GPU”：
+
+| 通路 | host 全量池 | device 保留内容 | 分配器 |
+| --- | --- | --- | --- |
+| DSA（V3.2 等） | `MLATokenToKVPoolHost`，保存全长 MLA 主 KV | `HiSparseDSATokenToKVPool` 主 KV 热缓冲；indexer K cache 仍在 GPU | `HiSparseTokenToKVPoolAllocator` |
+| DSv4 | `DeepSeekV4PagedHostPool`（`pool_name="dsv4_hisparse_c4"`），仅保存全量 C4 主 KV | `HiSparseC4DevicePool` C4 热缓冲；SWA、`c4_indexer_kv_pool`、C128 主 KV 及压缩状态仍在 GPU | `DeepSeekV4HiSparseTokenToKVPoolAllocator` |
+
+DSv4 的 `device_buffer_size` / `top_k` 以 **C4 压缩条目**计，DSA 则以原始 token 计。热缓冲容量上限为 `device_buffer_size`，实现还额外预留一页放新条目（`padded_buffer_size = device_buffer_size + page_size`）；DSA 短序列可按页逐步扩容，并非每个请求一开始就分满。**有上限的是被下放主 KV 的热缓冲，不是整个模型的 GPU 内存**：indexer cache、DSv4 C128 池、映射表等仍随容量配置变化。
+
+**decode 数据流**（`srt/managers/hisparse_coordinator.py`）：
+
+1. **准入**：PD 的 Direct-to-Host 通路把 prefill GPU 上的 KV 经 RDMA 直接写到 decode host 池，跳过 decode GPU 暂存峰值；DSv4 仅 C4 主 KV 走此路径，C4 indexer 与 C128 仍 device-to-device。源码另保留 `admit_request_into_staging`：先把已在 device 的 KV 异步备份到 host，再进入解码。
+2. **选中与换入**：需要稀疏检索的层取得 top-k 位置（本层 indexer 生成或跨层复用）；`swap_in_selected_pages` 检查热缓冲命中，更新 LRU，只把 miss 的 KV 从 host 换入，返回 device 物理位置供主 attention 重新打分。短序列可预载全部主 KV，走免换入快路径；DSv4 HCA 层不走 C4 换入。
+3. **新 KV 备份**：通过独立 stream 异步把新产生的主 KV 备份到 host；DSv4 按压缩率，只备份已完成的 C4 条目。后续换入通过 event 等待所需备份完成，不能把尚未落到 host 的新 KV 当成可读取条目。
+4. **结束 / 抢占**：协调器回收请求的 host 槽、device 热缓冲及位置映射。
+
+关键字段（都属于 `HiSparseCoordinator`；不能混同于 `ReqToTokenPool.req_to_token`）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `req_to_host_pool[req, pos]` | 请求内 token / 压缩条目位置 → host 物理槽 |
+| `req_to_device_buffer[req, slot]` | 请求热缓冲槽 → device 物理槽 |
+| `req_device_buffer_tokens[layer, req, slot]` | 每层该热槽当前缓存的是哪个请求内位置；用于命中判断 |
+| `req_device_buffer_token_locs[layer, req, slot]` | 每层热槽对应的 device KV 物理位置 |
+| `lru_slots[layer, req, ...]` | 每层、每请求的热槽淘汰顺序 |
+
+**与 (5) 容量公式的关系**：启用 HiSparse 时，`c4_shrink_factor = host_to_device_ratio`；未启用时为 1。对固定 full token 容量，设该比例为 $R$，则：
+
+$$
+\text{C4 host 条目数}\approx\left\lfloor\frac{N}{4}\right\rfloor,\qquad
+\text{C4 device 条目数}=\left\lfloor\frac{N}{4R}\right\rfloor.
+$$
+
+host 保留全量 C4，device 主 C4 池缩小；`c4_indexer` 仍按 `c4_logical_size` 保留全量索引。因此 **$R$ 不是整个 DSv4 KV 显存的缩减倍数**，也不是每请求热缓冲大小。
+
+**配置与边界**：使用 `--enable-hisparse` 和 `--hisparse-config`；解析默认 `top_k=2048`、`device_buffer_size=2*top_k`、`host_to_device_ratio=2`，且要求 $\text{device\_buffer\_size}\ge\text{top\_k}$（`srt/mem_cache/sparsity/factory.py`）。例如 `--hisparse-config '{"top_k":2048,"device_buffer_size":4096,"host_to_device_ratio":2}'`；DSv4 应按模型实际 top-k 配置条目数。官方指南当前要求 **PD 分离、仅 decode 实例开启**；源码虽保留 staging 路径，不能据此把非 PD 视作官方支持配置。校验要求 `--disable-radix-cache`，并禁止与 `--disaggregation-decode-enable-radix-cache` 同用（`arg_groups/hisparse_hook.py`、`arg_groups/pd_disaggregation_hook.py`）。
+
+进一步说明见 [`hisparse_zh.md`](hisparse_zh.md)（存储模型、换入核函数与 PD 直连的完整说明）、[`sparse_attention.md` §10](../arch/attention/sparse_attention.md#10-hisparse分层稀疏注意力) 与 [HiSparse 启动指南](../../docs/advanced_features/hisparse_guide.mdx)。
 
 ---
 
@@ -1443,6 +1606,11 @@ $$p_{\text{priority}}(n) = \big(\text{prio}(n),\; t_{\text{access}}(n)\big)$$
 
 另有一份逐行中文注释版 `radix_cache_annotated_zh.py` 可对照阅读。
 
+**DSA / CSA-HCA 与树的兼容性**：
+
+- **DSA（V3.2）**：主 KV 仍是 MLA latent，`TreeNode.value` 索引的就是主池 slot → **radix tree 完全复用**（`DSATokenToKVPool` 只在 MLA 池上多挂一份 indexer K cache，该 cache 不参与前缀匹配）。
+- **CSA / HCA（V4）**：KV 按**压缩条目**存储（CSA $4\times$、HCA $128\times$），一个 slot 覆盖多个原始 token → 前缀匹配与插入必须按**压缩块边界**对齐（页语义：SWA=256、CSA=64、HCA=2），不能沿用「一 token 一 slot」的复用；由 V4 专用池（`deepseek_v4_memory_pool.py`、`deepseek_v4_compress_state.py`）与相应缓存处理。
+
 ### 7.11 显存账本与守恒
 
 树的两级账本（`evictable_size_` / `protected_size_`）最终要与其他部分的 slot 数量对齐。调度器空闲时（没有运行中的请求），`SchedulerInvariantChecker._check_pool_invariant` 会校验下面的等式，不相等就判定为显存泄漏。
@@ -1800,7 +1968,8 @@ flowchart LR
 | 池类型 | 适用模型 | 与 MHA 池的区别 |
 | --- | --- | --- |
 | `MLATokenToKVPool` | DeepSeek V2/V3 | 每 token 一份 latent，`[size+page, 1, 576]`，TP 间不切分 |
-| `DSATokenToKVPool` | DeepSeek V3.2（DSA） | MLA 池基础上增加 indexer K cache |
+| `DSATokenToKVPool` | DeepSeek V3.2（DSA） | MLA 池基础上增加 indexer K cache（详见 §4.6） |
+| `DeepSeekV4SingleKVPool` / `HiSparseC4DevicePool` / `DeepSeekV4IndexerPool` | DeepSeek-V4（CSA/HCA 压缩 + 稀疏） | KV 按压缩条目（$4\times$/$128\times$）存储，一个 slot 覆盖多个 token；另配 indexer 池（详见 §4.7） |
 | `SWAKVPool` + `SWATokenToKVPoolAllocator` | Gemma、GPT-OSS 等滑窗模型 | full 层与 SWA 层分两个子池、两套 slot，窗口外的 SWA slot 可以提前释放（详见 §4.3） |
 | `HybridReqToTokenPool` + `MambaPool` | Qwen3-Next、Mamba 混合模型 | 每个请求额外占 1 个 Mamba state 槽位（`mamba_pool_idx`），state 大小固定，与序列长度无关（详见上文 `MambaPool` 小节） |
 | `HybridLinearKVPool` | 线性注意力混合模型 | 只为 full attention 层分配 KV |

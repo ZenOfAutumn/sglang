@@ -2,7 +2,7 @@
 
 > 对应源码：`python/sglang/srt/layers/dp_attention.py`
 >
-> 相关文档：`docs/learn/distributed/DP_attention.md`（原理）、`docs/learn/arch/MLA.md`（MLA）、`python/sglang/srt/managers/README_data_parallel_controller_zh.md`（副本级 DP）
+> 相关文档：`docs/learn/distributed/DP_attention.md`（原理）、`docs/learn/arch/attention/MLA.md`（MLA）、`python/sglang/srt/managers/README_data_parallel_controller_zh.md`（副本级 DP）
 
 ---
 

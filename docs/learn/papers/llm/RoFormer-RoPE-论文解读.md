@@ -455,7 +455,7 @@ $$
 q_m^\top k_n=(R_mW_qx_m)^\top(R_nW^{UK}c_n)=x_m^\top W_q^\top R_{n-m}W^{UK}c_n
 $$
 
-$R_{n-m}$ 夹在中间，而且随 $(m,n)$ 变化，所以 $W_q^\top$ 和 $W^{UK}$ **无法合并成一个固定矩阵**。DeepSeek 的解决方法是：把 head 拆成 **nope 部分**（不加位置，可以吸收）和 **rope 部分**（单独一小段维度 $d_h^R$ 加 RoPE，所有 head 共享一个 $k^R$）。详见 `docs/learn/arch/MLA.md`。
+$R_{n-m}$ 夹在中间，而且随 $(m,n)$ 变化，所以 $W_q^\top$ 和 $W^{UK}$ **无法合并成一个固定矩阵**。DeepSeek 的解决方法是：把 head 拆成 **nope 部分**（不加位置，可以吸收）和 **rope 部分**（单独一小段维度 $d_h^R$ 加 RoPE，所有 head 共享一个 $k^R$）。详见 [`docs/learn/arch/attention/MLA.md`](../../arch/attention/MLA.md)。
 
 ### 7.2 推理系统中与 RoPE 相关的问题
 
