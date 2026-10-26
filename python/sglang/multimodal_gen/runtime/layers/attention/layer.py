@@ -172,7 +172,7 @@ def _count_active_replicated_modes(
     )
 
 
-def _prepare_sdpa_mask(
+def prepare_sdpa_mask(
     mask: torch.Tensor, *, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
     mask = mask.to(device=device)
@@ -674,9 +674,11 @@ class LocalAttention(nn.Module):
         default_attention_backend: AttentionBackendEnum | None = None,
         is_cross_attention: bool = False,
         compute_dtype: torch.dtype | None = None,
+        capture_dense_attention: bool = False,
         **extra_impl_args,
     ) -> None:
         super().__init__()
+        self.capture_dense_attention = capture_dense_attention
         if softmax_scale is None:
             self.softmax_scale = head_size**-0.5
         else:
@@ -755,20 +757,7 @@ class LocalAttention(nn.Module):
             q_ = q.transpose(1, 2)
             k_ = k.transpose(1, 2)
             v_ = v.transpose(1, 2)
-
-            if torch.is_floating_point(attn_mask):
-                mask = attn_mask.to(dtype=q_.dtype, device=q_.device)
-                if mask.dim() == 2:
-                    mask = mask[:, None, None, :]
-                elif mask.dim() == 3:
-                    mask = mask[:, None, :, :]
-            else:
-                mask = attn_mask.to(dtype=q_.dtype, device=q_.device)
-                if mask.dim() == 2:
-                    mask = mask[:, None, None, :]
-                elif mask.dim() == 3:
-                    mask = mask[:, None, :, :]
-                mask = (mask - 1.0) * torch.finfo(q_.dtype).max
+            mask = prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
 
             if q_.shape[1] != k_.shape[1]:
                 repeat_factor = q_.shape[1] // k_.shape[1]
@@ -825,6 +814,7 @@ class USPAttention(nn.Module):
         skip_sequence_parallel: bool = False,
         enable_packed_qkv_input_a2a: bool = False,
         is_cross_attention: bool = False,
+        capture_dense_attention: bool = False,
         **extra_impl_args,
     ) -> None:
         """
@@ -842,6 +832,7 @@ class USPAttention(nn.Module):
               for cross-attention while remaining strict for self-attention.
         """
         super().__init__()
+        self.capture_dense_attention = capture_dense_attention
         if softmax_scale is None:
             self.softmax_scale = head_size**-0.5
         else:
@@ -978,7 +969,28 @@ class USPAttention(nn.Module):
                 and not num_replicated_kv_prefix
             ), "Varlen USPAttention does not support masks or replicated tokens"
             if effective_skip_sp or get_sequence_parallel_world_size() == 1:
-                return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+                if q.shape[0] != 1:
+                    raise NotImplementedError(
+                        "Local varlen USPAttention expects one packed batch row"
+                    )
+                total = sum(seq_lens)
+                if total != q.shape[1]:
+                    raise ValueError(
+                        f"sum(seq_lens)={total} must match packed length {q.shape[1]}"
+                    )
+                bounds = [0]
+                for length in seq_lens:
+                    bounds.append(bounds[-1] + int(length))
+                cu_seqlens = _fa_backend.cu_seqlens_on_device(tuple(bounds), q.device)
+                out = self.attn_impl.forward_varlen(
+                    q[0],
+                    k[0],
+                    v[0],
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max(seq_lens),
+                    cu_seqlens_host=tuple(bounds),
+                )
+                return out.unsqueeze(0)
             if get_ring_parallel_world_size() > 1:
                 # The varlen all-to-all spans the combined SP group and is not
                 # ring-aware; it would shuffle rows across ring ranks instead
@@ -1235,7 +1247,7 @@ class USPAttention(nn.Module):
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
-                mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
+                mask = prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
                 sdpa_context = (
                     sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
                     if self.allow_cudnn_sdp and q_.device.type == "cuda"
@@ -1414,7 +1426,7 @@ class USPAttention(nn.Module):
                 q_ = q.transpose(1, 2)
                 k_ = k.transpose(1, 2)
                 v_ = v.transpose(1, 2)
-                mask = _prepare_sdpa_mask(
+                mask = prepare_sdpa_mask(
                     gathered_mask, dtype=q_.dtype, device=q_.device
                 )
                 sdpa_context = (
@@ -1503,7 +1515,19 @@ class USPAttention(nn.Module):
                 out = self.attn_impl.forward(qs, ks, vs, ctx_attn_metadata)
                 return _usp_output_all_to_all(out, head_dim=2)
 
-            out = self._pipelined_ulysses(q, k, v, attend, sequential, layout="dense")
+            out = self._pipelined_ulysses(
+                q,
+                k,
+                v,
+                attend,
+                sequential,
+                layout="dense",
+                attend_into=lambda q_group, k_group, v_group, out: (
+                    self.attn_impl.forward_into(
+                        q_group, k_group, v_group, out, ctx_attn_metadata
+                    )
+                ),
+            )
             if out is not None:
                 return out
 
@@ -1562,6 +1586,7 @@ class USPAttention(nn.Module):
         layout: str,
         replicated=(None, None, None),
         replicated_first: bool = True,
+        attend_into=None,
     ) -> torch.Tensor | None:
         """Ulysses attention with the exchange pipelined over head groups.
 
@@ -1631,6 +1656,7 @@ class USPAttention(nn.Module):
             ),
             replicated=replicated,
             replicated_first=replicated_first,
+            attend_into=attend_into,
         )
         if out is None:
             self._pipeline_declined.add(key)
@@ -1680,10 +1706,9 @@ class USPAttention(nn.Module):
                 "Replicated prefix and suffix cannot be used at the same time."
             )
 
-        # slicing along dim 1 keeps the original row stride, so the shard is
-        # contiguous only while the batch dim is 1; all_gather_into_tensor
-        # requires a contiguous input, so materialize the shard before the
-        # collective
+        # A dim-1 slice keeps the original row stride, and Flux2 K/V are views
+        # from qkv.chunk, so neither form is contiguous. all_gather_into_tensor
+        # rejects a non-contiguous input, so materialize before the collective.
         if num_replicated_prefix:
             replicated = tensor[:, :num_replicated_prefix]
             sharded = tensor[:, num_replicated_prefix:].contiguous()
@@ -1696,7 +1721,7 @@ class USPAttention(nn.Module):
             gathered = sequence_model_parallel_all_gather(sharded, dim=1)
             return torch.cat([gathered, replicated], dim=1)
 
-        return sequence_model_parallel_all_gather(tensor, dim=1)
+        return sequence_model_parallel_all_gather(tensor.contiguous(), dim=1)
 
     def _forward_with_kv_gather(
         self,
@@ -2081,7 +2106,7 @@ class USPAttention(nn.Module):
         q_ = q.transpose(1, 2)
         k_ = k.transpose(1, 2)
         v_ = v.transpose(1, 2)
-        mask = _prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
+        mask = prepare_sdpa_mask(attn_mask, dtype=q_.dtype, device=q_.device)
         sdpa_context = (
             sdpa_kernel(_PYTORCH_DEFAULT_CUDA_SDP_BACKENDS, set_priority=True)
             if self.allow_cudnn_sdp and q_.device.type == "cuda"
@@ -2341,8 +2366,22 @@ def _make_breakable_attention_forward(forward_method):
     @functools.wraps(forward_method)
     def forward(self, *args, **kwargs):
         if is_in_breakable_cuda_graph():
-            out = bcg_forward(self, *args, **kwargs)
-            return out.astuple() if isinstance(out, _BCGBoxedTupleOutput) else out
+            # Opt-in for model paths with fixed-shape dense attention. SP,
+            # varlen and other backends retain the normal eager break points.
+            capture_dense = (
+                getattr(self, "capture_dense_attention", False)
+                and get_sequence_parallel_world_size() == 1
+                and kwargs.get("seq_lens") is None
+                and kwargs.get("attn_mask_meta") is None
+                and self.backend
+                in (
+                    AttentionBackendEnum.TORCH_SDPA,
+                    AttentionBackendEnum.DYNAMIC_CUDNN_SDPA,
+                )
+            )
+            if not capture_dense:
+                out = bcg_forward(self, *args, **kwargs)
+                return out.astuple() if isinstance(out, _BCGBoxedTupleOutput) else out
         return forward_method(self, *args, **kwargs)
 
     return forward
